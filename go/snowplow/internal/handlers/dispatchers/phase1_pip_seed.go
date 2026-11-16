@@ -85,7 +85,6 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
-	"github.com/krateo-platformops/plumbing/jqutil"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/apis"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
@@ -894,27 +893,21 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 	}
 }
 
-// hasTemplatedEndpointRef reports whether any api-step of cr carries a
-// TEMPLATED endpointRef.name — a jq template (${...}-shaped, jqutil.MaybeQuery)
-// that the resolver evaluates against REQUEST extras to select the dispatch
-// endpoint (#113 hub-spoke). Such a RESTAction cannot be seeded (the boot seed
-// has no request extras → the endpoint resolve misses → a truncated body would
-// be Put under the no-extras key without either GTTL-1 sink bumping, the §4
-// poisoning nuance). Each api-step and its *Reference EndpointRef is nil-guarded
-// (API is a *API, EndpointRef a *templates.Reference; either may be nil).
+// hasTemplatedEndpointRef is #113's predicate as the RESTAction seed asks it:
+// the one #1477 predicate (restactionNeedsRequestExtras) with NO carried extras,
+// because the seed resolves the RESTAction with none. It reports whether an
+// api-step carries a TEMPLATED endpointRef.name (${...}-shaped,
+// jqutil.MaybeQuery) that reads a request extra (a dict key the resolver does
+// not write itself: a stage's output, an errorKey, the pagination block), or
+// whose reads cannot be determined. The resolver evaluates such a template
+// against REQUEST extras to select the dispatch endpoint (#113 hub-spoke). Such
+// a RESTAction cannot be seeded (the boot seed has no request extras → the
+// endpoint resolve misses → a truncated body would be Put under the no-extras
+// key without either GTTL-1 sink bumping, the §4 poisoning nuance). Each
+// api-step and its *Reference EndpointRef is nil-guarded (API is a *API,
+// EndpointRef a *templates.Reference; either may be nil).
 func hasTemplatedEndpointRef(cr *templatesv1.RESTAction) bool {
-	if cr == nil {
-		return false
-	}
-	for _, step := range cr.Spec.API {
-		if step == nil || step.EndpointRef == nil {
-			continue
-		}
-		if _, isTemplate := jqutil.MaybeQuery(step.EndpointRef.Name); isTemplate {
-			return true
-		}
-	}
-	return false
+	return restactionNeedsRequestExtras(cr, nil)
 }
 
 // hasTemplatedEndpointRefFn is the #113 seed-skip PREDICATE seam. Production
@@ -926,11 +919,13 @@ func hasTemplatedEndpointRef(cr *templatesv1.RESTAction) bool {
 // production never reassigns it. Idiom-match: resolveOnceFn.
 var hasTemplatedEndpointRefFn = hasTemplatedEndpointRef
 
-// seedObjectsGetFn is the RESTAction-fetch seam for seedOneRestaction.
-// Production wires it to the real objects.Get; the ONLY reassigner is the
-// _test.go falsifier, which injects a fetched RESTAction unstructured (a
-// templated- vs static-endpointRef shape) to drive the #113 seed-skip
-// hermetically — without a cluster. A package var (not a parameter) so
+// seedObjectsGetFn is the RESTAction-fetch seam for seedOneRestaction and for
+// the #1477 predicate's read of a widget's apiRef RESTAction
+// (widgetNeedsRequestExtras: the walk and the widget seed) and of the content
+// prewarm's RESTAction. Production wires it to the real objects.Get; the ONLY
+// reassigners are the _test.go falsifiers, which inject a fetched RESTAction
+// unstructured (a templated- vs static-endpointRef shape) to drive the #113 /
+// #1477 skips hermetically — without a cluster. A package var (not a parameter) so
 // seedOneRestaction's signature is untouched; production never reassigns it.
 // Idiom-match: resolveOnceFn / paginationFetchPageFn.
 var seedObjectsGetFn = objects.Get
@@ -1076,6 +1071,7 @@ func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, aut
 	// cell for it. Greppable skip line mirrors the Class-5 refHasUnresolvedTemplateToken
 	// idiom. Every api-step EndpointRef is nil-guarded (*Reference, may be nil).
 	if hasTemplatedEndpointRefFn(&cr) {
+		bumpBackgroundResolveSkip(bgSkipSiteRestactionSeed, bgSkipReasonNeedsRequestExtras) // #1477
 		slog.Default().Info("phase1.seed.skip.templated_endpointref",
 			slog.String("subsystem", "cache"),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
@@ -1442,6 +1438,16 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// live widget cell implies its first paginated /call already found (or will
 	// lazily rebuild) the pinned full-list.
 	if seedSkipDecision(ctx, mode, handle, key, "widgets", e.W.GetNamespace()+"/"+e.W.GetName()) {
+		return nil
+	}
+	// #1477 — the #113 rule, inherited from the widget's apiRef RESTAction: a
+	// templated endpointRef that reads a request extra this resolve does not
+	// carry (the widget's inline apiRef extras and declared identity ARE
+	// carried) renders a Secret no customer's request selects, so no customer
+	// key can match the cell. Skipped before the admission, like the per-mode
+	// skip above, so it never consumes the #46 bound.
+	if widgetNeedsRequestExtras(ctx, e.W) {
+		logBackgroundResolveSkip(bgSkipSiteWidgetSeed, "widget", e.W.GetNamespace()+"/"+e.W.GetName())
 		return nil
 	}
 	// #394 — capture the terminal-Put guard at seed ENTRY (mirror of

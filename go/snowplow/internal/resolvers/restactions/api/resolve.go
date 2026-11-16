@@ -531,7 +531,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 			return endpoints.Endpoint{}, false, false, stageReturn
 		}
 		// nil ref: the caller's own clientconfig, which snowplow holds.
-		return resolved, isSA, true, stageProceed
+		return resolved, isSA, stageHoldsCredential(uafActive, ref), stageProceed
 	}
 	if uafActive {
 		saEP, saErr := serviceAccountEndpointFn()
@@ -557,7 +557,7 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		}
 		// The UAF stage dials the SA endpoint → isSAEndpoint=true (provenance): the
 		// dial site threads the SA token FILE (#267).
-		return *saEP, true, true, stageProceed
+		return *saEP, true, stageHoldsCredential(uafActive, ref), stageProceed
 	}
 	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref)
 	if err != nil {
@@ -573,8 +573,24 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		return endpoints.Endpoint{}, false, false, stageReturn
 	}
 	// A nil ref resolved to the ctx-carried SA endpoint (isSA) or the per-user
-	// clientconfig: both are held. A named ref carries its own credential.
-	return resolved, isSA, isSA || ref == nil, stageProceed
+	// clientconfig: both are held. A named ref carries its own credential
+	// (resolveOne reports isSA only for a nil ref).
+	return resolved, isSA, stageHoldsCredential(uafActive, ref), stageProceed
+}
+
+// stageHoldsCredential is whether a stage's endpoint presents a credential
+// snowplow holds (#723/#724), decided from the stage's SHAPE so it is known
+// before the endpoint is resolved (#1477: the plan needs it, and the endpoint
+// is resolved only when the plan has a request). A userAccessFilter stage dials
+// the ServiceAccount, or for a caller-supplied draft the caller's own
+// clientconfig: held. Otherwise a nil endpointRef dials the ctx-carried
+// ServiceAccount endpoint or the caller's own clientconfig: held. A named
+// endpointRef carries a third party's own credential: not held (resolveOne
+// never reports a named ref as the ServiceAccount, and #1025 refuses one that
+// names a per-user credential). ref is the stage's endpointRef, rendered or
+// not: rendering never turns a nil ref into a named one or back.
+func stageHoldsCredential(uafActive bool, ref *templates.Reference) bool {
+	return uafActive || ref == nil
 }
 
 // evalEndpointRef renders a templated endpointRef.name (#113). For a nil ref or
@@ -629,21 +645,17 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 	return &templates.Reference{Name: name, Namespace: ref.Namespace}, true
 }
 
-// collapseOrFanoutPlan builds the per-stage RequestOptions slice (the call
-// plan). It replaces the inline P5f+P5g+P5h block verbatim: createRequestOptions
-// (empty → the "empty request options" Warn + an empty return, which the
-// orchestrator treats as C-3), then the Ship D.5 cluster-list collapse
-// (rebinding tmp + setting the st timing fields), then the 0.30.92 lazy
-// informer register. st is the per-stage timing struct (a loop-local value,
-// passed by pointer) — its ClusterList* fields are written here exactly as
-// before. Returns tmp (possibly empty for C-3).
-func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, apiCall *templates.API, ep endpoints.Endpoint, st *cache.PIPStageTiming) []httpcall.RequestOptions {
-	// #1112 D2 — the #288 shape guard judges the path only when the stage dials
-	// this cluster's apiserver (the provenance runStage marked on provCtx); a
-	// write item any guard refuses is a stage failure with its reason, never a
-	// silent success (undialled_write.go).
-	tmp, skips, iterErr := createRequestOptionsWithSkips(r.ctx, r.log, apiCall, r.dict, targetsOwnCluster(provCtx))
-	r.failRefusedItems(id, apiCall, &ep, skips)
+// planStage is the first half of the stage's plan (#1477), run BEFORE the
+// stage's endpoint is resolved: the per-call elements (stagePlanElements). It
+// returns ok=false, with the stage's outcome already recorded, when the plan
+// has no request: an iterator that failed (#638, a stage error), or one that
+// yielded nothing (C-3, the empty plan). Neither reads the endpointRef Secret,
+// the ServiceAccount token or the caller's clientconfig, and neither logs above
+// DEBUG beyond the iterator's own error. planCtx carries the stage's held-
+// credential provenance (stageHoldsCredential), which is all planning needs of
+// the endpoint.
+func (r *resolveRun) planStage(planCtx context.Context, id string, apiCall *templates.API) (elems []any, ok bool) {
+	elems, iterErr := stagePlanElements(r.ctx, r.log, apiCall, r.dict)
 	if iterErr != nil {
 		// #638 — a non-benign iterator compile/eval error FAILS the stage. It
 		// used to be logged only: the stage ran a partial-or-empty plan and the
@@ -655,7 +667,7 @@ func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, ap
 		// Runs on the stage-loop goroutine before any worker exists, so dict
 		// needs no lock.
 		msg := iterErr.Error()
-		r.log.ErrorContext(provCtx, "stage iterator failed; stage not dispatched",
+		r.log.ErrorContext(planCtx, "stage iterator failed; stage not dispatched",
 			slog.String("name", id),
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 			slog.String("restaction_name", r.opts.RESTActionName))
@@ -663,42 +675,71 @@ func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, ap
 		r.taintNarrow() // #603 PR-2
 		r.stageErrSink.Bump(id, msg)
 		r.outcomes.fail(id, StageReasonError)
-		return nil
+		return nil, false
 	}
-	if len(tmp) == 0 {
-		// C-3 (a normal "continue" condition): an iterator stage evaluated to
-		// zero items, so there is nothing to call. Benign and per-resolve —
-		// DEBUG, not the WARN that dominates the healthy-cluster firehose.
-		//
-		// #279 C3 empty-fan fix: with zero request options the per-item edge-3
-		// recorder below (the `for i := range tmp` loop) never runs, so the
-		// fanned GVR's (gvr, ns, "*") LIST edge is never recorded and a later CR
-		// ADD of that GVR dirty-marks nothing → stale-negative. The target GVR is
-		// STATIC in the path template even with 0 items, so record the LIST edge
-		// from the skeleton here. ParseAPIServerListDepSkeleton returns ok=false
-		// on a templated version/resource → we skip and leave that residual to
-		// the #285 seed re-walk fence. Same guards as the edge-3 loop (L1 key
-		// present, cache on, GET) + nil-safe cache.Global() per the #277
-		// ensureInformer seam. Scope: cures the own-GVR list-then-get-each fan; a
-		// cross-GVR iterator's invalidation is the source stage's own LIST edge.
-		if l1Key := cache.L1KeyFromContext(r.ctx); l1Key != "" && !cache.Disabled() &&
-			ptr.Deref(apiCall.Verb, http.MethodGet) == http.MethodGet {
-			if gvr, ns, ok := cache.ParseAPIServerListDepSkeleton(apiCall.Path); ok {
-				// #603 PR-2 — no call serves this edge, so it widens at commit.
-				r.recordListEdge(id, l1Key, gvr, ns)
-				if rw := cache.Global(); rw != nil {
-					rw.EnsureResourceTypeFor(r.ctx, gvr)
-				}
-				r.log.Debug("dep.recorded",
-					slog.String("subsystem", "cache"),
-					slog.String("edge_type", "emptyFanSkeleton"),
-					slog.String("gvr", gvr.String()),
-					slog.String("ns", ns),
-					slog.String("l1_key", l1Key),
-				)
+	if len(elems) == 0 {
+		r.emptyPlan(id, apiCall)
+		return nil, false
+	}
+	return elems, true
+}
+
+// emptyPlan is C-3 (a normal "continue" condition): a stage whose plan has no
+// request to send — an iterator that evaluated to zero items (planStage), or
+// one whose every item a guard refused (collapseOrFanoutPlan, after
+// failRefusedItems recorded each refusal). Benign and per-resolve — DEBUG, not
+// the WARN that dominates the healthy-cluster firehose. The stage's dict[id]
+// stays unset.
+func (r *resolveRun) emptyPlan(id string, apiCall *templates.API) {
+	// #279 C3 empty-fan fix: with zero request options the per-item edge-3
+	// recorder below (the `for i := range tmp` loop) never runs, so the
+	// fanned GVR's (gvr, ns, "*") LIST edge is never recorded and a later CR
+	// ADD of that GVR dirty-marks nothing → stale-negative. The target GVR is
+	// STATIC in the path template even with 0 items, so record the LIST edge
+	// from the skeleton here. ParseAPIServerListDepSkeleton returns ok=false
+	// on a templated version/resource → we skip and leave that residual to
+	// the #285 seed re-walk fence. Same guards as the edge-3 loop (L1 key
+	// present, cache on, GET) + nil-safe cache.Global() per the #277
+	// ensureInformer seam. Scope: cures the own-GVR list-then-get-each fan; a
+	// cross-GVR iterator's invalidation is the source stage's own LIST edge.
+	if l1Key := cache.L1KeyFromContext(r.ctx); l1Key != "" && !cache.Disabled() &&
+		ptr.Deref(apiCall.Verb, http.MethodGet) == http.MethodGet {
+		if gvr, ns, ok := cache.ParseAPIServerListDepSkeleton(apiCall.Path); ok {
+			// #603 PR-2 — no call serves this edge, so it widens at commit.
+			r.recordListEdge(id, l1Key, gvr, ns)
+			if rw := cache.Global(); rw != nil {
+				rw.EnsureResourceTypeFor(r.ctx, gvr)
 			}
+			r.log.Debug("dep.recorded",
+				slog.String("subsystem", "cache"),
+				slog.String("edge_type", "emptyFanSkeleton"),
+				slog.String("gvr", gvr.String()),
+				slog.String("ns", ns),
+				slog.String("l1_key", l1Key),
+			)
 		}
-		r.log.Debug("empty request options for http call", slog.Any("name", id))
+	}
+	r.log.Debug("empty request options for http call", slog.Any("name", id))
+}
+
+// collapseOrFanoutPlan builds the per-stage RequestOptions slice (the call
+// plan) from the elements planStage planned, once the stage's endpoint is
+// resolved. It replaces the inline P5f+P5g+P5h block verbatim: the request
+// options are rendered (renderRequestOptions; none valid → emptyPlan + an empty
+// return, which the orchestrator treats as C-3), then the Ship D.5
+// cluster-list collapse (rebinding tmp + setting the st timing fields), then
+// the 0.30.92 lazy informer register. st is the per-stage timing struct (a
+// loop-local value, passed by pointer) — its ClusterList* fields are written
+// here exactly as before. Returns tmp (possibly empty for C-3).
+func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, apiCall *templates.API, ep endpoints.Endpoint, elems []any, st *cache.PIPStageTiming) []httpcall.RequestOptions {
+	// #1112 D2 — the #288 shape guard judges the path only when the stage dials
+	// this cluster's apiserver (the provenance runStage marked on provCtx); a
+	// write item any guard refuses is a stage failure with its reason, never a
+	// silent success (undialled_write.go).
+	tmp, skips := renderRequestOptions(r.log, apiCall, elems, targetsOwnCluster(provCtx))
+	r.failRefusedItems(id, apiCall, &ep, skips)
+	if len(tmp) == 0 {
+		r.emptyPlan(id, apiCall)
 		return tmp
 	}
 
@@ -1848,6 +1889,24 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// per-stage.
 	uafActive := apiCall.UserAccessFilter != nil
 
+	// #1477 — plan BEFORE the endpoint. The plan's size is a function of the
+	// stage and the dict alone; of the endpoint it needs only whether its
+	// credential is held (targetsOwnCluster, the #288 shape guard), which is
+	// the stage's shape (stageHoldsCredential). A stage that plans no request
+	// (an iterator over nothing) produces its empty result here, and reads no
+	// endpointRef Secret, no ServiceAccount token and no clientconfig: its
+	// endpoint is never used, so a miss of it cannot fail the resolve. #723/#724
+	// — the provenance mark, set to THIS stage's value, true or false, never
+	// inherited (#1019 review F1: a nested resolve's named-ref stage must not
+	// read as held because its outer stage was).
+	heldCred := stageHoldsCredential(uafActive, apiCall.EndpointRef)
+	planCtx := credhttp.WithHeldCredentialValue(r.ctx, heldCred)
+	elems, planned := r.planStage(planCtx, id, apiCall)
+	if !planned {
+		recordStageTiming()
+		return false
+	}
+
 	// Resolve the endpoint. UAF stages use the snowplow-SA
 	// endpoint; non-UAF stages go through the per-user
 	// clientconfig (or the named EndpointRef) as before. The
@@ -1857,7 +1916,9 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// #57 (C-b): the user-bearer-token append moved to AFTER endpoint
 	// resolution (was before) so the self-loopback arm can compare the
 	// RESOLVED endpoint host against the configured self-host.
-	ep, isSA, heldCred, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
+	// heldCred is the planned one above: resolveStageEndpoint returns the same
+	// stageHoldsCredential value.
+	ep, isSA, _, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
 	switch epAction {
 	case stageContinue:
 		recordStageTiming()
@@ -1868,16 +1929,12 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	}
 	// #723/#724 — the stage dials a credential snowplow holds (SA or the
 	// per-user clientconfig): the dial site's client never follows a redirect.
-	// #1017 — the same provenance is what targetsOwnCluster reads: marked once
-	// here, before the plan, so the collapse and the lazy register see it as
-	// the dispatch does (gctx derives from provCtx below).
-	// #1019 review F1 — set to THIS stage's provenance, true or false, never
-	// inherited: a nested resolve (resolve: true) runs its stages on a ctx
-	// derived from the outer stage's, and a nested named-ref stage must not
-	// read as held because its outer stage was.
-	provCtx := credhttp.WithHeldCredentialValue(r.ctx, heldCred)
-	// #1283 — the stage's dials record which endpointRef they went through.
-	provCtx = withStageEndpointRef(provCtx, r.stageRef)
+	// #1017 — the same provenance is what targetsOwnCluster reads: marked once,
+	// on planCtx above, so the render, the collapse and the lazy register see
+	// it as the dispatch does (gctx derives from provCtx below).
+	// #1283 — the stage's dials record which endpointRef they went through
+	// (r.stageRef: resolveStageEndpoint just set it for THIS stage).
+	provCtx := withStageEndpointRef(planCtx, r.stageRef)
 
 	// User-bearer-token append: only for non-UAF stages. When UAF is active
 	// the SA endpoint carries the SA token (no user-bearer override needed);
@@ -1993,12 +2050,12 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		slog.String("name", id), slog.String("host", redact.URL(ep.ServerURL)),
 		slog.Bool("uaf", uafActive))
 
-	// Build the per-stage call plan: request options + Ship D.5
-	// cluster-list collapse + 0.30.92 lazy informer register (the
-	// stageTiming.ClusterList* fields are written inside). An empty
-	// tmp is C-3 (the "empty request options" Warn fired inside) —
-	// the orchestrator owns the recordStageTiming()+continue.
-	tmp := r.collapseOrFanoutPlan(provCtx, id, apiCall, ep, &stageTiming)
+	// Build the per-stage call plan from the planned elements: request
+	// options + Ship D.5 cluster-list collapse + 0.30.92 lazy informer
+	// register (the stageTiming.ClusterList* fields are written inside). An
+	// empty tmp (every item refused) is C-3 (emptyPlan ran inside) — the
+	// orchestrator owns the recordStageTiming()+continue.
+	tmp := r.collapseOrFanoutPlan(provCtx, id, apiCall, ep, elems, &stageTiming)
 	if len(tmp) == 0 {
 		recordStageTiming()
 		return false

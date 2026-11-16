@@ -1572,6 +1572,11 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	resolveSkipped, err := m.Int64ObservableCounter("snowplow_prewarm_resolve_skipped_total",
+		metric.WithDescription("Background resolves skipped before they ran, by site (closed set: restaction_seed, widget_seed, walk, content_prewarm) and reason (closed set: needs_request_extras = a templated endpointRef reads a request extra the background resolve does not carry, so no customer key can match its cell, #1477 generalising #113). Every cell is published; its rate is the background work avoided."))
+	if err != nil {
+		return err
+	}
 	extFetch, err := m.Int64ObservableCounter("snowplow_external_fetch_total",
 		metric.WithDescription("LOGICAL external (non-apiserver) fetches issued by the RESTAction resolver, one per stage call, by origin {background, request} and driver (the resolver that dialled: refresher, cohort-seed, prewarm-engine-boot = the discovery walk, prewarm-path = the content prewarm, background-unattributed, serve); retries inside plumbing's RetryClient are NOT counted here (they are in snowplow_endpoint_retries_total, #1088), so this does not compare 1:1 with a server-side attempt log (ClickHouse query_log). background = any non-customer resolve (prewarm engine, content prewarm, refresher). A background rate that does not fall after boot is the #643 re-fetch loop."))
 	if err != nil {
@@ -1639,6 +1644,10 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		for _, c := range dispatchers.PrewarmSkipResumeDoneSnapshot() {
 			o.ObserveInt64(skipResume, int64(c.Count), kindAttr(c.Kind))
 		}
+		for _, c := range dispatchers.BackgroundResolveSkipSnapshot() {
+			o.ObserveInt64(resolveSkipped, int64(c.Count), metric.WithAttributes(
+				attribute.String("site", c.Site), attribute.String("reason", c.Reason)))
+		}
 		// #643 PR-B2 — one series per {origin, driver}: driver determines
 		// origin, so sum-by-origin is the pre-B2 {origin} reading unchanged.
 		for _, c := range restactionsapi.ExternalFetchByDriverSnapshot() {
@@ -1651,7 +1660,7 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		}
 		return nil
 	}, passTotal, planned, done, budget, elapsed, rWidgetUnits, rWidgetUS, rRAUnits, rRAUS,
-		skipDeclined, skipResume, extFetch, extAbandoned, declinedMarks, declinedRetired, gvrEpoch,
+		skipDeclined, skipResume, resolveSkipped, extFetch, extAbandoned, declinedMarks, declinedRetired, gvrEpoch,
 		walkSkip, walkUnmarkable)
 	return err
 }
