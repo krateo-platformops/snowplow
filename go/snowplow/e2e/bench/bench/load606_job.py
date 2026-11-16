@@ -198,17 +198,23 @@ exec python3 -u /opt/load606/load606.py preflight \\
 GO_RUNTIME_JOB = "runtime606"
 
 
-def render_go_runtime(*, snowplow_url: str, authn_url: str, user: str, password: str,
-                      src: str | None = None, job_name: str = GO_RUNTIME_JOB) -> str:
+def render_go_runtime(*, snowplow_url: str, authn_url: str, user: str, password: str, deadline: int,
+                      preflight_user: str, init: str, src: str | None = None,
+                      job_name: str = GO_RUNTIME_JOB) -> str:
     """Namespace + ConfigMap + the runtime606 Job: the bench's debug reader logs in and reads
     /debug/vars' snowplow_go_runtime (`load606 go-runtime`): the GC settings the snowplow process
-    runs with, as one JSON line. Seconds-scale, on the loadgen pool like the preflight."""
+    runs with. No answer is tried again until `deadline` (epoch s, the step's own: run606 GO_RUNTIME_S
+    from the apply), each attempt one line. Meanwhile its boot window (load606 BootWindow): /readyz
+    (anonymous) and the boot root `init` (the preflight user) every 5 s, and one goroutine dump (the
+    debug reader) when a request passes 5 s without a byte. The record last. On the loadgen pool."""
     script = f"""set -eu
 exec python3 -u /opt/load606/load606.py go-runtime \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
-  --user {json.dumps(user)} --password {json.dumps(password)}
+  --user {json.dumps(user)} --password {json.dumps(password)} --deadline {int(deadline)} \\
+  --preflight-user {json.dumps(preflight_user)} --init {json.dumps(init)}
 """
     return _one_shot_job(job_name, script, src)
+
 
 
 def _one_shot_job(job_name: str, script: str, src: str | None = None) -> str:
@@ -588,7 +594,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--snowplow-url", required=True)
     p.add_argument("--authn-url", required=True)
     p.add_argument("--password", required=True)
-    p.add_argument("--init", default=None, help="the portal's boot root (required, except with --go-runtime-only)")
+    p.add_argument("--init", default=None, help="the portal's boot root (required)")
     p.add_argument("--composite-route", action="append", default=None)
     p.add_argument("--burst-users", type=int, default=0)
     p.add_argument("--burst-at-s", type=float, default=600.0)
@@ -600,8 +606,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--debug-user", default=rbac_model.DEBUG_READER,
                    help="the ONE identity every /debug read is done as (bench/rbac_model.py THE DEBUG READER)")
     p.add_argument("--go-runtime-only", action="store_true",
-                   help="render only the runtime606 Job: the preflight user reads the GC settings the snowplow "
-                        "process runs with (/debug/vars snowplow_go_runtime)")
+                   help="render only the runtime606 Job: the debug reader reads the GC settings the snowplow "
+                        "process runs with (/debug/vars snowplow_go_runtime); its boot window probes /readyz "
+                        "and the boot root (--init, as --preflight-user) meanwhile")
+    p.add_argument("--go-runtime-deadline", type=int, default=None,
+                   help="--go-runtime-only (required): epoch s, the step's deadline (run606 GO_RUNTIME_S)")
     p.add_argument("--preflight-job-name", default="preflight606",
                    help="--preflight-only: the Job's name (a menu class's preflight, run606 s_classes)")
     p.add_argument("--menu-classes", action="store_true",
@@ -645,15 +654,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--browser-snowplow-url", default=None,
                    help="k6: snowplow as the browser reaches it (config SNOWPLOW_API_BASE_URL)")
     a = p.parse_args(argv)
-    if a.init is None and not a.go_runtime_only:
+    if a.init is None:
         p.error("the following arguments are required: --init")
     if a.menu_classes:
         for label in menu_classes_driven(a.users, a.namespaces, a.browser_sessions, a.burst_users, a.dry_run):
             print(label)
         return 0
     if a.go_runtime_only:
+        if a.go_runtime_deadline is None:
+            p.error("--go-runtime-only needs --go-runtime-deadline (the step's deadline, epoch s)")
         sys.stdout.write(render_go_runtime(snowplow_url=a.snowplow_url, authn_url=a.authn_url,
-                                           user=a.debug_user, password=a.password))
+                                           user=a.debug_user, password=a.password,
+                                           deadline=a.go_runtime_deadline, preflight_user=a.preflight_user,
+                                           init=a.init))
         return 0
     if a.preflight_only:
         sys.stdout.write(render_preflight(

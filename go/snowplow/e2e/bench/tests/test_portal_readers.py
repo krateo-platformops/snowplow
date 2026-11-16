@@ -419,8 +419,9 @@ def test_the_rehearsal_checks_the_image_and_runs_the_preflight_and_reports_both(
     assert rec["kind"] == "image_digest" and rec["result"] == "MATCH" and rec["expected"] == DIG
     assert "image digest MATCH: every live snowplow pod runs " + DIG in log
     assert "composite pages for the cold burst: /observability /compositions" in log
-    # the go runtime read comes first, then the image, then the preflight; and still no load
-    assert log.index("snowplow env verified from the running process") < log.index("image digest MATCH") < log.index("portal boot root")
+    # the preflight comes first (#1482: it makes the preflight user and reads the boot root the Go runtime
+    # read's boot window probes), then the go runtime read, then the image; and still no load
+    assert log.index("portal boot root") < log.index("snowplow env verified from the running process") < log.index("image digest MATCH")
     assert "=== step data ===" not in log and "=== step measure ===" not in log
     assert (state / "users").read_text().split() == ["scaleuser-debug-reader", "scaleuser-0000"]
 

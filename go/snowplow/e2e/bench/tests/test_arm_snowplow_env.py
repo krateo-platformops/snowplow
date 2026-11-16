@@ -309,8 +309,10 @@ def test_the_runtime_job_reads_what_snowplow_publishes():
     assert load606.GO_RUNTIME_FIELDS == ("gogc", "memory_limit_bytes", "memory_limit_source",
                                          "cgroup_memory_limit_bytes")
     from bench import load606_job
-    job = load606_job.render_go_runtime(snowplow_url="http://s", authn_url="http://a", user="u", password="pw")
+    job = load606_job.render_go_runtime(snowplow_url="http://s", authn_url="http://a", user="u", password="pw",
+                                        deadline=1794812999, preflight_user="p", init="/call?x")
     assert "name: runtime606" in job and "load606.py go-runtime" in job and "bench.krateo.io/pool: loadgen" in job
+    assert "--deadline 1794812999" in job      # the step's own deadline, never one of the Job's making
 
 
 # ─── agreed between the arms of a launch ────────────────────────────────────
@@ -707,7 +709,9 @@ def test_run606_reads_the_process_before_load_and_keeps_the_password_out(harness
     rec = json.loads((out / "snowplow-env.json").read_text())
     assert rec["effective"] == {"gogc": 100, "memory_limit_bytes": 7 * GIB, "memory_limit_source": "cgroup_v2",
                                 "cgroup_memory_limit_bytes": 8 * GIB}
-    assert json.loads((out / "go-runtime.jsonl").read_text())["ok"] is True
+    lines = [json.loads(x) for x in (out / "go-runtime.jsonl").read_text().splitlines()]
+    assert [x["kind"] for x in lines if x["kind"].startswith("go_runtime")] == ["go_runtime_attempt", "go_runtime"]
+    assert lines[-1]["kind"] == "go_runtime" and lines[-1]["ok"] is True
     # the Job ran before any driver, and the bench user's password is nowhere it was written
     calls = [json.loads(x)["argv"] for x in (state / "calls.jsonl").read_text().splitlines()
              if json.loads(x)["tool"] == "kubectl"]

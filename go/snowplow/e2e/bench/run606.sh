@@ -1093,16 +1093,27 @@ s_portal_routes() {
 # the cluster: the user is the bench's synthetic one (data606-debug-reader), with the bench's fixed
 # test password, which is redacted from the manifest once applied and from every log line. A reading
 # that fails leaves a file that says so, or none: the gate then fails the arm.
+# Runs 26j/27 (every GOGC=50 arm: no byte on /debug/vars for 30 s, 6-11 s after the rebooted pod's Ready):
+# a read with no answer is tried again within GO_RUNTIME_S, a real non-200 ends it, every attempt is a
+# line and a stall is its own finding (load606 read_answered). Meanwhile the Job's BOOT WINDOW (load606
+# BootWindow, report-only): every 5 s /readyz (anonymous) and the boot root (the preflight user), until
+# the read ended and one round more, and ONE goroutine dump (the debug reader) when a request of the
+# window passes 5 s without a byte -> $OUT/boot-window.json, $OUT/boot-goroutines.txt.gz, the run log.
 go_runtime_reading() {
   local out="$OUT/go-runtime.jsonl" job=runtime606 deadline ok="" failed=""
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.load606_job --go-runtime-only > $OUT/go-runtime-job.yaml; kapply it (Job bench-loadgen/${job}: the debug reader reads /debug/vars snowplow_go_runtime) -> $out"
+    log "DRY: python3 -m bench.load606_job --go-runtime-only --go-runtime-deadline <now + ${GO_RUNTIME_S}s> --init ${PORTAL_INIT} > $OUT/go-runtime-job.yaml; kapply it (Job bench-loadgen/${job}: the debug reader reads /debug/vars snowplow_go_runtime; a read with no answer is tried again within ${GO_RUNTIME_S}s, a refusal ends it; its boot window probes /readyz anonymous and the boot root as the preflight user every 5s until one round after the read, one goroutine dump as the debug reader when a request passes 5s without a byte) -> $out"
+    log "DRY: python3 -m bench.bootwindow said --effective $out --pod $OUT/pod-before.jsonl --dump $OUT/boot-goroutines.txt.gz --out $OUT/boot-window.json (report-only)"
     return 0
   fi
+  # ONE deadline for the step and the Job (GO_RUNTIME_S, its share of the run budget): no attempt, probe
+  # round or dump of the Job starts that could not end before it, and this wait ends there; whatever the
+  # wait outruns is in the Job's log all the same
+  deadline=$(( $(date +%s) + GO_RUNTIME_S ))
   python3 -m bench.load606_job --go-runtime-only --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" \
-      --password "$PW" > "$OUT/go-runtime-job.yaml"
+      --password "$PW" --go-runtime-deadline "$deadline" --init "${PORTAL_INIT:-}" > "$OUT/go-runtime-job.yaml" 2>"$KERR" \
+    || { log "the ${job} Job could not be rendered: $(kerr_line)"; return 0; }
   kapply "$OUT/go-runtime-job.yaml" >/dev/null || { log "the ${job} Job was not created: $(kerr_line)"; return 0; }
-  deadline=$(( $(date +%s) + PREFLIGHT_TIMEOUT_S ))
   while (( $(date +%s) < deadline )); do
     ok="$("${K[@]}" -n bench-loadgen get job "$job" -o 'jsonpath={.status.succeeded}' 2>/dev/null || true)"
     failed="$("${K[@]}" -n bench-loadgen get job "$job" -o 'jsonpath={.status.failed}' 2>/dev/null || true)"
@@ -1112,8 +1123,12 @@ go_runtime_reading() {
   done
   "${K[@]}" --request-timeout=60s -n bench-loadgen logs "job/$job" > "$out" 2>/dev/null || true
   if [[ -z "$ok" || "$ok" == "0" ]] && [[ -z "$failed" || "$failed" == "0" ]]; then
-    log "the ${job} Job did not finish within ${PREFLIGHT_TIMEOUT_S}s: $(job_pod_why "$job")"
+    log "the ${job} Job did not finish within ${GO_RUNTIME_S}s: $(job_pod_why "$job")"
   fi
+  # the read's own finding, then the boot window's block (report-only: it never changes the gate below)
+  log "$(python3 -m bench.snowplow_env read-said --effective "$out" 2>&1)"
+  python3 -m bench.bootwindow said --effective "$out" --pod "$OUT/pod-before.jsonl" \
+      --dump "$OUT/boot-goroutines.txt.gz" --out "$OUT/boot-window.json" 2>&1 | while IFS= read -r ln; do log "$ln"; done || true
 }
 # snowplow_env_gate: before any load, the running snowplow container must have every declared key as
 # declared (the reading tracing_reading just took: the container's env and the ConfigMaps it reads,
@@ -1124,7 +1139,7 @@ snowplow_env_gate() {
   local line rc=0
   if [[ "$DRY" == "1" ]]; then
     go_runtime_reading
-    log "DRY: python3 -m bench.snowplow_env check --declared '$SNOWPLOW_ENV' --tracing $OUT/tracing.json --effective $OUT/go-runtime.jsonl --out $OUT/snowplow-env.json (the running process must run with every declared setting)"
+    log "DRY: python3 -m bench.snowplow_env check --declared '$SNOWPLOW_ENV' --tracing $OUT/tracing.json --effective $OUT/go-runtime.jsonl --boot-window $OUT/boot-window.json --out $OUT/snowplow-env.json (the running process must run with every declared setting; the boot window rides along, report-only)"
     if [[ -n "$SNOWPLOW_ENV_DIR" ]]; then
       log "DRY: python3 -m bench.snowplow_env agree --dir $SNOWPLOW_ENV_DIR --arm $BENCH_ARM --arms $SNOWPLOW_ENV_ARMS --wait-s $ENV_AGREE_WAIT_S"
     fi
@@ -1132,7 +1147,8 @@ snowplow_env_gate() {
   fi
   go_runtime_reading
   line="$(python3 -m bench.snowplow_env check --declared "$SNOWPLOW_ENV" --tracing "$OUT/tracing.json" \
-            --effective "$OUT/go-runtime.jsonl" --arm "$BENCH_ARM" --out "$OUT/snowplow-env.json" 2>"$KERR")" || rc=$?
+            --effective "$OUT/go-runtime.jsonl" --boot-window "$OUT/boot-window.json" --arm "$BENCH_ARM" \
+            --out "$OUT/snowplow-env.json" 2>"$KERR")" || rc=$?
   if (( rc != 0 )); then
     # the other runs of the launch are not kept waiting for a reading that will not come
     if [[ -n "$SNOWPLOW_ENV_DIR" ]]; then mkdir -p "$SNOWPLOW_ENV_DIR"; : > "$SNOWPLOW_ENV_DIR/${BENCH_ARM}.gone"; fi
@@ -1155,12 +1171,13 @@ snowplow_env_gate() {
   fi
   log "snowplow env: ${line}"
 }
-# s_rehearsal (BENCH_606_REHEARSAL=env): after the install and the platform, the pod's reading and the
-# gate, the image the snowplow pod runs (#1468: digest_gate, the measuring run's own check, against
-# EXPECTED_IMAGE_DIGEST; no restart came before it here, so no leftover pod is expected), the
-# preflight (run 26j: the preflight user's boot call and the menu's routes, by s_preflight, the
-# measuring run's own step: the boot root must answer 200, the menu must list routes, and with
-# COMPOSITE_BURST_USERS > 0 one of them must be a composite page), the operations record, and ONE
+# s_rehearsal (BENCH_606_REHEARSAL=env): after the install and the platform, the preflight (run 26j:
+# the preflight user's boot call and the menu's routes, by s_preflight, the measuring run's own step:
+# the boot root must answer 200, the menu must list routes, and with COMPOSITE_BURST_USERS > 0 one of
+# them must be a composite page; first, since #1482's boot window probes that boot root as that user),
+# the pod's reading and the gate (with its boot window), the image the snowplow pod runs (#1468:
+# digest_gate, the measuring run's own check, against EXPECTED_IMAGE_DIGEST; no restart came before it
+# here, so no leftover pod is expected), the operations record, and ONE
 # block with everything the rehearsal exists to show. Each check runs whatever the one before it
 # said: the report shows them all, and the rehearsal fails when any of them did.
 s_rehearsal() {
@@ -1168,10 +1185,12 @@ s_rehearsal() {
   # the identity the runtime reading logs in as: the bench's debug reader, as the preflight step makes it
   debug_reader || return 1
   tracing_reading before
+  # the preflight first: it makes the preflight user and reads the boot root the Go runtime read's boot
+  # window probes (as in a measuring run, where the preflight step came long before)
+  s_preflight || gate=1
   snowplow_env_gate || gate=$?
   digest_gate snowplow "$SNOWPLOW_POD_SELECTOR" "$EXPECTED_IMAGE_DIGEST" image_digest "$OUT/image-digest.jsonl" \
     "$(( $(date +%s) + DIGEST_SETTLE_S ))" || gate=1
-  s_preflight || gate=1
   cluster_operations
   if [[ "$DRY" == "1" ]]; then
     log "DRY: python3 -m bench.snowplow_env rehearsal-report --out-dir $OUT"
