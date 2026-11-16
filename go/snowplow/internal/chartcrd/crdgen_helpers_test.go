@@ -86,6 +86,10 @@ const (
 	// v1.82.0 v1.84.0 -- crdgen`). So coreProviderCrdgenVersion is v1.82.0, and
 	// the invariant holds by code again, not only by output.
 	//
+	// v1.84.0 → v1.85.0 (snowplow#1481, plumbing#198): `git diff --stat` changes
+	// only dialguard/ and the Makefile; crdgen/ and crdgen/schemas/ are
+	// byte-identical, so v1.85.0's crdgen is still v1.82.0's.
+	//
 	// THE TWO CORE-PROVIDER VERSIONS ARE DIFFERENT THINGS. coreProviderVersion
 	// names the status schema in testdata (statusSchemaPath), which the guard
 	// compiles beside the chart because it counts toward the CRD's CEL cost;
@@ -96,7 +100,7 @@ const (
 	// input, so it is its own change (#1488), not part of a plumbing bump.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.84.0"
+	crdgenVersion       = "v1.85.0"
 	// coreProviderCrdgenVersion is the plumbing core-provider compiles with
 	// (core-provider 2.13.105's go/core-provider/go.mod).
 	coreProviderCrdgenVersion = "v1.82.0"

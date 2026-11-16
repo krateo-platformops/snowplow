@@ -186,7 +186,11 @@ import (
 // InternalError, and a non-2xx code it does not list is a Failure (it was a
 // Success); this file writes only 500 and 503 through it (its 401s are
 // credential_status.go's own), whose bodies are the same bytes.
-const PinnedPlumbingVersion = "v1.84.0"
+//
+// v1.84.0 → v1.85.0 (snowplow#1481): `git diff --stat` of the two tags changes
+// only dialguard/ and the Makefile; every package this file transcribes is
+// byte-identical.
+const PinnedPlumbingVersion = "v1.85.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
