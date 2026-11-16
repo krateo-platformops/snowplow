@@ -38,6 +38,8 @@ import (
 	"time"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
 // chartRepo is where this repo's charts are published (the release workflow's
@@ -140,7 +142,11 @@ func check(doc any, known map[string]bool) ([]string, []entry) {
 	return out, entries
 }
 
-var client = &http.Client{Timeout: 25 * time.Second}
+// client is built by credhttp like every other client in the module (#723,
+// #1131): its dials go through the destination guard, and it never follows a
+// redirect. The registry answers the token and manifest requests directly, so
+// a redirect is reported as an error, never read as "published".
+var client = credhttp.Client(&http.Client{Timeout: 25 * time.Second})
 
 // published reports whether chart:version resolves in the registry,
 // anonymously (as installer and the cluster pull it). A registry that cannot
