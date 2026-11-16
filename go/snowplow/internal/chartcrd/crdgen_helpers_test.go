@@ -133,9 +133,10 @@ const (
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
 	crdgenVersion       = "v1.88.0"
-	// coreProviderCrdgenVersion is the plumbing core-provider compiles with
-	// (core-provider 2.13.107's go/core-provider/go.mod).
+	// coreProviderCrdgenVersion is the plumbing core-provider compiles with:
+	// the require line of crdgenCoreProvider's go/core-provider/go.mod.
 	coreProviderCrdgenVersion = "v1.88.0"
+	crdgenCoreProvider        = "2.13.107"
 
 	// core-provider's statics/status.schema.json at coreProviderVersion, copied
 	// verbatim. crdgen compiles it into the same CRD, so it counts toward the
@@ -183,7 +184,7 @@ func requirePinnedCrdgen(t *testing.T) {
 			"byte-identical to %s, which core-provider %s compiles the chart with. Check which core-provider "+
 			"the installer deploys and the plumbing it requires, diff crdgen/ and crdgen/schemas/ of %q against "+
 			"that version, and re-pin crdgenVersion (and coreProviderCrdgenVersion) only if they match",
-			crdgenModule, got, crdgenVersion, coreProviderCrdgenVersion, coreProviderVersion, got)
+			crdgenModule, got, crdgenVersion, coreProviderCrdgenVersion, crdgenCoreProvider, got)
 	}
 }
 
