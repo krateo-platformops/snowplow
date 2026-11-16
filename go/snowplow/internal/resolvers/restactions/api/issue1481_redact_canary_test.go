@@ -39,7 +39,8 @@ func x1481Server(t *testing.T, outcome string) *x1106Srv {
 			w.Header().Set("Set-Cookie", "sid=RESPCOOKIE-canary")
 			x1106OK(w, r) // echoes x1106Body
 		case "redirect":
-			w.Header().Set("Location", "/elsewhere?sig="+x1481QueryCanary)
+			// Another origin: never followed (#1106), reported 502 (#729).
+			w.Header().Set("Location", x1481OtherOrigin(r)+"/elsewhere?sig="+x1481QueryCanary)
 			w.WriteHeader(http.StatusFound)
 		case "5xx":
 			w.Header().Set("Content-Type", "text/plain")
@@ -66,6 +67,12 @@ func x1481Stages() []*templates.API {
 }
 
 func ptrTrue() *bool { b := true; return &b }
+
+// x1481OtherOrigin is r's server under the hostname "localhost": another host
+// than 127.0.0.1, so a redirect there leaves the origin.
+func x1481OtherOrigin(r *http.Request) string {
+	return "http://" + strings.Replace(r.Host, "127.0.0.1", "localhost", 1)
+}
 
 func TestIssue1481_StageDialLogsNoCredentialQueryOrBody(t *testing.T) {
 	type chain struct {

@@ -138,8 +138,10 @@ func TestIssue1481_E_EndpointStageClassPerCode(t *testing.T) {
 }
 
 func TestIssue1481_X_RefusedRedirectIsAReasonless502(t *testing.T) {
-	ep := newX1106Srv(t, false, func(rw http.ResponseWriter, _ *http.Request) {
-		rw.Header().Set("Location", "/elsewhere")
+	// A hop to another origin is never followed (#1106): the stage gets the
+	// 3xx itself, which #729 reports as 502.
+	ep := newX1106Srv(t, false, func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Location", x1481OtherOrigin(r)+"/elsewhere")
 		rw.WriteHeader(http.StatusFound)
 	})
 	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(ep.srv.URL)})
