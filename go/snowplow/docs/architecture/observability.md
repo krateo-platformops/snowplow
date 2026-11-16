@@ -1646,6 +1646,48 @@ The operator-notable events:
 | `dispatcher.call.complete` | Info | `dispatchers/per_call_log.go` | per-dispatch structured timing (the per-call diagnostic) |
 | `cache.secrets.informer.assertion_violation` | Error | `internal/cache/secrets_informer.go` | secrets-informer invariant breach |
 
+### Failure lines: once per cell generation (#711, #1476)
+
+A resident cell is re-resolved on every refresh, keepwarm pass and prewarm pass, and a stage
+that failed fails the same way each time. So the failure lines below log **once per cell
+generation** at their own level, and at **Debug** while the failure repeats unchanged. They
+are `api call response failure` (each dispatch branch of a stage), `unable to resolve api
+endpoint reference` (a stage's `endpointRef`), and the widget's `unable to resolve api
+reference` (its `apiRef`). The rules (`internal/resolvers/restactions/api/failure_log.go`):
+
+- **What counts as the same failure.** The same target and the same class. The target is
+  what failed: the stage and the path it read, the stage's `endpointRef`, or the widget's
+  `apiRef`. The class is a closed label decided by the error's type: `per_identity_denied`,
+  the status code (`404`, `500`, ...), or `error` for a failure with no code. The class never
+  comes from the error's message, which can name the requester. So two failures with the same
+  code and different text are the same failure.
+- **When a line logs at its own level again.** On a different class for the same target, a
+  new target, or a new generation. A generation is one residency of the cell's L1 key in the
+  resolved cache. An eviction ends it, and so does an RBAC change, because the key folds the
+  identity's RBAC class. With no L1 key on the context (or the cache off), every line logs at
+  its own level.
+- **Its own level.** Decided before the line is written, from the class:
+  - **Warn**: an expected per-identity deny. That is a re-gate deny for the ctx identity (#711),
+    or the caller's own Forbidden: the apiserver's 403 on the requester's own dial (#681 F2),
+    an `apiRef` read made with the requester's credential or impersonating the ctx identity,
+    or the ServiceAccount read re-gated and denied for the ctx identity. The
+    ServiceAccount's own 403 is not one: it stays Error.
+  - **Debug, every time**: an authorized definite NotFound (#1080 N1/N2) on a stage that
+    declares `continueOnError` and records it under its `errorKey`. The stage declared that
+    outcome. A NotFound on a stage without `continueOnError`, and any other failure under
+    `continueOnError`, keep Error.
+  - **Error**: everything else.
+- **Dry runs.** An inert (#443) resolve never touches the dedupe state. Its expected deny
+  logs at Debug and its other failures at their own level.
+- **Counters are unchanged.** Every occurrence is still counted where it is recorded: the
+  stage-error and per-identity sinks, `snowplow_internal_dispatch_predial_total{outcome=denied}`.
+  Read the counters for how often a failure happens; the lines say which failures exist.
+- **What is held.** Per resident failure-holding cell, one note per failed target: a SHA-256
+  digest of the target and the class label. No path, name or identity in clear, no cap, no
+  timer. A key's notes go when it is next seen non-resident, or when a new key is noted.
+
+To see every repeat, raise `LOG_LEVEL=debug`.
+
 There are many more dotted events in the `phase1.*`, `prewarm.engine.*`,
 `cache.crd_discovery.*`, `cache.rbac.snapshot.*`, and `cache.discovery.*`
 families (full set is greppable with
