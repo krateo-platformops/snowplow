@@ -1579,6 +1579,21 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// clean no-op. #966: the seed resolves AND keys with this same pg.
 	w.navWidgetHarvester.harvestNavWidget(in, gvr, pg)
 
+	// #1477 — the #113 rule, inherited from the widget's apiRef RESTAction: the
+	// walk resolves with no request extras, so a templated endpointRef that
+	// reads one the widget does not supply inline renders a Secret no
+	// customer's request selects. The widgetContent cell this resolve would Put
+	// has no extras in its key, and every request that renders the template
+	// carries the extra, so nothing can serve it. Not resolved, and so not
+	// descended: the subtree below a widget whose body needs request extras is
+	// reached by the navigation that carries them (lazy register-on-navigation).
+	// The harvests above still run: the widget seed and the content prewarm
+	// apply the same predicate to what they resolve.
+	if widgetNeedsRequestExtras(ctx, in) {
+		logBackgroundResolveSkip(bgSkipSiteWalk, "widget", rootKey(in))
+		return nil
+	}
+
 	// Ship G defect-fix (AC-G.5): install the widgetContent L1 key on the
 	// ctx BEFORE widgets.Resolve. The resolver's inner-call dep recording
 	// site (resolvers/restactions/api/resolve.go:467-485) reads
