@@ -22,6 +22,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/krateo-platformops/plumbing/endpoints"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
@@ -97,7 +98,8 @@ func TestIssue1481_T_InternalDispatchTransportErrorCarriesNoQueryValue(t *testin
 	rc := &rest.Config{Host: dead.URL, BearerToken: "fake-sa-jwt"}
 	path := "/apis/composition.krateo.io/v1-2-2/githubscaffoldingwithcompositionpages?labelSelector=owner%3D" + x1481SiteCanary
 	lg, buf := x1481DebugLogs(t)
-	ctx := ownClusterCtx(withSlogLogger(cache.WithInternalRESTConfig(context.Background(), rc), lg))
+	ctx := ownClusterCtx(withSlogLogger(cache.WithInternalRESTConfig(ctxWithUser("u1481"), rc), lg))
+	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: rc.Host})
 	_, _, ierr := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{Path: path}})
 	if ierr == nil || !strings.Contains(ierr.Error(), x1481SiteCanary) {
 		t.Fatalf("PRE: the dispatch must fail with client-go's error quoting the URL, got %v", ierr)
@@ -108,7 +110,7 @@ func TestIssue1481_T_InternalDispatchTransportErrorCarriesNoQueryValue(t *testin
 	})
 	logs := buf.String()
 	if !strings.Contains(logs, "api call response failure") || !strings.Contains(logs, "labelSelector=") {
-		t.Fatalf("PRE: the failure line, with the URL's query keys, must be logged:\n%s", logs)
+		t.Fatalf("PRE: the failure line, with the URL's query keys, must be logged (dict %v):\n%s", dict, logs)
 	}
 	x1481RequireNoCanary(t, logs)
 	if v, _ := dict["sErr"].(string); strings.Contains(v, x1481SiteCanary) {
