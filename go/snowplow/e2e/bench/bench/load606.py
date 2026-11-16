@@ -5362,22 +5362,20 @@ class BootWindow:
 
     def _run(self) -> None:
         t0 = self.clock()
-        extra = False                    # the one more round after the read ended
         while True:
             now = self.clock()
             if now >= t0 + self.rounds * self.every_s:
                 if now + self.client.timeout > self.deadline:
                     self.skipped = "the step's deadline is nearer than a probe's bound"
                     break
+                over = self._read_over.is_set()      # the read has ended: this round is the one more
                 for route in ("readyz", "call"):
                     th = threading.Thread(target=self._probe, args=(route, self.rounds), daemon=True)
                     th.start()
                     self.threads.append(th)
                 self.rounds += 1
-                if extra:
+                if over:
                     break
-                if self._read_over.is_set():
-                    extra = True
             self.watch()
             time.sleep(self.tick_s)
         while any(th.is_alive() for th in list(self.threads)):

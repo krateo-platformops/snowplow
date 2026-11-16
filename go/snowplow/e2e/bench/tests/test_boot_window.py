@@ -344,7 +344,8 @@ def _window(client, *, read_s=1.2, stall_s=0.2, every_s=0.2, deadline_s=30.0):
         finally:
             done()
         time.sleep(0.05)
-    end = w.finish()
+    t_read_end = time.time()            # the read ended here: one more round must start after it
+    end = dict(w.finish(), t_read_end=t_read_end)
     return recs, end
 
 
@@ -368,9 +369,8 @@ def test_the_window_probes_until_the_read_ends_and_one_round_more():
     assert rounds == list(range(end["rounds"])) and end["rounds"] >= 3
     for k in rounds:
         assert {r["route"] for r in recs if r["kind"] == "boot_probe" and r["round"] == k} == {"readyz", "call"}
-    last = max(r["t"] for r in recs if r["kind"] == "boot_probe")
-    first_after = [r["t"] for r in recs if r["kind"] == "boot_probe" and r["round"] == rounds[-1]]
-    assert first_after and last >= end["t"] - 1.0
+    after = sorted({r["round"] for r in recs if r["kind"] == "boot_probe" and r["t"] >= end["t_read_end"]})
+    assert after == [rounds[-1]]                          # exactly one round after the read ended
     assert recs[0]["kind"] == "boot_window_start" and recs[-1]["kind"] == "boot_window_end"
 
 

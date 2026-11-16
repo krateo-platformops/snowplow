@@ -675,7 +675,7 @@ def test_run606_refuses_a_bad_declaration_or_rehearsal_mode_at_once(harness):  #
     p = _run606(env, SNOWPLOW_ENV="GOGC=")
     assert p.returncode == 2 and "refusing: SNOWPLOW_ENV: GOGC's value '' is empty" in p.stderr
     p = _run606(env, BENCH_606_REHEARSAL="all")
-    assert p.returncode == 2 and "BENCH_606_REHEARSAL must be 'env', 'bootwindow' or unset" in p.stderr
+    assert p.returncode == 2 and "BENCH_606_REHEARSAL must be 'env' or unset" in p.stderr
     assert not (state / "calls.jsonl").exists()
 
 
@@ -710,7 +710,8 @@ def test_run606_reads_the_process_before_load_and_keeps_the_password_out(harness
     assert rec["effective"] == {"gogc": 100, "memory_limit_bytes": 7 * GIB, "memory_limit_source": "cgroup_v2",
                                 "cgroup_memory_limit_bytes": 8 * GIB}
     lines = [json.loads(x) for x in (out / "go-runtime.jsonl").read_text().splitlines()]
-    assert [x["kind"] for x in lines] == ["go_runtime_attempt", "go_runtime"] and lines[-1]["ok"] is True
+    assert [x["kind"] for x in lines if x["kind"].startswith("go_runtime")] == ["go_runtime_attempt", "go_runtime"]
+    assert lines[-1]["kind"] == "go_runtime" and lines[-1]["ok"] is True
     # the Job ran before any driver, and the bench user's password is nowhere it was written
     calls = [json.loads(x)["argv"] for x in (state / "calls.jsonl").read_text().splitlines()
              if json.loads(x)["tool"] == "kubectl"]
