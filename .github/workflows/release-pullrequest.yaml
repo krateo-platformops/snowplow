@@ -131,3 +131,9 @@ jobs:
       # of the browser code.
       - name: js/wasm browser build gate
         run: bash scripts/check_js_wasm.sh
+      # The repo root's retracted-versions.yaml, which installer's CI reads to refuse
+      # a pin: well formed, only this repo's charts (helm/*/Chart.yaml names), and
+      # every retracted version and `use` published in the chart registry. A
+      # malformed entry would match nothing in installer and let the pin through.
+      - name: retracted-versions.yaml gate
+        run: bash scripts/check_retracted_versions.sh
