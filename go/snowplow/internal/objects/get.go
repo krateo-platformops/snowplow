@@ -24,6 +24,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -45,6 +46,13 @@ type Result struct {
 	// ctx; a caller that installs its sinks only after the read (the dispatcher's
 	// fetch of the dispatched CR) marks them from this.
 	RequesterDialled bool
+	// PerIdentityDenied (#1476): Err is a Forbidden for the ctx identity, not
+	// for snowplow's own credential: the apiserver's 403 on a read made with
+	// the requester's credential or impersonating the ctx identity, or the
+	// ServiceAccount read re-gated and denied for the ctx identity. A caller
+	// reports it as an expected per-identity deny (WARN once per cell
+	// generation), never as a fault. The ServiceAccount's own 403 is not one.
+	PerIdentityDenied bool
 }
 
 func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
@@ -334,6 +342,7 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 			res.Err = st // #1115 — 504 Timeout
 		} else if apierrors.IsForbidden(err) {
 			res.Err = response.New(http.StatusForbidden, err)
+			res.PerIdentityDenied = dialsAsCtxIdentity(ctx, rc)
 		} else if dynamic.IsNotServed(err) {
 			// #1414 — 424, before the object's 404.
 			res.TypeNotInstalled = typeNotInstalled(res.GVR)
@@ -373,6 +382,7 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 		res.Err = response.New(http.StatusForbidden,
 			apierrors.NewForbidden(res.GVR.GroupResource(), ref.Name,
 				fmt.Errorf("user not authorized to get %s/%s", ref.Namespace, ref.Name)))
+		res.PerIdentityDenied = true // #1476 — denied for the ctx identity
 		return
 	}
 
@@ -386,6 +396,22 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	res.Unstructured = uns
 	res.Err = nil
 	return
+}
+
+// dialsAsCtxIdentity reports whether a read built from rc presents the ctx
+// identity to the apiserver (#1476): the requester's own credential, or a
+// config that impersonates an identity (the refresher's, #574). A 403 to such
+// a read is that identity's answer; a 403 to the ServiceAccount's own
+// credential is snowplow's.
+func dialsAsCtxIdentity(ctx context.Context, rc *rest.Config) bool {
+	if cache.RequesterCredentialFor(ctx) {
+		return true
+	}
+	if rc == nil {
+		return false
+	}
+	imp := rc.Impersonate
+	return imp.UserName != "" || imp.UID != "" || len(imp.Groups) > 0
 }
 
 // ReasonFailedDependency is the Status reason of a 424 answer

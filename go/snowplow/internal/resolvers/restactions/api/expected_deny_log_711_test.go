@@ -9,11 +9,13 @@ package api
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"sync"
 	"testing"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
@@ -73,20 +75,29 @@ func resolve711(t *testing.T, rec *rec711, l1Key string) {
 
 func resolvePath711(t *testing.T, rec *rec711, l1Key, path string, wantDenialOnly bool) {
 	t.Helper()
+	s := resolveStage711(t, rec, l1Key, stage681("catalog", path))
+	if wantDenialOnly && !cache.DenialOnly(s.stage, s.forb, s.ext, "restactions") {
+		t.Fatal("precondition: the resolve must be denial-only (the #685 cell shape)")
+	}
+}
+
+// resolveStage711 runs one stage under the cell key on the branch C harness
+// ("ghost" is missing) and returns the resolve's sinks.
+func resolveStage711(t *testing.T, rec *rec711, l1Key string, stage *templates.API) sinks681 {
+	t.Helper()
 	f, rc := newFakeAPI677(t)
 	f.missing["ghost"] = true
+	f.missing["ghost2"] = true
 	ctx := cache.WithInternalRESTConfig(ctxWithUser("u677"), rc)
 	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: rc.Host})
 	ctx = cache.WithL1KeyContext(ctx, l1Key)
 	ctx = xcontext.BuildContext(ctx, xcontext.WithLogger(slog.New(rec)))
 	ctx, s := withSinks681(ctx)
 	Resolve(context.WithoutCancel(ctx), ResolveOptions{
-		RC: rc, Items: []*templates.API{stage681("catalog", path)},
+		RC: rc, Items: []*templates.API{stage},
 		RESTActionNamespace: "krateo-system", RESTActionName: "global-search",
 	})
-	if wantDenialOnly && !cache.DenialOnly(s.stage, s.forb, s.ext, "restactions") {
-		t.Fatal("precondition: the resolve must be denial-only (the #685 cell shape)")
-	}
+	return s
 }
 
 func setup711(t *testing.T, resident func(string) bool) {
@@ -95,11 +106,11 @@ func setup711(t *testing.T, resident func(string) bool) {
 	scope677(t)
 	resetInternalClientCacheForTest()
 	t.Cleanup(resetInternalClientCacheForTest)
-	resetExpectedDenyNotedForTest()
-	t.Cleanup(resetExpectedDenyNotedForTest)
-	prev := expectedDenyResidentFn
-	expectedDenyResidentFn = func(k string) (bool, bool) { return resident(k), true }
-	t.Cleanup(func() { expectedDenyResidentFn = prev })
+	resetFailureNotedForTest()
+	t.Cleanup(resetFailureNotedForTest)
+	prev := failureResidentFn
+	failureResidentFn = func(k string) (bool, bool) { return resident(k), true }
+	t.Cleanup(func() { failureResidentFn = prev })
 }
 
 func TestIssue711_NRefreshesOfOneDenialOnlyCell_OneLine_NCounts(t *testing.T) {
@@ -186,7 +197,7 @@ func TestIssue711_InertResolve_DoesNotConsumeTheWarn(t *testing.T) {
 	if by, _ := rec.failures(); by[slog.LevelWarn] != 0 || by[slog.LevelError] != 0 || by[slog.LevelDebug] != 2 {
 		t.Fatalf("inert resolves: want 2 DEBUG / 0 WARN / 0 ERROR, got %v", by)
 	}
-	if _, noted := expectedDenyNoted.Load("cell-711-a"); noted {
+	if _, noted := failureNoted.Load("cell-711-a"); noted {
 		t.Fatal("an inert resolve wrote the dedupe state")
 	}
 	resolve711(t, rec, "cell-711-a")
@@ -199,19 +210,24 @@ func TestIssue711_InertResolve_DoesNotConsumeTheWarn(t *testing.T) {
 	}
 }
 
-// A failure that is NOT the per-identity re-gate class stays at ERROR every
-// time, on the same cell and the same branch — the distinction is the error's
-// type, not the stage or the RESTAction. u677 may get any configmap in team-a,
-// so the pre-dial check allows and the dial answers 404.
+// A failure that is NOT the per-identity re-gate class is never demoted to the
+// deny's WARN, on the same cell and the same branch — the distinction is the
+// error's type, not the stage or the RESTAction. u677 may get any configmap in
+// team-a, so the pre-dial check allows and the dial answers 404. The stage
+// does not declare continueOnError, so the 404 is not a declared outcome
+// (#1476): its first line is ERROR, and its unchanged repeats in the cell's
+// generation are DEBUG (#1476 — before it, ERROR every time).
 func TestIssue711_OtherFailures_StayError(t *testing.T) {
 	setup711(t, func(string) bool { return true })
 	rec := &rec711{}
 	before := deniedCount711()
+	stage := &templates.API{Name: "catalog", Path: "/api/v1/namespaces/team-a/configmaps/ghost",
+		Verb: ptr.To(http.MethodGet), ErrorKey: ptr.To("catalogErr")}
 	for i := 0; i < 3; i++ {
-		resolvePath711(t, rec, "cell-711-a", "/api/v1/namespaces/team-a/configmaps/ghost", false)
+		resolveStage711(t, rec, "cell-711-a", stage)
 	}
-	if by, _ := rec.failures(); by[slog.LevelError] != 3 || by[slog.LevelWarn] != 0 || by[slog.LevelDebug] != 0 {
-		t.Fatalf("a 404 must log at ERROR every time, got %v", by)
+	if by, _ := rec.failures(); by[slog.LevelError] != 1 || by[slog.LevelWarn] != 0 || by[slog.LevelDebug] != 2 {
+		t.Fatalf("a 404 must log at ERROR once, then DEBUG, and never WARN, got %v", by)
 	}
 	if got := deniedCount711() - before; got != 0 {
 		t.Fatalf("a 404 is not a pre-dial deny, predial denied moved by %d", got)
