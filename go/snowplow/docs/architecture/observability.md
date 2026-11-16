@@ -1683,17 +1683,30 @@ The rules are in `internal/resolvers/restactions/api/failure_log.go`:
     class.
 
   With no L1 key on the context (or the cache off), every line logs at its own level.
+- **Overlapping resolves of one cell** (a refresh and a `/call`, or two prewarm passes):
+  - Each resolve reads the notes at its first failure, and writes them at its end in one
+    compare-and-swap.
+  - If the notes moved in between (another resolve of the cell ended), the late resolve does
+    not write the failures it logged at Debug, so the next resolve logs them at their own
+    level.
+  - So a recurrence that a concurrent recovery hides stays hidden for that one overlapping
+    resolve only.
+  - Two overlapping failing resolves can cost one extra line at the failure's own level, never
+    a hidden one.
 - **Its own level.** Decided before the line is written, from the class:
   - **Warn**: an expected per-identity deny. That is either a re-gate deny for the ctx identity
     (#711), or the caller's own Forbidden:
     - the apiserver's 403 on the requester's own dial (#681 F2);
     - an `apiRef` read refused by the apiserver for the requester's credential or for the
-      identity being impersonated. The 403's typed details must name the resource that was
-      read;
+      identity being impersonated. The 403's typed details must name the object that was
+      read (group, resource and name);
     - the ServiceAccount read re-gated and denied for the ctx identity.
 
     The ServiceAccount's own 403 is not one, and neither is the apiserver refusing the
-    impersonation itself (its details name `users` or `groups`). Both stay Error.
+    impersonation itself. That refusal's details name the impersonated user, group or
+    ServiceAccount, not the object read. Both stay Error. The one refusal this cannot tell
+    apart is a read of the very ServiceAccount being impersonated: it is marked as the
+    identity's deny.
   - **Debug, every time**: an authorized definite NotFound (#1080 N1/N2). That classification
     already requires `continueOnError`, so the stage declared the outcome. Every failure is
     recorded under the stage's `errorKey` (it defaults to `error`), so that adds no condition.
