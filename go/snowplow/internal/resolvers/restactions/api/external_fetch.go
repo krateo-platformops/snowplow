@@ -467,14 +467,13 @@ func isJSONObjectOrArray(b []byte) bool {
 	return strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[")
 }
 
-// failureStatus is response.New for a non-2xx answer, always a Failure.
-// plumbing's response.New marks every code it does not list (a 3xx, 429, 502,
-// 504, ...) as SUCCESS, so a refused redirect (#723/#724: the credentialed
-// client hands back the 3xx itself) with an HTML or empty body would have been
-// taken for a success and fed a nil body onward. The code stays the status
-// line's; the reason stays whatever response.New derives from that code.
+// failureStatus is the envelope of a non-2xx answer whose body is not a
+// Status: always a Failure, so a refused redirect (#723/#724: the credentialed
+// client hands back the 3xx itself) with an HTML or empty body is never taken
+// for a success (plumbing before v1.84.0 marked every code it did not list as
+// one). The code stays the status line's. #1481: the reason is the one derived
+// from the code that agrees with it (credhttp.ReasonForCode): an upstream 502
+// carries none, never plumbing's InternalError, the reason of a 500.
 func failureStatus(code int, err error) *response.Status {
-	res := response.New(code, err)
-	res.Status = response.StatusFailure
-	return res
+	return credhttp.FailureStatus(code, err)
 }

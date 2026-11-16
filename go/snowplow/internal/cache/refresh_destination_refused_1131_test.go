@@ -40,7 +40,7 @@ func TestIssue1131_ARefusedDestinationReachesTheDropPointOnItsFirstAttempt(t *te
 		wantClass string
 	}{
 		{"refused", x1131Refused(), 1, RefreshErrDestinationRefused},
-		{"control_ordinary_502", x1131Status("BadGateway"), maxRefreshRequeues + 1, RefreshErrUnclassified},
+		{"control_ordinary_502", x1131Status("BadGateway"), maxRefreshRequeues + 1, RefreshErrBadGateway},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("CACHE_ENABLED", "true")
