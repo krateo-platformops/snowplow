@@ -1,7 +1,8 @@
 // l1_perstep_rbac_cross_user_falsifier_test.go — #423 acceptance falsifier.
 //
 // QUESTION: on origin/main c20cc763 the restactions-class L1 key folds only the RESTAction's own
-// first-match dispatch BindingUID + the requester's RBACSubGen sum
+// first-match dispatch BindingUID + the requester's RBACSubGen (a sum then;
+// the latest RBAC state since #1439)
 // (helpers.go dispatchCacheLookupKey, resolved.go ComputeKey). A NON-UAF stage
 // inside the RESTAction is narrowed PER REQUESTER by the apiserver (the
 // requester's own <user>-clientconfig) or by the informer pivot's
@@ -123,6 +124,19 @@ type psArm struct {
 	// noPrereg: do not pre-register the target informer (the #398 arms observe
 	// whether the REQUEST path registers it).
 	noPrereg bool
+	// raByRoleBinding: the shared ClusterRoleBinding grants the RESTAction to no
+	// one, so the arm grants it with a namespaced RoleBinding of its own: the
+	// binding a partial snapshot drops, so the read of the RESTAction falls
+	// through to the apiserver under the requester's credential.
+	raByRoleBinding bool
+}
+
+// psRASubjects is who the shared ClusterRoleBinding grants the RESTAction to.
+func psRASubjects(a psArm) []rbacv1.Subject {
+	if a.raByRoleBinding {
+		return nil
+	}
+	return psSubjects(a)
 }
 
 func psGroups(a psArm) []string {
@@ -144,7 +158,7 @@ func psSubjects(a psArm) []rbacv1.Subject {
 
 // psBuildWatcher publishes: one CRB (the shared RESTAction grant); alice's RB in
 // ns x granting get on the target resource; bob's SYMMETRIC but unrelated RB in
-// ns z (get pods) so the per-subject RBACSubGen sums come out equal (asserted,
+// ns z (get pods) so the two RBACSubGen values come out equal (asserted,
 // not assumed). The target object (Secret or ConfigMap x/y) carries the
 // sentinel and is also present in the fake dynamic client so the lazily
 // registered informer can serve it.
@@ -198,7 +212,7 @@ func psBuildWatcher(t *testing.T, a psArm, extra ...runtime.Object) *dynamicfake
 		},
 		&rbacv1.ClusterRoleBinding{
 			ObjectMeta: metav1.ObjectMeta{Name: "portal-ra-bind", UID: types.UID("uid-portal-shared")},
-			Subjects:   psSubjects(a),
+			Subjects:   psRASubjects(a),
 			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "ra-reader"},
 		},
 		&rbacv1.Role{
@@ -382,7 +396,7 @@ func psSeedClientconfigs(t *testing.T, srvURL string) {
 	cache.ResetSecretsSnapshotForTest()
 	mk := func(user string) *corev1.Secret {
 		return &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: psAuthnNS, Name: user + "-clientconfig"},
+			ObjectMeta: authnMeta(psAuthnNS, user+"-clientconfig", user),
 			Data: map[string][]byte{
 				"server-url": []byte(srvURL),
 				"token":      []byte("tok-" + user),

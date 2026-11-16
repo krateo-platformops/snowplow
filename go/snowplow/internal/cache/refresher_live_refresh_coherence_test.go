@@ -97,7 +97,7 @@ func runStaleWindowProbe(t *testing.T, floorSeconds string, customerInflight boo
 	// (1) Commit the first /call result (v1). Put stamps CreatedAt=now — the
 	// realistic case: a live-refresh refetch hits an entry the first /call
 	// JUST populated, i.e. YOUNGER than the 2s floor.
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in})
 	// (2) Real dep edge: widget L1 key depends on the backing object.
 	Deps().Record(context.Background(), key, gvr, ns, objName)
 
@@ -108,7 +108,7 @@ func runStaleWindowProbe(t *testing.T, floorSeconds string, customerInflight boo
 		if resolveCost > 0 {
 			time.Sleep(resolveCost)
 		}
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
 		committedAt.Store(time.Now().UnixNano())
 		return nil
 	})
@@ -182,6 +182,8 @@ func runStaleWindowProbe(t *testing.T, floorSeconds string, customerInflight boo
 // FLOORED re-resolve commits v2. The window is ~2s (the rate-floor), NOT the
 // "sub-ms–ms" the proposal assumed.
 func TestLiveRefreshCoherence_StaleWindow_ProductionDefault(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	win, observed, n, commit := runStaleWindowProbe(t, "", false, 5*time.Millisecond)
 	t.Logf("STALE-WINDOW[prod-default floor=2s, no customer load]: stale_window=%s observed_fresh=%v refetch_samples=%d commit_latency_from_reconcile=%s",
 		win.Round(time.Millisecond), observed, n, commit.Round(time.Millisecond))
@@ -200,6 +202,8 @@ func TestLiveRefreshCoherence_StaleWindow_ProductionDefault(t *testing.T) {
 // ASSUMED world: floor=0 (kill-switch), no load, sub-ms resolve. Isolates the
 // floor's contribution — the window collapses to ~ms here.
 func TestLiveRefreshCoherence_StaleWindow_FloorZeroBaseline(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	win, observed, n, commit := runStaleWindowProbe(t, "0", false, 5*time.Millisecond)
 	t.Logf("STALE-WINDOW[floor=0 baseline, no customer load]: stale_window=%s observed_fresh=%v refetch_samples=%d commit_latency_from_reconcile=%s",
 		win.Round(time.Millisecond), observed, n, commit.Round(time.Millisecond))
@@ -252,12 +256,12 @@ func TestLiveRefreshCoherence_RefetchLandsInsideWindow(t *testing.T) {
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: ns, Name: "widget-detail"}
 	key := ComputeKey(in)
 
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in})
 	Deps().Record(context.Background(), key, gvr, ns, objName)
 
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
 		time.Sleep(5 * time.Millisecond)
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
 		return nil
 	})
 
@@ -307,6 +311,8 @@ func TestLiveRefreshCoherence_RefetchLandsInsideWindow(t *testing.T) {
 // residual queue+commit gap, and the production window is owned by the
 // floor/yield gates, not the resolve.
 func TestLiveRefreshCoherence_RefresherMechanismOverhead(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	win, observed, n, commit := runStaleWindowProbe(t, "0", false, 0)
 	t.Logf("MECHANISM-OVERHEAD[floor=0, zero resolve cost]: stale_window=%s observed_fresh=%v refetch_samples=%d commit_latency_from_reconcile=%s",
 		win.Round(time.Microsecond), observed, n, commit.Round(time.Microsecond))
@@ -355,7 +361,7 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 	// "1 immediate + collapsed-rest" shape deterministically — mirrors
 	// putAgedEntry's intent in refresher_rate_floor_test.go). agedBackoff
 	// (30s) is past every test floor yet under the cache TTL.
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
 	Deps().Record(context.Background(), key, gvr, ns, objName)
 
 	var resolves atomic.Int32
@@ -365,7 +371,7 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 		// small but non-zero cost so the alloc/wall figures are meaningful
 		// without making the test slow.
 		time.Sleep(2 * time.Millisecond)
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
 		resolves.Add(1)
 		lastCommitAt.Store(time.Now().UnixNano())
 		return nil
@@ -449,6 +455,8 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 // NOT turn N marks back into N re-resolves (that would reintroduce the
 // pre-#318 amplification the floor exists to prevent).
 func TestLiveRefreshCoherence_FloorOnAmplificationBaseline(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const marks = 200
 	const spread = 400 * time.Millisecond // whole wave inside the 2s floor
 	res := runFloorOnBurstCollapse(t, "", marks, spread)
@@ -478,6 +486,8 @@ func TestLiveRefreshCoherence_FloorOnAmplificationBaseline(t *testing.T) {
 // what a naive always-bypass would cost — the explicit amplification the
 // floor-bypass design must avoid for churn (non-subscribed) keys.
 func TestLiveRefreshCoherence_FloorOffAmplificationContrast(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const marks = 200
 	const spread = 400 * time.Millisecond
 	res := runFloorOnBurstCollapse(t, "0", marks, spread)

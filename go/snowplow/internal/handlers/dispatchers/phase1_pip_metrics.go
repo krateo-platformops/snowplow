@@ -13,9 +13,7 @@
 //
 // PER-COHORT MAPS are exposed as a single expvar.Func returning a
 // map[string]uint64 — same shape as snowplow_apiserver_fallthrough_cells.
-// The cohort label is the canonical cohortLogLabel (Username for
-// user-kind cohorts, "group:<name>" for group-kind cohorts). PIP itself
-// is gated such that under PREWARM_PIP_ENABLED=false the counters
+// PIP itself is gated such that under PREWARM_PIP_ENABLED=false the counters
 // register at zero and never increment — operator sees fresh zeros
 // rather than a missing key.
 //
@@ -66,6 +64,11 @@ var (
 	pipBindingSetSeedResolvesTotal atomic.Uint64
 	pipBindingSetSeedFailuresTotal atomic.Uint64
 
+	// #857 — harvested nav widgets whose CR copy a re-walk REPLACED because it
+	// saw a different object version (UID or resourceVersion): an edit the
+	// seeds now resolve instead of the boot-time spec.
+	navWidgetHarvestRefreshedTotal atomic.Uint64
+
 	// #158 (P9-B) — the SPLIT of pipBindingSetSeedFailuresTotal by error
 	// class. pipBindingSetSeedFailuresTotal is KEPT as the back-compat
 	// grand total (= rbac_deny + operational) so existing dashboards do
@@ -98,6 +101,13 @@ var (
 	// attributable in /debug/vars (the falsifier keys on this DELTA, not the
 	// refresher's counter). Exposed as snowplow_phase1_seed_skipped_stage_error_total.
 	pipSeedSkippedStageErrorTotal atomic.Uint64
+
+	// #912 re-review — pipSeedSkippedDeclaredWriteTotal counts seed Puts declined
+	// because the RESTAction DECLARES a write stage (#903 F1: never stored). Its
+	// own series, not folded into the stage-error one: a declared write is not a
+	// degraded resolve, and it is permanent (the cell is marked and skipped).
+	// Exposed as snowplow_phase1_seed_skipped_declared_write_total.
+	pipSeedSkippedDeclaredWriteTotal atomic.Uint64
 
 	// F.4 (design §3.2) — pipSeedFreshSkipTotal counts boot-scope seed targets
 	// fast-forwarded by the boot-only fresh-skip: a live (non-expired) L1 cell
@@ -266,6 +276,10 @@ func registerPIPMetrics() {
 		expvar.Publish("snowplow_phase1_bindingset_seed_failures_total", expvar.Func(func() any {
 			return pipBindingSetSeedFailuresTotal.Load()
 		}))
+		// #857 — harvested widget copies replaced by a newer object version.
+		expvar.Publish("snowplow_phase1_nav_harvest_refreshed_total", expvar.Func(func() any {
+			return navWidgetHarvestRefreshedTotal.Load()
+		}))
 
 		// #158 (P9-B) — the discriminated split of the failures total. The
 		// back-compat grand total above stays = rbac_deny + operational so
@@ -283,6 +297,11 @@ func registerPIPMetrics() {
 		// refresherSkippedStageError so a keepwarm-sweep decline is attributable.
 		expvar.Publish("snowplow_phase1_seed_skipped_stage_error_total", expvar.Func(func() any {
 			return pipSeedSkippedStageErrorTotal.Load()
+		}))
+		// #912 re-review — seed Puts declined because the RESTAction declares a
+		// write (#903 F1). SEED-SCOPED, its own reason.
+		expvar.Publish("snowplow_phase1_seed_skipped_declared_write_total", expvar.Func(func() any {
+			return pipSeedSkippedDeclaredWriteTotal.Load()
 		}))
 
 		// F.4 (design §3.2) — boot-scope seed targets fresh-skipped (live cell

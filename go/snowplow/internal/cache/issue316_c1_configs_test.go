@@ -809,7 +809,7 @@ func c1FastForwardAndCountColdNavs(c *ResolvedCacheStore, warm []c1Cell) int {
 		}
 		if m.TTLRemainingSeconds < c1TTLSeconds/4 {
 			in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: c1NS, Name: warm[i].name}
-			c.Put(warm[i].key, &ResolvedEntry{RawJSON: c1Body(warm[i].bytes), Inputs: &in, CreatedAt: pastTTL})
+			c.put(warm[i].key, &ResolvedEntry{RawJSON: c1Body(warm[i].bytes), Inputs: &in, CreatedAt: pastTTL})
 		}
 	}
 	_, miss := c1Navigate(c, warm)

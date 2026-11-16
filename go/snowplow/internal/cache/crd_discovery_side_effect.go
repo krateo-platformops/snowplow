@@ -53,6 +53,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -88,6 +89,11 @@ type crdDiscoveryEvent struct {
 	// discovery against the new spec; DELETE tears down the per-resource
 	// informer + dirty-marks dependent L1.
 	kind crdLifecycleKind
+	// rw and gvr carry a crdLifecycleListRefused event (#807): the watcher
+	// whose informer for gvr had its LIST/WATCH refused with 404. obj is nil
+	// for that kind.
+	rw  *ResourceWatcher
+	gvr schema.GroupVersionResource
 }
 
 // crdLifecycleKind discriminates the three CRD events the bridge handles
@@ -95,9 +101,10 @@ type crdDiscoveryEvent struct {
 type crdLifecycleKind uint8
 
 const (
-	crdLifecycleAdd    crdLifecycleKind = iota // CRD CREATE
-	crdLifecycleUpdate                         // CRD UPDATE (spec.versions[] / served[] / group changes)
-	crdLifecycleDelete                         // CRD DELETE (group no longer served by the apiserver)
+	crdLifecycleAdd         crdLifecycleKind = iota // CRD CREATE
+	crdLifecycleUpdate                              // CRD UPDATE (spec.versions[] / served[] / group changes)
+	crdLifecycleDelete                              // CRD DELETE (group no longer served by the apiserver)
+	crdLifecycleListRefused                         // #807: a data informer's LIST/WATCH was refused with 404
 )
 
 // crdDiscovery is the process-scoped CRD-ADD-side-effect bridge:
@@ -140,7 +147,7 @@ type crdDiscovery struct {
 	// sync.Map for defensiveness against a future multi-worker change and so
 	// the test reset can clear it without a lock.
 	schemaFingerprints sync.Map      // map[string]string (CRD name → schema fingerprint)
-	schemaRelistsFired atomic.Uint64 // relist passes that tore down >=1 GVR on a detected schema change
+	schemaRelistsFired atomic.Uint64 // schema-change passes that requested >=1 store build (#870: built beside the live copy, swapped in)
 	schemaUnchanged    atomic.Uint64 // ADD/UPDATE where the schema fingerprint was unchanged (no relist — thrash guard hit)
 	// #218 — discovery-identity fingerprint (spec.group / names / scope /
 	// per-version {served,storage,deprecated,status/scale subresource}): the served-GVR SHAPE the global
@@ -157,24 +164,23 @@ type crdDiscovery struct {
 	// previous one); it is the number that should have been moving while
 	// watch_broken climbed 4 -> 40 and never fell.
 	staleVersionPruned atomic.Uint64
-	// 1.12.5 / #187 — post-sync re-fires of the relist dirty-mark. One per
-	// relisted GVR whose new informer synced inside the timeout. A count
-	// lagging schema_relists_fired means informers are not syncing after a
-	// relist, which strands entries deleted in the teardown window.
-	relistDirtyMarkPostSync atomic.Uint64
-	relistPostSyncTimeout   atomic.Uint64
-
-	// 1.12.6 C2 — the relist delta bridge (relist_bridge.go). runs counts
-	// bridges spawned (one per relisted GVR); enqueued counts coordinates
-	// synthesized from (old indexer keys \ fresh LIST); timeout counts
-	// bridges whose fresh informer never synced inside the bound (the
-	// bridge then enqueued nothing — the SOAK SIGNAL that keeps the 1.12.5
-	// re-fire in place); aborted counts bridges with nothing to diff (no
-	// sync channel, or the GVR removed again while waiting).
-	relistBridgeRuns     atomic.Uint64
-	relistBridgeEnqueued atomic.Uint64
-	relistBridgeTimeout  atomic.Uint64
-	relistBridgeAborted  atomic.Uint64
+	// #807 (unserved_version_block.go) — servedVersions maps crdServedKey →
+	// map[string]struct{} (the CRD's served version names, from its latest
+	// ADD/UPDATE). Written and read only on the worker; sync.Map for the same
+	// reasons as schemaFingerprints.
+	servedVersions               sync.Map
+	listRefusedChecks            atomic.Uint64 // 404 refusals the worker checked
+	listRefusedDropped           atomic.Uint64 // 404 refusals not queued (queue full; the reflector reports again)
+	listRefusedCRDUnknown        atomic.Uint64 // checked refusals with no CRD record — declined
+	listRefusedStillServed       atomic.Uint64 // checked refusals whose version the CRD still serves — declined
+	refusedVersionPruned         atomic.Uint64 // informers torn down and blocked on a refusal
+	unservedRegistrationsRefused atomic.Uint64 // registrations refused because the version is blocked
+	// #870 — the 1.12.5 post-sync re-fire counters (relist_dirtymark_postsync,
+	// relist_postsync_timeout) and the 1.12.6 C2 relist-bridge counters
+	// (relist_bridge_{runs,enqueued,timeout,aborted}) are DELETED with the
+	// mechanisms they counted: a schema widen no longer tears the informer
+	// down, so there is no teardown window to bridge. The swap's own
+	// instruments are snowplow_store_swap (store_swap_stats.go).
 }
 
 var (
@@ -206,8 +212,10 @@ func (c *crdDiscovery) startCRDDiscoveryWorker() {
 		c.workerWG.Add(1)
 		go func() {
 			defer c.workerWG.Done()
+			workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 			defer func() {
 				if rec := recover(); rec != nil {
+					// log-ctx-waiver: worker: the CRD discovery worker goroutine
 					slog.Error("cache.crd_discovery.worker.panic",
 						slog.String("subsystem", "cache"),
 						slog.Any("panic", rec),
@@ -250,6 +258,8 @@ func (c *crdDiscovery) processEvent(ev crdDiscoveryEvent) {
 		triggerCRDDiscovery(ev.obj, ev.kind)
 	case crdLifecycleDelete:
 		triggerCRDDelete(ev.obj)
+	case crdLifecycleListRefused:
+		c.handleListRefused(ev.rw, ev.gvr)
 	default:
 		// Ship L review note (#200) — defensive default for the closed
 		// crdLifecycleKind enum. submitCRDLifecycleEvent is the only
@@ -260,6 +270,7 @@ func (c *crdDiscovery) processEvent(ev crdDiscoveryEvent) {
 		// stays alive and the event still counts as processed below. No
 		// side-effect fires — there is no safe default action for an
 		// unknown lifecycle event.
+		// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 		slog.Error("cache.crd_discovery.unknown_kind",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", crdLifecycleKindString(ev.kind)),
@@ -340,6 +351,7 @@ func (c *crdDiscovery) submitCRDLifecycleEvent(obj interface{}, kind crdLifecycl
 	// indefinitely. Reaching it means something is badly wrong and the WARN
 	// says so.
 	c.eventsParked.Add(1)
+	// log-ctx-waiver: informer-event: a CRD informer event handler
 	slog.Warn("cache.crd_discovery.queue_parked",
 		slog.String("subsystem", "cache"),
 		slog.String("kind", crdLifecycleKindString(kind)),
@@ -359,6 +371,7 @@ func (c *crdDiscovery) submitCRDLifecycleEvent(obj interface{}, kind crdLifecycl
 		c.eventsDropped.Add(1)
 	case <-timer.C:
 		c.eventsDropped.Add(1)
+		// log-ctx-waiver: informer-event: a CRD informer event handler
 		slog.Error("cache.crd_discovery.event_dropped",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", crdLifecycleKindString(kind)),
@@ -389,6 +402,8 @@ func crdLifecycleKindString(k crdLifecycleKind) string {
 		return "UPDATE"
 	case crdLifecycleDelete:
 		return "DELETE"
+	case crdLifecycleListRefused:
+		return "LIST_REFUSED"
 	default:
 		return "unknown"
 	}
@@ -458,6 +473,7 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			c.panicsRecovered.Add(1)
+			// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 			slog.Error("cache.crd_discovery.trigger.panic_recovered",
 				slog.String("subsystem", "cache"),
 				slog.String("kind", crdLifecycleKindString(kind)),
@@ -502,9 +518,16 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 	// discovery, so it runs up front, ahead of the SA-rc gate.
 	AddNavigationDiscoveredGroup(group)
 
+	// #807 — record the served set and lift the block on every version the
+	// CRD serves. On EVERY ADD/UPDATE, ahead of the fingerprint gates below:
+	// a re-served version must never stay blocked because an event was judged
+	// a no-op.
+	c.recordServedVersions(u)
+
 	saRC := ProcessSARestConfig()
 	if saRC == nil {
 		c.discoverySkippedNG.Add(1)
+		// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 		slog.Warn("cache.crd_discovery.no_sa_rc",
 			slog.String("subsystem", "cache"),
 			slog.String("group", group),
@@ -548,7 +571,7 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 		// registers against a stale cached read (S4/F-4 stuck-zero class).
 		ctx := context.Background()
 		if _, derr := DiscoverGroupResourcesFresh(ctx, saRC, group); derr != nil {
-			slog.Warn("cache.crd_discovery.discover_group_failed",
+			slog.WarnContext(ctx, "cache.crd_discovery.discover_group_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("group", group),
 				slog.Any("err", derr),
@@ -664,15 +687,15 @@ func crdSchemaFingerprint(u *unstructured.Unstructured) string {
 // (serialised with every other CRD lifecycle side-effect), AFTER the
 // discovery + schema-memo invalidators.
 //
-// Mechanism per served GVR: RemoveResourceType (tears down the stale informer
-// via the R6 per-GVR stop channel, watcher.go:1406) then EnsureResourceType
-// (re-registers → fresh LIST under the now-current schema), and
-// OnResourceTypeSchemaRelisted to dirty-mark L1 entries depending on that GVR
-// so a cached widget resolve recomputes against the now-unpruned objects
-// (same dirty-mark-only set as the DELETE path's OnResourceTypeRemoved, but
-// it logs cache_event.consumed type=SCHEMA_RELIST, not CRD_DELETE). Between
-// teardown and the new informer's HasSynced, objects.Get falls through to the
-// apiserver under the 0.30.97 IsServable guard (correct, just slower).
+// Mechanism per served GVR (#870): a build with reason schema
+// (requestStoreBuild, store_swap.go). The replacement informer LISTs under the
+// now-current schema BESIDE the live one; the GVR stays servable and keeps
+// serving the pre-widen objects, known-stale and counted
+// (store_swap_known_stale_*{reason=schema}), until the swap; the swap delivers
+// exactly the objects whose bytes the widen changed (M) to the consumers, so a
+// cached widget resolve recomputes against the unpruned objects. There is no
+// teardown, no whole-type dirty-mark and no live-read fall-through (N5: one
+// repair mechanism for every reason).
 func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 	name := u.GetName()
 	if name == "" {
@@ -735,12 +758,13 @@ func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 		if rw == nil {
 			break
 		}
-		// The sync channel is deliberately DISCARDED here: this loop runs on
-		// the single CRD-lifecycle worker, and blocking it on a rebuild would
-		// stall every other CRD event. The store-repair caller does wait — see
-		// the note at the end of relistGVRForRepair.
-		if _, ok := c.relistGVRForRepair(rw, gvr, confirmRetractSchemaRelist,
-			func(d *DepTracker, g schema.GroupVersionResource) int { return d.OnResourceTypeSchemaRelisted(g) }); !ok {
+		// #870 — a BUILD with reason schema (store_swap.go): the replacement
+		// is listed under the new schema beside the live copy and swapped in;
+		// the GVR stays servable, and only the objects the widen changed reach
+		// the consumers (M). A build already running for this GVR is
+		// SUPERSEDED, carrying its reasons and keys (F7). The request returns
+		// at once: this loop runs on the single CRD-lifecycle worker.
+		if !rw.IsRegistered(gvr) || !rw.requestStoreBuild(gvr, reasonSchema, nil) {
 			continue
 		}
 		relisted++
@@ -756,142 +780,6 @@ func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
 				"pre-change indexer (followup-crd-schema-widen-informer-relist)."),
 		)
 	}
-}
-
-// relistGVRForRepair tears one GVR's informer down and re-registers it, so the
-// replacement's fresh snapshot Replace()s the store and processDeltas repairs
-// the indexer AND fires the handlers from it.
-//
-// EXTRACTED VERBATIM from triggerCRDSchemaRelist's per-GVR loop body (#237
-// deliverable B). The CRD-fingerprint logic stays where it was and remains one
-// of the two callers; the other is the store-repair queue (store_repair.go).
-// A move, not a rewrite: every goroutine, every guard and every comment below
-// was already running in production on the schema-relist path.
-//
-// WHY THIS IS THE REPAIR VERB, when two cheaper-looking ones were rejected:
-//
-//   - Indexer.Update (write the fresh object straight into the store) has NO
-//     compare-and-swap. We would GET the object and then write it, and a real
-//     watch UPDATE landing in that window is silently clobbered by our older
-//     fetch — MANUFACTURING the exact defect class we are detecting. The
-//     mutex that makes processDeltas atomic against this (blockDeltas) is
-//     private. It also bypasses processDeltas entirely, so no handler fires
-//     and L1 keeps the stale rendering.
-//
-//   - Injecting a synthetic watch.Modified goes through the real path, but
-//     handleAnyWatch calls setLastSyncResourceVersion on EVERY event it
-//     processes. The injected object's RV comes from our own apiserver read
-//     and is typically far ahead of the watch position, so it would advance
-//     that position past every event for the GVR in between. On the plain
-//     re-watch path — which resumes from LastSyncResourceVersion and is a
-//     DELTA watch — that is an undetected multi-object event gap traded for
-//     one detected stale object. Strictly worse, and self-inflicted.
-//
-// THE COST, stated because it is the largest in deliverable B:
-// removeResourceTypeWithReason retracts the GVR's confirmation, so it is NOT
-// SERVABLE for the whole rebuild window and every resolve for it falls through
-// to the apiserver — minutes at 50K. That is the right trade for a CONFIRMED
-// divergence (slow-and-correct replacing fast-and-wrong) and an unacceptable
-// one to pay speculatively, which is what the bounds in store_repair.go exist
-// for. It is also why repairs are globally serialised: unserialised, a
-// correlated divergence would take N GVRs non-servable at once and send the
-// whole portal to the apiserver — the pre-cache regime plus a self-inflicted
-// thundering herd.
-//
-// retractReason names the teardown in confirm_retracted_by_reason; dirtyMark is
-// the caller's dep-tracker cause so a store repair does not log itself as a
-// SCHEMA_RELIST. Returns false when there was nothing to relist.
-func (c *crdDiscovery) relistGVRForRepair(
-	rw *ResourceWatcher,
-	gvr schema.GroupVersionResource,
-	retractReason string,
-	dirtyMark func(*DepTracker, schema.GroupVersionResource) int,
-) (<-chan struct{}, bool) {
-	if rw == nil {
-		return nil, false
-	}
-	// Only relist a GVR we are actually watching. EnsureResourceType is
-	// registration-idempotent, so an unconditional Ensure would SPAWN an
-	// informer for a never-watched GVR (wrong — lazy registration is the
-	// resolver's job). Gate on current registration via IsRegistered.
-	if !rw.IsRegistered(gvr) {
-		return nil, false
-	}
-	// 1.12.6 C2 — snapshot the OLD indexer's key set BEFORE the teardown
-	// (relist_bridge.go). Read-only; the diff against the fresh LIST runs
-	// on the bridge goroutine spawned below.
-	before, had := rw.IndexerKeys(gvr)
-	rw.removeResourceTypeWithReason(gvr, retractReason) // R6 per-GVR teardown; idempotent, nil-safe
-	_, syncCh := rw.EnsureResourceType(gvr)             // re-register → fresh LIST under current schema
-	dirtyMark(Deps(), gvr)                              // dirty-mark dependent L1 under the CALLER's cause label
-	// 1.12.5 / #187 — RE-FIRE THE DIRTY-MARK AFTER THE NEW INFORMER SYNCS.
-	//
-	// The teardown above opens a window in which DELETEs are lost with no
-	// trace at any log level. RemoveResourceType closes the old informer's
-	// per-GVR stop channel and purges its state, so anything still in its
-	// DeltaFIFO or in flight on its watch is dropped with no handler run.
-	// The replacement informer is freshly constructed, so its knownObjects
-	// indexer is EMPTY — DeltaFIFO.Replace() has nothing to diff against
-	// and synthesises NO Deleted delta for an object that vanished before
-	// the new LIST. The object simply never appears.
-	//
-	// The dirty-mark on the line above does cover entries whose objects
-	// were ALREADY gone: OnResourceTypeSchemaRelisted walks the forward dep
-	// index, not the indexer, so an absent object is still matched. But it
-	// runs ONCE, at the START of the window. An entry dirty-marked at that
-	// instant re-resolves SUCCESSFULLY (its object still exists), survives,
-	// and is then stranded when the delete lands a moment later with no
-	// future trigger of any kind. That is the #187 burst shape exactly:
-	// relist at ~09:21, deletes 09:21-09:24.
-	//
-	// Re-firing the same dirty-mark once the new informer has synced closes
-	// it. Every stranded entry is re-resolved, its own object 404s, and the
-	// drop-point eviction removes it. Deliberately reuses the existing
-	// dirty-mark rather than adding a store walk: no RangeMetadata, no
-	// lock-order hazard between the store mutex and rw.mu, no new
-	// invalidation semantics. The pre-sync fire is KEPT — both run, and the
-	// dirty-mark is idempotent.
-	//
-	// Off the discovery worker goroutine: the relist runs on the single
-	// CRD-lifecycle worker, so blocking it on a sync channel would stall
-	// every other CRD event. Bounded by a timeout so a GVR that never syncs
-	// cannot leak the goroutine for the process lifetime.
-	//
-	// WORTHLESS WITHOUT THE SELF-404 EVICTION. On its own this just re-runs
-	// the five-requeue drop. It is the delivery half; the eviction is the
-	// other half.
-	// Accounted on workerWG so the bridge's stop path WAITS for it. The
-	// goroutine touches the Deps() singleton after it wakes, and an
-	// untracked goroutine outliving its bridge would read that singleton
-	// while a teardown is replacing it.
-	// The tracker handle is captured HERE, on the worker goroutine, not
-	// read from the Deps() singleton after the wait. The goroutine
-	// outlives this call by design, and a later read of the global would
-	// race anything that replaces the singleton (test teardown does
-	// exactly that). Capturing also makes the goroutine's dependency
-	// explicit rather than ambient.
-	c.workerWG.Add(1)
-	go c.refireRelistDirtyMarkAfterSync(Deps(), gvr, dirtyMark, syncCh)
-	// 1.12.6 C2 — the delta bridge (relist_bridge.go). ADDITIVE to the
-	// re-fire above (PM condition C10): the re-fire stays until the bridge
-	// has soaked with relist_bridge_timeout_total at zero. Same goroutine
-	// discipline: off the discovery worker, on workerWG, bounded wait.
-	// The dep-event bridge handle is captured HERE, on the worker
-	// goroutine, for the same reason Deps() is captured above: the
-	// goroutine outlives this call and must not read a process singleton
-	// after its wait (depEventHandlers captures it the same way).
-	if had {
-		c.workerWG.Add(1)
-		go c.bridgeRelistDeletes(rw, depWatchSingleton(), gvr, before, syncCh)
-	}
-	// The replacement informer's sync channel is returned so the CALLER can
-	// wait for the rebuild. The CRD caller does not (it is on the single
-	// discovery worker and must not block it); the store-repair worker DOES, and
-	// that wait is what makes global serialisation mean what it claims. Without
-	// it only the teardown CALLS would be serialised, while the rebuild WINDOWS
-	// overlapped freely -- and it is the window, not the call, during which a
-	// GVR is non-servable and its resolves fall through to the apiserver.
-	return syncCh, true
 }
 
 // pruneUnservedGVRs tears down the per-GVR state of every registered GVR that
@@ -948,7 +836,10 @@ func (c *crdDiscovery) pruneUnservedGVRs(rw *ResourceWatcher, u *unstructured.Un
 		return
 	}
 	for _, gvr := range pruned {
-		rw.removeResourceTypeWithReason(gvr, confirmRetractStaleVersionPruned)
+		// #807 — retired AND blocked: a resolver touching the old path must
+		// not register it again, which is how a pruned version came back and
+		// 404'd forever.
+		rw.retireUnservedVersion(gvr, confirmRetractStaleVersionPruned)
 	}
 	c.staleVersionPruned.Add(uint64(len(pruned)))
 	names := make([]string, 0, len(pruned))
@@ -965,94 +856,6 @@ func (c *crdDiscovery) pruneUnservedGVRs(rw *ResourceWatcher, u *unstructured.Un
 			"confirmation, watch-broken and last-sync state and dep edges are torn down. Before 1.12.7 "+
 			"they persisted for the life of the process with a reflector retrying a dead API version, and "+
 			"every dep event for those kinds degraded to a dirty-mark forever (#219)."),
-	)
-}
-
-// relistPostSyncTimeout bounds how long the post-sync re-fire goroutine
-// waits for a relisted informer to sync before giving up (1.12.5 / #187).
-// A relisted informer that has not synced in two minutes is not going to;
-// waiting longer only holds the goroutine. The give-up is counted and
-// logged, because it means entries deleted inside that GVR's teardown
-// window stay stranded until their TTL.
-const relistPostSyncWait = 2 * time.Minute
-
-// refireRelistDirtyMarkAfterSync waits for a relisted GVR's replacement
-// informer to finish its initial LIST, then re-fires the dependent
-// dirty-mark. See the call site for why the single pre-sync fire is not
-// enough.
-//
-// dirtyMark is the CALLER's dep-tracker cause, the same function the pre-sync
-// fire in relistGVRForRepair used (#380). Before #380 this re-fire hardcoded
-// OnResourceTypeSchemaRelisted, so a store repair's post-sync re-mark logged
-// cache_event.consumed type=SCHEMA_RELIST and landed in the schema_relist #239
-// bucket: the #237 wrong-cause defect, reintroduced inside the shared relist
-// mechanism. Both fires of one relist now carry one label.
-//
-// Runs on its own goroutine: the relist loop executes on the single
-// CRD-lifecycle worker, and blocking there would stall every other CRD
-// event. Panic-guarded for the same reason every other handler here is —
-// a goroutine panic takes the process down, and this one is spawned from
-// an informer-driven path.
-func (c *crdDiscovery) refireRelistDirtyMarkAfterSync(
-	d *DepTracker,
-	gvr schema.GroupVersionResource,
-	dirtyMark func(*DepTracker, schema.GroupVersionResource) int,
-	syncCh <-chan struct{},
-) {
-	defer c.workerWG.Done()
-	defer func() {
-		if rec := recover(); rec != nil {
-			c.panicsRecovered.Add(1)
-			slog.Error("cache.crd_discovery.relist_postsync.panic",
-				slog.String("subsystem", "cache"),
-				slog.String("gvr", gvr.String()),
-				slog.Any("panic", rec),
-				slog.String("stack", string(debug.Stack())),
-			)
-		}
-	}()
-
-	if syncCh == nil {
-		// EnsureResourceType returned no channel (passthrough / nil watcher).
-		// Nothing to wait for and nothing useful to re-mark.
-		return
-	}
-
-	timer := time.NewTimer(relistPostSyncWait)
-	defer timer.Stop()
-
-	select {
-	case <-syncCh:
-	case <-c.stopCh:
-		return
-	case <-timer.C:
-		c.relistPostSyncTimeout.Add(1)
-		slog.Warn("cache.crd_discovery.relist_postsync.timeout",
-			slog.String("subsystem", "cache"),
-			slog.String("gvr", gvr.String()),
-			slog.Duration("waited", relistPostSyncWait),
-			slog.String("effect", "the relisted informer never synced, so the post-sync "+
-				"dirty-mark did not run — L1 entries whose objects were deleted inside the "+
-				"relist teardown window stay resident until TTL (#187)"),
-		)
-		return
-	}
-
-	// Re-check the stop signal: the bridge may have been torn down while we
-	// waited, and a dirty-mark issued after shutdown is pure noise.
-	select {
-	case <-c.stopCh:
-		return
-	default:
-	}
-	dirtyMark(d, gvr) // the caller's cause label, as the pre-sync fire (#380)
-	c.relistDirtyMarkPostSync.Add(1)
-	slog.Info("cache.crd_discovery.relist_postsync.dirty_marked",
-		slog.String("subsystem", "cache"),
-		slog.String("gvr", gvr.String()),
-		slog.String("hint", "re-marked dependent L1 entries after the relisted informer synced; "+
-			"an entry whose object was deleted inside the teardown window gets no informer "+
-			"DELETE (a fresh informer synthesises none) and this is its only trigger (#187)"),
 	)
 }
 
@@ -1092,6 +895,7 @@ func triggerCRDDelete(obj interface{}) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			c.panicsRecovered.Add(1)
+			// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 			slog.Error("cache.crd_discovery.delete.panic_recovered",
 				slog.String("subsystem", "cache"),
 				slog.Any("panic", rec),
@@ -1115,11 +919,13 @@ func triggerCRDDelete(obj interface{}) {
 	// otherwise match the stale fingerprint and no-op, leaving the discovery cache
 	// / RESTMapper without the recreated GVR.
 	c.dropCRDFingerprints(u.GetName())
+	c.forgetServedVersions(u) // #807
 
 	group, _, _ := unstructured.NestedString(u.Object, "spec", "group")
 	plural, _, _ := unstructured.NestedString(u.Object, "spec", "names", "plural")
 	if group == "" || plural == "" {
 		c.deleteSkippedNG.Add(1)
+		// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 		slog.Warn("cache.crd_discovery.delete.no_group_or_plural",
 			slog.String("subsystem", "cache"),
 			slog.String("group", group),
@@ -1133,6 +939,7 @@ func triggerCRDDelete(obj interface{}) {
 	versions, found, vErr := unstructured.NestedSlice(u.Object, "spec", "versions")
 	if vErr != nil || !found || len(versions) == 0 {
 		c.deleteSkippedNG.Add(1)
+		// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 		slog.Warn("cache.crd_discovery.delete.no_versions",
 			slog.String("subsystem", "cache"),
 			slog.String("group", group),
@@ -1218,6 +1025,7 @@ func warnOnceCRDDecodeSkip(obj interface{}, kind crdLifecycleKind) {
 	if _, loaded := crdDecodeSkipWarnedTypes.LoadOrStore(typeName, struct{}{}); loaded {
 		return
 	}
+	// log-ctx-waiver: worker: the CRD discovery worker, one line per skipped shape
 	slog.Warn("cache.crd_discovery.decode_skipped",
 		slog.String("subsystem", "cache"),
 		slog.String("kind", crdLifecycleKindString(kind)),
@@ -1256,16 +1064,13 @@ type CRDDiscoveryStats struct {
 	CRDDiscoveryNoop   uint64 `stat:"crd_discovery_noop"`   // #218 ADD/UPDATE where NEITHER the schema nor the discovery-identity fingerprint changed → nothing invalidated (the ~9.5min re-list amplifier removed; climbs ~1/CRD/re-list at steady state)
 	// 1.12.7 F2 / #219
 	StaleVersionPruned uint64 `stat:"stale_version_pruned_total"` // per-GVR state torn down because the CRD stopped serving that version
-
-	// 1.12.5 / #187
-	RelistDirtyMarkPostSync uint64 `stat:"relist_dirtymark_postsync_total"` // post-sync re-fires of the relist dirty-mark
-	RelistPostSyncTimeout   uint64 `stat:"relist_postsync_timeout_total"`   // relisted GVRs whose new informer did not sync in time
-
-	// 1.12.6 C2 — relist delta bridge (relist_bridge.go)
-	RelistBridgeRuns     uint64 `stat:"relist_bridge_runs_total"`     // bridges spawned (one per relisted GVR with a registered indexer)
-	RelistBridgeEnqueued uint64 `stat:"relist_bridge_enqueued_total"` // coordinates synthesized from (old indexer keys \ fresh LIST)
-	RelistBridgeTimeout  uint64 `stat:"relist_bridge_timeout_total"`  // bridges that gave up because the fresh informer never synced — the soak signal
-	RelistBridgeAborted  uint64 `stat:"relist_bridge_aborted_total"`  // bridges with nothing to diff (no sync channel / GVR removed while waiting)
+	// #807
+	ListRefusedChecks            uint64 `stat:"list_refused_checks_total"`                    // 404 LIST/WATCH refusals checked against the CRD's served set
+	ListRefusedDropped           uint64 `stat:"list_refused_dropped_total"`                   // 404 refusals not queued (worker queue full)
+	ListRefusedCRDUnknown        uint64 `stat:"list_refused_crd_unknown_total"`               // refusals declined: no CRD record for the group+plural
+	ListRefusedStillServed       uint64 `stat:"list_refused_still_served_total"`              // refusals declined: the CRD still serves the version
+	RefusedVersionPruned         uint64 `stat:"refused_version_pruned_total"`                 // informers torn down and blocked because the 404'd version is not served
+	UnservedRegistrationsRefused uint64 `stat:"unserved_version_registrations_refused_total"` // registrations refused for a blocked version
 }
 
 // crdDiscoveryStatsOverride, when set, replaces the live snapshot. TEST-ONLY
@@ -1298,13 +1103,12 @@ func CRDDiscoveryStatsSnapshot() CRDDiscoveryStats {
 		CRDDiscoveryNoop:   c.crdDiscoveryNoop.Load(),
 		StaleVersionPruned: c.staleVersionPruned.Load(),
 
-		RelistDirtyMarkPostSync: c.relistDirtyMarkPostSync.Load(),
-		RelistPostSyncTimeout:   c.relistPostSyncTimeout.Load(),
-
-		RelistBridgeRuns:     c.relistBridgeRuns.Load(),
-		RelistBridgeEnqueued: c.relistBridgeEnqueued.Load(),
-		RelistBridgeTimeout:  c.relistBridgeTimeout.Load(),
-		RelistBridgeAborted:  c.relistBridgeAborted.Load(),
+		ListRefusedChecks:            c.listRefusedChecks.Load(),
+		ListRefusedDropped:           c.listRefusedDropped.Load(),
+		ListRefusedCRDUnknown:        c.listRefusedCRDUnknown.Load(),
+		ListRefusedStillServed:       c.listRefusedStillServed.Load(),
+		RefusedVersionPruned:         c.refusedVersionPruned.Load(),
+		UnservedRegistrationsRefused: c.unservedRegistrationsRefused.Load(),
 	}
 }
 

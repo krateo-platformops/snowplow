@@ -60,9 +60,7 @@ func fakeApiRefPaginationJob(ns, name string) apiRefPaginationJob {
 		GVR:        schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "datagrids"},
 		Page1Res:   res,
 		Depth:      1,
-		PerPage:    5,
-		KeyPerPage: -1,
-		KeyPage:    -1,
+		Pagination: newPrewarmPagination(5, 1),
 		AuthnNS:    "krateo-system",
 	}
 }
@@ -274,4 +272,3 @@ func TestDrain_CancelsOnContextCancel(t *testing.T) {
 		t.Fatalf("drain did not observe ctx cancel within 2s — leak / no cancellation hook")
 	}
 }
-

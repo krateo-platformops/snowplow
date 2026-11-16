@@ -29,6 +29,7 @@ package apiref
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"sync/atomic"
 
@@ -37,6 +38,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -157,15 +159,8 @@ func seedFullListRAKey(ctx context.Context, gvr schema.GroupVersionResource,
 	if err != nil {
 		return cache.ResolvedKeyInputs{}, "", false
 	}
-	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:  ui.Username,
-		Groups:    ui.Groups,
-		Verb:      "get",
-		Group:     gvr.Group,
-		Resource:  gvr.Resource,
-		Namespace: namespace,
-		Name:      name,
-	})
+	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, rbac.ObjectCheck(ui.Username, ui.Groups, "get",
+		rbac.TargetOf(gvr, namespace, name)))
 	if bindingUID == "" {
 		return cache.ResolvedKeyInputs{}, "", false
 	}
@@ -261,6 +256,18 @@ func SeedFullListRAKeyInputsForTest(ctx context.Context, gvr schema.GroupVersion
 // resolveRA(perPage, page) is the page-keyed resolve seam — a closure over
 // restactions.Resolve so this file does not duplicate the apiref Resolve
 // plumbing; it returns the RA Status map for the given pagination.
+//
+// ONE RUN OF A WRITE PER /call (#942). served=false makes apiref.Resolve run the
+// RESTAction page-keyed, so once this function has run it, falling back would
+// run every stage again, writes included. What a run wrote is known only after
+// it ran: the RESTAction's own write stage AND a write in any RESTAction it
+// resolves in-process (resolve:true) both set the runtime declared-write mark on
+// the Put-gate sinks installed below (restactions/api ResolveWithFailure). So:
+//   - first sight runs the page-keyed resolve FIRST, and takes a permanent
+//     decline (a declared write among them) before it runs the unpaginated one:
+//     the page it already holds is served, nothing runs twice;
+//   - every fall-back after a run goes through fallBackAfterRun, which never
+//     hands a run that declared a write back for a second run.
 func raFullListServe(
 	ctx context.Context,
 	gvr schema.GroupVersionResource,
@@ -274,7 +281,6 @@ func raFullListServe(
 	if c == nil {
 		return nil, false, nil // cache off — fall back
 	}
-
 	// #592 — THE 1.12.3 A-1 BYPASS WAS REMOVED HERE. It used to refuse this whole
 	// layer (served=false) for a RESTAction declaring a userAccessFilter, before
 	// deriving a key, on this reasoning: the cell holds the RA's full resolve
@@ -396,12 +402,49 @@ func raFullListServe(
 	// never over counts the enclosing /call recorded before it got here.
 	ctx, gate := cache.WithChildPutGateSinks(ctx)
 
+	// fallBackAfterRun is the ONLY way out with served=false once this function
+	// has run the RESTAction (#942, see the function comment). A read-only run
+	// falls back to the page-keyed resolve as before. A run that declared a write
+	// has sent it: it is not run again, and the /call answers an error instead
+	// of a page it does not have. Reached only on the known-sliceable repopulate
+	// branch (first sight never falls back after a run), when the full list
+	// stops slicing (shape drift) or a just-stored cell has no backing edge,
+	// which a declared write cannot reach: its verdict never stores.
+	fallBackAfterRun := func() (map[string]any, bool, error) {
+		if gate.External.DeclaredWrite() {
+			raFullListWriteNotRerun.Add(1)
+			return nil, false, errRAFullListWriteNotRerun
+		}
+		return nil, false, nil
+	}
+
 	raEpoch, haveEpoch := cache.DepGenStartSeqFromContext(ctx)
 	if !haveEpoch {
 		raEpoch = cache.DepGenEpochNow()
 	}
-	fullCtx := cache.WithL1KeyContextFromEpoch(ctx, raKey, raEpoch,
-		cache.DepKey{GVR: gvr, Namespace: namespace, Name: name})
+	// #1319 — the unpaginated resolve reports its stage outcomes into its OWN
+	// collector: they are the full list's, stored with the raKey cell and
+	// replayed to the widget whenever the served body is a slice of it (a hit
+	// replays the stored ones). The page-keyed resolve (sRA) reports into the
+	// caller's collector on ctx as any resolve does.
+	fullCtx, fullOutcomes := api.WithStageOutcomes(cache.WithL1KeyContextFromEpoch(ctx, raKey, raEpoch,
+		cache.DepKey{GVR: gvr, Namespace: namespace, Name: name}))
+	// servedFromFull returns a slice of the full list this call resolved, and
+	// hands the caller the full list's outcomes (a no-op when a page-keyed
+	// resolve on ctx already reported its own).
+	servedFromFull := func(m map[string]any) (map[string]any, bool, error) {
+		api.ReplayStageOutcomes(ctx, api.StorableStageOutcomes(fullOutcomes))
+		return m, true, nil
+	}
+	// #890/#893 — an unpaginated resolve under fullCtx records edges under raKey;
+	// if its full list is not stored they are released when this serve returns.
+	// The fast-path hit records nothing under raKey, so it releases nothing.
+	resolvedFull := false
+	defer func() {
+		if resolvedFull {
+			cache.Deps().ReleaseUnstored(fullCtx, raKey)
+		}
+	}()
 
 	// Single source of truth for the sliceShape — the SAME derivation the #42
 	// FIX-B pre-check (SeedFullListShapeKnownNonSliceable) uses, so the seed
@@ -471,7 +514,12 @@ func raFullListServe(
 					if len(edges) == 0 {
 						return nil, false, nil
 					}
-					cache.Deps().ReplayEdges(ctx, widgetL1Key, edges)
+					// #765 B: carry the raKey edges' LIVE interest states. Sound
+					// because the raKey resolve's commit runs inside it (deferred in
+					// restactions.Resolve), before any raKey Put: the live state
+					// covers every version already stored (architect-623, #765).
+					cache.Deps().ReplayEdgesWithStates(ctx, widgetL1Key, edges,
+						cache.Deps().EdgeNarrowStates(raKey, edges), cache.ReplaySiteFullList)
 					// #406 — this body is DERIVED from the raKey cell, which may be
 					// dirty-marked and not yet refreshed (an RA edit marks both; the
 					// refresher may dequeue the widget first). Note which raKey version
@@ -480,6 +528,9 @@ func raFullListServe(
 					// later raKey commit at a new version remarks the stored widget.
 					c.NoteRAFullListSlice(ctx, raKey, entry)
 					cache.RecordRAFullListServe(cache.RAFullListServeHit)
+					// #1319 — served without a resolve: the caller gets the
+					// outcomes the resolve that stored the full list produced.
+					api.ReplayStageOutcomes(ctx, entry.StageOutcomes)
 					return sliced, true, nil
 				}
 			}
@@ -497,6 +548,7 @@ func raFullListServe(
 		if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
 			c.ForgetRAFullListConsumer(raKey, widgetL1Key)
 		}
+		resolvedFull = true
 		full, rerr := resolveRA(fullCtx, 0, 0)
 		if rerr != nil {
 			return nil, false, rerr
@@ -504,8 +556,9 @@ func raFullListServe(
 		sliced, sok := cache.GoSliceFullList(full, offset, perPage)
 		if !sok {
 			// The full result no longer slices cleanly (shape drift). Fall
-			// back this /call without poisoning the established verdict.
-			return nil, false, nil
+			// back this /call without poisoning the established verdict —
+			// never by running a write a second time (#942).
+			return fallBackAfterRun()
 		}
 		// External-no-cache (proposal 2026-06-22) — if the unpaginated
 		// re-resolve touched a genuine external endpoint, SERVE the slice but
@@ -513,13 +566,14 @@ func raFullListServe(
 		// edge to invalidate the cell). Load-bearing surface #4 — without this
 		// the external aggregate would be cached + served stale across pages.
 		// #684 — GenuineExternal (#681 C2): the requester's own-credential
-		// apiserver 403 is not an external touch.
-		if cache.GenuineExternal(gate.External, gate.Forbidden) > 0 {
-			if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
-				cache.BumpExternalSkippedPut()
+		// apiserver 403 is not an external touch. Read through the shared
+		// Put-gate verdict, which also declines a declared write (#903 F1).
+		if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
+			if raFullListEvictable(ctx, c, gvr, namespace, name, extras, raKey) { // #1255
+				c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey)
 			}
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
-			return sliced, true, nil
+			return servedFromFull(sliced)
 		}
 		// #323 — generation-guarded write: on accept, record the self-dep + replay
 		// the backing edges; on REFUSE (a DELETE-eviction bumped the generation
@@ -532,17 +586,32 @@ func raFullListServe(
 		// minted for; a change mid-resolve makes `full` another class's body.
 		// Serve the slice (correct for this requester), never write it.
 		// #684 — a stage error that is not a per-identity forbidden declines.
-		if cache.DeclineSensitivePut(fullCtx) || raFullListStageDecline(ctx, gate) ||
-			!raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+		// #912 re-review — the verdict is taken over everything this path
+		// resolved, and the write itself takes it: PutRAFullListIfGen stores
+		// nothing unless it allows the Put.
+		v := raFullListVerdict(gate)
+		if cache.DeclineSensitivePut(fullCtx) {
+			if raFullListEvictable(ctx, c, gvr, namespace, name, extras, raKey) { // #1255
+				c.EvictUnstorable(fullCtx, raKey, cache.UnstorableSensitive)
+			}
 			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
-			return sliced, true, nil
+			return servedFromFull(sliced)
+		}
+		if raFullListDeclines(ctx, v) || !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
+			return servedFromFull(sliced)
 		}
 		// #592 — observed limb, immediately before the write (the unpaginated
 		// resolve that built `full` has run by now, so a nested refilter has
 		// bumped the sink).
 		stampObservedUAF()
-		if c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0) {
-			noteRAFullListDenialOnlyPut(gate)
+		put := c.PutRAFullListIfGenOutcome(fullCtx, v, raKey, keyInputs, full, api.StorableStageOutcomes(fullOutcomes), raGen0)
+		// #1321 B1 — this repopulate replaces a resident raKey cell, which a
+		// /refreshes connection can arm (raFullList coordinates, #426): a write
+		// that changed its bytes announces the change itself.
+		cache.PublishPutIfSubscribed(raKey, put)
+		if put.Stored() {
+			noteRAFullListDenialOnlyPut(v)
 			// #375 C3 — under fullCtx (the Put's sink; it chains to the widget sink, which
 			// still receives the dep), so an RA edit in [Put-check, Record) is re-checked.
 			cache.Deps().Record(fullCtx, raKey, gvr, namespace, name)
@@ -553,27 +622,26 @@ func raFullListServe(
 			// the cell we just Put carries no backing edge, so fall through.
 			edges := cache.Deps().EdgesUnder(raKey)
 			if len(edges) == 0 {
-				return nil, false, nil
+				return fallBackAfterRun()
 			}
-			cache.Deps().ReplayEdges(ctx, widgetL1Key, edges)
+			// #765 B: the raKey edges' live states (see the hit branch).
+			cache.Deps().ReplayEdgesWithStates(ctx, widgetL1Key, edges,
+				cache.Deps().EdgeNarrowStates(raKey, edges), cache.ReplaySiteFullList)
 		}
 		cache.RecordRAFullListServe(cache.RAFullListServeRepopulateSlice)
-		return sliced, true, nil
+		return servedFromFull(sliced)
 	}
 
 	// --- First sight of (RA × shape): byte-VERIFY, then memoise ---------
-	// 1. Resolve UNPAGINATED -> full F (deps scoped to the RAFullList key).
 	// #406 — as on the repopulate branch: a fresh-resolve body is no consumer.
 	if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
 		c.ForgetRAFullListConsumer(raKey, widgetL1Key)
 	}
-	full, err := resolveRA(fullCtx, 0, 0)
-	if err != nil {
-		return nil, false, err
-	}
-	// 2. Resolve the OLD page-keyed way -> S_ra (the fall-back reference).
-	//    Under the ORIGINAL ctx so its deps belong to the widget cell,
-	//    unchanged from today.
+	// 1. Resolve the OLD page-keyed way -> S_ra (the fall-back reference, and
+	//    the page this /call is served whenever first sight declines). Under
+	//    the ORIGINAL ctx so its deps belong to the widget cell, unchanged from
+	//    today. FIRST, so a permanent decline is known before a second run
+	//    (#942, below).
 	//
 	// #277 / edge-3 [C3 + C-branch-precision] PIN: this first-sight page-keyed
 	// resolve runs under the ORIGINAL ctx (widget L1 key), so its inner LIST/
@@ -587,17 +655,35 @@ func raFullListServe(
 		return nil, false, err
 	}
 
-	// External-no-cache (proposal 2026-06-22) — load-bearing surface #4. If
-	// either first-sight resolve touched a genuine external endpoint, SERVE
-	// the (correct, fresh) page-keyed S_ra but record NO sliceability verdict,
-	// NO dep edge, and Put NO cell — external data has no informer edge to
-	// invalidate it, so caching it would serve it stale across pages/widgets
-	// (the exact defect this proposal kills). Checked AFTER both resolves so
-	// the sink reflects either one touching the external fetch (#684: both
-	// resolve under the gate sinks; GenuineExternal per #681 C2).
-	if cache.GenuineExternal(gate.External, gate.Forbidden) > 0 {
-		if !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
-			cache.BumpExternalSkippedPut()
+	// External-no-cache (proposal 2026-06-22) — load-bearing surface #4, and
+	// #942. If the page-keyed resolve declared a write (its own stage or one of
+	// a RESTAction it resolved in-process) or touched a genuine external
+	// endpoint, SERVE the (correct, fresh) page-keyed S_ra and stop: record NO
+	// sliceability verdict, NO dep edge, Put NO cell, and do NOT run the
+	// unpaginated resolve — a write would be sent a second time for this /call,
+	// and external data has no informer edge to invalidate a cell (the exact
+	// defect the proposal kills). Read through the shared Put-gate verdict
+	// (#684: the resolve ran under the gate sinks; GenuineExternal per #681 C2).
+	if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
+		if raFullListEvictable(ctx, c, gvr, namespace, name, extras, raKey) { // #1255
+			c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey)
+		}
+		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
+		return sRA, true, nil
+	}
+
+	// 2. Resolve UNPAGINATED -> full F (deps scoped to the RAFullList key).
+	resolvedFull = true
+	full, err := resolveRA(fullCtx, 0, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	// The same decline for what only the unpaginated resolve touched (a
+	// genuine external endpoint reached on a later page). It has run once, so
+	// S_ra is served and nothing runs again.
+	if raFullListPermanentDecline(ctx, raFullListVerdict(gate)) {
+		if raFullListEvictable(ctx, c, gvr, namespace, name, extras, raKey) { // #1255
+			c.EvictOnPermanentDecline(fullCtx, raFullListVerdict(gate), raKey)
 		}
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sRA, true, nil
@@ -638,6 +724,16 @@ func raFullListServe(
 	//    `full`, so identity holds by construction — re-encode both to
 	//    canonical JSON to be safe) AND S_go must byte-equal S_ra.
 	verdict := sok && canonicalJSONEqual(sGo, sRA)
+	// #874 — a source that DECLARES its own pagination (slice.continue /
+	// slice.cursor in its output) is page-dependent by construction: a page
+	// Go-sliced from the unpaginated full list would carry the full list's
+	// declaration, not this page's. Never sliceable, permanently — even on the
+	// one page where the two happen to byte-match (e.g. a last page whose
+	// continue is false in both).
+	_, _, declaresPagination := cache.SourcePagination(sRA)
+	if declaresPagination {
+		verdict = false
+	}
 
 	// Ship #91 / 0.30.211 — Class C heuristic. When the byte-verify FAILED
 	// AND `full` is shape-identical to S_ra modulo length-vs-perPage, this
@@ -645,8 +741,8 @@ func raFullListServe(
 	// whose verdict will never flip. Mark it permanent so the retry cap
 	// drops from 3 to 1. Mechanism-uniform: derived from (full, sRA, perPage),
 	// no resource/name/GVR literal (feedback_no_special_cases).
-	permanent := false
-	if !verdict {
+	permanent := declaresPagination
+	if !verdict && !permanent {
 		permanent = cache.IsStructurallyNonSliceable(full, sRA, perPage)
 	}
 
@@ -693,18 +789,27 @@ func raFullListServe(
 	// #424 — same identity-class re-check as the repopulate branch.
 	// #398 — a full list built from a sensitive read is never cached.
 	// #684 — nor one with a stage error that is not a per-identity forbidden.
-	if cache.DeclineSensitivePut(fullCtx) || raFullListStageDecline(ctx, gate) ||
-		!raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+	v := raFullListVerdict(gate) // #912 re-review — twin of the repopulate branch
+	if cache.DeclineSensitivePut(fullCtx) {
+		if raFullListEvictable(ctx, c, gvr, namespace, name, extras, raKey) { // #1255
+			c.EvictUnstorable(fullCtx, raKey, cache.UnstorableSensitive)
+		}
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
-		return sGo, true, nil
+		return servedFromFull(sGo)
+	}
+	if raFullListDeclines(ctx, v) || !raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey) {
+		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
+		return servedFromFull(sGo)
 	}
 	// #592 — observed limb, twin of the repopulate branch above.
 	stampObservedUAF()
-	if c.PutRAFullListIfGen(fullCtx, raKey, keyInputs, full, raGen0) {
-		noteRAFullListDenialOnlyPut(gate)
+	put := c.PutRAFullListIfGenOutcome(fullCtx, v, raKey, keyInputs, full, api.StorableStageOutcomes(fullOutcomes), raGen0)
+	cache.PublishPutIfSubscribed(raKey, put) // #1321 B1 — see the repopulate branch
+	if put.Stored() {
+		noteRAFullListDenialOnlyPut(v)
 	}
 	cache.RecordRAFullListServe(cache.RAFullListServeVerifiedSlice)
-	return sGo, true, nil
+	return servedFromFull(sGo)
 }
 
 // raFullListStageErrorDeclined counts raFullList cell writes declined by the
@@ -715,16 +820,33 @@ var raFullListStageErrorDeclined atomic.Uint64
 // RAFullListStageErrorDeclinedForTest reads the counter.
 func RAFullListStageErrorDeclinedForTest() uint64 { return raFullListStageErrorDeclined.Load() }
 
-// raFullListStageDecline is the #681 stage-error gate on the full-list cell,
-// over the full list's own sinks (#684): any stage error declines unless
-// EVERY one was a per-identity forbidden (cache.DenialOnly — the one predicate
-// every Put site shares). The denial-only body is already identity-free: the
-// resolver records F1 and F2 as the canonical forbidden body.
-func raFullListStageDecline(ctx context.Context, g cache.PutGateSinks) bool {
-	if g.Stage.Count() == 0 || cache.DenialOnly(g.Stage, g.Forbidden, g.External, cache.CacheEntryClassRAFullList) {
+// errRAFullListWriteNotRerun is the /call's answer when the known-sliceable
+// repopulate run declared a write and cannot be served as a page (#942,
+// fallBackAfterRun): the write was sent once, and is not sent again.
+var errRAFullListWriteNotRerun = errors.New("raFullList: the RESTAction declares a write that this request already sent, " +
+	"and its full list does not slice into the requested page; it is not run a second time")
+
+// raFullListWriteNotRerun counts fallBackAfterRun refusing a second run (#942).
+var raFullListWriteNotRerun atomic.Uint64
+
+// RAFullListWriteNotRerunForTest reads the counter.
+func RAFullListWriteNotRerunForTest() uint64 { return raFullListWriteNotRerun.Load() }
+
+// raFullListVerdict is the full-list cell's Put-gate verdict, over the full
+// list's own sinks (#684): the same cache.PutGateVerdict every Put site reads.
+func raFullListVerdict(g cache.PutGateSinks) cache.PutVerdict {
+	return cache.PutGateVerdict(g, cache.CacheEntryClassRAFullList)
+}
+
+// raFullListDeclines reports whether the verdict declines the full-list Put
+// (any reason; the write would refuse it anyway). A stage error that is not a
+// per-identity forbidden (#681 DenialOnly false) is counted; the reason only
+// selects the counter.
+func raFullListDeclines(ctx context.Context, v cache.PutVerdict) bool {
+	if v.Store() {
 		return false
 	}
-	if !cache.Inert(ctx) { // #443 — dry-run traffic is not a decline
+	if v.Reason() == cache.PutReasonStageError && !cache.Inert(ctx) { // #443 — dry-run traffic is not a decline
 		raFullListStageErrorDeclined.Add(1)
 	}
 	return true
@@ -732,10 +854,26 @@ func raFullListStageDecline(ctx context.Context, g cache.PutGateSinks) bool {
 
 // noteRAFullListDenialOnlyPut counts a STORED full-list cell that carried
 // stage errors (the gate admitted it, so they were all per-identity forbidden).
-func noteRAFullListDenialOnlyPut(g cache.PutGateSinks) {
-	if g.Stage.Count() > 0 {
+func noteRAFullListDenialOnlyPut(v cache.PutVerdict) {
+	if v.DenialOnly() {
 		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteRAFullList)
 	}
+}
+
+// raFullListPermanentDecline is the full-list cell's early decline, taken as
+// soon as the resolve ran: a PERMANENT verdict (a declared write, #903 F1, or a
+// genuine external touch, alone or beside a stage error) means no resolve of
+// this RESTAction can ever be stored, so no sliceability verdict is recorded
+// either. A transient decline is raFullListDeclines', at the Put. The
+// external-skip counter counts external touches only.
+func raFullListPermanentDecline(ctx context.Context, v cache.PutVerdict) bool {
+	if !v.Permanent() {
+		return false
+	}
+	if v.Reason() != cache.PutReasonDeclaredWrite && !cache.Inert(ctx) { // #443 — an inert (dry-run) resolve leaves no trace
+		cache.BumpExternalSkippedPut()
+	}
+	return true
 }
 
 // raKeyClassDriftDeclined counts raFullList cell writes declined because the
@@ -751,6 +889,17 @@ func RAKeyClassDriftDeclinedForTest() uint64 { return raKeyClassDriftDeclined.Lo
 // reports whether it still equals raKey. A grant/revoke that landed during the
 // resolve moves it (#424) — including a grant-then-revoke or a Role edit that
 // leaves the binding set unchanged, via the monotone sub-gen (#435).
+// raFullListEvictable reports whether a decline of this full-list resolve may
+// evict raKey's cell (#1255): there is one, and the requester is still in the
+// RBAC class raKey was minted for. A resolve whose class moved mid-resolve read
+// another class's view, so its decline proves nothing about raKey (#424; F3 of
+// the #1263 review). Residency is read first: the class re-derivation runs only
+// when there is a cell to evict.
+func raFullListEvictable(ctx context.Context, c *cache.ResolvedCacheStore, gvr schema.GroupVersionResource,
+	namespace, name string, extras map[string]any, raKey string) bool {
+	return c.Has(raKey) && raKeyClassCurrent(ctx, gvr, namespace, name, extras, raKey)
+}
+
 func raKeyClassCurrent(ctx context.Context, gvr schema.GroupVersionResource,
 	namespace, name string, extras map[string]any, raKey string) bool {
 	_, now, ok := seedFullListRAKey(ctx, gvr, namespace, name, extras)

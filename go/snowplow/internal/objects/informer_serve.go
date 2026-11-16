@@ -55,7 +55,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -146,6 +146,7 @@ func startObjectsGetSummary() {
 		objectsGetSummaryWG.Add(1)
 		go func() {
 			defer objectsGetSummaryWG.Done()
+			workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 			t := time.NewTicker(every)
 			defer t.Stop()
 			for {
@@ -297,52 +298,58 @@ func stripForServe(uns *unstructured.Unstructured) {
 // Per feedback_no_special_cases.md: uniform over every GVR — no
 // per-resource carve-out.
 func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *unstructured.Unstructured) bool {
-	log := xcontext.Logger(ctx)
-
 	if obj == nil {
 		// Defensive: the caller only reaches here on an indexer HIT
 		// (obj non-nil), but the helper fails closed rather than trust
 		// that invariant blindly.
 		return false
 	}
+	return authorizeGetOf(ctx, gvr, obj.GetNamespace(), obj.GetName())
+}
+
+// authorizeGetOf is filterGetByRBAC's evaluation by coordinates: `get` of
+// (gvr, namespace, name) for the ctx identity. A `get` verdict depends only on
+// (identity, verb, GVR, namespace, name), never on the object's content, so the
+// same call decides an object already in hand (filterGetByRBAC) and one not yet
+// fetched (getFromAPIServer's authorize-before-dial step, #1483).
+func authorizeGetOf(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) bool {
+	log := xcontext.Logger(ctx)
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
 		// FAIL-CLOSED: no identity → cannot vouch for the object. Fall
 		// through to the apiserver, whose per-user-token gate is the
 		// authoritative answer.
-		log.Warn("objects.Get.rbac_get_filter.no_identity",
+		log.WarnContext(ctx, "objects.Get.rbac_get_filter.no_identity",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
-			slog.String("namespace", obj.GetNamespace()),
-			slog.String("name", obj.GetName()),
+			slog.String("namespace", namespace),
+			slog.String("name", name),
 			slog.Any("err", err),
 			slog.String("action", "fallthrough_to_apiserver"),
 		)
 		return false
 	}
 
+	// #1046 — the check is about obj itself: rbac.ObjectCheck over the
+	// object's own namespace AND name, so a resourceNames-scoped `get` grant
+	// is served from the informer instead of falling through to the
+	// apiserver (and, on the SA re-gate in getFromAPIServer, instead of
+	// failing closed).
 	// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller ignores
 	// matchedBindingUID.
-	allowed, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:  user.Username,
-		Groups:    user.Groups,
-		Verb:      "get",
-		Group:     gvr.Group,
-		Resource:  gvr.Resource,
-		Namespace: obj.GetNamespace(),
-		// Ship L1 (0.30.252): per-item caller discards
-		// matchedBindingUID — skip the CRB/RB stable-sort.
-		SkipBindingUID: true,
-	})
+	opts := rbac.ObjectCheck(user.Username, user.Groups, "get", rbac.TargetOf(gvr, namespace, name))
+	// Ship L1 (0.30.252): per-item caller discards matchedBindingUID — skip
+	// the CRB/RB stable-sort.
+	opts.SkipBindingUID = true
+	allowed, _, err := rbac.EvaluateRBAC(ctx, opts)
 	if err != nil {
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.
-		log.Warn("objects.Get.rbac_get_filter.evaluate_error",
+		log.WarnContext(ctx, "objects.Get.rbac_get_filter.evaluate_error",
 			slog.String("subsystem", "cache"),
-			slog.String("user", redact.User(user.Username)),
 			slog.String("gvr", gvr.String()),
-			slog.String("namespace", obj.GetNamespace()),
-			slog.String("name", obj.GetName()),
+			slog.String("namespace", namespace),
+			slog.String("name", name),
 			slog.Any("err", err),
 			slog.String("action", "fallthrough_to_apiserver"),
 		)
@@ -351,10 +358,9 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 
 	log.Debug("objects.Get.rbac_get_filter",
 		slog.String("subsystem", "cache"),
-		slog.String("user", redact.User(user.Username)),
 		slog.String("gvr", gvr.String()),
-		slog.String("namespace", obj.GetNamespace()),
-		slog.String("name", obj.GetName()),
+		slog.String("namespace", namespace),
+		slog.String("name", name),
 		slog.Bool("allowed", allowed),
 	)
 	return allowed

@@ -13,10 +13,13 @@ import (
 	"github.com/krateo-platformops/snowplow/apis"
 	v1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -67,6 +70,12 @@ var _ http.Handler = (*restActionHandler)(nil)
 func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// #443 (j) ingest — FIRST, before observeLiveCaller and the L1 key mint.
 	req = reseedInertFromHeaders(req)
+	req = reseedBackgroundFromHeaders(req) // #903
+	// #871 — measurement only: the dispatch's work class (customer, or a
+	// demand revalidation's fill_bg, or a background caller's class across a
+	// self-loopback) as a pprof label on req's context and goroutine.
+	req, endWork := beginServeWorkClass(req)
+	defer endWork()
 	log := xcontext.Logger(req.Context())
 
 	// #443 part 2 — an inline RESTAction is resolved, never stored. Echo it
@@ -87,6 +96,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// the slow /call class in the 8-cycle parallelism diagnostic.
 	pcs, pcEmit := beginPerCall(req, "restactions")
 	defer pcEmit()
+	// #1265 P0 — one serve outcome per top-level customer call (counter + header).
+	serve, serveEnd := beginCustomerServe(wri, req, serveHandlerRestactions)
+	defer serveEnd()
 
 	// Ship 1 — customer-priority signal. Mark this /call as in-flight so
 	// the prewarm engine yields its background re-seed work for the
@@ -159,8 +171,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// Cache=off skips this gate — fetchObject already runs per-user
 	// against apiserver, which enforces RBAC inline.
 	if !cache.Disabled() {
-		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured.GetNamespace()) {
-			log.Warn("RESTAction dispatch denied by EvaluateRBAC",
+		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured) {
+			log.WarnContext(req.Context(), "RESTAction dispatch denied by EvaluateRBAC",
 				slog.String("name", got.Unstructured.GetName()),
 				slog.String("namespace", got.Unstructured.GetNamespace()),
 				slog.String("gvr", got.GVR.String()),
@@ -210,7 +222,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			}
 			// Depth-8 backstop: bounded 508-class error (never empty, never a
 			// panic), mirroring the in-process depth guard (nested_call.go:114).
-			response.Encode(wri, response.New(http.StatusLoopDetected,
+			response.Encode(wri, credhttp.FailureStatus(http.StatusLoopDetected,
 				fmt.Errorf("nested resolve depth limit exceeded (%d) for %s/%s/%s over HTTP self-loopback",
 					cache.NestedCallMaxDepth(), got.GVR.Resource,
 					got.Unstructured.GetNamespace(), got.Unstructured.GetName())))
@@ -248,8 +260,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// to the shared empty-identity row → treat as a CACHE MISS, fall through to
 	// a direct resolve under THIS request's identity; never serve the shared ""
 	// cell to a different ""-deriving identity. See serveFromCacheEligible.
+	lookupMiss := cache.LookupAbsent
 	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
-		if entry, ok := cacheHandle.Get(cacheKey); ok {
+		var entry *cache.ResolvedEntry
+		if entry, lookupMiss = l1Get(req.Context(), cacheHandle, cacheKey); lookupMiss == cache.LookupHit {
 			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
 			// refresher's replacement if the recorded representative drifts).
@@ -257,14 +271,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			pcs.l1Hit = "hit"
 			// #261 serve-time detector (observability only; the keying FIX is
 			// v7-deferred — this changes NO serving behaviour, RawJSON below is
-			// untouched). Both at-risk carriers of the bounded self-stale-leak
+			// untouched). The at-risk carrier of the bounded self-stale-leak
 			// class — case-2 (winning subject is an implicit group; an RBAC fact)
-			// and case-3 (first-permitting binding's roleRef was unresolved at the
-			// last bindings_by_gvr index build; an index fact) — were computed at
-			// KEY-MINT (dispatchCacheLookupKey) and carried on cacheInputs.
-			// AtRiskClass. Here we merely READ that MARK and bump the matching
-			// counter — never re-evaluating RBAC or the index at the hit (pm
-			// load-bearing #4). Through such a binding a grant/revoke can shift the
+			// — was computed at KEY-MINT (dispatchCacheLookupKey) and carried on
+			// cacheInputs.AtRiskClass. Here we merely READ that MARK and bump the
+			// counter — never re-evaluating RBAC at the hit (pm load-bearing #4).
+			// (Case-3, a binding skipped at the index build, was retired with
+			// that skip: #1449.) Through such a binding a grant/revoke can shift the
 			// serve-time first-match BindingUID with NO sub-gen bump, so a HIT of
 			// the at-risk-keyed cell can serve potentially-stale bytes.
 			// HIT-GATED ONLY: a MISS re-resolves under fresh perms (no stale), so
@@ -282,9 +295,6 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				case cache.AtRiskImplicitGroup:
 					cache.ResolvedCache().BumpServeMissedRotationAtriskImplicitGroup()
 					class = "implicit_group"
-				case cache.AtRiskRolerefUnresolved:
-					cache.ResolvedCache().BumpServeMissedRotationAtriskRolerefUnresolved()
-					class = "roleref_unresolved"
 				}
 				if class != "" {
 					log.Debug("l1.serve_missed_rotation_atrisk",
@@ -298,8 +308,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				}
 			}
 			setRefreshKeyHeader(wri, cacheKey, "restactions")
-			staleHitWritePoint(cacheKey, entry) // #710 PR-2b
+			stampRefreshDigest(wri, entry.ContentDigest) // #1324: the cell is served verbatim
+			setStoredStageOutcomesHeader(wri, entry)     // #904
+			// #710 PR-2b; #1062 — armed (the header above), for this requester.
+			staleHitWritePoint(req.Context(), cacheKey, entry, true)
 			noteStaleWrite(cacheKey, entry.StaleDerived, true)
+			serve.servedCell(cacheKey, entry)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
 			// revalidate it on demand under this requester, detached.
@@ -315,6 +329,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, false, false, 0)
 		pcs.l1Hit = "miss"
 	}
+	serve.servedLive(coldCauseOfLookup(req.Context(), cacheHandle, cacheInputs, lookupMiss))
 
 	// #189 — capture the cache key's generation BEFORE the resolve below. If the
 	// RESTAction CR is DELETE-evicted during the (live-apiserver) resolve, the
@@ -329,7 +344,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 
 	scheme := runtime.NewScheme()
 	if err := apis.AddToScheme(scheme); err != nil {
-		log.Error("unable to add apis to scheme",
+		log.ErrorContext(req.Context(), "unable to add apis to scheme",
 			slog.Any("err", err))
 		response.InternalError(wri, err)
 		return
@@ -338,7 +353,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	var cr v1.RESTAction
 	err = runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr)
 	if err != nil {
-		log.Error("unable to convert unstructured to typed rest action",
+		log.ErrorContext(req.Context(), "unable to convert unstructured to typed rest action",
 			slog.String("name", got.Unstructured.GetName()),
 			slog.String("namespace", got.Unstructured.GetNamespace()),
 			slog.Any("err", err))
@@ -366,11 +381,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	if cacheKey != "" {
 		ctx = cache.WithL1KeyContextFromEpoch(ctx, cacheKey, depEpoch, cache.DepKey{
 			GVR: got.GVR, Namespace: got.Unstructured.GetNamespace(), Name: got.Unstructured.GetName()})
+		// #890/#893 — a resolve whose cell is not stored (refused, declined, failed)
+		// leaves no edges behind; a stored cell keeps them (DepTracker.ReleaseUnstored).
+		defer cache.Deps().ReleaseUnstored(ctx, cacheKey)
 		// #710 PR-2b — this response is armable when its cell is stored, so its
 		// resolve may be served a KNOWN-STALE content cell at once (D2, "show then
 		// replace"); the sink carries the fact to the Put below (StaleDerived) and
 		// the content layer's debt pushes this key once the fresh value lands.
-		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "restactions")
+		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "restactions", staleSubjectOf(ctx))
 	}
 	// #83 Option A — seed THIS top-level RESTAction as an ancestor of the
 	// nested-resolve descent BEFORE resolving. The #79 cycle-stop
@@ -425,6 +443,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// (no informer/dep edge can invalidate it). Additive to the stage-error
 	// sink — both gate the Put independently. nil-receiver-safe.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
+	// The dispatched CR was fetched before this sink existed: a fetch that left
+	// snowplow under the requester's credential marks it now (objects.Result).
+	if got.RequesterDialled {
+		extTouchedSink.Bump()
+	}
 	// #398 — sensitive-resource sink: a resolve that dispatched a core
 	// v1/secrets read must not be persisted by any resolved-output Put.
 	ctx, _ = cache.WithSensitiveTouchedSink(ctx)
@@ -432,14 +455,20 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// above. Whatever bumps it, wherever that happens and however many resolver
 	// frames down, the Put-gate below reads Count()>0 and declines.
 	//
-	// It is the mechanism INTENDED to cover a NON-UAF RESTAction that NESTS a UAF
-	// one — its own spec declares no userAccessFilter, so the declaration limb is
-	// blind to it, while its resolved body still carries per-requester-narrowed
-	// rows. That case is NOT closed on this branch: the only bump today is
-	// declaration-based (apiref.Resolve) and inspects the parent — the blindness
-	// is asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref). It
-	// closes with the refilter bump on fix/1.12.3-authz-hardening, whose own arm
-	// is TestA4_RefilterBumpsUAFTouchedSink.
+	// A NON-UAF RESTAction that NESTS a UAF one declares no userAccessFilter, so
+	// the declaration limb (apiref.Resolve) is blind to it (asserted by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref), while its resolved
+	// body still carries per-requester-narrowed rows. Two shapes, two gates:
+	//   - IN-PROCESS nesting (a direct apiserver path with `resolve: true`): the
+	//     child resolves under this ctx, so the refilter's execution-based bump
+	//     (applyUserAccessFilterOnPig, present since 1.12.3) marks this sink.
+	//   - HTTP SELF-LOOPBACK (a named snowplow endpoint calling /call): the child
+	//     is a separate request and its refilter marks only that request's sink.
+	//     This Put is declined by the external-touched verdict below instead —
+	//     the dial is a branch-E send, which bumps extTouchedSink, and on this
+	//     handler an external touch is a permanent decline.
+	// TestA4_RefilterBumpsUAFTouchedSink pins that a refilter run marks the ctx
+	// it runs under; no arm drives a nested in-process resolve against this sink.
 	ctx, uafTouchedSink := cache.WithUAFTouchedSink(ctx)
 	// v7 Step 2D — DARK shadow-parity. Install the read-only shadow context (the
 	// cell's identity-free access domain D + this requester's identity + the
@@ -451,13 +480,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// unchanged). No-op (ctx unchanged) in production until an observability
 	// control turns the toggle on.
 	ctx = installShadowParityRESTAction(ctx, &cr)
-	// #443 part 2 — an inline resolve reports per-stage outcomes in a header
-	// (reason codes only), outside the body, so the body stays byte-identical
-	// to a stored resolve even when the draft's filter drops its error keys.
-	var outcomes *api.StageOutcomes
-	if inline {
-		ctx, outcomes = api.WithStageOutcomes(ctx)
-	}
+	// #443 part 2 / #904 — every RESTAction resolve reports its per-stage
+	// outcomes in a header (stage names and reason codes only), outside the
+	// body, so a caller can tell a half-done write sequence from a done one
+	// even when the RESTAction's filter drops the error keys from the body.
+	ctx, outcomes := api.WithStageOutcomes(ctx)
 	res, err := restactionsResolveFn(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		SArc:    r.saRC,
@@ -470,20 +497,44 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// stages are read as the caller (api.ProvenanceCallerSupplied).
 		Provenance: provenanceFor(inline),
 	})
-	if outcomes != nil {
-		wri.Header().Set(util.HeaderStageOutcomes, outcomes.HeaderValue())
-	}
+	wri.Header().Set(util.HeaderStageOutcomes, outcomes.HeaderValue())
 	if err != nil {
-		log.Error("unable to resolve rest action",
+		// #1116 — extras that name a key the resolver writes: a 400 naming
+		// the keys. Nothing was read or dialled, so there is no stale-derived
+		// pass to withdraw.
+		if isReservedExtrasRefusal(err) {
+			serve.refused() // #1265 — refused before anything was read: not a cold serve
+			WriteReservedExtrasRefusal(wri, err)
+			return
+		}
+		// #905 (c) — an error from a stale-derived pass is withdrawn and the
+		// request re-run with D2 disabled, exactly like a declined body: a write
+		// held in that pass (rule a) makes a filter that needs its output fail,
+		// and the fresh re-run is the one that sends the write.
+		if staleWritePoint(r, wri, req, staleSink, false, nil) {
+			return
+		}
+		log.ErrorContext(ctx, "unable to resolve rest action",
 			slog.String("name", cr.GetName()),
 			slog.String("namespace", cr.GetNamespace()),
 			slog.Any("err", err))
 		// #709 — a stage that failed without continueOnError is reported with
 		// its upstream status (restactions.Resolve returns it typed), as the
 		// widget handler already does for an apiRef error: a 404 stays a 404.
+		//
+		// #1429 — a `resolve: true` stage whose target's TYPE is not installed
+		// is snowplow's own type-not-installed answer, as on every other route:
+		// recognised by objects.Get's Go type, never by a status's shape.
+		var notInstalled *statusdetails.TypeNotInstalledError
+		if errors.As(err, &notInstalled) {
+			response.Encode(wri, notInstalled.Status())
+			return
+		}
 		var statusErr *apierrors.StatusError
 		if errors.As(err, &statusErr) {
-			response.Encode(wri, response.New(int(statusErr.Status().Code), fmt.Errorf("%s", statusErr.Status().Message)))
+			// #1481 — the reason that agrees with the code
+			// (credhttp.ReasonForCode): a 502 answers none.
+			response.Encode(wri, credhttp.FailureStatus(int(statusErr.Status().Code), fmt.Errorf("%s", statusErr.Status().Message)))
 			return
 		}
 		response.InternalError(wri, err)
@@ -494,9 +545,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// bytes for the next lookup. Sharing the same []byte between the
 	// http.ResponseWriter write path and the cache entry is safe
 	// because the cache treats RawJSON as immutable once put.
+	enc := slowcall.Start(ctx, slowcall.PhaseEncode) // #1054
 	encoded, err := encodeResolvedJSON(res)
+	enc.End()
 	if err != nil {
-		log.Error("unable to encode rest action response",
+		log.ErrorContext(ctx, "unable to encode rest action response",
 			slog.String("name", cr.Name),
 			slog.String("namespace", cr.Namespace),
 			slog.Any("err", err))
@@ -560,7 +613,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		)
 	} else if cache.DeclineSensitivePut(ctx) {
 		// #398 — the resolve read a sensitive resource (core v1/secrets): serve
-		// the body, persist it nowhere.
+		// the body, persist it nowhere. #1255 — and evict an older cell of this key
+		// (a #547 demand revalidation re-enters here over one): no writer can
+		// ever replace it.
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableSensitive)
 		log.Debug("RESTAction resolve read a sensitive resource; declining to cache",
 			slog.String("key_hash", cacheKey),
 			slog.String("effect", "body served (200); not persisted — Secret reads are always live (#398)"),
@@ -574,6 +630,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		)
 	} else if reason := uafDeclineReason(cacheInputs, uafTouchedSink); reason != "" {
 		declineUAFPut(cacheInputs, uafTouchedSink) // bumps the class counter
+		// #1255 — the same class-driven gate as the refresher's: an older cell of
+		// this key can never be replaced, so it is evicted.
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableUAF)
 		// DEBUG, not WARN: this fires on EVERY /call of a UAF RA and
 		// LOG_LEVEL=warn is the production floor — a WARN here would flood.
 		// snowplow_restactions_uaf_put_declined_total carries the rate.
@@ -585,42 +644,67 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			slog.Int64("uaf_touches", uafTouchedSink.Count()),
 			slog.String("effect", "body served (200) narrowed for THIS requester; not persisted — a co-bound user would key onto the same cell and be served these rows (1.12.3 A-1; 1.13.0 folds the UAF scope into the key)"),
 		)
-	} else if stageErrSink.Count() > 0 && !cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, "restactions") {
-		// #681 — a result whose ONLY stage errors are per-identity forbidden
-		// (cache.DenialOnly) is NOT declined here: it is correct and
-		// deterministic for this requester's binding-set class, carries the
-		// identity-free canonical error body, and is cached below.
-		//
-		// A bare decline: the partial body is SERVED (written below) and not
-		// persisted, so a transient item failure self-heals on the next
-		// resolve. 1.12.6 C9 retired the D bounded-partial Put that used to
-		// sit here (PARTIAL_RESULT_TTL_SECONDS, default-off, never enabled on
-		// any deployment): a partial-with-errors body is exactly the kind of
-		// wrong content the C4 terminal semantics and the C5 lifetime bound
-		// exist to keep OUT of L1, and a second, parallel TTL layer for it was
-		// one more mechanism to reason about for no measured gain.
-		log.Warn("RESTAction served with per-item stage error(s); declining to cache the partial result",
-			slog.String("name", cr.Name),
-			slog.String("namespace", cr.Namespace),
-			slog.Int64("stage_errors", stageErrSink.Count()),
-			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
-		)
-	} else if cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 {
-		// External-no-cache (proposal 2026-06-22) — the resolve touched a
-		// genuine external endpoint (no informer/dep edge to invalidate it).
-		// #681 C2: an own-credential apiserver 403 is not one.
-		// Serve the body (already encoded above) but DECLINE the Put so every
-		// /call re-fetches the external API live (fresh). Declining the Put
-		// also declines the self-dep Record below — an external RA never
-		// enters the DepTracker. BumpExternalSkippedPut is the process-wide
-		// "did the gate fire?" falsifier.
-		cache.BumpExternalSkippedPut()
-		log.Warn("RESTAction touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
-			slog.String("name", cr.Name),
-			slog.String("namespace", cr.Namespace),
-			slog.Int64("external_touches", extTouchedSink.Count()),
-			slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
-		)
+	} else if verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, "restactions"); !verdict.Store() {
+		// The shared Put-gate verdict (cache.PutGateVerdict): a declared write
+		// (#903 F1), a stage error that is not per-identity forbidden (#681), a
+		// genuine external touch. Each reason keeps its own log and counter.
+		// #1255 — a PERMANENT decline also evicts an older cell of this key (a
+		// #547 demand revalidation re-enters here over a resident known-stale
+		// one): no writer can ever replace it. A transient one keeps it.
+		evictOnPermanentDecline(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), verdict, cacheKey)
+		switch verdict.Reason() {
+		case cache.PutReasonDeclaredWrite:
+			// DEBUG: designed, and it fires on every /call of a write RESTAction.
+			log.Debug("RESTAction declares a write stage; declining to cache",
+				slog.String("name", cr.Name),
+				slog.String("namespace", cr.Namespace),
+				slog.String("effect", "body served (200); not persisted — every /call runs its write (#903 F1)"),
+			)
+		case cache.PutReasonStageError:
+			// #681 — a result whose ONLY stage errors are per-identity forbidden
+			// (cache.DenialOnly) is NOT declined here: it is correct and
+			// deterministic for this requester's binding-set class, carries the
+			// identity-free canonical error body, and is cached below.
+			//
+			// A bare decline: the partial body is SERVED (written below) and not
+			// persisted, so a transient item failure self-heals on the next
+			// resolve. 1.12.6 C9 retired the D bounded-partial Put that used to
+			// sit here (PARTIAL_RESULT_TTL_SECONDS, default-off, never enabled on
+			// any deployment): a partial-with-errors body is exactly the kind of
+			// wrong content the C4 terminal semantics and the C5 lifetime bound
+			// exist to keep OUT of L1, and a second, parallel TTL layer for it was
+			// one more mechanism to reason about for no measured gain.
+			log.WarnContext(ctx, "RESTAction served with per-item stage error(s); declining to cache the partial result",
+				slog.String("name", cr.Name),
+				slog.String("namespace", cr.Namespace),
+				slog.Int64("stage_errors", stageErrSink.Count()),
+				slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
+			)
+		case cache.PutReasonExternal:
+			// External-no-cache (proposal 2026-06-22) — the resolve touched a
+			// genuine external endpoint (no informer/dep edge to invalidate it).
+			// #681 C2: an own-credential apiserver 403 is not one.
+			// Serve the body (already encoded above) but DECLINE the Put so every
+			// /call re-fetches the external API live (fresh). Declining the Put
+			// also declines the self-dep Record below — an external RA never
+			// enters the DepTracker. BumpExternalSkippedPut is the process-wide
+			// "did the gate fire?" falsifier.
+			cache.BumpExternalSkippedPut()
+			log.WarnContext(ctx, "RESTAction touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
+				slog.String("name", cr.Name),
+				slog.String("namespace", cr.Namespace),
+				slog.Int64("external_touches", extTouchedSink.Count()),
+				slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
+			)
+		default:
+			// Any other decline: today only cache.PutReasonUnobserved, a verdict
+			// over Put-gate sinks that were not all installed on the resolve. It
+			// admits nothing (#912 delta-3 item 3); never read as another reason.
+			slog.Default().WarnContext(ctx, "resolve declined by the Put-gate verdict; declining to cache",
+				slog.String("reason", string(verdict.Reason())),
+				slog.String("effect", "body served; not persisted"),
+			)
+		}
 	} else if cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
 		// #95 SECURITY (A4 populate side, customer path) — sibling of the
 		// widgets.go Put-gate + seed FIX-C: a re-derived BindingUID of "" must
@@ -660,18 +744,20 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			// delete body) if a DELETE-eviction bumped the key's generation during
 			// the resolve; a cold fill (key absent, gen 0) still inserts.
 			noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
-			putStored := cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
-				RawJSON:      encoded,
-				Inputs:       cacheInputs,
-				TTLOverride:  uafTTLOverrideForEntry(cacheInputs),
-				StaleDerived: staleSink.StaleDerived(), // #710 PR-2b
+			put := cacheHandle.PutResolvedIfGenOutcome(ctx, verdict, cacheKey, &cache.ResolvedEntry{
+				RawJSON:       encoded,
+				Inputs:        cacheInputs,
+				TTLOverride:   uafTTLOverrideForEntry(cacheInputs),
+				StaleDerived:  staleSink.StaleDerived(),        // #710 PR-2b
+				StageOutcomes: storableStageOutcomes(outcomes), // #904
 			}, cacheGen0)
+			putStored := put.Stored()
 			// #189 — the dep Record + the /refreshes publish run ONLY on an
 			// accepted write. A refused PutIfGen (a DELETE-eviction bumped the gen
 			// during the resolve) stored no cell, so — exactly like the declined
 			// branches above (1.12.3 A-1) — there is nothing to dep-track and
 			// nothing to announce.
-			if putStored && stageErrSink.Count() > 0 {
+			if putStored && verdict.DenialOnly() {
 				cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteCallRA) // #681
 			}
 			if putStored {
@@ -687,7 +773,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				// registered BEFORE recording the dep. Without this, a
 				// previously-unseen RestAction GVR would record a forward
 				// edge whose DELETE/UPDATE events the watcher never wires.
-				ensureWatcherInformerForGVR(got.GVR)
+				ensureWatcherInformerForGVR(ctx, got.GVR)
 				cache.Deps().Record(ctx, cacheKey, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
 
 				// #62: GENUINE cold-dispatch Put (this else-if guarantees a real
@@ -696,7 +782,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				// (it re-armed after a TTL-eviction, and this cold-fill replaces the
 				// evicted entry), announce the fill so the viewer's frame goes fresh
 				// now instead of waiting for the next churn. No-op when unarmed.
-				publishIfSubscribed(cacheKey)
+				// #1321 — and only when the Put changed the stored bytes.
+				publishIfSubscribed(cacheKey, put)
 
 				// #548 — ARM the browser here, and ONLY here, on the cold path.
 				// This block is the one place a cold RESTAction dispatch stores a
@@ -727,10 +814,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// a different reason — it mints no key at all (dispatchCacheLookupKey).
 	// #710 PR-2b — a stale-derived body is written only behind an accepted Put
 	// + the armed header (+ an owed-push mark); otherwise re-run fresh.
-	if staleWritePoint(r, wri, req, staleSink, refreshArmable) {
+	if staleWritePoint(r, wri, req, staleSink, refreshArmable, encoded) {
 		return
 	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "restactions", refreshArmable)
+	stampRefreshDigest(wri, func() string { return cache.AnswerDigest(encoded, storableStageOutcomes(outcomes)) }) // #1324, #1319: the stored and written answer
 	noteStaleWrite(cacheKey, staleSink.StaleDerived(), refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }

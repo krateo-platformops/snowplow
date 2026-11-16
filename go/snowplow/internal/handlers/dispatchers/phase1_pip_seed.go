@@ -9,7 +9,7 @@
 // the errgroup back-out lever (PREWARM_ENGINE_ENABLED=false) that kept the
 // legacy path alive is retired. This file is now the SHARED SEED-PRIMITIVE
 // LIBRARY: seedOneRestaction / seedOneWidget / seedRAFullListForWidget /
-// withCohortSeedContext / cohortLogLabel + the navWidgetHarvester type — all
+// withCohortSeedContext + the navWidgetHarvester type — all
 // called by the engine boot seed. The seedTarget type + PrewarmPIPEnabled gate
 // also live here.
 //
@@ -85,16 +85,15 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
-	"github.com/krateo-platformops/plumbing/jqutil"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/apis"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -155,32 +154,24 @@ func PrewarmPIPEnabled() bool {
 }
 
 // navWidgetEntry is one navigation widget CR captured during the
-// Phase-1 walk together with the GVR + pagination tuple it resolved
+// Phase-1 walk together with the GVR + the pagination it was reached
 // under. The seed loop re-resolves the SAME CR per cohort under per-
 // cohort identity and Puts the per-user widgets L1 entry.
-//
-// Ship 0.30.187 D2: the RESOLUTION tuple (PerPage, Page — passed to
-// widgets.Resolve) is DECOUPLED from the dispatcher-lookup KEY tuple
-// (KeyPerPage, KeyPage — passed to dispatchCacheLookupKey). Pre-0.30.187
-// both used the walker's prewarmPageLimit() default for no-slice
-// widgets, but the dispatcher's serve-time paginationInfo defaults to
-// (-1, -1) when the request URL carries no ?page/?perPage params —
-// seed→serve cells thus missed on every no-slice widget. The seed-key
-// tuple is now derived via deriveSeedKeyTuple from the /call Path the
-// walker reached the widget through; the resolution tuple stays
-// bounded by prewarmPageLimit() as the 0.30.127 storm guard.
 type navWidgetEntry struct {
-	W       *unstructured.Unstructured
-	GVR     schema.GroupVersionResource
-	PerPage int // resolution tuple — passed to widgets.Resolve
-	Page    int // resolution tuple — passed to widgets.Resolve
+	W   *unstructured.Unstructured
+	GVR schema.GroupVersionResource
 
-	// Ship 0.30.187 D2 — dispatcher-lookup KEY tuple. Set to (-1, -1)
-	// for widgets reached via a /call Path with no slice declared (the
-	// dispatcher's paginationInfo default), or to the declared (page,
-	// perPage) when the Path carries them. See deriveSeedKeyTuple.
-	KeyPerPage int
-	KeyPage    int
+	// Pagination is THE pagination of this widget's seed cell (#966): the
+	// seed resolves the widget with it AND keys the cell with it. It is the
+	// walk's pg (prewarmPaginationFor of the /call Path the walk reached the
+	// widget through), so the cell matches the dispatcher's serve-time
+	// paginationInfo for that URL and holds the body that request resolves.
+	//
+	// Before #966 the entry carried two tuples — a resolve tuple bounded at
+	// perPage=5 (0.30.127) and a key tuple of (-1,-1) for the same no-slice
+	// widget (0.30.187 D2) — so the cell held a perPage=5 body under the
+	// unpaginated key.
+	Pagination prewarmPagination
 
 	// #42 FIX-E — FIRST-NAV WALK ORDER. A monotonic sequence number
 	// assigned at harvest time. The Phase-1 walk visits nav roots in
@@ -431,30 +422,22 @@ func (h *navWidgetHarvester) BeginRoot() {
 	h.mu.Unlock()
 }
 
-// harvestNavWidget records a navigation widget CR plus the GVR +
-// pagination tuples it was reached under. Nil-safe: a nil harvester /
-// nil widget is a no-op (flag-off Phase 1 passes no harvester).
+// harvestNavWidget records a navigation widget CR plus the GVR + the
+// pagination it was reached under. Nil-safe: a nil harvester / nil widget
+// is a no-op (flag-off Phase 1 passes no harvester).
 //
-// Ship 0.30.187 D2: TWO pagination tuples are now passed.
-//   - resolvePerPage/resolvePage: what the walker passes to
-//     widgets.Resolve (bounded by prewarmPageLimit() for no-slice
-//     widgets — the 0.30.127 storm guard).
-//   - keyPerPage/keyPage: what the per-cohort seed loop passes to
-//     dispatchCacheLookupKey — derived from the /call Path the walker
-//     reached the widget through so the cell matches the dispatcher's
-//     serve-time lookup. See deriveSeedKeyTuple.
+// pg is the walk's one pagination for this widget (#966): the per-cohort
+// seed resolves the widget with it and keys the cell with it.
 //
-// Dedupe is over (gvr, ns, name, keyPerPage, keyPage) — the dispatcher-
-// key tuple — because that is the cell the seed populates. Two
-// different roots reaching the same widget via the same key tuple yield
+// Dedupe is over (gvr, ns, name, pg) — the cell the seed populates. Two
+// different roots reaching the same widget via the same pagination yield
 // one Put (idempotent — the resolver output is per-cohort identical for
-// a given key tuple).
-func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr schema.GroupVersionResource,
-	resolvePerPage, resolvePage, keyPerPage, keyPage int) {
+// a given pagination).
+func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr schema.GroupVersionResource, pg prewarmPagination) {
 	if h == nil || w == nil {
 		return
 	}
-	key := navWidgetHarvestKey(gvr, w.GetNamespace(), w.GetName(), keyPerPage, keyPage)
+	key := navWidgetHarvestKey(gvr, w.GetNamespace(), w.GetName(), pg.PerPage, pg.Page)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	// ── 1.12.7 / #220 — RECORD THE REACH, ABOVE THE DEDUPE RETURN BELOW.
@@ -469,11 +452,22 @@ func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr 
 		h.passReached = map[string]struct{}{}
 	}
 	h.passReached[navWidgetCoordKey(gvr, w.GetNamespace(), w.GetName())] = struct{}{}
-	if _, seen := h.entries[key]; seen {
-		// First-write-wins. The dedupe is intentional: the walk's
-		// visited-set in phase1Walker.walk already prevents re-traversal,
-		// so a second harvest for the same key only happens across roots
-		// (idempotent — same CR + same key tuple yields identical Put).
+	if prev, seen := h.entries[key]; seen {
+		// First-write-wins for the entry's STAMPS (NavOrder, RootIndex, the
+		// pagination tuples): the walk's visited-set already prevents
+		// re-traversal within a pass, and a second sighting across roots is the
+		// same CR. #857 — but not for the CR itself: every keep-warm sweep
+		// re-walks the nav roots from live reads, and the seeds resolve THIS
+		// copy, so keeping the boot-time copy resolved an edited widget with its
+		// boot-time spec for the whole pod lifetime (057: an apiRef moved by a
+		// portal upgrade was still resolved at its old address every sweep).
+		// A sighting of a different object version (UID or resourceVersion)
+		// replaces the copy; the stamps stay.
+		if prev.W == nil || prev.W.GetUID() != w.GetUID() || prev.W.GetResourceVersion() != w.GetResourceVersion() {
+			prev.W = w.DeepCopy()
+			h.entries[key] = prev
+			navWidgetHarvestRefreshedTotal.Add(1)
+		}
 		return
 	}
 	// Deep-copy the CR so a downstream resolver mutation does not race
@@ -498,45 +492,10 @@ func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr 
 	h.entries[key] = navWidgetEntry{
 		W:          w.DeepCopy(),
 		GVR:        gvr,
-		PerPage:    resolvePerPage,
-		Page:       resolvePage,
-		KeyPerPage: keyPerPage,
-		KeyPage:    keyPage,
+		Pagination: pg,
 		NavOrder:   seq,
 		RootIndex:  rootIdx,
 	}
-}
-
-// deriveSeedKeyTuple computes the dispatcher-lookup key tuple
-// (perPage, page) the per-cohort seed Put MUST use for a widget the
-// walker reached via the given /call Path. Ship 0.30.187 D2.
-//
-// CONTRACT: the returned tuple MUST equal what the dispatcher's
-// paginationInfo (helpers.go:50-76) returns at serve time for a request
-// with that Path's query parameters.
-//
-//   - Empty path (root navigation widget — fetched directly via
-//     objects.Get, no /call Path) → the frontend's first request
-//     URL carries no slice params → paginationInfo returns (-1, -1) →
-//     seed-key tuple = (-1, -1).
-//   - Path with no page/perPage params → ParseCallPathPagination
-//     returns ok=false → paginationInfo returns (-1, -1) →
-//     seed-key tuple = (-1, -1).
-//   - Path with explicit ?page=N&perPage=M → ParseCallPathPagination
-//     returns the declared values → paginationInfo at serve time
-//     returns the same → seed-key tuple = (perPage=M, page=N).
-//
-// The returned order is (perPage, page) — matches the seedOneWidget
-// argument order to dispatchCacheLookupKey.
-func deriveSeedKeyTuple(callPath string) (perPage, page int) {
-	if callPath == "" {
-		return -1, -1
-	}
-	p, pp, ok := util.ParseCallPathPagination(callPath)
-	if !ok {
-		return -1, -1
-	}
-	return pp, p
 }
 
 // navWidgetHarvestKey is the canonical dedup key for harvested
@@ -640,6 +599,9 @@ type seedTarget struct {
 	// cache.PrewarmTarget.Learned). Seeded in its own capacity-bounded phase,
 	// and its identity reaches logs only as cache.LearnedClassLabel.
 	Learned bool
+	// Population — #841: known requesters deriving this target's key (carried
+	// from cache.PrewarmTarget.Population). The seed order's primary key.
+	Population int
 }
 
 // withCohortSeedContext builds the per-cohort seed context. Mirrors
@@ -674,17 +636,28 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 		// non-empty username; without the explicit group the seeded body would
 		// lack every grant a real member gets through system:authenticated —
 		// a NARROWER body under the very key that member derives (the binding-set
-		// digest always counts system:authenticated). Every real /call is
-		// authenticated, so this is the member's effective group set.
+		// digest counts the apiserver's implicit group). WithAuthenticatedGroup
+		// is the apiserver's rule (#1334), so this is the member's effective
+		// group set — system:authenticated for an authenticated cohort, none for
+		// a cohort presenting system:unauthenticated.
 		xcontext.WithUserInfo(jwtutil.UserInfo{
 			Username: cohort.Username,
-			Groups:   rbac.WithAuthenticatedGroup(cohort.Groups),
+			Groups:   rbac.WithAuthenticatedGroup(cohort.Username, cohort.Groups),
 		}),
 	}
 	rctx := xcontext.BuildContext(ctx, opts...)
+	// #841 — the seed class the primitives stamp on the cells they insert
+	// (cache.ResolvedEntry.SeedOrigin; counts only, never identity).
+	// cohort.Learned, not the privacy predicate: a base representative whose
+	// username was once learned is still a base target.
 	if learned {
-		rctx = withLearnedSeedLabel(rctx, redact.Label(cache.LearnedClassLabel(cohort.Username, cohort.Groups)))
+		rctx = withLearnedSeedMark(rctx)
 	}
+	origin := cache.SeedOriginBase
+	if cohort.Learned {
+		origin = cache.SeedOriginLearned
+	}
+	rctx = cache.WithSeedOrigin(rctx, origin)
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
 	// #130 F3b Fix 2 — attach the shared watcher so the cohort seed's inner LIST
@@ -786,7 +759,7 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 // effectiveTTL logic the serve path uses (resolved.go Get, strict `>` expiry).
 // For the age-skip, the entry's CreatedAt (Put-time-stamped, resolved.go Put)
 // is read directly off the returned live entry — no cache-side accessor needed.
-func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandle, key, class, target string, cohortLabel redact.Label) bool {
+func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandle, key, class, target string) bool {
 	// #132 F4b Lever A / #643 PR-B — BEFORE the per-mode switch, for EVERY mode:
 	// a key whose earlier resolve touched an external endpoint is never Put
 	// (#102 decline, I-2), so re-resolving it in any seed pass warms nothing and
@@ -796,7 +769,7 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 	// mark whose facts changed is retired inside the consult and the cell is
 	// resolved (declined_external_mark.go). Not consulted on the I-3/I-4 paths in
 	// any way that skips a cacheable cell: only marked (uncacheable) keys skip.
-	if declinedExternalSkipFn(ctx, key, class, target, cohortLabel) {
+	if declinedExternalSkipFn(ctx, key, class, target) {
 		if mode == seedModeBoot {
 			pipSeedFreshSkipTotal.Add(1) // back-compat: boot counted this skip here before #643
 		}
@@ -808,7 +781,6 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 			slog.String("mode", mode.String()),
 			slog.String("class", class),
 			slog.String("target", target),
-			slog.String("cohort", cohortLabel.String()),
 			slog.String("effect", "this (unit,cohort) key was resolved-and-declined for an external touch "+
 				"by an earlier seed pass; re-resolving it makes no Put and only re-dials the endpoint"),
 		)
@@ -839,7 +811,6 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 			slog.String("subsystem", "cache"),
 			slog.String("class", class),
 			slog.String("target", target),
-			slog.String("cohort", cohortLabel.String()),
 			slog.String("effect", "boot-scope fresh-skip: live L1 cell under the production key; "+
 				"resolve+Put skipped, target counted as processed (F.4 cost-proportional resume)"),
 		)
@@ -860,14 +831,15 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 		// at or beyond the threshold is re-resolved (return false). Strict `<`
 		// mirrors the store's strict `>` expiry so a cell AT the threshold is
 		// re-resolved, never left to race the expiry edge.
-		if time.Since(entry.CreatedAt) < keepwarmAgeSkipThreshold() {
+		// #930 — the age on the STORE clock, the one that stamped CreatedAt.
+		age := handle.Now().Sub(entry.CreatedAt)
+		if age < keepwarmAgeSkipThreshold() {
 			keepwarmAgeSkipTotal.Add(1)
 			slog.Default().Debug("phase1.seed.keepwarm_age_skip",
 				slog.String("subsystem", "cache"),
 				slog.String("class", class),
 				slog.String("target", target),
-				slog.String("cohort", cohortLabel.String()),
-				slog.Int64("age_ms", time.Since(entry.CreatedAt).Milliseconds()),
+				slog.Int64("age_ms", age.Milliseconds()),
 				slog.Int64("threshold_ms", keepwarmAgeSkipThreshold().Milliseconds()),
 				slog.String("effect", "keepwarm age-skip: live cell younger than TTL/4; resolve+Put "+
 					"skipped (cell survives to next sweep at age<TTL; refresher/customer-Put dedup)"),
@@ -895,7 +867,6 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 			slog.String("subsystem", "cache"),
 			slog.String("class", class),
 			slog.String("target", target),
-			slog.String("cohort", cohortLabel.String()),
 			slog.String("effect", "#258 the rotated subject's new-sub-gen key is already live (minted after "+
 				"the rotation); resolve+Put skipped"),
 		)
@@ -913,7 +884,6 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 				slog.String("subsystem", "cache"),
 				slog.String("class", class),
 				slog.String("target", target),
-				slog.String("cohort", cohortLabel.String()),
 				slog.String("effect", "#643 resume: re-Put by an earlier attempt of this gvr-discovered scope in "+
 					"the current discovery epoch; the cell is unchanged and clean — not redone"),
 			)
@@ -923,27 +893,21 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 	}
 }
 
-// hasTemplatedEndpointRef reports whether any api-step of cr carries a
-// TEMPLATED endpointRef.name — a jq template (${...}-shaped, jqutil.MaybeQuery)
-// that the resolver evaluates against REQUEST extras to select the dispatch
-// endpoint (#113 hub-spoke). Such a RESTAction cannot be seeded (the boot seed
-// has no request extras → the endpoint resolve misses → a truncated body would
-// be Put under the no-extras key without either GTTL-1 sink bumping, the §4
-// poisoning nuance). Each api-step and its *Reference EndpointRef is nil-guarded
-// (API is a *API, EndpointRef a *templates.Reference; either may be nil).
+// hasTemplatedEndpointRef is #113's predicate as the RESTAction seed asks it:
+// the one #1477 predicate (restactionNeedsRequestExtras) with NO carried extras,
+// because the seed resolves the RESTAction with none. It reports whether an
+// api-step carries a TEMPLATED endpointRef.name (${...}-shaped,
+// jqutil.MaybeQuery) that reads a request extra (a dict key the resolver does
+// not write itself: a stage's output, an errorKey, the pagination block), or
+// whose reads cannot be determined. The resolver evaluates such a template
+// against REQUEST extras to select the dispatch endpoint (#113 hub-spoke). Such
+// a RESTAction cannot be seeded (the boot seed has no request extras → the
+// endpoint resolve misses → a truncated body would be Put under the no-extras
+// key without either GTTL-1 sink bumping, the §4 poisoning nuance). Each
+// api-step and its *Reference EndpointRef is nil-guarded (API is a *API,
+// EndpointRef a *templates.Reference; either may be nil).
 func hasTemplatedEndpointRef(cr *templatesv1.RESTAction) bool {
-	if cr == nil {
-		return false
-	}
-	for _, step := range cr.Spec.API {
-		if step == nil || step.EndpointRef == nil {
-			continue
-		}
-		if _, isTemplate := jqutil.MaybeQuery(step.EndpointRef.Name); isTemplate {
-			return true
-		}
-	}
-	return false
+	return restactionNeedsRequestExtras(cr, nil)
 }
 
 // hasTemplatedEndpointRefFn is the #113 seed-skip PREDICATE seam. Production
@@ -972,7 +936,13 @@ var seedObjectsGetFn = objects.Get
 // (seedRestactionResolveAndPutProd); only the _test.go falsifier reassigns it.
 var seedRestactionResolveAndPutFn = seedRestactionResolveAndPutProd
 
-func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templatesv1.ObjectReference, authnNS string, mode seedScopeMode) error {
+func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, authnNS string, mode seedScopeMode) error {
+	// #1233 — the key is minted and the resolve runs only on a complete RBAC
+	// snapshot: the store admits no write of a resolve that began before it, so a
+	// unit run earlier would be refused and leave its cell cold.
+	if err := cache.WaitRBACSnapshotComplete(ctx); err != nil {
+		return fmt.Errorf("seed RESTAction %s/%s: waiting for a complete RBAC snapshot: %w", ref.Namespace, ref.Name, err)
+	}
 	// #643 PR-C — the discovery epoch at this unit's RESOLVE START (before any
 	// read), carried to its terminal Put (no resume set on ctx → no-op).
 	ctx = withResolveStartEpoch(ctx)
@@ -983,36 +953,38 @@ func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templa
 	// [read, PutIfGen] would be invisible for keepwarm / gvr-discovered. resCtx below
 	// is built from this epoch with the RA's own coordinate pre-declared.
 	selfEpoch := cache.DepGenEpochNow()
-	got := seedObjectsGetFn(ctx, ref)
-	if got.Err != nil {
-		// #158 (design §1.3): preserve the typed status error so the call
-		// site's classifySeedErr sees 403 (RBAC deny) vs 5xx (operational)
-		// instead of an opaque string. statusErrFromResponse lifts the
-		// plumbing *response.Status back into an *apierrors.StatusError
-		// carrying Code+Reason. Wrapped with %w so the RESTAction identity
-		// is visible in logs while errors.As/Is still thread through to the
-		// embedded StatusError.
-		return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResponse(got.Err))
+	// #1483 — THE UNIT'S `get` IS DECIDED BEFORE THE FETCH, as the widget leg
+	// decides it: the key's first-match `get` evaluation (dispatchCacheLookupKey)
+	// reads only the identity and the RESTAction's coordinates, which the ref
+	// carries (the fetch is a GET by name in that namespace). An identity that
+	// may not `get` the RESTAction derives an empty BindingUID and is skipped
+	// here, with no apiserver read; before #1483 the CR was fetched as the
+	// ServiceAccount and then re-gated and discarded, on every keepwarm and
+	// gvr-discovered pass (~1,960 GETs and WARNs a day on krateo-057). A ref
+	// whose apiVersion does not parse keeps the old order: the fetch refuses it.
+	refGV, refGVErr := schema.ParseGroupVersion(ref.APIVersion)
+	if refGVErr != nil {
+		got := seedObjectsGetFn(ctx, ref)
+		if got.Err != nil {
+			return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
+		}
+		return fmt.Errorf("fetch RESTAction %s/%s: apiVersion %q: %w", ref.Namespace, ref.Name, ref.APIVersion, refGVErr)
 	}
-	if got.Unstructured == nil {
-		return fmt.Errorf("fetch RESTAction %s/%s: nil object", ref.Namespace, ref.Name)
-	}
-
 	// Compute the per-user dispatcher key — IDENTICAL shape to
 	// restactions.go:117. ctx already carries the cohort's UserInfo, so
 	// dispatchCacheLookupKey reads it and hashes Username + Groups into
 	// the key.
 	key, handle, inputs := dispatchCacheLookupKey(ctx, "restactions",
-		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
-		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		refGV.Group, refGV.Version, ref.Resource,
+		ref.Namespace, ref.Name,
 		-1, -1, nil)
 	// Ship 0.30.188 — diagnostic slog: emit the seed-side cache key +
 	// its components so it can be diff'd against the dispatcher_get and
 	// per_user_fallback_put log lines at widgets.go / restactions.go.
 	emitDispatchCacheKeyDiag(seedDiagLogger(ctx), "seed", ctx,
 		key, inputs, "restactions",
-		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
-		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		refGV.Group, refGV.Version, ref.Resource,
+		ref.Namespace, ref.Name,
 		-1, -1, nil)
 	if handle == nil || key == "" {
 		// L1 disabled OR no identity on ctx — defensive skip. PIP's
@@ -1035,11 +1007,24 @@ func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templa
 			slog.String("subsystem", "cache"),
 			slog.String("class", "restactions"),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
-			slog.String("cohort", cohortLabel.String()),
 			slog.String("effect", "cohort re-derived first-match BindingUID=\"\" (RBAC deny/err fail-closed); "+
 				"skipping the shared empty-identity cell Put (A4 populate-side guard)"),
 		)
 		return nil
+	}
+	got := seedObjectsGetFn(ctx, ref)
+	if got.Err != nil {
+		// #158 (design §1.3): preserve the typed status error so the call
+		// site's classifySeedErr sees 403 (RBAC deny) vs 5xx (operational)
+		// instead of an opaque string. statusErrFromResponse lifts the
+		// plumbing *response.Status back into an *apierrors.StatusError
+		// carrying Code+Reason. Wrapped with %w so the RESTAction identity
+		// is visible in logs while errors.As/Is still thread through to the
+		// embedded StatusError.
+		return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
+	}
+	if got.Unstructured == nil {
+		return fmt.Errorf("fetch RESTAction %s/%s: nil object", ref.Namespace, ref.Name)
 	}
 
 	// Per-mode seed skip (F.4 boot fresh-skip + keepwarm c2 age-skip, single
@@ -1050,7 +1035,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templa
 	// enterSeedUnit so a skipped target never consumes the #46 memory admission.
 	// The mode selects the predicate: boot = bare liveness (F.4), keepwarm =
 	// age-skip (c2 §4.2), gvr-discovered = never skip (F4-C3 boundary).
-	if seedSkipDecision(ctx, mode, handle, key, "restactions", ref.Namespace+"/"+ref.Name, cohortLabel) {
+	if seedSkipDecision(ctx, mode, handle, key, "restactions", ref.Namespace+"/"+ref.Name) {
 		return nil
 	}
 	// #394 — capture the terminal-Put guard at seed ENTRY: after the skip
@@ -1100,10 +1085,10 @@ func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templa
 	// cell for it. Greppable skip line mirrors the Class-5 refHasUnresolvedTemplateToken
 	// idiom. Every api-step EndpointRef is nil-guarded (*Reference, may be nil).
 	if hasTemplatedEndpointRefFn(&cr) {
+		bumpBackgroundResolveSkip(bgSkipSiteRestactionSeed, bgSkipReasonNeedsRequestExtras) // #1477
 		slog.Default().Info("phase1.seed.skip.templated_endpointref",
 			slog.String("subsystem", "cache"),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
-			slog.String("cohort", cohortLabel.String()),
 			slog.String("effect", "RESTAction has a templated api-step endpointRef.name (request-extras-driven "+
 				"endpoint selection, e.g. hub-spoke); the boot seed has no request extras to resolve it → skipping "+
 				"to avoid Putting a truncated body under the no-extras key (#113 §4). Spoke reads are external → "+
@@ -1158,7 +1143,6 @@ func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templa
 		snapshot := stageTimingSink.Snapshot()
 		slog.Default().Info("phase1.seed.restaction.timing",
 			slog.String("subsystem", "cache"),
-			slog.String("cohort", cohortLabel.String()),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
 			slog.Int64("elapsed_ms_total", time.Since(restactionStart).Milliseconds()),
 			slog.Int("stages_total", len(snapshot)),
@@ -1173,6 +1157,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel redact.Label, ref templa
 	// the customer handler's WithL1KeyContextFromEpoch does.
 	resCtx := cache.WithL1KeyContextFromEpoch(ctx, key, selfEpoch, cache.DepKey{
 		GVR: got.GVR, Namespace: got.Unstructured.GetNamespace(), Name: got.Unstructured.GetName()})
+	defer cache.Deps().ReleaseUnstored(resCtx, key) // #890/#893 — a seed whose cell is not stored leaves no edges
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
 	// #394 — the terminal-Put guard captured at seed entry, read back by the
 	// resolve+Put tail (seedTerminalGuardFromContext).
@@ -1237,6 +1222,9 @@ func seedRestactionResolveAndPutProd(
 	stageErrSink *cache.StageErrorSink,
 	extTouchedSink *cache.ExternalTouchedSink,
 ) error {
+	// #904 — the seed's stage outcomes, kept on the entry so an L1 hit of the
+	// seeded cell answers with the header a cold resolve would have.
+	resCtx, stageOutcomes := restactionsapi.WithStageOutcomes(resCtx)
 	res, err := restactions.Resolve(resCtx, restactions.ResolveOptions{
 		In: cr,
 		// Ship 0.30.230 fix-at-root: SArc is the SA *rest.Config carried
@@ -1260,12 +1248,16 @@ func seedRestactionResolveAndPutProd(
 	// #102 GTTL-1: decline the Put (return nil, best-effort — NOT an error, so
 	// the engine seed loop's PROCESSED-not-SUCCEEDED latch decrement is
 	// unaffected and readyz never hangs) when the resolve observed a stage
-	// error or touched an external endpoint. Keeps the prior good entry (if
-	// any); TTL is the outer net.
+	// error or touched an external endpoint. A transient decline keeps the
+	// prior good entry (if any); a permanent one evicts an older entry, which no
+	// writer can ever replace (#1255).
 	// #643 PR-B — resCtx, not ctx: the decline's mark reads the resolve's
 	// captured deps + entry stamp and the decline unit off it. resCtx inherits
 	// everything the decline otherwise reads off ctx (identity, the set).
-	if declineSeedPutOnError(resCtx, "restactions", ref.Namespace+"/"+ref.Name, key, stageErrSink, extTouchedSink, cache.PerIdentityForbiddenSinkFromContext(resCtx)) {
+	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink,
+		Forbidden: cache.PerIdentityForbiddenSinkFromContext(resCtx), External: extTouchedSink}, "restactions")
+	if declineSeedPutOnError(resCtx, "restactions", ref.Namespace+"/"+ref.Name, key, verdict, stageErrSink, extTouchedSink) {
+		evictOnPermanentDecline(resCtx, inClassEvicter(resCtx, handle, inputs), verdict, key)
 		return nil
 	}
 
@@ -1314,6 +1306,11 @@ func seedRestactionResolveAndPutProd(
 		// already holds. See seedProvenanceForMode.
 		SeededAtBoot: terminalGuard.seededAtBoot,
 		TTLOverride:  uafTTLOverrideForEntry(inputs),
+		// #841 — the seed class, kept only if this Put INSERTS the cell (the store
+		// keeps a resident cell's own origin on a replace).
+		SeedOrigin: cache.SeedOriginFromContext(resCtx),
+		// #904 — "" when every stage succeeded.
+		StageOutcomes: storableStageOutcomes(stageOutcomes),
 	}
 	// #394 — the terminal write goes through seedTerminalPut with the guard
 	// seedOneRestaction captured at seed entry: PutIfGen for the post-readyz
@@ -1321,7 +1318,7 @@ func seedRestactionResolveAndPutProd(
 	// resurrecting the cell), plain Put for boot (pre-readyz exemption, #323). A refusal wrote nothing, so the
 	// resolves counter, the seeded-set Mark and the dep Record below are all
 	// skipped; the engine closure re-seeds once.
-	if !seedTerminalPut(resCtx, handle, key, entry, terminalGuard) {
+	if !seedTerminalPut(resCtx, handle, verdict, key, entry, terminalGuard) {
 		logSeedTerminalPutRefused("restactions", ref.Namespace+"/"+ref.Name)
 		return fmt.Errorf("restaction %s/%s: %w", ref.Namespace, ref.Name, errSeedTerminalPutRefused)
 	}
@@ -1348,7 +1345,7 @@ func seedRestactionResolveAndPutProd(
 	// is wired (AC-PIP.5 — without this the refresher never wakes for
 	// the seeded entry; falsifier #5 triggers). Matches
 	// restactions.go:229-230.
-	ensureWatcherInformerForGVR(got.GVR)
+	ensureWatcherInformerForGVR(resCtx, got.GVR)
 	// #375 C3 — Recorded under resCtx (the sink the terminal PutIfGen was checked
 	// against), so an RA edit in [Put-check, this Record) — no edge yet on a cold
 	// cell — is re-checked and remarks the key once.
@@ -1361,21 +1358,11 @@ func seedRestactionResolveAndPutProd(
 // dispatcher's canonical key. STRUCTURALLY MATCHES widgets.go:148-231:
 //
 //   - dispatchCacheLookupKey("widgets", group, version, resource, ns,
-//     name, KeyPerPage, KeyPage, nil) with the DISPATCHER-LOOKUP key
-//     tuple (Ship 0.30.187 D2 decoupling) so cohort A's first /call with
-//     no URL slice params hits the SAME cell as the seed Put. Pre-D2
-//     this used the RESOLUTION tuple (prewarmPageLimit()) which never
-//     matched the dispatcher's paginationInfo default of (-1, -1) and
-//     caused the 0.30.186 14/17 first-nav-hit defect.
+//     name, pg.PerPage, pg.Page, extras) and widgets.Resolve with the SAME
+//     pg = e.Pagination (#966), so the cell holds what a /call of the URL
+//     the walk reached the widget through resolves, and that /call hits it.
 //   - cache.WithL1KeyContext(ctx, key) before Resolve so the inner-call
 //     dep tracker records edges.
-//   - widgets.Resolve at widgets.go:187-193 (same entrypoint). The
-//     RESOLUTION tuple (e.PerPage, e.Page) stays bounded by
-//     prewarmPageLimit() — the 0.30.127 storm guard. For no-slice
-//     navigation widgets the resolved output is structurally invariant
-//     under pagination (no row fan-out at the top widget level — row
-//     data flows from declared-slice child resourcesRefs which carry
-//     their own URL-matching pagination).
 //   - encodeResolvedJSON + cacheHandle.Put + recordWidgetDeps —
 //     matches widgets.go:215-231 (recordWidgetDeps calls
 //     ensureWatcherInformerForGVR for the widget GVR + apiRef GVR +
@@ -1383,6 +1370,10 @@ func seedRestactionResolveAndPutProd(
 func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode seedScopeMode) error {
 	if e.W == nil {
 		return nil
+	}
+	// #1233 — as seedOneRestaction: mint and resolve on a complete RBAC snapshot.
+	if err := cache.WaitRBACSnapshotComplete(ctx); err != nil {
+		return fmt.Errorf("seed widget: waiting for a complete RBAC snapshot: %w", err)
 	}
 	// #643 PR-C — the discovery epoch at this unit's RESOLVE START (before any
 	// read), carried to its terminal Put (no resume set on ctx → no-op).
@@ -1410,16 +1401,15 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// will fold the same identity a live request folds.
 	seedKeyExtras := effectiveKeyExtras(ctx, e.W.Object, nil)
 
-	// Ship 0.30.187 D2: the dispatcher-lookup key uses the KEY tuple
-	// (KeyPerPage, KeyPage) — derived from the /call Path the walker
-	// reached this widget through so the cell matches the dispatcher's
-	// serve-time paginationInfo. The resolution tuple (e.PerPage,
-	// e.Page) is still used for widgets.Resolve below (the 0.30.127
-	// storm guard).
+	// #966 — ONE pagination for this unit: the key below folds pg and the
+	// widgets.Resolve further down resolves with pg. It is the walk's
+	// pagination for the /call Path that reached the widget, so the cell
+	// matches the dispatcher's serve-time paginationInfo for that URL.
+	pg := e.Pagination
 	key, handle, inputs := dispatchCacheLookupKey(ctx, "widgets",
 		e.GVR.Group, e.GVR.Version, e.GVR.Resource,
 		e.W.GetNamespace(), e.W.GetName(),
-		e.KeyPerPage, e.KeyPage, seedKeyExtras)
+		pg.PerPage, pg.Page, seedKeyExtras)
 	// Ship 0.30.188 — diagnostic slog: emit the widget seed Put cache
 	// key + components so it can be diff'd against the dispatcher_get
 	// and per_user_fallback_put log lines at widgets.go.
@@ -1427,7 +1417,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 		key, inputs, "widgets",
 		e.GVR.Group, e.GVR.Version, e.GVR.Resource,
 		e.W.GetNamespace(), e.W.GetName(),
-		e.KeyPerPage, e.KeyPage, seedKeyExtras)
+		pg.PerPage, pg.Page, seedKeyExtras)
 	if handle == nil || key == "" {
 		// L1 disabled or no identity — same defensive skip as
 		// seedOneRestaction.
@@ -1461,7 +1451,17 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// accelerator is skipped along with the widget resolve — correct, because a
 	// live widget cell implies its first paginated /call already found (or will
 	// lazily rebuild) the pinned full-list.
-	if seedSkipDecision(ctx, mode, handle, key, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), "") {
+	if seedSkipDecision(ctx, mode, handle, key, "widgets", e.W.GetNamespace()+"/"+e.W.GetName()) {
+		return nil
+	}
+	// #1477 — the #113 rule, inherited from the widget's apiRef RESTAction: a
+	// templated endpointRef that reads a request extra this resolve does not
+	// carry (the widget's inline apiRef extras and declared identity ARE
+	// carried) renders a Secret no customer's request selects, so no customer
+	// key can match the cell. Skipped before the admission, like the per-mode
+	// skip above, so it never consumes the #46 bound.
+	if widgetNeedsRequestExtras(ctx, e.W) {
+		logBackgroundResolveSkip(bgSkipSiteWidgetSeed, "widget", e.W.GetNamespace()+"/"+e.W.GetName())
 		return nil
 	}
 	// #394 — capture the terminal-Put guard at seed ENTRY (mirror of
@@ -1548,8 +1548,14 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// the pre-edit harvested spec with no remark; if the edit's own dirty-mark was
 	// already consumed (refresher re-resolve, or skipped_no_entry on a non-resident
 	// cell) the cell stays stale until its next dirty-mark or TTL.
+	// #857 bounds that window: a keep-warm sweep re-walks first, and the walk
+	// REPLACES a harvested copy whose object version moved (harvestNavWidget),
+	// so the sweep resolves the current spec. The reseed paths that do not walk
+	// (#258 rbac-shift, #262 class-seed) can still resolve a copy up to one sweep
+	// old — tracked in #859.
 	resCtx := cache.WithL1KeyContextFromEpoch(ctx, key, cache.DepGenEpochNow(), cache.DepKey{
 		GVR: e.GVR, Namespace: e.W.GetNamespace(), Name: e.W.GetName()})
+	defer cache.Deps().ReleaseUnstored(resCtx, key) // #890/#893 — a seed whose cell is not stored leaves no edges
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
 	// #102 GTTL-1 (arch Option A, uniform) — see seedOneRestaction: the
 	// error-aware Put-gate sinks make the seed honor the refresher's backstop
@@ -1620,6 +1626,10 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	//     POINTER the gate below holds — bump it there, watch the Put decline.
 	//
 	// Behaviour is unchanged: the seam's production value IS widgets.Resolve.
+	// #1319 — the seed's stage outcomes (its widget's apiRef RESTAction's),
+	// kept on the entry so an L1 hit of the seeded cell answers with the header
+	// a cold resolve would have.
+	resCtx, stageOutcomes := restactionsapi.WithStageOutcomes(resCtx)
 	res, err := widgetsResolveFn(resCtx, widgets.ResolveOptions{
 		In: in,
 		// Ship 0.30.230 fix-at-root: RC is the SA *rest.Config carried
@@ -1628,8 +1638,9 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 		// cache.GVRFor → discoverPluralInfo (the four-revert root cause).
 		RC:      rcFromCtx(resCtx),
 		AuthnNS: authnNS,
-		PerPage: e.PerPage,
-		Page:    e.Page,
+		// #966 — the pagination `key` above folds.
+		PerPage: pg.PerPage,
+		Page:    pg.Page,
 	})
 	if err != nil {
 		return fmt.Errorf("resolve widget %s/%s: %w", e.W.GetNamespace(), e.W.GetName(), err)
@@ -1641,9 +1652,12 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	}
 
 	// #102 GTTL-1: decline the Put (best-effort, return nil) on a stage error
-	// or external touch — keeps any prior good entry; TTL is the outer net.
+	// or external touch — a transient decline keeps any prior good entry; a
+	// permanent one evicts an older entry, which no writer can replace (#1255).
 	// #643 PR-B — resCtx (deps, stamp, decline unit); see seedRestactionResolveAndPutProd.
-	if declineSeedPutOnError(resCtx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), key, stageErrSink, extTouchedSink, forbiddenSink) {
+	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, "widgets")
+	if declineSeedPutOnError(resCtx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), key, verdict, stageErrSink, extTouchedSink) {
+		evictOnPermanentDecline(resCtx, inClassEvicter(resCtx, handle, inputs), verdict, key)
 		return nil
 	}
 
@@ -1690,11 +1704,16 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 		// warm (warmLocked) and ride #378's re-mint past #496's gate.
 		SeededAtBoot: terminalGuard.seededAtBoot,
 		TTLOverride:  uafTTLOverrideForEntry(inputs),
+		// #841 — the seed class, kept only if this Put INSERTS the cell (the store
+		// keeps a resident cell's own origin on a replace).
+		SeedOrigin: cache.SeedOriginFromContext(resCtx),
+		// #1319 — the widget's apiRef RESTAction's outcomes ("" = complete).
+		StageOutcomes: storableStageOutcomes(stageOutcomes),
 	}
 	// #394 — generation-guarded terminal write for the post-readyz modes (plain
 	// for boot); see seedOneRestaction's tail. A refusal skips the counter, the
 	// seeded-set Mark, the dep Record and the 4a full-list pin below.
-	if !seedTerminalPut(resCtx, handle, key, entry, terminalGuard) {
+	if !seedTerminalPut(resCtx, handle, verdict, key, entry, terminalGuard) {
 		logSeedTerminalPutRefused("widgets", e.W.GetNamespace()+"/"+e.W.GetName())
 		return fmt.Errorf("widget %s/%s: %w", e.W.GetNamespace(), e.W.GetName(), errSeedTerminalPutRefused)
 	}
@@ -1730,35 +1749,37 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// bindingUID, which key-diverged from the RA-CR verdict → G inert).
 	//
 	// #130 F4 Option 2 — SKIP the 4a full-list pin when THIS widget resolves
-	// UNPAGINATED (apiref.IsPaginatedResolve(e.PerPage, e.Page) false). The 4a
+	// UNPAGINATED (pg.paginated() false — apiref.IsPaginatedResolve). The 4a
 	// pin exists to warm a sliceable full-list for a subsequent PAGINATED /call
 	// (shouldServeRAFullList engages only when perPage>0 && page>0). An
 	// unpaginated-consuming widget (a Statistic/Tag widget counting `list:`
-	// wholesale) resolves at (0,0)/(−1,−1), so its own /call never engages the
+	// wholesale) resolves at (−1,−1), so its own /call never engages the
 	// slice serve — the pin's second full ~18s benchapps materialization is pure
 	// waste. Reuses the EXACT serve-gate pagination predicate (one derivation
 	// site, no drift) and is DATA-DERIVED (reads the resolve tuple, never
 	// widget-kind — feedback_no_special_cases / C-F4-7). A paginated widget is
 	// byte-unchanged (still pins). Emits a greppable skip line for the falsifier.
-	if !apiref.IsPaginatedResolve(e.PerPage, e.Page) {
+	if !pg.paginated() {
 		slog.Default().Info("phase1.seed.rafulllist.skip_unpaginated",
 			slog.String("subsystem", "cache"),
 			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
-			slog.Int("perpage", e.PerPage),
-			slog.Int("page", e.Page),
+			slog.Int("perpage", pg.PerPage),
+			slog.Int("page", pg.Page),
 			slog.String("effect", "F4 Option 2 — widget consumes the list unpaginated; the 4a full-list "+
 				"pin would never be slice-served on its own /call, so the redundant unpaginated re-resolve is skipped"),
 		)
 		return nil
 	}
-	seedRAFullListForWidget(resCtx, in, authnNS, e.W.GetNamespace(), e.W.GetName())
+	seedRAFullListForWidget(resCtx, in, authnNS, e.W.GetNamespace(), e.W.GetName(), pg)
 	return nil
 }
 
 // seedRAFullListForWidget prewarms + pins the page-independent RAFullList
 // cell for a widget's underlying RESTAction, under the cohort ctx — Ship 4a
-// (0.30.198). It resolves the widget's apiRef at a PAGINATED tuple
-// (prewarmPageLimit, page 1) so apiref.Resolve engages raFullListServe,
+// (0.30.198). It resolves the widget's apiRef at the widget's own PAGINATED
+// pagination pg (#966: the one its seed cell is keyed and resolved with —
+// the caller only reaches here when pg is paginated) so apiref.Resolve
+// engages raFullListServe,
 // which: resolves the RA UNPAGINATED, byte-verifies sliceability for the
 // apiRef shape, Puts the full cell (pinned when the cost predicate fires —
 // envelope bytes ≥ threshold), and records the verdict. Reusing the serve
@@ -1771,7 +1792,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 // is a harmless extra read (only reached when ResolvedCacheEnabled, see the
 // guard below). The whole block is gated under cache.ResolvedCacheEnabled()
 // so a cache-off process never runs the extra resolve.
-func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, authnNS, ns, name string) {
+func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, authnNS, ns, name string, pg prewarmPagination) {
 	if !cache.ResolvedCacheEnabled() {
 		return
 	}
@@ -1843,15 +1864,14 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 			}
 		}
 	}
-	// Resolve at a paginated tuple so raFullListServe engages (it requires
-	// perPage>0 && page>0). page 1 + prewarmPageLimit is sufficient: the
+	// Resolve at the widget's own paginated pg so raFullListServe engages (it
+	// requires perPage>0 && page>0) exactly as that widget's /call does. The
 	// byte-verify + pin are per-(RA × shape), NOT per-page, so this single
 	// prewarm populates+verifies+pins the cell for EVERY subsequent (page,
 	// perPage) /call by this cohort. The result is discarded (we only want
 	// the cell-populating side-effect).
-	pp := prewarmPageLimit()
-	if pp <= 0 {
-		pp = 1
+	if !pg.paginated() {
+		return // raFullListServe would not engage; the caller already skips this
 	}
 	if _, rerr := apiref.Resolve(ctx, apiref.ResolveOptions{
 		ApiRef: apiRef,
@@ -1864,14 +1884,14 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 		// of the construction-site fixes.
 		RC:      rcFromCtx(ctx),
 		AuthnNS: authnNS,
-		PerPage: pp,
-		Page:    1,
+		PerPage: pg.PerPage,
+		Page:    pg.Page,
 		// inline-extras P §5 — fold the apiRef-inline map so the RAFullList
 		// key matches the dispatcher's apiRef-effective key (seed has no
 		// request extras). NOT the union — rrt-inline must not key this cell.
 		Extras: apiRefInline,
 	}); rerr != nil {
-		slog.Default().Warn("phase1.seed.rafulllist.skipped",
+		slog.Default().WarnContext(ctx, "phase1.seed.rafulllist.skipped",
 			slog.String("subsystem", "cache"),
 			slog.String("widget", ns+"/"+name),
 			slog.String("apiref", apiRef.Namespace+"/"+apiRef.Name),
@@ -1898,32 +1918,61 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 // legitimately-empty result produces no stage error (sink Count()==0) → NOT
 // declined → its empty bytes ARE stored (mirrors resolve_populate.go:248-250).
 //
-// The identity for the log is read from ctx (withCohortSeedContext installs
-// WithUserInfo) so both primitives share one helper without threading a label.
-func declineSeedPutOnError(ctx context.Context, class, target, key string,
-	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink,
-	forbiddenSink *cache.PerIdentityForbiddenSink) bool {
+// verdict is the shared Put-gate verdict (cache.PutGateVerdict) the caller took
+// over this resolve's sinks, in the same function that builds the entry it
+// Puts (scripts/check_resolved_entry_put_sites.sh). #681 C2 — an
+// own-credential apiserver 403 (F2) is not a genuine external touch, at the
+// mark AND at the decline. The sinks are read for the decline log only.
+func declineSeedPutOnError(ctx context.Context, class, target, key string, verdict cache.PutVerdict,
+	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink) bool {
 
-	// #681 C2 — the ONE external count: an own-credential apiserver 403 (F2) is
-	// not a genuine external touch, at the mark AND at the decline.
-	genuineExternal := cache.GenuineExternal(extTouchedSink, forbiddenSink)
-
-	// #643 PR-B (brief §1(c) as amended, #643 comment 6150618043) — mark on an
-	// OBSERVED external touch, whichever branch declines. A fetch abandoned at
-	// the boot-readiness bound bumps the stage-error sink TOO, and returning from
-	// the stage-error branch first left exactly those fetches — the bulk of the
-	// 057 ClickHouse load — unmarked and re-dialled every pass. A stage error
-	// with no external touch never marks (it is transient and is retried).
-	if genuineExternal > 0 {
+	// #643 PR-B (brief §1(c) as amended, #643 comment 6150618043) — mark on a
+	// PERMANENT verdict, whichever reason declines: a genuine external touch (a
+	// fetch abandoned at the boot-readiness bound bumps the stage-error sink
+	// TOO, and returning from the stage-error branch first left exactly those
+	// fetches — the bulk of the 057 ClickHouse load — unmarked and re-dialled
+	// every pass), or a declared write (#903 F1: never storable). A transient
+	// stage error never marks (it is retried).
+	if verdict.Permanent() {
 		markDeclinedExternal(ctx, key)
 	}
 	// #681 G — a result whose ONLY stage errors are per-identity forbidden is
 	// seeded (shared DenialOnly predicate): first visit warm.
-	if stageErrSink.Count() > 0 && cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, class) {
-		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteSeed)
+	if verdict.Store() {
+		if verdict.DenialOnly() {
+			cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteSeed)
+		}
 		return false
 	}
-	if stageErrSink.Count() > 0 {
+	// Declined, whatever the reason (#912 re-review: the reason only selects the
+	// counter and the log line; the seed's write takes the verdict too and would
+	// refuse it anyway).
+	switch verdict.Reason() {
+	case cache.PutReasonDeclaredWrite:
+		pipSeedSkippedDeclaredWriteTotal.Add(1)
+		slog.Default().Info("phase1.seed.skip.declared_write",
+			slog.String("subsystem", "cache"),
+			slog.String("class", class),
+			slog.String("target", target),
+			slog.String("effect", "the RESTAction declares a write stage: never stored, every /call runs its write "+
+				"(#903 F1); marked so later passes skip it"),
+		)
+	case cache.PutReasonExternal:
+		pipSeedSkippedStageErrorTotal.Add(1)
+		cache.BumpExternalSkippedPut()
+		// #132 F4b Lever A / #643 — the declined-external mark for this EXACT key
+		// (C-F4B-2) is taken above, so it covers every permanent reason. The set
+		// is absent on /call and the refresher, so Mark is a nil-receiver no-op
+		// there (C-F4B-3's request half, I-6).
+		slog.Default().Info("phase1.seed.skip.external_touch",
+			slog.String("subsystem", "cache"),
+			slog.String("class", class),
+			slog.String("target", target),
+			slog.Int64("external_touches", extTouchedSink.Count()),
+			slog.String("effect", "seed re-resolve touched an external endpoint (no dep edge to invalidate); "+
+				"declining the Put — GTTL-1 backstop, uniform with the refresher"),
+		)
+	case cache.PutReasonStageError:
 		pipSeedSkippedStageErrorTotal.Add(1)
 		// Back-compat parity with the refresher's process-wide counter so
 		// existing "how many degraded re-Puts were declined" dashboards see the
@@ -1934,79 +1983,21 @@ func declineSeedPutOnError(ctx context.Context, class, target, key string,
 			slog.String("subsystem", "cache"),
 			slog.String("class", class),
 			slog.String("target", target),
-			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
+			slog.String("reason", string(verdict.Reason())),
 			slog.Int64("stage_errors", stageErrSink.Count()),
 			slog.String("stage_err_stage", stage),
 			slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
 			slog.String("effect", "seed re-resolve observed a swallowed stage error; declining the Put "+
 				"(keeps any prior good entry; TTL is the outer net) — GTTL-1 backstop, uniform with the refresher"),
 		)
-		return true
-	}
-	if genuineExternal > 0 {
-		pipSeedSkippedStageErrorTotal.Add(1)
-		cache.BumpExternalSkippedPut()
-		// #132 F4b Lever A / #643 — the declined-external mark for this EXACT key
-		// (C-F4B-2) is taken above the stage-error branch, so it covers both. The
-		// set is absent on /call and the refresher, so Mark is a nil-receiver no-op
-		// there (C-F4B-3's request half, I-6).
-		slog.Default().Info("phase1.seed.skip.external_touch",
-			slog.String("subsystem", "cache"),
-			slog.String("class", class),
-			slog.String("target", target),
-			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
-			slog.Int64("external_touches", extTouchedSink.Count()),
-			slog.String("effect", "seed re-resolve touched an external endpoint (no dep edge to invalidate); "+
-				"declining the Put — GTTL-1 backstop, uniform with the refresher"),
+	default:
+		// Any other decline: today only cache.PutReasonUnobserved, a verdict
+		// over Put-gate sinks that were not all installed on the resolve. It
+		// admits nothing (#912 delta-3 item 3); never read as another reason.
+		slog.Default().WarnContext(ctx, "resolve declined by the Put-gate verdict; declining to cache",
+			slog.String("reason", string(verdict.Reason())),
+			slog.String("effect", "body served; not persisted"),
 		)
-		return true
 	}
-	return false
-}
-
-// seedIdentityLabelFromCtx renders the seeding identity from the cohort ctx
-// (withCohortSeedContext installs WithUserInfo) as its redact label: the
-// username's, else the first group's, else redact.Anonymous. That is the same
-// domain as cohortLogLabel, for log parity. #453: never the username or group
-// in clear.
-func seedIdentityLabelFromCtx(ctx context.Context) string {
-	var label redact.Label
-	var learned bool
-	if label, learned = learnedSeedLabelFromCtx(ctx); learned {
-		return label.String() // #262: a learned class is never logged in clear
-	}
-	ui, err := xcontext.UserInfo(ctx)
-	if err != nil {
-		return redact.Anonymous
-	}
-	if ui.Username != "" {
-		return redact.User(ui.Username)
-	}
-	if len(ui.Groups) > 0 {
-		return redact.Group(ui.Groups[0])
-	}
-	return redact.Anonymous
-}
-
-// cohortLogLabel renders a cohort into its log label. It is a LOG LABEL ONLY
-// (#453). It is no expvar key and no cache, memo or sort key, and it changes
-// on every restart (internal/redact's per-process key).
-//
-// User-kind cohort: redact.User of the canonical Username. Group-kind cohort:
-// redact.Group of the group name. A learned class (#262): its
-// cache.LearnedClassLabel. A cohort with neither (defensive — should never
-// happen post-enum): redact.Anonymous.
-func cohortLogLabel(c seedTarget) redact.Label {
-	if c.Username != "" && isLearnedSeedTarget(c) {
-		// #262: a learned class is a real username + groups; its label is the
-		// class's label, never in clear.
-		return redact.Label(cache.LearnedClassLabel(c.Username, c.Groups))
-	}
-	if c.Username != "" {
-		return redact.Label(redact.User(c.Username))
-	}
-	if len(c.Groups) > 0 {
-		return redact.Label(redact.Group(c.Groups[0]))
-	}
-	return redact.Anonymous
+	return true
 }

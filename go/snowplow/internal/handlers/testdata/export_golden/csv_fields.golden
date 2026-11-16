@@ -1,0 +1,13 @@
+status: 200
+Content-Type: "text/csv; charset=utf-8"
+Content-Disposition: "attachment; filename=\"golden.csv\""
+X-Export-Truncated: ""
+X-Content-Type-Options: ""
+X-From-Call: ""
+call[0]: name=demo&page=1&perPage=500&resource=restactions
+body:
+name,health,usage.cpu,missing,labels.app.kubernetes.io/name,tags,meta,note,ready,text,multi
+alpha,OK,2,,web,"[""a"",""b""]",{},,true,,
+'=1+1,"Critical, degraded",7,,,[],,,false,Grüße — Ελληνικά — Кириллица — 東京,"line one
+line ""two"""
+'@SUM(A1),'-x,0.25,,,,,,true,,

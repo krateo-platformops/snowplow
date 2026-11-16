@@ -19,8 +19,10 @@
 package dispatchers
 
 import (
+	"context"
 	"net/http"
-	"time"
+
+	xcontext "github.com/krateo-platformops/plumbing/context"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
@@ -29,8 +31,11 @@ import (
 
 // staleWritePoint applies the write-point rule for a cold response. It
 // returns true when it re-ran the request (the caller writes nothing more).
+//
+// body is the response body about to be written (the accepted Put's bytes when
+// armable): #1321 — a replacement with the same bytes owes the client no frame.
 func staleWritePoint(h http.Handler, wri http.ResponseWriter, req *http.Request,
-	sink *cache.StaleServeSink, armable bool) (rerun bool) {
+	sink *cache.StaleServeSink, armable bool, body []byte) (rerun bool) {
 	if !sink.StaleDerived() {
 		return false
 	}
@@ -46,7 +51,7 @@ func staleWritePoint(h http.Handler, wri http.ResponseWriter, req *http.Request,
 		h.ServeHTTP(wri, req.WithContext(cache.WithStaleServeDisabled(req.Context())))
 		return true
 	}
-	api.CommitStaleServe(sink)
+	api.CommitStaleServe(sink, body)
 	return false
 }
 
@@ -60,11 +65,31 @@ func isStaleRerun(req *http.Request) bool {
 
 // staleHitWritePoint keeps the invariant on a HIT of a stale-derived cell (a
 // co-bound request before the replace lands): the hit is armed, so it only
-// needs the key's owed-push mark.
-func staleHitWritePoint(key string, entry *cache.ResolvedEntry) {
+// needs the key's owed-push mark. #1062: an ARMED hit whose bytes are stale —
+// stale-derived (apistage) or on a dirty-stamped cell (l1) — is a stale serve
+// timed until its replacing frame is written to the REQUESTER's stream
+// (cache.NoteStaleHit; the requester's digest is derived from ctx only when a
+// serve opens). armed is whether this hit stamped the refresh-key header.
+func staleHitWritePoint(ctx context.Context, key string, entry *cache.ResolvedEntry, armed bool) {
 	if entry != nil && entry.StaleDerived {
-		cache.MarkStaleOwed(key, time.Now())
+		cache.MarkStaleOwed(key, entry.Raw()) // #1321: the body this hit writes
 	}
+	if armed {
+		cache.NoteStaleHit(ctx, key, entry, staleSubjectOf)
+	}
+}
+
+// staleSubjectOf is the requester's stale-push subject (#1062): the digest of
+// the authenticated username the /refreshes handler derives for its stream
+// the same way (cache.StaleSubject). An L1 key is shared by a whole RBAC class
+// (and a widgetContent key by everyone), so the key alone never names the
+// client. "" when ctx carries no identity.
+func staleSubjectOf(ctx context.Context) string {
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return ""
+	}
+	return cache.StaleSubject(ui.Username)
 }
 
 // staleRerunHookForTest observes the ResponseWriter at the moment of the

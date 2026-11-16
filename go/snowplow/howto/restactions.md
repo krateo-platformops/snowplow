@@ -69,7 +69,7 @@ Defines a single HTTP request and its dependencies.
 | `filter` | `string` | Optional filter to process or extract data from the response. | ❌ |
 | `errorKey` | `string` | Key to identify error fields in the response. | ❌ |
 | `exportJwt` | `boolean` | If `true`, exports a JWT token from this request for later use. | ❌ |
-| `continueOnError` | `boolean` | If `true`, continues execution even if this call fails. | ❌ |
+| `continueOnError` | `boolean` | Changes the answer when this stage fails (see [When a stage fails](#when-a-stage-fails)). On a write stage it also means "send me even if the stage I depend on did not succeed". | ❌ |
 | `endpointRef` | `object` | Reference (`name` + `namespace`) to a Kubernetes [`Endpoint`](endpoints.md) object defining the target service. | ❌ |
 | `dependsOn` | `object` | Declares a dependency on another API call defined in this spec. | ❌ |
 | `resolve` | `boolean` | When this stage's `path` is a **direct apiserver path to a `RESTAction` or `Widget` CR**, controls whether snowplow runs the fetched CR through the resolver in-process. **Opt-in — defaults to `false`** (the raw stored CR is returned). See [resolving a referenced RESTAction/Widget in-process](#resolving-a-referenced-restactionwidget-in-process). | ❌ |
@@ -93,6 +93,20 @@ Useful for chaining calls where one must complete before another.
 |--------|------|-------------|-----------|
 | `name` | `string` | Name of another API call in the list that this call depends on. | ✅ |
 | `iterator` | `string` | Optional field on which to iterate (used for loop-like behavior). | ❌ |
+
+**Stages run one at a time, in a fixed order.** First every stage with no
+`dependsOn`, in the order you declare them. Then each stage with a `dependsOn`,
+once its dependency has run, in the order they became ready. The same spec always
+runs the same way.
+
+`dependsOn` decides order, not success: a read stage still runs when its
+dependency failed, and reads the missing value. Only a write stage is withheld
+when its dependency failed or was skipped (see below). A stage that reads another
+stage's result should declare `dependsOn` on it.
+
+Stages share the page's time budget, so a stage that stalls spends it for the
+stages after it, and a stage that starts after the budget ran out fails with
+`Timeout`. A stage with no `dependsOn` runs ahead of every stage that has one.
 
 ### Resolving a referenced `RESTAction`/`Widget` in-process
 
@@ -207,10 +221,141 @@ the stage's value is `null`, and it is not an error.
 
 ## When a stage fails
 
-A failing stage never stops the stages after it. Its error is recorded under
-its `errorKey` (default `error`): the upstream's `Status` (`code`, `reason`,
-`message`) when it answered one, otherwise a message. A non-2xx answer always
-keeps its HTTP code, even with an empty body or a body that is not a `Status`.
+A failing **read** stage never stops the stages after it. Its error is
+recorded under its `errorKey` (default `error`): the upstream's `Status`
+(`code`, `reason`, `message`) when it answered one, otherwise a message. A
+non-2xx answer always keeps its HTTP code, even with an empty body or a body
+that is not a `Status`.
+
+### A list the caller may not make is `Forbidden`, whichever path answers it
+
+A read stage without `endpointRef` runs as the caller. Snowplow answers it
+either from its own copy of the data (the cache) or by asking the Kubernetes
+API server, depending on what it holds at that moment. A `GET` of a list gets
+the same answer either way:
+
+Snowplow authorizes the list the way Kubernetes does:
+
+- A **namespaced** list (`.../namespaces/team-a/...`) needs a `list` grant in
+  that namespace: a `ClusterRoleBinding`, or a `RoleBinding` in `team-a`.
+- A **cluster-wide** list needs a `ClusterRoleBinding`. `RoleBinding`s in some
+  (or all) namespaces do not authorize it, whatever the resource.
+
+If the caller may not make the list, the stage fails with `Forbidden`:
+`errorKey` holds the `Status` `{"reason":"Forbidden","code":403}`, and the
+stage-outcome header lists the stage as `Forbidden`. The message names the
+resource and the scope ("at the cluster scope", or "in the namespace
+"team-a""), never the caller. A `RESTAction` that branches on a 403 sees it on
+every path, not only when the cache is cold.
+
+If the caller may make the list, the stage gets `200` with the items. An empty
+collection is `200` with `items: []`, not a 403.
+
+The decision comes from the caller's RBAC rules, never from how many items
+happen to be visible. To show a caller "everything I may see across
+namespaces", list as snowplow's ServiceAccount with a
+[`userAccessFilter`](#specapiuseraccessfilter). A cluster-wide list made as
+the caller is refused when the caller holds only namespace grants.
+
+### A write stage waits for the stage it depends on
+
+A **write** stage (any verb but `GET`, `HEAD`, `OPTIONS`, `TRACE`) whose
+`dependsOn` stage **failed or was skipped** is **not sent**, unless the write
+stage itself sets `continueOnError: true` ("send me even if what I depend on
+did not succeed"). `continueOnError` on the stage it depends on does not
+change this.
+
+Each stage ends in exactly one outcome:
+
+- **succeeded**: it ran, and every item it sent succeeded. An `iterator` that
+  yields **zero items** succeeded: it had nothing to do;
+- **failed**: at least one item failed, or the stage could not be built (its
+  iterator errored, its endpoint could not be resolved);
+- **skipped**: a write stage not sent because of this rule. A skipped stage
+  leaves no value in the result and blocks its own dependent writes, so a
+  chain `read → detach → delete` stops at the first failure;
+- **not executed**: a write stage snowplow did not send on purpose, because
+  of what the request is: a dry run (`StageNotExecuted`), an export or
+  background work (`WriteRefused`). It does not block its dependent writes:
+  they are not sent for the same reason and report the same reason, not
+  `Skipped`, unless the dependent's `iterator` runs over the refused stage's
+  output, which then yields zero items: it has nothing to send and succeeds
+  (not listed). So `Skipped` always follows a real failure. A write stage
+  with an item that failed on its own (`InvalidPath`, `TemplateError`) as
+  well as refused items reads that failure, not `WriteRefused` or
+  `StageNotExecuted` (#1347). It failed, so its dependent writes read
+  `Skipped`, in a dry run, an export or background work exactly as in the
+  real run.
+
+Example: a delete lifecycle where `delete.dependsOn` is `detachVolumes`
+(an iterator over the server's data volumes), and `delete` has no
+`continueOnError`:
+
+- a detach fails → `delete` is skipped;
+- the server has no data volumes (empty iterator) → `detachVolumes` succeeded
+  → `delete` is sent.
+
+### The stage-outcome header
+
+Every `/call` answer of a RESTAction carries `X-Snowplow-Stage-Outcomes`: a
+compact JSON array, in dependency order, of every stage that did **not**
+succeed. `[]` means every stage succeeded.
+
+The header has exactly two shapes:
+
+- a JSON **array** of rows (above); `[]` is the only "all succeeded";
+- the object `{"truncated":true,"failed":N}` when the array would exceed
+  4 KiB: N stages did not succeed, and which ones cannot be told.
+
+A reader must treat anything else — a header it cannot parse, a JSON value
+that is neither, a missing header — as **not** succeeded, never as `[]`.
+
+```
+[{"name":"detachVolumes","ok":false,"reason":"Error"},
+ {"name":"delete","ok":false,"reason":"Skipped","dependsOn":"detachVolumes"}]
+```
+
+- `reason` is a code: `Forbidden`, `NotFound`, `NotFoundForRequester` (#1319:
+  a watched named object that does not exist for this requester, #1080),
+  `Unauthorized`, `Error`,
+  `Skipped`, `NotRun` (the resolve stopped before this stage),
+  `StageNotExecuted` (a dry run), `WriteRefused` (a write stage an export or
+  background work does not send, #903/#970; before #1288 it read `Error`),
+  and for a write stage snowplow refused to
+  send (#1112) `InvalidPath`, `TemplateError` or `NotSent` (see "A write
+  that is not sent fails" below), and `DestinationRefused` for an endpoint
+  address snowplow refuses to dial (see "Which addresses an endpoint can
+  dial" below). `dependsOn` is set on a `Skipped` row.
+- One row has one `reason`, even when the stage's items failed with
+  different codes (an `iterator`). The codes are in three groups: **cut /
+  failed** (every code not listed below), **denied** (`Forbidden`,
+  `NotFoundForRequester`) and **by design** (`StageNotExecuted`,
+  `WriteRefused`). The row reads a code of the highest group any item
+  recorded: cut / failed, then denied, then by design (#1347). Inside one
+  group the most specific code wins, by a fixed order. So a stage with a
+  `403` item and an item cut by the page budget reads `Timeout`, not
+  `Forbidden`. A stage with a refused item and an item that failed on its own
+  (`InvalidPath`, `TemplateError`) reads that failure, not `WriteRefused` or
+  `StageNotExecuted`, and it blocks its dependent writes. A widget `/call`
+  header uses the same rule
+  ([docs/howto-frontend-widget-stage-outcomes.md](../docs/howto-frontend-widget-stage-outcomes.md)).
+- A resolve that runs no stage at all (its `dependsOn` graph names a stage
+  that does not exist or has a cycle) answers a resolve-level row
+  `{"name":"","ok":false,"reason":"Aborted"}` followed by every stage as
+  `NotRun`, never `[]`.
+- It carries stage names and codes only: no error text, path, identity or
+  data.
+- The HTTP status is unchanged (see below), so a controller that drives a
+  write lifecycle through `/call` reads this header to tell a half-done
+  sequence from a done one, even when the RESTAction's `filter` hides the
+  error keys. A cached answer carries the header of the resolve that stored
+  it. Most cached answers carry `[]`; two kinds of resolve are stored with
+  a non-`[]` header: one whose only failures are per-identity forbiddens
+  (#681), and one that ran no stage (`Aborted`) — it is stored with its
+  `Aborted` / `NotRun` header and answered with it until the RESTAction is
+  edited (an edit evicts the cell).
+
+### The HTTP status
 
 What `continueOnError` changes is what happens when the top-level `filter`
 **cannot produce a value**: it yields nothing (jq `empty`), or it fails because
@@ -227,14 +372,280 @@ stage's own request (resource, namespace, name), never from the upstream's
 text, which can name the requester. The upstream's full text stays under the
 stage's `errorKey` and in the logs.
 
+## Write stages run only on a user's request
+
+A **write** stage (any verb but `GET`, `HEAD`, `OPTIONS`, `TRACE`) is sent
+only when a user (or a controller, with its own credential) calls `/call`.
+Snowplow's own background work — the cache refresher, the prewarm walks and
+seeds, the content prewarm, the pagination drain, and the revalidation of a
+stale cached answer — resolves the same RESTActions but **never sends their
+write stages**, whatever credential the stage uses (snowplow's
+ServiceAccount, an `endpointRef` Secret, an external URL). The refused stage
+gets an error under its `errorKey`, and that background result is never
+stored or served.
+
+- A RESTAction that **declares** a write stage is never stored, whether or
+  not a given `/call` sent the write (an iterator with no items, a resolve
+  that stopped early because an `endpointRef` Secret is missing). Every
+  `/call` runs it, and the background never prewarms or refreshes it. This
+  holds for a widget that uses it too, including a widget that opted into the
+  external cache (`krateo.io/external-cache-ttl-seconds`, #915).
+- The external cache (`krateo.io/external-cache-ttl-seconds`) applies only when
+  every stage that reached an endpoint used a named `endpointRef` with its own
+  credential. A stage with no `endpointRef`, a stage with `exportJwt: true` and a
+  call to snowplow itself all carry the requester, so the answer can differ per
+  user: the widget is not cached, even if its other stages are eligible (#1221).
+- A `/call` that snowplow makes to itself on behalf of background work
+  carries `X-Snowplow-Background: 1`, so that call refuses write stages too.
+  Snowplow sends the header only to itself and strips it from every other
+  request.
+
+## A write that is not sent fails
+
+A write stage that snowplow refuses to send never reads as a success
+(#1112). Before any request leaves, snowplow refuses a call whose `path`,
+`payload` or a header did not render (a jq error, e.g. `tonumber` on a
+non-number, or an unrendered `${…}`), and a rendered path that lost a segment
+its template meant to fill (#288): an empty namespace (`/namespaces//`), or
+an empty last segment on a `PUT`/`PATCH`/`DELETE` (a trailing `/`, which would
+turn a by-name delete into a collection delete). That holds for every stage,
+a named `endpointRef` to another cluster's apiserver included. Only on a
+stage with no `endpointRef` (this cluster's apiserver) is a name or namespace
+that is not a valid Kubernetes name refused as well: an external API's ids
+(`/api/v2/tickets/Ab_12`) are not judged as Kubernetes names. Constrain caller
+input in the template itself.
+
+For a **read** the refused call is skipped and the page renders what it can,
+as before. For a **write** each refused call (one item of an iterator
+included) fails the stage with reason `InvalidPath`, `TemplateError` or
+`NotSent` in `X-Snowplow-Stage-Outcomes`, an error under its `errorKey`
+(code 400, or 500 for `NotSent`), and, without `continueOnError`, the
+resolve's status (see "The HTTP status"). A write stage that depends on it is
+`Skipped`. An iterator write with **zero** items has nothing to send and
+succeeds.
+
+## Redirects and credentials
+
+A stage's request never goes to another host (#1106). When an endpoint
+answers a redirect to another origin (scheme, host and port), snowplow does
+not follow it, whatever the endpoint's credential (token, basic auth, client
+certificate, AWS signature) and whatever the stage's `headers`: any header
+can carry a credential (`X-Api-Key`, `PRIVATE-TOKEN`, an `exportJwt` bearer),
+and the HTTP client would forward it. The stage fails with `502`, naming the
+redirect. A redirect within the endpoint's own origin is followed. A stage
+with no `endpointRef` (this cluster's apiserver, a snowplow-held credential)
+follows no redirect at all (#723). An endpoint that legitimately redirects
+elsewhere (a CDN, a moved host) must be given its final URL.
+
+snowplow is stricter here than the plumbing library other Krateo components
+use, on purpose, so a RESTAction that works through plumbing can still fail
+here:
+
+- plumbing lets a credential follow a redirect from `http` to `https` on the
+  same host. snowplow refuses it like any other change of origin: give the
+  endpoint its `https` URL.
+- the endpoint Secret's `pass-credentials-on-redirect` key has no effect in
+  snowplow. A redirect to another origin is refused with or without it.
+
+## Which addresses an endpoint can dial
+
+snowplow refuses to dial these addresses, on every stage and every `/call`, with
+or without a credential (#1131):
+
+| Refused | Why |
+| --- | --- |
+| `169.254.0.0/16`, `fe80::/10` | link-local, including the cloud metadata service |
+| `0.0.0.0`, `::` | unspecified |
+| `224.0.0.0/4`, `ff00::/8` | multicast |
+
+The v4-mapped IPv6 spellings of these are refused too. Loopback and private
+ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`) are allowed:
+in-cluster services (`*.svc.cluster.local`) and on-prem endpoints live there.
+
+The check runs on the address actually dialled, after DNS. A hostname that
+resolves to a refused address is refused, however it is spelled, and a name that
+changes its answer is checked again on each dial. If a name resolves to several
+addresses, a refused one is skipped and the others are tried. A name that does not
+resolve is never dialled, and fails as a DNS error.
+
+A refused stage fails with reason `DestinationRefused` in
+`X-Snowplow-Stage-Outcomes` and a `502` under its `errorKey`, naming the address
+and its range. Without `continueOnError`, the same `502` and text answer the
+`/call`. Nothing is sent and the dial is not retried. A write that depends on the
+stage is `Skipped`. A background refresh of a refused stage stops at its first
+attempt: the cached entry stays resident as known-stale, the failure counts as
+`destination_refused` in `snowplow_refresh_failed`, and the next change to its
+data tries again. There is no setting and no allowlist: to fix it, point the
+endpoint at an address the policy allows.
+
+With a proxy (the Secret's `proxy-url`, or the process's `HTTP_PROXY`), the address
+checked is the proxy's, because that is the address dialled.
+
 ## jq templating of `path`, `payload` and `headers`
 
 A stage's `path`, `payload` and each `headers` entry may embed a **jq template**
 delimited by `${ ... }`. The template is evaluated against the shared resolve
 dict (previous stage outputs + `extras`) before the request is issued; a plain
 string without the delimiter is passed through verbatim. (`endpointRef.name`
-supports the same templating, with a guardrail: a request-templated name may
-never resolve to a reserved `<user>-clientconfig` credential Secret.)
+supports the same templating. Whether literal or templated, it may never
+name a per-user credential Secret; see below.)
+
+### A value in a `path` is one segment (#1123)
+
+The `path` template is a **template**: its string literals are what you wrote,
+and every value it splices in (`+ .x`, `"\(.x)"`, or a whole `${ .path }`) is
+**exactly one path segment** — or, after the template's `?`, **exactly one query
+value**. Values come from the caller (`extras`), from earlier stages and from
+iterator elements, and the request goes out with the stage's credential, so a
+value must never decide what that credential is used for.
+
+| A value spliced into… | is rendered as | and refused (not dialed) when |
+|---|---|---|
+| the path (before the template's `?`) | one segment, escaped like `url.PathEscape` (`?` → `%3F`, `#` → `%23`, `%` → `%25`, space → `%20`) | it contains `/`, or the segment it lands in is `.` or `..` |
+| the query (after the template's `?`) | one query value: `&`, `=`, `+`, `;`, `#`, `%`, space and non-query characters are escaped | never |
+
+A clean value (a name, a namespace, a number, a UUID, `system:admin`) renders as
+itself. For an apiserver path (`/api/…`, `/apis/…`) a value that needed an
+escape is refused too: the apiserver decodes the path before it reads the
+namespace, resource and name, and no valid one contains `%`.
+
+What counts as **your text** rather than a value: a string literal, an
+interpolated string, `+` of those, parentheses, an `if` whose branches are
+those, the right side of `|` or of `E as $x | …`, and a variable bound to one of
+those (`(if .range == "1h" then "1%20HOUR" else "6%20HOUR" end) as $iv` keeps
+`$iv` your text), or a literal key of an object of them (`$w.bk`). Anything
+else — `.x`, `.x // "default"`, `(.x | f)`, a function call, a variable bound to
+a value — is a value.
+
+**A value that holds several segments must be declared.** Either split it into
+single values (the right form for an `apiVersion`, which is `group/version`):
+
+```yaml
+path: ${ (.apiVersion | split("/")) as [$g, $v] | "/apis/" + $g + "/" + $v + "/" + .resource }
+```
+
+or declare it with `segments(E)`, which keeps `/` between pieces and still
+escapes each piece and refuses a `.` or `..` piece:
+
+```yaml
+path: ${ segments(.path) }      # the iterator yields a whole path
+```
+
+`segments()` lets the value choose **how many** segments it is. Never use it on
+caller input for a stage whose credential the caller does not hold (an
+`endpointRef`, or a `userAccessFilter` stage, which dials with the
+ServiceAccount): split the known shape instead. `segments()` is valid only
+spliced into the path, never in the query.
+
+**A value you encoded yourself is not encoded again.** `.x | @uri` (and
+`@uri "...\(.x)..."`) renders as jq wrote it, so `"/search?q=" + (.q | @uri)`
+sends one value, escaped once. In the path it is still one segment: an encoded
+`/` is refused like a `/`. Any other format (`@base64`, `@sh`, …) is a value.
+
+**A query parameter is declared in the template:**
+`"/events?limit=200&composition_id=" + .uid` encodes `.uid` as one value. A
+whole path that carries its own query (`${ .path }` with `?…` inside) is
+refused; move the query into the template and pass only the values.
+
+A refused value makes no call. Like every refused item (#1116) it **fails its
+stage** with `InvalidPath` and a 400 under the stage's `errorKey`; without
+`continueOnError` it fails the RESTAction. It is counted in `/debug/vars`
+`snowplow_malformed_dial_skipped_total.path_value_refused`.
+
+**Edge cases of `segments(E)`:**
+
+| `E` is… | renders | |
+|---|---|---|
+| `null`, missing or `""` | refused: one empty piece is an empty segment | `"/" + segments(.p)` and `"/a/" + segments(.p) + "/z"` make no call |
+| `a//b`, `a/` or `/` | refused: every piece is one segment, so an empty piece is an empty segment | |
+| `/a/b` where it opens the path | `/a/b`: that leading `/` is the root, not an empty piece | `${ segments(.path) }`. After other text it is an empty piece: `"/x/" + segments(.p)` is refused |
+| a number, boolean, array or object | a template error: nothing is sent, the stage fails with `TemplateError` | convert it yourself: `segments(.n \| tostring)` |
+
+`segments()` in the query is refused for every `E`, `null` included.
+
+**An expression that leaves a path segment empty makes no call.** `"/v2/tickets/"
++ .id` with `.id` empty, null or missing would name the collection, not one
+ticket, and a write there could reach every ticket. So it is refused, on every
+verb, for a stage with an `endpointRef` and for one that dials this cluster
+alike. It doesn't matter where the empty comes from: a value, an `if` branch, or
+a literal `""`.
+
+| With `.x` empty, null or missing | |
+|---|---|
+| `"/a/" + .x`, `"/a/" + .x + "/z"`, `"/" + .x + "/z"`, `.x + "/z"` | refused: the segment holds nothing |
+| `"/a/" + .x + "?q=1"` | refused: the path ends at the `?` |
+| `"/a/" + .x + "-b"`, `"/a" + .x` | sent: the segment has other text, so `.x` is empty *inside* it |
+| `"/a?q=" + .x` | sent: a query value is not a segment |
+| `"/a/\(.x)"` with `.x` null | sent as `/a/null`: jq's interpolation of null is the text `null`. `""` is refused |
+| `"/a/" + (if (.x // "") == "" then "" else .x end)` | refused: the `""` branch leaves the segment after `/a/` empty |
+| `(if (.x // "") == "" then "/a/" else "/a/" + .x end)` | refused: the `/` is in the branch, and the segment after it is still empty |
+| `"/a" + (if (.x // "") == "" then "" else "/" + .x end)` | sent as `/a`: the `/` is inside the branch, so no segment is empty |
+| `(if (.x // "") == "" then "" else "/" + .x end) + "/z"` | sent as `/z`: nothing comes before the path's first `/`, so no segment is empty |
+| `(if (.x // "") == "" then "" else "/" + .x end) + "?q=1"`, the same with `"/"` or `"/?q=1"`, `"" + "/"` | refused: no path follows the root, so the request would read the endpoint's root |
+| `(if (.x // "") == "" then null else "/" + .x end) + "/z"` | refused: `null` is a value, not your text, so write `""` here |
+
+The rule asks whether an expression contributed to a segment and left it empty,
+not what the rendered text looks like. An expression is a value, the text of an
+`if` branch, or a literal `""`, which writes nothing. A `/` or a `//` in a string
+literal outside an `if` is your own text: this rule neither refuses nor excuses
+it, and the checks every literal path goes through still apply (a stage that
+dials this cluster refuses a `//`, and a write that ends in `/`). The same text
+in an `if` branch counts as that branch's, so `(if .c then "/a//b" else "/c" end)`
+is refused when the branch is taken.
+
+A value of spaces is not empty: it renders `%20`, one segment. A stage that
+dials this cluster refuses it like any other escape, and a named endpoint
+receives `/a/%20`. Check for it yourself if it can occur.
+
+**An optional part holds its own `/`.** `segments()` does not make a value
+optional: the `/` before it is your text and stays, so `"/v2/tickets/" +
+segments(.x)` would still name the collection, and an `if` around the value
+alone leaves that `/` behind in the same way. Use one of:
+
+```yaml
+# Put the "/" inside the branch, so that the part is absent as a whole.
+path: ${ "/apis/g/v1/things" + (if (.name // "") == "" then "" else "/" + .name end) }
+```
+
+```yaml
+# Or gate the stage: an iterator with no elements has nothing to call and succeeds.
+dependsOn:
+  iterator: '[ {name: .name} | select((.name // "") != "") ]'
+path: ${ "/apis/g/v1/things/" + .name }
+```
+
+**A template that renders no path makes no call.** `${ segments(.path) }` with
+`.path` null or `""` renders nothing, and so does a template with no output
+(`${ empty }`). Dialling that would read the endpoint's root with the stage's
+credential.
+
+Both are refused on every stage. The stage fails with `InvalidPath` and a 400,
+which is the same failure as a refused value above: nothing is stored for it, and
+it is counted as `snowplow_malformed_dial_skipped_total.empty_interp`. A prewarm
+runs with no `extras`, so a stage whose path comes only from `extras` fails
+there. To make that stage quiet rather than failed, gate it with an iterator
+that yields no element when the value is absent.
+
+A stage that has no `path` at all has no template and is unchanged. `${ .path }`
+without `segments()` is one value, and jq's `tostring` of null is the text
+`null`.
+
+### `endpointRef` never names a per-user credential
+
+A stage's `endpointRef` may never name a per-user credential Secret: the
+session `<user>-clientconfig` or the step-up `<user>-clientconfig-stepup`.
+This holds for every RESTAction, stored or sent inline as a draft, for both
+literal and templated names (a templated name is checked after it is
+rendered and normalised), and for every stage, including a
+`userAccessFilter` stage, which does not use its `endpointRef` at all. Snowplow refuses such a stage before it reads the
+Secret: the stage fails, the resolve stops there, and the refusal is logged
+as `endpointRef refused: it names a per-user credential Secret` (the Secret
+name appears only as a redacted label) and counted in
+`snowplow_endpointref_per_user_refused_total{provenance}` at `/debug/vars`.
+
+To call the Kubernetes API as the requesting user, omit `endpointRef`.
+Snowplow then uses the caller's own credential: the step-up one when the
+caller has stepped up, the session one otherwise.
 
 ## Example
 

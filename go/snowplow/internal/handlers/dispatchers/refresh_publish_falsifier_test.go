@@ -59,7 +59,7 @@ func TestFalsifier62_ColdFillPublishesToArmedSubscriber(t *testing.T) {
 	// The cold-dispatch Put fires this (restactions.go / widgets.go genuine-Put
 	// else-if). Pre-#62 the cold Put did NOT publish → this would be a no-op →
 	// the subscriber starves until the next churn.
-	publishIfSubscribed(keyA)
+	publishIfSubscribed(keyA, cache.PutChanged)
 
 	select {
 	case got := <-ch:
@@ -101,7 +101,7 @@ func TestFalsifier62_ColdFillNoCrossUserLeak(t *testing.T) {
 	_, deliveredBefore, _, _ := cache.RefreshBroadcasterCounters()
 
 	// userA's request cold-fills userA's key (the cold-Put path stamps keyA).
-	publishIfSubscribed(keyA)
+	publishIfSubscribed(keyA, cache.PutChanged)
 
 	// userB must receive NOTHING — keyA != keyB.
 	select {
@@ -138,7 +138,7 @@ func TestFalsifier62_NoSubscriberNoPublish(t *testing.T) {
 
 	// No SubscribeRefresh — nobody armed for keyA. The vast majority of cold
 	// fills (no live viewer on that exact widget) hit this path.
-	publishIfSubscribed(keyA)
+	publishIfSubscribed(keyA, cache.PutChanged)
 
 	pubAfter, delAfter, dropAfter, coalAfter := cache.RefreshBroadcasterCounters()
 	if pubAfter != pubBefore || delAfter != delBefore || dropAfter != dropBefore || coalAfter != coalBefore {
@@ -170,7 +170,7 @@ func TestFalsifier62_ConcurrentColdFillAndSubscribe(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			publishIfSubscribed(keyA)
+			publishIfSubscribed(keyA, cache.PutChanged)
 		}()
 	}
 	// Concurrent arm/disarm churn on the same key.

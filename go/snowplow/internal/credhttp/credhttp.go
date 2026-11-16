@@ -38,6 +38,59 @@
 //
 // The structural guard (guard_test.go) fails CI when any non-test file in the
 // module builds a client, a transport or a *rest.Config by any other route.
+//
+// #920 — NO CLIENT-SIDE RATE LIMIT. client-go gives every client whose config
+// leaves QPS at 0 and RateLimiter nil its own token bucket of 5 requests/s,
+// burst 10 (rest.DefaultQPS / rest.DefaultBurst). Nobody chose that cap, and it
+// silently paced every long-lived client snowplow built (the metadata client's
+// store-verification re-check ran at exactly 5 reads/s in bench run 16). The
+// apiserver's own Priority & Fairness is the authority on how fast snowplow may
+// read, so every *rest.Config that leaves this package, and every client built
+// here, carries no client-side limiter: noClientRateLimit is the one place that
+// says so. Harden applies it to the configs (so a client built from one by code
+// outside this package, such as plumbing's endpoints.FromSecret, inherits it),
+// and every client constructor applies it to its own copy (so a client built
+// here has no limiter whatever config it was handed).
+//
+// #988 — THE RESOLVE COLLECTION-LIST COUNTER. Because every config and client
+// that carries a snowplow-held credential leaves this package, this is also
+// where a resolve's collection LISTs are counted on the wire
+// (snowplow_resolve_collection_lists, resolve_lists.go): Harden and Client
+// install CountResolveCollectionLists wherever they install RefuseRedirectHops.
+//
+// #1131 — THE DESTINATION POLICY. The dialer that carries a named endpoint
+// refuses link-local, unspecified and multicast addresses on the address it
+// dials (destination.go).
+//
+// THE BROWSER BUILD (js/wasm, the Agentiko sandbox). A program in a browser
+// worker cannot open a connection: every request leaves through the
+// browser's fetch (BrowserEgress, egress_js.go), installed innermost, so
+// every wrapper and rule above still applies to the request. Three things
+// below the request are the browser's, not this package's, on that build:
+//
+//   - THE DESTINATION POLICY (#1131) does not apply. Go never sees the
+//     address fetch connects to, so there is nothing for the dial-time check
+//     to check; the browser's own rules for where a page may send a request
+//     apply instead.
+//   - TLS CLIENT CERTIFICATES do not apply. fetch presents no certificate a
+//     program supplies, so a config's client certificate (a cert-auth
+//     clientconfig) is not sent, and server certificates are verified by the
+//     browser against its own roots, not against a config's CA data.
+//   - A REDIRECT fails the request instead of being returned: fetch is told
+//     to refuse it, so the never-follow rule holds, but the caller gets an
+//     error rather than the 3xx response. That holds on every egress path:
+//     BrowserEgress (every hardened config, the owned branch of a stage
+//     fetch), guardedTransport (destination.go), and every client plumbing
+//     builds (the JWKS key source, the /call passthrough, the plumbing branch
+//     of a stage fetch), which plumbing >= v1.52.0 sends through
+//     dialguard.RoundTripper (#1360).
+//
+// And the browser's own credentials are never sent: dialguard.RoundTripper
+// also sets fetch's credentials mode "omit" (plumbing >= v1.54.0), on the same
+// paths (egress_js.go).
+//
+// A server build is unaffected: BrowserEgress is nil there (egress.go), and
+// dialguard.RoundTripper is the identity.
 package credhttp
 
 import (
@@ -48,22 +101,46 @@ import (
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/kubeconfig"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/transport"
 )
 
 // RedirectRefusedError is what a refused redirect hop returns. It carries the
-// status code of the redirect that was refused and nothing else: never a URL
-// (a Location can carry credentials), a token or an identity.
+// status code of the redirect that was refused and which credential the hop
+// carried, and nothing else: never a URL (a Location can carry credentials), a
+// token or an identity.
 type RedirectRefusedError struct {
 	StatusCode int
+	// Carried is the credential the refused hop carried, so the text names the
+	// rule that refused it (#1138): a held credential never follows any
+	// redirect, a named endpoint's never leaves its origin. The zero value is
+	// CarriedHeld.
+	Carried RedirectCredential
 }
 
+// RedirectCredential is the credential a refused redirect hop carried.
+type RedirectCredential int
+
+const (
+	// CarriedHeld: a credential snowplow holds and attaches itself (the
+	// ServiceAccount endpoint, a per-user clientconfig; WithHeldCredential).
+	// Such a client never follows a redirect (#723/#724).
+	CarriedHeld RedirectCredential = iota
+	// CarriedEndpoint: a named endpointRef's own credential, and any header
+	// its stage set. Such a dial never sends a hop to another origin (#1106).
+	CarriedEndpoint
+)
+
 func (e *RedirectRefusedError) Error() string {
+	if e.Carried == CarriedEndpoint {
+		return fmt.Sprintf("refused to follow a %d redirect to another origin: a named endpoint's own credential, and any header its stage set, never leave the origin the request was sent to (#1106)", e.StatusCode)
+	}
 	return fmt.Sprintf("refused to follow a %d redirect: a client carrying snowplow-held credentials never follows a redirect (#723/#724)", e.StatusCode)
 }
 
@@ -77,7 +154,7 @@ func CheckRedirect(*http.Request, []*http.Request) error {
 // Idempotent in effect (a double wrap refuses the same requests).
 func RefuseRedirectHops(rt http.RoundTripper) http.RoundTripper {
 	if rt == nil {
-		rt = http.DefaultTransport
+		rt = guardedTransport
 	}
 	return &refuseRedirectHops{next: rt}
 }
@@ -99,26 +176,85 @@ func (t *refuseRedirectHops) RoundTrip(req *http.Request) (*http.Response, error
 // CloseIdleConnectionsFor).
 func (t *refuseRedirectHops) WrappedRoundTripper() http.RoundTripper { return t.next }
 
-// Harden installs RefuseRedirectHops on rc (in place) and returns it. Every
-// client later built from rc or from a rest.CopyConfig of it inherits the
-// layer. nil-safe.
+// Harden installs RefuseRedirectHops on rc, with the #988 resolve
+// collection-LIST counter inside it, and removes its client-side rate limit
+// (#920), in place, and returns it. Every client later built from rc or from a
+// rest.CopyConfig of it inherits all three. nil-safe.
+//
+// #1115 — and the customer page budget (BudgetTransport, budget.go): a round
+// trip of a request that carries one runs under its deadline.
+//
+// #847 — and its connections count under EgressAPIServer (connections.go).
 func Harden(rc *rest.Config) *rest.Config {
 	if rc != nil {
+		// js/wasm only, below every wrapper, the ones rc already carries
+		// included: the browser's fetch replaces the dial (egress_js.go). On
+		// a server build BrowserEgress is nil and this leaves WrapTransport
+		// as it was.
+		rc.WrapTransport = transport.Wrappers(BrowserEgress, rc.WrapTransport)
+		// #1054 — innermost: every attempt (a client-go 429 retry included)
+		// is recorded on the slow-call record of the request that sent it.
+		rc.Wrap(slowcall.Transport)
+		// #847 — new vs reused connections. Inside the budget and the hop
+		// refusal: a request either of them stops takes no connection anyway.
+		rc.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+			return countConnectionsTransport(EgressAPIServer, rt)
+		})
+		// #1115 — the customer page budget: a round trip of a request that
+		// carries one runs under its deadline.
+		rc.Wrap(BudgetTransport)
+		rc.Wrap(CountResolveCollectionLists)
 		rc.Wrap(RefuseRedirectHops)
+		noClientRateLimit(rc)
 	}
 	return rc
 }
 
-// Client applies both layers to c (in place) and returns it.
+// noClientRateLimit removes client-go's client-side rate limit from rc, in
+// place (#920). A negative QPS with a nil RateLimiter is client-go's own "no
+// limiter" setting (rest.Config.QPS: "Setting this to a negative value will
+// disable client-side ratelimiting"): rest.RESTClientForConfigAndClient builds
+// a token bucket only when RateLimiter is nil and QPS > 0, and a QPS of 0 means
+// rest.DefaultQPS (5/s). RateLimiter is cleared as well because a non-nil one
+// is used verbatim whatever QPS says. Burst is read only by a bucket, so it is
+// zeroed to say that no bucket exists. Idempotent.
+func noClientRateLimit(rc *rest.Config) {
+	rc.QPS = -1
+	rc.Burst = 0
+	rc.RateLimiter = nil
+}
+
+// Client applies both layers to c (in place), with the #988 resolve
+// collection-LIST counter inside the hop refusal, and returns it. #1115 — the
+// customer page budget (BudgetTransport) is innermost.
 func Client(c *http.Client) *http.Client {
 	c.CheckRedirect = CheckRedirect
-	c.Transport = RefuseRedirectHops(c.Transport)
+	base := c.Transport
+	if base == nil {
+		base = guardedTransport
+	}
+	c.Transport = RefuseRedirectHops(CountResolveCollectionLists(BudgetTransport(slowcall.Transport(base)))) // #1054 innermost, then #1115
 	return c
+}
+
+// inClusterConfig is the source InClusterConfig hardens. rest.InClusterConfig
+// reads fixed service-account paths, so this package's own tests replace it to
+// build the in-cluster config against a test server.
+var inClusterConfig = rest.InClusterConfig
+
+// SetInClusterConfigForTest replaces the in-cluster config source and returns
+// the restore func. TEST-ONLY: it lets another package's test drive a caller
+// of InClusterConfig (the auth middleware's apiserver re-read, #994) against a
+// test server. Not safe for concurrent use with InClusterConfig.
+func SetInClusterConfigForTest(fn func() (*rest.Config, error)) (restore func()) {
+	prev := inClusterConfig
+	inClusterConfig = fn
+	return func() { inClusterConfig = prev }
 }
 
 // InClusterConfig is rest.InClusterConfig, hardened.
 func InClusterConfig() (*rest.Config, error) {
-	rc, err := rest.InClusterConfig()
+	rc, err := inClusterConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -135,6 +271,19 @@ func NewClientConfig(ctx context.Context, ep endpoints.Endpoint) (*rest.Config, 
 	return Harden(rc), nil
 }
 
+// FromSecret is plumbing's endpoints.FromSecret over a hardened copy of rc.
+// FromSecret builds its own REST client from the config it is given (one per
+// call), so this is where that client gets both #723's redirect refusal and
+// #920's absence of a client-side rate limit, whatever config the caller holds.
+// The caller's rc is not changed. Errors are plumbing's, unwrapped, so callers
+// keep telling a NotFound from any other failure.
+func FromSecret(ctx context.Context, rc *rest.Config, name, namespace string) (endpoints.Endpoint, error) {
+	if rc != nil {
+		rc = Harden(rest.CopyConfig(rc))
+	}
+	return endpoints.FromSecret(ctx, rc, name, namespace)
+}
+
 // HTTPClientFor is rest.HTTPClientFor with both layers applied.
 func HTTPClientFor(rc *rest.Config) (*http.Client, error) {
 	hc, err := rest.HTTPClientFor(rc)
@@ -144,9 +293,11 @@ func HTTPClientFor(rc *rest.Config) (*http.Client, error) {
 	return Client(hc), nil
 }
 
-// Dynamic is dynamic.NewForConfig through HTTPClientFor.
+// Dynamic is dynamic.NewForConfig through HTTPClientFor, with no client-side
+// rate limit (#920).
 func Dynamic(rc *rest.Config) (*dynamic.DynamicClient, error) {
 	cfg := dynamic.ConfigFor(rc)
+	noClientRateLimit(cfg)
 	hc, err := HTTPClientFor(cfg)
 	if err != nil {
 		return nil, err
@@ -154,9 +305,11 @@ func Dynamic(rc *rest.Config) (*dynamic.DynamicClient, error) {
 	return dynamic.NewForConfigAndClient(cfg, hc)
 }
 
-// Metadata is metadata.NewForConfig through HTTPClientFor.
+// Metadata is metadata.NewForConfig through HTTPClientFor, with no client-side
+// rate limit (#920).
 func Metadata(rc *rest.Config) (metadata.Interface, error) {
 	cfg := metadata.ConfigFor(rc)
+	noClientRateLimit(cfg)
 	hc, err := HTTPClientFor(cfg)
 	if err != nil {
 		return nil, err
@@ -164,9 +317,11 @@ func Metadata(rc *rest.Config) (metadata.Interface, error) {
 	return metadata.NewForConfigAndClient(cfg, hc)
 }
 
-// Kubernetes is kubernetes.NewForConfig through HTTPClientFor.
+// Kubernetes is kubernetes.NewForConfig through HTTPClientFor, with no client-side
+// rate limit (#920).
 func Kubernetes(rc *rest.Config) (*kubernetes.Clientset, error) {
 	cfg := *rc
+	noClientRateLimit(&cfg)
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
@@ -178,9 +333,10 @@ func Kubernetes(rc *rest.Config) (*kubernetes.Clientset, error) {
 }
 
 // APIExtensions is the apiextensions clientset NewForConfig through
-// HTTPClientFor.
+// HTTPClientFor, with no client-side rate limit (#920).
 func APIExtensions(rc *rest.Config) (*apiextensionsclientset.Clientset, error) {
 	cfg := *rc
+	noClientRateLimit(&cfg)
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
@@ -195,9 +351,11 @@ func APIExtensions(rc *rest.Config) (*apiextensionsclientset.Clientset, error) {
 // NewDiscoveryClientForConfig applies before building its http.Client.
 const discoveryDefaultTimeout = 32 * time.Second
 
-// Discovery is discovery.NewDiscoveryClientForConfig through HTTPClientFor.
+// Discovery is discovery.NewDiscoveryClientForConfig through HTTPClientFor,
+// with no client-side rate limit (#920).
 func Discovery(rc *rest.Config) (*discovery.DiscoveryClient, error) {
 	cfg := *rc
+	noClientRateLimit(&cfg)
 	if cfg.Timeout == 0 {
 		cfg.Timeout = discoveryDefaultTimeout
 	}
@@ -222,7 +380,15 @@ type heldCredentialKey struct{}
 // present. PROVENANCE, never endpoint shape: a token-auth endpointRef is
 // shape-identical to the SA endpoint.
 func WithHeldCredential(ctx context.Context) context.Context {
-	return context.WithValue(ctx, heldCredentialKey{}, true)
+	return WithHeldCredentialValue(ctx, true)
+}
+
+// WithHeldCredentialValue sets the mark to held, true OR false. The mark is
+// per stage: a stage sets it to its own provenance every time, so a ctx a
+// nested resolve inherits from an outer held stage never makes a nested
+// named-ref stage read as held (#1019 review F1).
+func WithHeldCredentialValue(ctx context.Context, held bool) context.Context {
+	return context.WithValue(ctx, heldCredentialKey{}, held)
 }
 
 // HeldCredential reports whether ctx carries the WithHeldCredential mark.
@@ -231,11 +397,14 @@ func HeldCredential(ctx context.Context) bool {
 	return v
 }
 
-// RESTClient is rest.RESTClientFor through HTTPClientFor.
+// RESTClient is rest.RESTClientFor through HTTPClientFor, with no client-side
+// rate limit (#920).
 func RESTClient(rc *rest.Config) (*rest.RESTClient, error) {
-	hc, err := HTTPClientFor(rc)
+	cfg := *rc
+	noClientRateLimit(&cfg)
+	hc, err := HTTPClientFor(&cfg)
 	if err != nil {
 		return nil, err
 	}
-	return rest.RESTClientForConfigAndClient(rc, hc)
+	return rest.RESTClientForConfigAndClient(&cfg, hc)
 }

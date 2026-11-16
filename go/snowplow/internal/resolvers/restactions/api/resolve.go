@@ -16,8 +16,8 @@ import (
 	"os"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -34,8 +34,11 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -149,7 +152,12 @@ type ResolveOptions struct {
 	Items   []*templates.API
 	PerPage int
 	Page    int
-	Extras  map[string]any
+	// Cursor (#874) — the data source's continuation token from the previous
+	// page. On a paginated resolve it is added to the jq dict as
+	// .slice.cursor next to page/perPage/offset, so a cursor-paging RESTAction
+	// (one that emits slice.cursor) is handed back where it left off.
+	Cursor string
+	Extras map[string]any
 
 	// Watcher is the cluster-wide informer cache. When nil (the
 	// default at 0.30.1, since CACHE_ENABLED defaults to false),
@@ -173,6 +181,11 @@ type ResolveOptions struct {
 	// inline dry-run draft) switches UAF stages and endpointRef Secret reads
 	// to the caller's own identity (see Provenance).
 	Provenance Provenance
+
+	// SpecFilter is the owning RESTAction's spec.filter, read ONLY by the
+	// #603 PR-2 shadow's read-set analysis (narrow.go). Nil is safe: the
+	// analysis then reads the whole dict, a sound over-approximation.
+	SpecFilter *string
 }
 
 // accumulateErrorKey implements Ship 0.30.257 (#313) Option W-A: the shared
@@ -226,6 +239,11 @@ func accumulateErrorKey(dict map[string]any, key string, value any) {
 // unchanged -race corpus (TestResolve_ConcurrentRequestsDoNotCrossPollinate,
 // TestShip2a_FullResolve_ManagedFields_Race, etc.).
 type resolveRun struct {
+	// stageRef is the endpointRef the current stage resolved (its templated
+	// name rendered), set by resolveStageEndpoint and carried to the stage's
+	// dials for the record (#1283). Stages run one at a time.
+	stageRef *templates.Reference
+
 	ctx             context.Context
 	log             *slog.Logger
 	opts            ResolveOptions            // verbatim caller opts (RC already non-nil)
@@ -234,15 +252,19 @@ type resolveRun struct {
 	apistageEnabled bool                      // F1 content-keyed api-stage L1 gate (read once)
 	apistageStore   *cache.ResolvedCacheStore // nil when apistage disabled / store unavailable
 	stageErrSink    *cache.StageErrorSink     // nil on the request path (refresher-only)
-	// outcomes (#443 part 2) collects per-stage outcomes for the
-	// X-Snowplow-Stage-Outcomes header; non-nil only for the top-level
-	// caller-supplied (inline) resolve.
+	// outcomes (#443 part 2, #904) collects this resolve's per-stage outcomes:
+	// the #904 dependent-write rule reads them between stages, and the
+	// top-level resolve's are the X-Snowplow-Stage-Outcomes header. Never nil
+	// once ResolveWithFailure has started the run (claimStageOutcomes).
 	outcomes      *StageOutcomes
 	pipTimingSink *cache.PIPStageTimingSink // nil on the request path (PIP-seed-only)
 	// failure (#709) is the first stage, in topological order, that failed
 	// without continueOnError. Written only by the orchestrator goroutine
 	// between stages (runStage after g.Wait), never by a worker.
 	failure *StageFailure
+	// narrow (#603 PR-2 SHADOW, narrow.go) records this resolve's list edges
+	// and how their calls were served; nil = plain recording.
+	narrow *narrowRun
 }
 
 // newResolveRun builds the per-call resolveRun. user is already resolved by
@@ -257,6 +279,7 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 	mapper := endpointReferenceMapper{
 		authnNS:    opts.AuthnNS,
 		username:   user.Username,
+		groups:     user.Groups,
 		rc:         opts.RC,
 		provenance: opts.Provenance,
 	}
@@ -267,11 +290,15 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 	}
 
 	if opts.PerPage > 0 && opts.Page > 0 {
-		dict["slice"] = map[string]any{
+		sl := map[string]any{
 			"page":    opts.Page,
 			"perPage": opts.PerPage,
 			"offset":  (opts.Page - 1) * opts.PerPage,
 		}
+		if opts.Cursor != "" {
+			sl["cursor"] = opts.Cursor // #874
+		}
+		dict["slice"] = sl
 	}
 
 	// #487: the base dict is the request extras (client-chosen keys and
@@ -357,16 +384,74 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 // pre-sized slot (no lock needed — same property the inline code relied on).
 // Exercised under -race by TestResolve_IteratorErrorCollection_Race.
 func (r *resolveRun) recordItemError(mu *sync.Mutex, itemErrs []error, id string, i int, errKey string, accumVal any, bumpMsg string, itemErr error) {
+	r.recordItemErrorAs(stageReasonOf(accumVal), mu, itemErrs, id, i, errKey, accumVal, bumpMsg, itemErr)
+}
+
+// recordItemErrorAs is recordItemError with the stage outcome's reason named by
+// the caller instead of read from accumVal: a refusal snowplow decided whose
+// errorKey value is plain text (background_write.go, #1288 WriteRefused).
+func (r *resolveRun) recordItemErrorAs(reason string, mu *sync.Mutex, itemErrs []error, id string, i int, errKey string, accumVal any, bumpMsg string, itemErr error) {
 	mu.Lock()
 	accumulateErrorKey(r.dict, errKey, accumVal)
 	mu.Unlock()
+	r.taintNarrow() // #603 PR-2 — an errored resolve narrows nothing
 	r.stageErrSink.Bump(id, bumpMsg)
-	r.outcomes.fail(id, stageReasonOf(accumVal))
+	r.outcomes.fail(id, reason)
 	if itemErr != nil {
 		// #709 — keep the status this item recorded, so a resolve whose
 		// RESTAction filter cannot produce a value reports it (stage_failure.go).
 		itemErrs[i] = newStageItemFailure(id, accumVal, itemErr)
 	}
+}
+
+// recordRBACDeny records a per-identity deny snowplow decided from RBAC (a
+// *regateDeniedError: branch C's re-gate, or a LIST served from snowplow's own
+// copy that the requester may not make, #961) exactly as the apiserver's own
+// 403 on the requester's dial is recorded (#681 F2, resolve.go's branch E): the
+// ONE identity-free canonical body under errorKey (so the stage outcome reads
+// Forbidden and continueOnError behaves the same), the same item error, and a
+// bump of the per-identity forbidden sink at the same site, for the same item,
+// as the stage-error bump. external is false: nothing was dialed.
+func (r *resolveRun) recordRBACDeny(dictMu *sync.Mutex, itemErrs []error, id string, i int, call httpcall.RequestOptions, deny error) {
+	msg := deny.Error()
+	var itemErr error
+	if !call.ContinueOnError {
+		itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, deny)
+	}
+	r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, canonicalForbiddenBody(msg), msg, itemErr)
+	notePerIdentityForbidden(r.ctx, false)
+}
+
+// recordDefiniteNotFound records a #1080 definite NotFound decided at branch C
+// (N2): the canonical identity-free NotFound body under errorKey, the item
+// error a stage without continueOnError would carry (never, by the classifier),
+// and a bump of the per-identity definite-answer sink at the same site, for the
+// same item, as the stage-error bump. Not external: branch C's SA dial is not an
+// external touch.
+func (r *resolveRun) recordDefiniteNotFound(dictMu *sync.Mutex, itemErrs []error, id string, i int, call httpcall.RequestOptions, msg string) {
+	var itemErr error
+	if !call.ContinueOnError {
+		itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, msg)
+	}
+	// #1319 — its own closed code (NotFoundForRequester, a denial for the
+	// client), not the NotFound a plain 404 reads: the errorKey body is the
+	// same canonical 404 Status.
+	r.recordItemErrorAs(StageReasonNotFoundForRequester, dictMu, itemErrs, id, i, call.ErrorKey, canonicalNotFoundBody(msg), msg, itemErr)
+	notePerIdentityForbidden(r.ctx, false)
+}
+
+// recordServedListDeny is recordRBACDeny for a LIST served from the informer or
+// the api-stage content cell (dispatch names which), with the failure line an
+// expected per-identity deny logs (#711: WARN once per cell generation, DEBUG
+// after).
+func (r *resolveRun) recordServedListDeny(dictMu *sync.Mutex, itemErrs []error, id string, i int, call httpcall.RequestOptions, deny error, dispatch string) {
+	r.log.Log(r.ctx, expectedDenyLevel(r.ctx, stageFailureTarget(id, call.Path)), "api call response failure", slog.String("name", id),
+		slog.String("restaction_namespace", r.opts.RESTActionNamespace),
+		slog.String("restaction_name", r.opts.RESTActionName),
+		redact.PathAttr("path", call.Path),
+		slog.String("dispatch", dispatch),
+		slog.String("error", deny.Error()))
+	r.recordRBACDeny(dictMu, itemErrs, id, i, call, deny)
 }
 
 // stageAction encodes what the per-stage endpoint resolution tells the
@@ -403,25 +488,32 @@ const (
 // endpointRef carrying a third party's OWN credential. runStage marks the
 // dispatch ctx with credhttp.WithHeldCredential on it, and the dial site then
 // builds a client that never follows a redirect. Provenance, never shape.
+//
+// The stage's endpointRef is r.stageRef: rendered and passed through the #1025
+// rule by refuseStageEndpointRef, which runStage runs for every stage before
+// the plan; runStage reaches this function only when the plan has a request
+// (#1477). TestRev1032_ResolveOneOnlyBehindRefusePerUserRef keeps both true.
 func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, bool, bool, stageAction) {
+	ref := r.stageRef
 	if uafActive && r.opts.Provenance == ProvenanceCallerSupplied {
 		// #443 part 2 — an inline (caller-vouched) draft's UAF stage dials the
 		// CALLER's own clientconfig, never the ServiceAccount: isSA=false, so
 		// the SA-dial mark never fires. The refilter still runs unchanged. A
 		// path the caller cannot list is then the apiserver's 403 stage error.
-		resolved, isSA, err := r.mapper.resolveOne(r.ctx, nil, false)
+		resolved, isSA, err := r.mapper.resolveOne(r.ctx, nil)
 		if err != nil {
-			r.log.Error("userAccessFilter (caller-supplied): unable to resolve the caller's endpoint",
+			r.auditEndpointUnresolved(apiCall, nil, err)
+			r.log.ErrorContext(r.ctx, "userAccessFilter (caller-supplied): unable to resolve the caller's endpoint",
 				slog.String("name", id), slog.Any("error", err))
 			return endpoints.Endpoint{}, false, false, stageReturn
 		}
 		// nil ref: the caller's own clientconfig, which snowplow holds.
-		return resolved, isSA, true, stageProceed
+		return resolved, isSA, stageHoldsCredential(uafActive, ref), stageProceed
 	}
 	if uafActive {
 		saEP, saErr := serviceAccountEndpointFn()
 		if saErr != nil {
-			r.log.Error("userAccessFilter: cannot acquire ServiceAccount endpoint; falling through to per-user dispatch (degraded mode)",
+			r.log.ErrorContext(r.ctx, "userAccessFilter: cannot acquire ServiceAccount endpoint; falling through to per-user dispatch (degraded mode)",
 				slog.String("name", id), slog.Any("err", saErr))
 			// Fail-closed-but-respond: per Revision 5 atomic
 			// ship there is no toggle to fall back to the
@@ -432,43 +524,93 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 			// #760 — that empty is a stage FAILURE (typically a transient
 			// token-file read), not "no resources": the sink bump every L1 Put
 			// gate declines on. A fixed class, never the acquire error's text.
-			// (No stage outcome: outcomes are recorded only for a
-			// caller-supplied resolve, whose UAF stage dials the caller's
-			// endpoint above and never reaches this branch.)
+			// #904 — and the stage FAILED: a write stage depending on it is
+			// not sent. (A caller-supplied resolve's UAF stage dials the
+			// caller's endpoint above and never reaches this branch.)
+			r.taintNarrow() // #603 PR-2 — a failed stage narrows nothing
 			r.stageErrSink.Bump(id, uafSAEndpointUnavailableMsg)
+			r.outcomes.fail(id, StageReasonError)
 			return endpoints.Endpoint{}, false, false, stageContinue
 		}
 		// The UAF stage dials the SA endpoint → isSAEndpoint=true (provenance): the
 		// dial site threads the SA token FILE (#267).
-		return *saEP, true, true, stageProceed
+		return *saEP, true, stageHoldsCredential(uafActive, ref), stageProceed
 	}
-	// #113 — template endpointRef.name through the SAME jq/extras evaluator that
-	// already renders this stage's path/payload/headers (evalJQ over r.dict, the
-	// exact ds createRequestOptions is handed at :405), so `.name` resolves
-	// identically to how `path` resolves it. ONLY the templated (MaybeQuery-shaped)
-	// named-ref path is touched; a nil ref (internal/clientconfig synthesis) and a
-	// literal ref pass through byte-identically (§1.3, guardrail (a): namespace
-	// stays literal, never templated). Returns templated=true so resolveOne applies
-	// the guardrail (b) defense-in-depth layer.
-	ref, templated, guardErr := r.evalEndpointRef(apiCall.EndpointRef)
-	if guardErr != nil {
-		// Guardrail (b) refusal at the eval site (fail-fast, before any Secret
-		// lookup): a templated name resolved to the reserved `-clientconfig`
-		// internal-identity class. Same truncating posture as any endpoint-resolve
-		// failure (R-2 stageReturn) — the Secret is never dialed.
-		r.log.Error("templated endpoint reference refused",
-			slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", guardErr))
-		return endpoints.Endpoint{}, false, false, stageReturn
-	}
-	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref, templated)
+	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref)
 	if err != nil {
-		r.log.Error("unable to resolve api endpoint reference",
+		r.auditEndpointUnresolved(apiCall, ref, err)
+		// #1476 — an unchanged failure of the same ref in this cell's
+		// generation logs once at ERROR, then DEBUG (failure_log.go).
+		r.log.Log(r.ctx, FailureLogLevel(r.ctx, slog.LevelError, endpointRefTarget(id, ref), FailureClassOf(err)),
+			"unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
+		// #1115 — the endpointRef Secret read is a network exchange of this
+		// request: if the page budget ended it, the stage outcome reads
+		// Timeout (the truncating exit's Error ranks below it).
+		if be := (*pagebudget.ExhaustedError)(nil); errors.As(err, &be) {
+			r.outcomes.fail(id, StageReasonTimeout)
+		}
 		return endpoints.Endpoint{}, false, false, stageReturn
 	}
 	// A nil ref resolved to the ctx-carried SA endpoint (isSA) or the per-user
-	// clientconfig: both are held. A named ref carries its own credential.
-	return resolved, isSA, isSA || ref == nil, stageProceed
+	// clientconfig: both are held. A named ref carries its own credential
+	// (resolveOne reports isSA only for a nil ref).
+	return resolved, isSA, stageHoldsCredential(uafActive, ref), stageProceed
+}
+
+// stageHoldsCredential is whether a stage's endpoint presents a credential
+// snowplow holds (#723/#724), decided from the stage's SHAPE so it is known
+// before the endpoint is resolved (#1477: the plan needs it, and the endpoint
+// is resolved only when the plan has a request). A userAccessFilter stage dials
+// the ServiceAccount, or for a caller-supplied draft the caller's own
+// clientconfig: held. Otherwise a nil endpointRef dials the ctx-carried
+// ServiceAccount endpoint or the caller's own clientconfig: held. A named
+// endpointRef carries a third party's own credential: not held (resolveOne
+// never reports a named ref as the ServiceAccount, and #1025 refuses one that
+// names a per-user credential). ref is the stage's endpointRef, rendered or
+// not: rendering never turns a nil ref into a named one or back.
+func stageHoldsCredential(uafActive bool, ref *templates.Reference) bool {
+	return uafActive || ref == nil
+}
+
+// refuseStageEndpointRef renders the stage's endpointRef into r.stageRef and
+// applies the #1025 rule to it; it reports whether the stage was refused.
+// runStage calls it for EVERY stage, before the plan (#1477 review B1), so the
+// rule is decided whatever the data, like refuseUAFOnNonReadVerb: a stage whose
+// iterator yields nothing is refused all the same. It reads and dials nothing:
+// the render is jq over r.dict, the rule a name check.
+//
+// #113 — the endpointRef.name is templated through the SAME jq/extras evaluator
+// that already renders this stage's path/payload/headers (evalJQ over r.dict),
+// so `.name` resolves identically to how `path` resolves it. ONLY the templated
+// (MaybeQuery-shaped) named-ref path is touched; a nil ref (internal/clientconfig
+// synthesis) and a literal ref pass through byte-identically (§1.3, guardrail
+// (a): namespace stays literal, never templated).
+//
+// #1025 — every stage passes here before it branches on userAccessFilter, so
+// the one rule covers every stage: a named ref to a per-user credential Secret
+// is refused for every provenance, literal or templated, UAF or not (a UAF
+// stage ignores its endpointRef, but naming one is still refused). Same
+// truncating posture as any endpoint-resolve failure (R-2 stageReturn); nothing
+// was read or dialed. The Secret name embeds a username, so it is not logged,
+// in clear or as a label (#1192).
+func (r *resolveRun) refuseStageEndpointRef(id string, apiCall *templates.API) (refused bool) {
+	ref, templated := r.evalEndpointRef(apiCall.EndpointRef)
+	r.stageRef = ref
+	if err := r.mapper.refusePerUserRef(ref); err != nil {
+		// audit#22 (a) — denied, per_user_credential_ref. The record never
+		// carries the reference: its name embeds a username. With no
+		// endpoint resolved, it names no target (marked target).
+		r.auditStageRefusal(r.ctx, stageRefusal{apiCall: apiCall,
+			outcome: audit.OutcomeDenied, reason: audit.DenialPerUserCredentialRef})
+		r.log.ErrorContext(r.ctx, "endpointRef refused: it names a per-user credential Secret",
+			slog.String("name", id),
+			slog.String("provenance", provenanceLabel(r.opts.Provenance)),
+			slog.Bool("templated", templated),
+			slog.String("namespace", ref.Namespace))
+		return true
+	}
+	return false
 }
 
 // evalEndpointRef renders a templated endpointRef.name (#113). For a nil ref or
@@ -477,22 +619,25 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 // refs are untouched). For a MaybeQuery-shaped name it evaluates the name through
 // evalJQ against r.dict (the SAME per-stage dict path/payload/headers see, so
 // `.name` resolves identically), RFC1123-sanitizes the result, applies guardrail
-// (a) (namespace stays the author-literal — NEVER templated) and guardrail (b)
-// (a resolved `-clientconfig` name is REFUSED here, fail-fast, so the Secret
-// lookup never fires), and returns templated=true so resolveOne applies its
-// defense-in-depth reserved-suffix refusal too. A jq error keeps the §1.2
-// honest-error posture — the error string is still sanitized to a name that
-// resolves to a Secret miss downstream, byte-identical to pre-#341 — but #341
-// now also SURFACES it (a DEBUG line + snowplow_nondial_jq_error_total) instead
-// of swallowing it silently; not a new error class.
-func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Reference, bool, error) {
+// (a) (namespace stays the author-literal — NEVER templated) and returns
+// templated=true. Guardrail (b) — a name that resolves to a per-user credential
+// Secret — is not applied here: since #1025 resolveStageEndpoint applies the
+// one rule (refusePerUserRef) to every ref, templated or literal, on the
+// normalised name this returns, before any lookup. A jq
+// error keeps the §1.2 honest-error posture — the error string is still
+// sanitized to a name that resolves to a Secret miss downstream, byte-identical
+// to pre-#341 — but #341 now also SURFACES it (a DEBUG line +
+// snowplow_nondial_jq_error_total) instead of swallowing it silently; not a new
+// error class.
+func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Reference, bool) {
 	if ref == nil {
-		return ref, false, nil
+		return ref, false
 	}
 	if _, isTemplate := jqutil.MaybeQuery(ref.Name); !isTemplate {
-		// Static/literal name (incl a literal `-clientconfig` internal ref, which
-		// is the author's own business): pass through, NOT templated, NOT gated.
-		return ref, false, nil
+		// Static/literal name: passed through, NOT templated. The caller
+		// (resolveStageEndpoint) still applies the #1025 per-user credential
+		// rule to it.
+		return ref, false
 	}
 	// #341 — NON-dial evalJQ-swallow cleanup (#302 sibling). Render through
 	// evalJQE and SURFACE a jq error (a DEBUG line + the per-site
@@ -510,32 +655,27 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 		)
 		rendered = jqErr.Error() // byte-identical to evalJQ's pre-#341 swallow value
 	}
+	// Normalised BEFORE the caller applies the #1025 rule, so the rule
+	// checks the name that is looked up.
 	name := kubeutil.MakeDNS1123Compatible(rendered)
-	// Guardrail (b), layer 1 (fail-fast): a request-templated name may never
-	// resolve to the reserved `<user>-clientconfig` internal-identity class.
-	if strings.HasSuffix(name, clientConfigSuffix) {
-		return nil, true, fmt.Errorf(
-			"templated endpointRef.name %q resolved to %q, which carries the reserved internal-identity suffix %q; refusing at the template-eval site (#113 guardrail b) — user query-extras may not select a per-user credential Secret",
-			ref.Name, name, clientConfigSuffix)
-	}
 	// Guardrail (a): namespace is NEVER templated in V1 — it stays the
 	// author-authored literal, so a templated name can only ever select WITHIN
 	// the namespace the RA author already chose (the credential-store trust
-	// boundary). templated=true so resolveOne applies guardrail (b) again (§2
-	// two-layer defense).
-	return &templates.Reference{Name: name, Namespace: ref.Namespace}, true, nil
+	// boundary).
+	return &templates.Reference{Name: name, Namespace: ref.Namespace}, true
 }
 
-// collapseOrFanoutPlan builds the per-stage RequestOptions slice (the call
-// plan). It replaces the inline P5f+P5g+P5h block verbatim: createRequestOptions
-// (empty → the "empty request options" Warn + an empty return, which the
-// orchestrator treats as C-3), then the Ship D.5 cluster-list collapse
-// (rebinding tmp + setting the st timing fields), then the 0.30.92 lazy
-// informer register. st is the per-stage timing struct (a loop-local value,
-// passed by pointer) — its ClusterList* fields are written here exactly as
-// before. Returns tmp (possibly empty for C-3).
-func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep endpoints.Endpoint, st *cache.PIPStageTiming) []httpcall.RequestOptions {
-	tmp, iterErr := createRequestOptionsChecked(r.ctx, r.log, apiCall, r.dict)
+// planStage is the first half of the stage's plan (#1477), run BEFORE the
+// stage's endpoint is resolved: the per-call elements (stagePlanElements). It
+// returns ok=false, with the stage's outcome already recorded, when the plan
+// has no request: an iterator that failed (#638, a stage error), or one that
+// yielded nothing (C-3, the empty plan). Neither reads the endpointRef Secret,
+// the ServiceAccount token or the caller's clientconfig, and neither logs above
+// DEBUG beyond the iterator's own error. planCtx carries the stage's held-
+// credential provenance (stageHoldsCredential), which is all planning needs of
+// the endpoint.
+func (r *resolveRun) planStage(planCtx context.Context, id string, apiCall *templates.API) (elems []any, ok bool) {
+	elems, iterErr := stagePlanElements(r.ctx, r.log, apiCall, r.dict)
 	if iterErr != nil {
 		// #638 — a non-benign iterator compile/eval error FAILS the stage. It
 		// used to be logged only: the stage ran a partial-or-empty plan and the
@@ -547,48 +687,79 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 		// Runs on the stage-loop goroutine before any worker exists, so dict
 		// needs no lock.
 		msg := iterErr.Error()
-		r.log.Error("stage iterator failed; stage not dispatched",
+		r.log.ErrorContext(planCtx, "stage iterator failed; stage not dispatched",
 			slog.String("name", id),
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 			slog.String("restaction_name", r.opts.RESTActionName))
 		accumulateErrorKey(r.dict, ptr.Deref(apiCall.ErrorKey, "error"), msg)
+		r.taintNarrow() // #603 PR-2
 		r.stageErrSink.Bump(id, msg)
 		r.outcomes.fail(id, StageReasonError)
-		return nil
+		return nil, false
 	}
-	if len(tmp) == 0 {
-		// C-3 (a normal "continue" condition): an iterator stage evaluated to
-		// zero items, so there is nothing to call. Benign and per-resolve —
-		// DEBUG, not the WARN that dominates the healthy-cluster firehose.
-		//
-		// #279 C3 empty-fan fix: with zero request options the per-item edge-3
-		// recorder below (the `for i := range tmp` loop) never runs, so the
-		// fanned GVR's (gvr, ns, "*") LIST edge is never recorded and a later CR
-		// ADD of that GVR dirty-marks nothing → stale-negative. The target GVR is
-		// STATIC in the path template even with 0 items, so record the LIST edge
-		// from the skeleton here. ParseAPIServerListDepSkeleton returns ok=false
-		// on a templated version/resource → we skip and leave that residual to
-		// the #285 seed re-walk fence. Same guards as the edge-3 loop (L1 key
-		// present, cache on, GET) + nil-safe cache.Global() per the #277
-		// ensureInformer seam. Scope: cures the own-GVR list-then-get-each fan; a
-		// cross-GVR iterator's invalidation is the source stage's own LIST edge.
-		if l1Key := cache.L1KeyFromContext(r.ctx); l1Key != "" && !cache.Disabled() &&
-			ptr.Deref(apiCall.Verb, http.MethodGet) == http.MethodGet {
-			if gvr, ns, ok := cache.ParseAPIServerListDepSkeleton(apiCall.Path); ok {
-				cache.Deps().RecordList(r.ctx, l1Key, gvr, ns)
-				if rw := cache.Global(); rw != nil {
-					rw.EnsureResourceTypeFor(r.ctx, gvr)
-				}
-				r.log.Debug("dep.recorded",
-					slog.String("subsystem", "cache"),
-					slog.String("edge_type", "emptyFanSkeleton"),
-					slog.String("gvr", gvr.String()),
-					slog.String("ns", ns),
-					slog.String("l1_key", l1Key),
-				)
+	if len(elems) == 0 {
+		r.emptyPlan(id, apiCall)
+		return nil, false
+	}
+	return elems, true
+}
+
+// emptyPlan is C-3 (a normal "continue" condition): a stage whose plan has no
+// request to send — an iterator that evaluated to zero items (planStage), or
+// one whose every item a guard refused (collapseOrFanoutPlan, after
+// failRefusedItems recorded each refusal). Benign and per-resolve — DEBUG, not
+// the WARN that dominates the healthy-cluster firehose. The stage's dict[id]
+// stays unset.
+func (r *resolveRun) emptyPlan(id string, apiCall *templates.API) {
+	// #279 C3 empty-fan fix: with zero request options the per-item edge-3
+	// recorder below (the `for i := range tmp` loop) never runs, so the
+	// fanned GVR's (gvr, ns, "*") LIST edge is never recorded and a later CR
+	// ADD of that GVR dirty-marks nothing → stale-negative. The target GVR is
+	// STATIC in the path template even with 0 items, so record the LIST edge
+	// from the skeleton here. ParseAPIServerListDepSkeleton returns ok=false
+	// on a templated version/resource → we skip and leave that residual to
+	// the #285 seed re-walk fence. Same guards as the edge-3 loop (L1 key
+	// present, cache on, GET) + nil-safe cache.Global() per the #277
+	// ensureInformer seam. Scope: cures the own-GVR list-then-get-each fan; a
+	// cross-GVR iterator's invalidation is the source stage's own LIST edge.
+	if l1Key := cache.L1KeyFromContext(r.ctx); l1Key != "" && !cache.Disabled() &&
+		ptr.Deref(apiCall.Verb, http.MethodGet) == http.MethodGet {
+		if gvr, ns, ok := cache.ParseAPIServerListDepSkeleton(apiCall.Path); ok {
+			// #603 PR-2 — no call serves this edge, so it widens at commit.
+			r.recordListEdge(id, l1Key, gvr, ns)
+			if rw := cache.Global(); rw != nil {
+				rw.EnsureResourceTypeFor(r.ctx, gvr)
 			}
+			r.log.Debug("dep.recorded",
+				slog.String("subsystem", "cache"),
+				slog.String("edge_type", "emptyFanSkeleton"),
+				slog.String("gvr", gvr.String()),
+				slog.String("ns", ns),
+				slog.String("l1_key", l1Key),
+			)
 		}
-		r.log.Debug("empty request options for http call", slog.Any("name", id))
+	}
+	r.log.Debug("empty request options for http call", slog.Any("name", id))
+}
+
+// collapseOrFanoutPlan builds the per-stage RequestOptions slice (the call
+// plan) from the elements planStage planned, once the stage's endpoint is
+// resolved. It replaces the inline P5f+P5g+P5h block verbatim: the request
+// options are rendered (renderRequestOptions; none valid → emptyPlan + an empty
+// return, which the orchestrator treats as C-3), then the Ship D.5
+// cluster-list collapse (rebinding tmp + setting the st timing fields), then
+// the 0.30.92 lazy informer register. st is the per-stage timing struct (a
+// loop-local value, passed by pointer) — its ClusterList* fields are written
+// here exactly as before. Returns tmp (possibly empty for C-3).
+func (r *resolveRun) collapseOrFanoutPlan(provCtx context.Context, id string, apiCall *templates.API, ep endpoints.Endpoint, elems []any, st *cache.PIPStageTiming) []httpcall.RequestOptions {
+	// #1112 D2 — the #288 shape guard judges the path only when the stage dials
+	// this cluster's apiserver (the provenance runStage marked on provCtx); a
+	// write item any guard refuses is a stage failure with its reason, never a
+	// silent success (undialled_write.go).
+	tmp, skips := renderRequestOptions(r.log, apiCall, elems, targetsOwnCluster(provCtx))
+	r.failRefusedItems(id, apiCall, &ep, skips)
+	if len(tmp) == 0 {
+		r.emptyPlan(id, apiCall)
 		return tmp
 	}
 
@@ -621,7 +792,7 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 	// gate-attempt signal is gone with the field.
 	st.ClusterListAttempted = true
 	if newTmp, useClusterList, denyGate := attemptClusterListCollapse(
-		r.ctx, r.log, apiCall, r.dict, ep, r.apistageStore, r.apistageEnabled); useClusterList {
+		provCtx, r.log, apiCall, r.dict, ep, r.apistageStore, r.apistageEnabled); useClusterList {
 		tmp = newTmp
 		st.ClusterListUsed = true
 		st.ClusterListDenyGate = denyGate // 0 on success
@@ -653,7 +824,13 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 	// Timing instrumentation: if EnsureResourceType ever blocks
 	// longer than lazyRegisterSlowThreshold we emit a WARN so the
 	// 0.30.92 first-read-latency follow-up has a falsifier.
-	lazyRegisterInnerCallPaths(r.ctx, r.log, tmp)
+	//
+	// #1017 — only for a stage that targets this cluster: a named endpointRef's
+	// paths name another endpoint's resources, so registering (and discovering,
+	// with the ServiceAccount) them on THIS cluster is neither needed nor sound.
+	if targetsOwnCluster(provCtx) {
+		lazyRegisterInnerCallPaths(r.ctx, r.log, tmp)
+	}
 	return tmp
 }
 
@@ -678,6 +855,13 @@ type stageCtx struct {
 	wireVerbose bool
 	ep          endpoints.Endpoint
 	calls       []httpcall.RequestOptions
+	// thirdPartyDial: this stage's dial carries nothing of the requester, so a
+	// touch of it may qualify for the external-TTL opt-in (#1221, runStage).
+	thirdPartyDial bool
+	// sent counts the items that reached the send (branch E, the one place a
+	// write leaves snowplow). #1112 D2: a write stage that sent fewer than it
+	// planned and recorded no failure fails with NotSent (failUnsentWrites).
+	sent atomic.Int64
 }
 
 // dispatchOneCall is one iterator item's worker — the body the stage loop
@@ -718,7 +902,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// stage is NOT executed. It gets an explicit per-stage error and returns
 	// before any egress (no informer, no internal rest config, no discovery,
 	// no external fetch), so a draft can never mutate anything.
-	if verb := ptr.Deref(call.Verb, http.MethodGet); cache.Inert(gctx) && verb != http.MethodGet {
+	// #903 F7 — the one write classifier (isWriteVerb / isSafeMethod).
+	if verb := ptr.Deref(call.Verb, http.MethodGet); cache.Inert(gctx) && isWriteVerb(call.Verb) {
 		// Stable contract (#443): reason "StageNotExecuted" is the machine
 		// field; the message keeps its stable prefix/suffix.
 		msg := fmt.Sprintf("dry-run: stage %q verb %s is not executed", id, verb)
@@ -728,6 +913,17 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		}
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey,
 			map[string]any{"reason": StageReasonNotExecuted, "message": msg}, msg, itemErr)
+		// audit#22 (a) — denied, dry_run_not_executed: what the item would
+		// have written, as far as it was built.
+		r.auditStageRefusal(gctx, stageRefusal{apiCall: sc.apiCall, method: verb, path: call.Path,
+			ep: &sc.ep, ref: stageEndpointRef(gctx),
+			outcome: audit.OutcomeDenied, reason: audit.DenialDryRunNotExecuted})
+		return nil
+	}
+	// #903 — background work never writes: a write stage is sent only on a
+	// customer's own request, whatever credential it uses (background_write.go).
+	// Before any egress, like the dry-run refusal above.
+	if r.refuseBackgroundWrite(gctx, sc, i) {
 		return nil
 	}
 	// Ship 0.30.121 R1-a — per-call verbose decision. `sc.ep` is shared
@@ -770,6 +966,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// resourcesFrom returned [] → 0-count regression on the
 	// multi-stage compositions-list RA.
 	listGVR, listOK := k8sListGVR(call.Path)
+	servedGVR, _, _, servedOK := cache.ParseAPIServerPathToDep(call.Path)
 	hOpts := jsonHandlerOptions{
 		key:         id,
 		out:         dict,
@@ -789,12 +986,17 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// SubjectAccessReview) answers with an object, not a list envelope.
 		k8sList: ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet && listOK,
 		listGVR: listGVR,
+		// #1124 — the resource the response's items are objects of: the
+		// userAccessFilter refilter checks such an object on its own resource.
+		served:   servedGVR.GroupResource(),
+		servedOK: servedOK,
 		// #651 — a served-but-failed stage (an unresolved userAccessFilter
 		// resource set) takes the same sink bump + Error outcome as every other
 		// stage failure (recordItemError), against THIS resolve's own stage:
-		// r.outcomes is nil for a nested stored resolve, so it never marks a
-		// caller's stage by name.
+		// a nested resolve records into its own private outcomes
+		// (claimStageOutcomes), so it never marks a caller's stage by name.
 		stageFailed: func(msg string) {
+			r.taintNarrow() // #603 PR-2 — a served-but-failed stage narrows nothing
 			r.stageErrSink.Bump(id, msg)
 			r.outcomes.fail(id, StageReasonError)
 		},
@@ -823,7 +1025,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 
 	r.log.Debug("calling api", slog.String("name", id),
 		slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-		slog.String("path", call.Path),
+		redact.PathAttr("path", call.Path),
 	)
 
 	// RETIRED (2026-06-22 unified ship): the /call?resource=...&apiVersion=...
@@ -872,16 +1074,16 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	feedRawOrResolved := func(raw []byte, dispatch string) string {
 		substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve)
 		if rerr != nil {
-			r.log.Error("in-process resolve failed",
+			r.log.ErrorContext(gctx, "in-process resolve failed",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch+"-resolve"),
 				slog.String("error", rerr.Error()))
 			var itemErr error
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 			return dispatch + "-resolve-error"
 		}
 		bytesToFeed := raw
@@ -890,9 +1092,9 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			dispatch += "-resolved"
 		}
 		if ferr := feedBytes(bytesToFeed); ferr != nil {
-			r.log.Error("response handler failed",
+			r.log.ErrorContext(gctx, "response handler failed",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", ferr.Error()))
 			var itemErr error
@@ -941,27 +1143,37 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// step 2 — no cross-user leak, the hit path is gated too.
 	// Flag-off (apistageEnabled false) this is byte-identical
 	// to the 0.30.118 pivot path.
-	if resolverUseInformer() {
+	//
+	// #1017 — only for a stage that targets this cluster (targetsOwnCluster):
+	// the cells and informers hold THIS cluster's objects, and a named
+	// endpointRef may name another one.
+	if resolverUseInformer() && targetsOwnCluster(gctx) {
 		if r.apistageEnabled {
 			// #443 part 2 — a caller-supplied UAF stage is dispatched as the
 			// caller (non-UAF gating: the requester's own RBAC narrows the
 			// content), and the UAF refilter still runs downstream. Only a
 			// STORED UAF stage is served un-narrowed for the refilter alone.
 			uafContent := apiCall.UserAccessFilter != nil && r.opts.Provenance != ProvenanceCallerSupplied
-			gatedVal, served, ok, cerr := apistageContentServe(gctx, r.apistageStore, call, uafContent)
+			gatedVal, served, ok, fallCtx, cerr := apistageContentServe(gctx, r.apistageStore, call, uafContent)
+			if isRegateDenied(cerr) {
+				// #961 — the requester may not make this LIST: the same answer,
+				// through the same recording, as the apiserver's 403.
+				r.recordServedListDeny(dictMu, itemErrs, id, i, call, cerr, "apistage-content")
+				return nil
+			}
 			if cerr != nil {
 				// #710 PR-2a (D1) — the call's content fill was not admitted under
 				// the memory ceiling before its deadline: an honest per-item stage
 				// error, never a fall-through that would rebuild the refused list.
-				r.log.Error("apistage content fill not admitted",
+				r.log.ErrorContext(fallCtx, "apistage content fill not admitted",
 					slog.String("name", id),
-					slog.String("path", call.Path),
+					redact.PathAttr("path", call.Path),
 					slog.String("error", cerr.Error()))
 				var itemErr error
 				if !call.ContinueOnError {
 					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, cerr)
 				}
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, cerr.Error(), cerr.Error(), itemErr)
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(cerr), cerr.Error(), itemErr)
 				return nil
 			}
 			if ok {
@@ -992,16 +1204,16 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 					dispatch := "apistage-content"
 					substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve)
 					if rerr != nil {
-						r.log.Error("in-process resolve failed",
+						r.log.ErrorContext(fallCtx, "in-process resolve failed",
 							slog.String("name", id),
-							slog.String("path", call.Path),
+							redact.PathAttr("path", call.Path),
 							slog.String("dispatch", "apistage-content-resolve"),
 							slog.String("error", rerr.Error()))
 						var itemErr error
 						if !call.ContinueOnError {
 							itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 						}
-						r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+						r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 						dispatch = "apistage-content-resolve-error"
 					} else {
 						var ferr error
@@ -1010,11 +1222,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 							dispatch = "apistage-content-resolved"
 						} else {
 							ferr = feedValue(gatedVal)
+							if ferr == nil {
+								// #603 PR-2 — informer-filled content, fed clean.
+								r.noteNarrowServed(id, call.Path)
+							}
 						}
 						if ferr != nil {
-							r.log.Error("apistage-content response handler failed",
+							r.log.ErrorContext(fallCtx, "apistage-content response handler failed",
 								slog.String("name", id),
-								slog.String("path", call.Path),
+								redact.PathAttr("path", call.Path),
 								slog.String("dispatch", dispatch),
 								slog.String("error", ferr.Error()))
 							var itemErr error
@@ -1029,7 +1245,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 					r.log.Debug("api successfully resolved",
 						slog.String("name", id),
 						slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-						slog.String("path", call.Path),
+						redact.PathAttr("path", call.Path),
 						slog.Int("depth", depth),
 						slog.String("dispatch", dispatch),
 					)
@@ -1042,7 +1258,18 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// ok=false — the content layer could not serve this
 			// call (not pivot-servable: write verb, external URL,
 			// metadata-only GVR, pre-sync). Fall through.
-		} else if raw, served := dispatchViaInformer(gctx, call); served {
+			//
+			// #988 — with the reason the content layer decided, so the
+			// apiserver LIST below is labelled with it on
+			// snowplow_resolve_collection_lists. gctx is this item's
+			// own (dispatchOneCall's local), never a peer's.
+			gctx = fallCtx
+		} else if raw, served, fallCtx, denied := dispatchViaInformer(gctx, call); denied != nil {
+			// #961 — the requester may not make this LIST: the same answer,
+			// through the same recording, as the apiserver's 403.
+			r.recordServedListDeny(dictMu, itemErrs, id, i, call, denied, "informer")
+			return nil
+		} else if served {
 			// Informer-served bytes are in memory — feed direct
 			// (Ship 0.30.128 P-CORE-1 — no io.ReadAll copy). For a
 			// resolve:true direct-path RA/widget GET, feedRawOrResolved
@@ -1051,16 +1278,22 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// recordItemError (no truncation — #313 C-A); the returned
 			// dispatch label captures whether the in-process resolve fired.
 			dispatch := feedRawOrResolved(raw, "informer")
+			if dispatch == "informer" {
+				// #603 PR-2 — informer-served and fed (a feed error taints the run).
+				r.noteNarrowServed(id, call.Path)
+			}
 			// Ship #6 — see depthForLog (support.go).
 			depth := depthForLog(r.ctx, r.log, dictMu, dict)
 			r.log.Debug("api successfully resolved",
 				slog.String("name", id),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.Int("depth", depth),
 				slog.String("dispatch", dispatch),
 			)
 			return nil
+		} else {
+			gctx = fallCtx // #988 — the pivot's fall-through reason (see above)
 		}
 	}
 
@@ -1104,18 +1337,38 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if raw, served, ierr := dispatchViaInternalRESTConfig(gctx, call); served || ierr != nil {
 		dispatch := "internal-rest-config"
 		if ierr != nil {
-			// #711 — an expected per-identity re-gate deny (classified by its
-			// type) logs at WARN once per cell generation, DEBUG after; every
-			// other failure stays at ERROR. predial_total{denied} counts each.
-			failLevel := slog.LevelError
-			if isRegateDenied(ierr) {
-				failLevel = expectedDenyLevel(r.ctx, call.Path)
+			// #1481 — a client-go transport error quotes the request's URL,
+			// query included (a *url.Error), and it is logged and recorded
+			// below. redact.ErrorURL keeps the chain (a StatusError, a deny).
+			ierr = redact.ErrorURL(ierr)
+			// #1476 — classify BEFORE logging, so the line's level is the
+			// class's: an expected per-identity re-gate deny (#711) logs at
+			// WARN, an authorized definite NotFound (#1080 N2, which requires
+			// continueOnError: the stage declared the outcome) at DEBUG, any
+			// other failure at ERROR; a failure unchanged since the cell's
+			// previous round at DEBUG (failure_log.go). Every occurrence is
+			// still counted where it is recorded below (predial_total{denied},
+			// the stage-error and per-identity sinks).
+			regateDenied := isRegateDenied(ierr)
+			var definiteNF string
+			var isDefiniteNF bool
+			if !regateDenied {
+				definiteNF, isDefiniteNF = classifyAuthorizedNotFound(call, ierr)
+			}
+			var failLevel slog.Level
+			switch {
+			case regateDenied:
+				failLevel = expectedDenyLevel(r.ctx, stageFailureTarget(id, call.Path))
+			case isDefiniteNF:
+				failLevel = slog.LevelDebug
+			default:
+				failLevel = FailureLogLevel(r.ctx, slog.LevelError, stageFailureTarget(id, call.Path), FailureClassOf(ierr))
 			}
 			r.log.Log(r.ctx, failLevel, "api call response failure", slog.String("name", id),
 				slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 				slog.String("restaction_name", r.opts.RESTActionName),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", "internal-rest-config"),
 				// diagnostic for #271 — self-name the SAR-401 root cause. sa_dial
 				// reads the SAME provenance marker the dial consumes (gctx :=
@@ -1134,20 +1387,20 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// the real error behind a second x509 failure) — the
 			// success-log line + return below covers both the error
 			// and the fed-bytes case.
-			var itemErr error
-			if !call.ContinueOnError {
-				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
-			}
-			if isRegateDenied(ierr) {
-				// #681 F1 — a per-identity re-gate deny. Recorded as the ONE
-				// identity-free canonical body (per_identity_forbidden.go) and
-				// counted on the per-identity forbidden sink at the same site,
-				// for the same item, as the stage-error bump.
-				msg := ierr.Error()
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, canonicalForbiddenBody(msg), msg, itemErr)
-				notePerIdentityForbidden(r.ctx, false)
+			if regateDenied {
+				// #681 F1 — a per-identity re-gate deny: the ONE identity-free
+				// canonical body (per_identity_forbidden.go).
+				r.recordRBACDeny(dictMu, itemErrs, id, i, call, ierr)
+			} else if isDefiniteNF {
+				// #1080 N2 — an authorized GET of a named object that does not
+				// exist: a definite answer, with its canonical body.
+				r.recordDefiniteNotFound(dictMu, itemErrs, id, i, call, definiteNF)
 			} else {
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
+				var itemErr error
+				if !call.ContinueOnError {
+					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
+				}
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(ierr), ierr.Error(), itemErr)
 			}
 			dispatch = "internal-rest-config-error"
 		} else {
@@ -1165,7 +1418,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
 		)
@@ -1211,11 +1464,16 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if raw, served, derr := dispatchViaDiscovery(gctx, call); served || derr != nil {
 		dispatch := "discovery"
 		if derr != nil {
-			r.log.Error("api call response failure", slog.String("name", id),
+			derr = redact.ErrorURL(derr) // #1481, as for the internal dispatch above
+			// #1476 — an unchanged repeat in the cell's generation logs at
+			// DEBUG (failure_log.go); it is recorded and counted below every
+			// time.
+			r.log.Log(gctx, FailureLogLevel(r.ctx, slog.LevelError, stageFailureTarget(id, call.Path), FailureClassOf(derr)),
+				"api call response failure", slog.String("name", id),
 				slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 				slog.String("restaction_name", r.opts.RESTActionName),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", "discovery"),
 				// diagnostic for #271 (C3 caveat). dispatchViaDiscovery uses the
 				// process-wide SA rest.Config SINGLETON, independent of the
@@ -1231,12 +1489,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, derr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, derr.Error(), derr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(derr), derr.Error(), itemErr)
 			dispatch = "discovery-error"
 		} else if ferr := feedBytes(raw); ferr != nil {
-			r.log.Error("discovery response handler failed",
+			r.log.ErrorContext(gctx, "discovery response handler failed",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", ferr.Error()))
 			var itemErr error
@@ -1249,7 +1507,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
 		)
@@ -1291,21 +1549,21 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve); did || rerr != nil {
 		dispatch := "cache-off-inprocess-resolve"
 		if rerr != nil {
-			r.log.Error("in-process resolve failed (cache-off path)",
+			r.log.ErrorContext(gctx, "in-process resolve failed (cache-off path)",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", rerr.Error()))
 			var itemErr error
 			if !call.ContinueOnError {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 			}
-			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 			dispatch = "cache-off-inprocess-resolve-error"
 		} else if ferr := feedBytes(substituted); ferr != nil {
-			r.log.Error("in-process resolve response handler failed (cache-off path)",
+			r.log.ErrorContext(gctx, "in-process resolve response handler failed (cache-off path)",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", ferr.Error()))
 			var itemErr error
@@ -1318,7 +1576,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
 		)
@@ -1368,15 +1626,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		branchEImp, branchE, branchEReason = branchEDecide(gctx, call)
 	}
 	if saEndpointDial && (rbac.MustRegateSADial(gctx) || branchE == branchEFailClosed) {
-		msg := fmt.Sprintf("branch-E SA-endpoint dial re-gated: caller not authorized to read %s (Part 2, #268 site 1)", call.Path)
+		msg := fmt.Sprintf("branch-E SA-endpoint dial re-gated: caller not authorized to read %s (Part 2, #268 site 1)", redact.Path(call.Path))
 		if branchE == branchEFailClosed {
-			msg = fmt.Sprintf("branch-E SA-endpoint dial refused under impersonation: %s (%s, #615)", branchEReason, call.Path)
+			msg = fmt.Sprintf("branch-E SA-endpoint dial refused under impersonation: %s (%s, #615)", branchEReason, redact.Path(call.Path))
 		}
 		// #574 — attribute the refusal to its driver (refresher trigger/trigger-less,
 		// cohort seed + prewarm scope, prewarm, live) and to the cell it was
 		// populating (key_hash), from stamps the ctx already carries.
-		r.log.Warn("branch-E SA-endpoint dial re-gated and failed closed",
-			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)), slog.String("path", call.Path),
+		r.log.WarnContext(gctx, "branch-E SA-endpoint dial re-gated and failed closed",
+			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)), redact.PathAttr("path", call.Path),
 			slog.String("sa_regate_origin", rbac.SARegateOrigin(gctx)),
 			slog.String("sa_regate_trigger", rbac.SARegateTrigger(gctx)),
 			slog.String("sa_regate_scope", rbac.SARegateScope(gctx)),
@@ -1388,11 +1646,25 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, msg, msg, itemErr)
 		r.log.Debug("api resolved (branch-E SA-endpoint dial re-gated, fail-closed)",
 			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.String("dispatch", "branch-e-sa-regate-denied"))
 		return nil
 	}
-	cache.ExternalTouchedSinkFromContext(gctx).Bump()
+	// #905 — a customer write is sent exactly once. This is the one place a
+	// write leaves snowplow (every other dispatch branch is GET-only), so the
+	// D2 stale-serve sink is asked here, right before the send: a pass that is
+	// already stale-derived does not send it (that pass is withdrawn and re-run
+	// with D2 disabled, and the re-run sends it), and a sent write ends D2 for
+	// the rest of the resolve (stale_write_once.go).
+	if r.refuseWriteFromStalePass(gctx, sc, i) {
+		return nil
+	}
+	sc.sent.Add(1)
+	if sc.thirdPartyDial {
+		cache.ExternalTouchedSinkFromContext(gctx).BumpThirdParty()
+	} else {
+		cache.ExternalTouchedSinkFromContext(gctx).Bump()
+	}
 	// #643 PR-A — count the fetch at the same site that marks the touch, by
 	// origin (background driver vs customer /call).
 	recordExternalFetch(gctx)
@@ -1410,7 +1682,21 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if branchE == branchEImpersonate {
 		fctx = withEndpointImpersonation(fctx, branchEImp)
 	}
-	res, jsonBytes, _, fetchErr := httpFetchAllowingNonJSON(fctx, call)
+	// Always a live fetch of this caller's own: its send policy, page budget,
+	// audit record, item error and stage outcome are its own. Only a request
+	// on the wire may be shared with an identical read waiting at the same
+	// time (#1320: same request, credentials and every header included; never
+	// after it completes), and the CONVERSION is memoised by the response's
+	// bytes (external_fetch_cache.go, external_fetch_flight.go). The touch
+	// above still declines the L1 Put.
+	// AUDIT-4 — observe what the authority answered (the real code, an accepted
+	// body that could not be used) for the audit record below.
+	fctx, answer := credhttp.WithAnswer(fctx)
+	// #1054 — the endpoint call, every attempt the retry client makes (a 429's
+	// Retry-After or 2 s, a 5xx backoff) recorded on it. No path or host.
+	fctx, dial := slowcall.StartDial(fctx, slowcall.BranchExternalFetch, ptr.Deref(call.Verb, http.MethodGet), "")
+	res, jsonBytes, _, fetchErr := sharedExternalFetch(fctx, call)
+	dial.EndErr(fctx, fetchErr)
 	if fetchErr != nil && fctx.Err() != nil {
 		// #643 PR-A — the caller's ctx was done before the response was read
 		// (the boot-readiness bound, a cut scope, a client that left). Counted,
@@ -1425,6 +1711,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// these as res.Status == Failure with the error message).
 		_ = fetchErr
 	}
+	// AUDIT-4 (installer#410) — a write-verb stage records what the authority it
+	// was sent to answered, as observed at the dial: never the fetch's reshaped
+	// envelope, nor what the stage filter below makes of it (stage_audit.go).
+	auditStageWrite(gctx, r.opts.RESTActionNamespace, r.opts.RESTActionName, apiCall, call, answer, jsonBytes)
 
 	// SUCCESS (feat/restaction-yaml-response): on a non-Failure fetch the
 	// owned fetch does NOT invoke call.ResponseHandler (unlike httpcall.Do);
@@ -1453,11 +1743,40 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	}
 
 	if res.Status == response.StatusFailure {
-		r.log.Error("api call response failure", slog.String("name", id),
+		// #681 F2 — the apiserver's typed 403 Forbidden on the requester's OWN
+		// dial of an apiserver read: a per-identity forbidden. Its message names
+		// the requester, so it is replaced by the identity-free canonical body
+		// before it enters the result (S1), and counted on the per-identity
+		// forbidden sink (stage + external: this dial bumped the external sink).
+		// #1080 N1 — the apiserver's typed 404 NotFound on the requester's OWN
+		// dial of a named object, in a continueOnError stage, that the watcher
+		// confirms absent: a definite answer for this identity (the apiserver
+		// authorized the `get` first), recorded with the canonical NotFound body
+		// and counted on the same sink (external: this dial bumped the sink).
+		// #1476 — both are classified BEFORE the failure line, so its level is
+		// the class's: the caller's own Forbidden is an expected per-identity
+		// deny (WARN), the definite NotFound (which requires continueOnError:
+		// the stage declared the outcome) DEBUG, any other failure ERROR; a
+		// failure unchanged since the cell's previous round DEBUG
+		// (failure_log.go). Every occurrence is still recorded and counted
+		// below.
+		ownDenied, isOwnDenied := classifyOwnDialForbidden(gctx, apiCall, call, res)
+		ownNotFound, isOwnNotFound := classifyOwnDialNotFound(gctx, apiCall, call, res)
+		var failLevel slog.Level
+		switch {
+		case isOwnDenied:
+			failLevel = expectedDenyLevel(r.ctx, stageFailureTarget(id, call.Path))
+		case isOwnNotFound:
+			failLevel = slog.LevelDebug
+		default:
+			failLevel = FailureLogLevel(r.ctx, slog.LevelError, stageFailureTarget(id, call.Path),
+				externalFailureClass(res, fetchErr, answer.LastStatus()))
+		}
+		r.log.Log(fctx, failLevel, "api call response failure", slog.String("name", id),
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 			slog.String("restaction_name", r.opts.RESTActionName),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			// diagnostic for #271 — external/owned-fetch site. sa_dial reads
 			// the SAME provenance marker the dial consumes (gctx := sc.gctx,
 			// marked at runStage when isSA): sa_dial=true names a stale
@@ -1468,7 +1787,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 
 		asMap, mapErr := response.AsMap(res)
 		if mapErr != nil {
-			r.log.Warn("unable to encode status as dict", slog.Any("err", mapErr))
+			r.log.WarnContext(fctx, "unable to encode status as dict", slog.Any("err", mapErr))
 		}
 
 		// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
@@ -1485,21 +1804,42 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			accumVal = asMap
 		}
 		bumpMsg := res.Message
-		// #681 F2 — the apiserver's typed 403 Forbidden on the requester's OWN
-		// dial of an apiserver read: a per-identity forbidden. Its message names
-		// the requester, so it is replaced by the identity-free canonical body
-		// before it enters the result (S1), and counted on the per-identity
-		// forbidden sink (stage + external: this dial bumped the external sink).
-		ownDenied, isOwnDenied := classifyOwnDialForbidden(gctx, apiCall, call, res)
+		// F2 / N1 (classified above): the identity-free canonical bodies.
 		if isOwnDenied {
 			accumVal, bumpMsg = canonicalForbiddenBody(ownDenied), ownDenied
+		}
+		if isOwnNotFound {
+			accumVal, bumpMsg = canonicalNotFoundBody(ownNotFound), ownNotFound
 		}
 		var itemErr error
 		if !call.ContinueOnError {
 			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, bumpMsg)
+			// #1476 — the caller's own Forbidden stays an expected per-identity
+			// deny on its way to the resolve's StageFailure, so the site that
+			// reports the failed resolve (a widget's apiRef) logs it as one.
+			if isOwnDenied {
+				itemErr = &causedItemError{text: itemErr.Error(), cause: MarkPerIdentityDenied(errors.New(ownDenied))}
+			}
+			// #1115 — the page budget ended the fetch: the item error carries
+			// the *pagebudget.ExhaustedError (same text), so the resolve's
+			// StageFailure reports the budget, not an upstream answer.
+			if be := (*pagebudget.ExhaustedError)(nil); errors.As(fetchErr, &be) {
+				itemErr = &causedItemError{text: itemErr.Error(), cause: be}
+			}
+			// #1131 — the destination policy refused the dial: the same, so the
+			// StageFailure says that and not "upstream answered".
+			if credhttp.DestinationRefused(fetchErr) {
+				itemErr = &causedItemError{text: itemErr.Error(), cause: fetchErr}
+			}
 		}
-		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
-		if isOwnDenied {
+		// #1319 — the definite per-identity NotFound reads its own closed
+		// code; every other answer's reason is read from its code as before.
+		reason := stageReasonOf(accumVal)
+		if isOwnNotFound {
+			reason = StageReasonNotFoundForRequester
+		}
+		r.recordItemErrorAs(reason, dictMu, itemErrs, id, i, call.ErrorKey, accumVal, bumpMsg, itemErr)
+		if isOwnDenied || isOwnNotFound {
 			notePerIdentityForbidden(r.ctx, true)
 		}
 		// Fall through to the success-log line (preserves
@@ -1516,7 +1856,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	r.log.Debug("api successfully resolved",
 		slog.String("name", id),
 		slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-		slog.String("path", call.Path),
+		redact.PathAttr("path", call.Path),
 		slog.Int("depth", depth),
 	)
 	return nil
@@ -1546,7 +1886,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// Get the api with this identifier
 	apiCall, ok := apiMap[id]
 	if !ok {
-		r.log.Warn("api not found in apiMap", slog.Any("name", id))
+		r.log.WarnContext(r.ctx, "api not found in apiMap", slog.Any("name", id))
 		return false
 	}
 	if apiCall.Headers == nil {
@@ -1618,6 +1958,31 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// per-stage.
 	uafActive := apiCall.UserAccessFilter != nil
 
+	// #1477 — plan BEFORE the endpoint. The plan's size is a function of the
+	// stage and the dict alone; of the endpoint it needs only whether its
+	// credential is held (targetsOwnCluster, the #288 shape guard), which is
+	// the stage's shape (stageHoldsCredential). A stage that plans no request
+	// (an iterator over nothing) produces its empty result here, and reads no
+	// endpointRef Secret, no ServiceAccount token and no clientconfig: its
+	// endpoint is never used, so a miss of it cannot fail the resolve (the
+	// #1025 rule above is name-only and has already run). #723/#724
+	// — the provenance mark, set to THIS stage's value, true or false, never
+	// inherited (#1019 review F1: a nested resolve's named-ref stage must not
+	// read as held because its outer stage was).
+	// #1025 — render the endpointRef and apply the per-user-credential rule
+	// FIRST, for every stage, whatever the data (#1477 review B1). No I/O.
+	if r.refuseStageEndpointRef(id, apiCall) {
+		recordStageTiming()
+		return true
+	}
+	heldCred := stageHoldsCredential(uafActive, apiCall.EndpointRef)
+	planCtx := credhttp.WithHeldCredentialValue(r.ctx, heldCred)
+	elems, planned := r.planStage(planCtx, id, apiCall)
+	if !planned {
+		recordStageTiming()
+		return false
+	}
+
 	// Resolve the endpoint. UAF stages use the snowplow-SA
 	// endpoint; non-UAF stages go through the per-user
 	// clientconfig (or the named EndpointRef) as before. The
@@ -1627,7 +1992,9 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// #57 (C-b): the user-bearer-token append moved to AFTER endpoint
 	// resolution (was before) so the self-loopback arm can compare the
 	// RESOLVED endpoint host against the configured self-host.
-	ep, isSA, heldCred, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
+	// heldCred is the planned one above: resolveStageEndpoint returns the same
+	// stageHoldsCredential value.
+	ep, isSA, _, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
 	switch epAction {
 	case stageContinue:
 		recordStageTiming()
@@ -1636,6 +2003,14 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		recordStageTiming()
 		return true
 	}
+	// #723/#724 — the stage dials a credential snowplow holds (SA or the
+	// per-user clientconfig): the dial site's client never follows a redirect.
+	// #1017 — the same provenance is what targetsOwnCluster reads: marked once,
+	// on planCtx above, so the render, the collapse and the lazy register see
+	// it as the dispatch does (gctx derives from provCtx below).
+	// #1283 — the stage's dials record which endpointRef they went through
+	// (r.stageRef: refuseStageEndpointRef set it for THIS stage).
+	provCtx := withStageEndpointRef(planCtx, r.stageRef)
 
 	// User-bearer-token append: only for non-UAF stages. When UAF is active
 	// the SA endpoint carries the SA token (no user-bearer override needed);
@@ -1644,22 +2019,21 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// (UAF stages resolve to the SA endpoint at resolveStageEndpoint:385,
 	// never an external/loopback ref, so the `!uafActive` guard is preserved
 	// EXACTLY — UAF is untouched by the #57 self-loopback arm.)
+	requesterBearer := false
 	if !uafActive {
 		if accessToken, _ := xcontext.AccessToken(r.ctx); accessToken != "" {
-			// The append fires when EITHER:
-			//   - the original gate: no named endpoint, or exportJWT:true
-			//     (a named endpoint is assumed to carry its own auth); OR
-			//   - #57 (C-b) self-loopback arm (ADDITIVE): the resolved
-			//     endpoint host EXACTLY equals the configured self-host
-			//     (URL_SELF) — i.e. the step is a /call loopback back at
-			//     snowplow's OWN JWT-gated endpoint, which DOES need the
-			//     bearer even though it has a named EndpointRef
-			//     (snowplow-endpoint). Exact scheme+host+port equality
-			//     (parsedHostEqualsSelf) — NEVER a substring/Contains match,
-			//     so an EXTERNAL endpoint whose host merely CONTAINS
-			//     "snowplow" (e.g. snowplow-foo.example.com) does NOT match
-			//     and the bearer stays OFF it (the leak guard).
+			// The append fires iff the stage sets `exportJwt: true` OR the
+			// resolved endpoint is the same host as URL_SELF (a /call loopback
+			// at snowplow's own JWT-gated endpoint; the short and FQDN forms of
+			// one Service match, scheme and port must match — hostsMatch) — and
+			// never on the SA endpoint (#271). A nil endpointRef resolves to the
+			// caller's own clientconfig, which carries its own k8s credential,
+			// so it gets NO bearer (#292); a named JWT-gated target must opt in
+			// with `exportJwt: true`. The rule and its leak guard live in
+			// bearerAppendForStage's doc (self_host.go): read it there, not
+			// here (#794).
 			if bearerAppendForStage(apiCall, ep, isSA) {
+				requesterBearer = true
 				// 0.30.164: stage-local Headers — never write the user
 				// bearer back into the shared CR slice (the CR is marshaled
 				// into the /call response body at restactions.go:149; an
@@ -1706,6 +2080,10 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 						stageHeaders = append(stageHeaders,
 							fmt.Sprintf("%s: %s", cache.ResolveAncestorsHeader, anc))
 					}
+					// #871 — measurement only (self_host.go).
+					if h, ok := selfLoopbackWorkClassHeader(r.ctx); ok {
+						stageHeaders = append(stageHeaders, h)
+					}
 				}
 
 				local := *apiCall
@@ -1729,6 +2107,13 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		local.Headers = hdrs
 		apiCall = &local
 	}
+	// #903 egress — a non-customer resolve that calls snowplow ITSELF (the HTTP
+	// self-loopback) tells the next hop, so that hop refuses write stages too
+	// (its ctx carries no background marker otherwise). Sent ONLY to snowplow's
+	// own host (parsedHostEqualsSelf, the self-loopback predicate); on every
+	// other egress the header is stripped, even when the RESTAction itself sets
+	// it, so it never reaches an external endpoint. Stage-local copy.
+	apiCall = withBackgroundHopHeader(apiCall, cache.NonCustomerWriteOrigin(r.ctx) != "", parsedHostEqualsSelf(ep.ServerURL))
 	// Ship 0.30.121 R1 — the verbose wire-dump (httpcall's DumpResponse)
 	// is the single largest transient-memory consumer (~1.94 GiB
 	// alloc_space on the 50K bench: it stringifies every HTTP response
@@ -1741,12 +2126,12 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		slog.String("name", id), slog.String("host", redact.URL(ep.ServerURL)),
 		slog.Bool("uaf", uafActive))
 
-	// Build the per-stage call plan: request options + Ship D.5
-	// cluster-list collapse + 0.30.92 lazy informer register (the
-	// stageTiming.ClusterList* fields are written inside). An empty
-	// tmp is C-3 (the "empty request options" Warn fired inside) —
-	// the orchestrator owns the recordStageTiming()+continue.
-	tmp := r.collapseOrFanoutPlan(id, apiCall, ep, &stageTiming)
+	// Build the per-stage call plan from the planned elements: request
+	// options + Ship D.5 cluster-list collapse + 0.30.92 lazy informer
+	// register (the stageTiming.ClusterList* fields are written inside). An
+	// empty tmp (every item refused) is C-3 (emptyPlan ran inside) — the
+	// orchestrator owns the recordStageTiming()+continue.
+	tmp := r.collapseOrFanoutPlan(provCtx, id, apiCall, ep, elems, &stageTiming)
 	if len(tmp) == 0 {
 		recordStageTiming()
 		return false
@@ -1774,22 +2159,18 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// concurrent jsonHandler writes. On the common (Info) path
 	// neither the walk nor the lock runs.
 	var dictMu sync.Mutex
-	g, gctx := errgroup.WithContext(r.ctx)
+	g, gctx := errgroup.WithContext(provCtx)
 	// #267/#268/#269 — PROVENANCE marker for the dial site. When this stage's
 	// endpoint is snowplow's own SA endpoint (isSA, from resolveStageEndpoint:
 	// the ctx-carried internal endpoint or the UAF SA endpoint), mark the per-stage
 	// dispatch ctx so httpClientForEndpoint threads the SA token FILE (self-reloading,
-	// #267) rather than a read-once static token. Per-stage granularity: a non-SA
-	// (per-user clientconfig / named-ref) stage's gctx is never marked. Only ADDS a
-	// ctx value — g's Done channel (errgroup cancellation) is preserved.
-	if isSA {
-		gctx = cache.WithServiceAccountDial(gctx)
-	}
-	// #723/#724 — the stage dials a credential snowplow holds (SA or the
-	// per-user clientconfig): the dial site's client never follows a redirect.
-	if heldCred {
-		gctx = credhttp.WithHeldCredential(gctx)
-	}
+	// #267) rather than a read-once static token. Per-stage granularity: the mark
+	// is SET to this stage's isSA, true or false, never inherited (#1019 review
+	// F2): a nested resolve's stages run on a ctx derived from the outer stage's,
+	// and a nested stage with its own endpoint must not dial as the SA (its own
+	// Authorization dropped, then refused at branch E). Only a ctx value — g's
+	// Done channel (errgroup cancellation) is preserved.
+	gctx = cache.WithServiceAccountDialValue(gctx, isSA)
 	// #710 — the owning RESTAction and stage name a content fill (pprof labels,
 	// by_ra). Once per stage, not per call: a content HIT pays nothing for it.
 	gctx = withContentFillOwner(gctx, r.opts.RESTActionNamespace, r.opts.RESTActionName, id)
@@ -1837,9 +2218,24 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		wireVerbose: wireVerbose,
 		ep:          ep,
 		calls:       tmp,
+		// #1221 — PROVENANCE, never endpoint shape: a held credential is the SA or
+		// the requester's own clientconfig, and #1025 keeps a named ref off every
+		// per-user credential, so not held is a named endpoint's own credential. A
+		// requester bearer (exportJwt, the self-loopback) puts the requester on that
+		// dial all the same. Either way the answer can depend on who asked.
+		thirdPartyDial: !heldCred && !requesterBearer,
 	}
 
+	requestGone := false
 	for i := range tmp {
+		// #1320 review B1 — the request is gone (its client left, its scope
+		// was cut): no further item is dispatched. With a bounded fan-out the
+		// loop reaches item N only after earlier items finished, so without
+		// this a request that ended during item 1 still walked every item.
+		if r.ctx.Err() != nil {
+			requestGone = true
+			break
+		}
 		call := tmp[i]
 
 		// Edge type 3 dep recording — see 0.30.94 ship for full
@@ -1859,7 +2255,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 			if ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
 				if gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path); parseOK {
 					if name == "" {
-						cache.Deps().RecordList(r.ctx, l1Key, gvr, ns)
+						r.recordListEdge(id, l1Key, gvr, ns) // #603 PR-2: narrowable
 					} else {
 						cache.Deps().Record(r.ctx, l1Key, gvr, ns, name)
 					}
@@ -1901,6 +2297,20 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		recordStageTiming()
 		return true
 	}
+	if requestGone {
+		// The stage did not run every item: a truncating exit, like the
+		// hard-error one above, and a stage error for the Put gates, so the
+		// partial result of a request nobody waits for is never stored. Not a
+		// stage failure for the caller (ResolveWithFailure: a caller
+		// cancellation is not one).
+		r.taintNarrow() // #603 PR-2: an errored resolve never narrows its list edges
+		r.stageErrSink.Bump(id, "the request ended before every item was dispatched")
+		r.log.Debug("api stage stopped: the request ended before every item was dispatched",
+			slog.String("name", id), slog.Int("items", len(tmp)))
+		stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
+		recordStageTiming()
+		return true
+	}
 	stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
 
 	// Ship 0.30.257 (#313) — per-item errors recorded by the worker
@@ -1921,6 +2331,9 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	if r.failure == nil {
 		r.failure = firstStageFailure(itemErrs, sc.calls)
 	}
+	// #1112 D2 — the catch-all: a write stage none of whose refusals reported
+	// itself did not do what it declared (undialled_write.go).
+	r.failUnsentWrites(sc)
 
 	// Ship 0.30.235 — the pre-0.30.235 post-g.Wait()
 	// applyUserAccessFilter call was DELETED; UAF now runs per-worker
@@ -1958,11 +2371,51 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 		return map[string]any{}, nil
 	}
 
+	// #1476 — this resolve is one failure-log round of its cell (or joins the
+	// round its caller opened for the same cell): a failure unchanged since the
+	// cell's previous round logs at DEBUG (failure_log.go).
+	ctx, endFailureRound := BeginFailureRound(ctx)
+	defer endFailureRound()
+
+	// #1116 (SECURITY) — the dict is seeded from extras below (newResolveRun),
+	// and the resolver writes its own keys into it. Extras that name one of
+	// them (a stage name, an errorKey, slice) would stand in for the
+	// resolver's value, so the resolve does not start: nothing is read or
+	// dialled (reserved_extras.go). restactions.Resolve applies the same rule
+	// first and returns the refusal to its caller as a 400.
+	if RefuseReservedExtras(ctx, opts.Items, opts.Extras, opts.RESTActionNamespace, opts.RESTActionName) != nil {
+		return map[string]any{}, nil
+	}
+
+	// #903 (team-lead ruling, the generic form of "never store a resolve that
+	// stopped before its write") — a RESTAction that DECLARES a write stage is
+	// never stored, whether or not this resolve dialed the write (a zero-item
+	// write iterator, a truncated resolve, a write refused in the background).
+	// Stored, its cell would be "stale then replace" with a replace that never
+	// comes: every background re-resolve refuses the write, and a customer hit
+	// never runs it. The mark is an input of the shared Put-gate verdict
+	// (cache.PutGateVerdict → permanent, declared_write), which every Put site
+	// and every background mark site reads — the opt-in external-TTL widget Put
+	// (#915) included. Classified ONCE over the spec, before any exit (#912
+	// N2): a resolve that stops before running a stage (no client config, no
+	// identity, a dependsOn naming no stage or a cycle) is never stored either.
+	//
+	// #905 (#913 re-review) — the same classification marks the REQUEST's D2
+	// sink too (a nested resolve's write included), before any stage runs, so
+	// staleServeEligible refuses every later read of the request: a RESTAction
+	// that declares a write is never served stale content. The hold / withdraw
+	// / re-run machinery then only applies to a write first seen inside a
+	// nested resolve. ONE classification, both marks.
+	if declaredWriteStage(opts.Items) != "" {
+		cache.ExternalTouchedSinkFromContext(ctx).MarkDeclaredWrite()
+		cache.StaleServeSinkForWrite(ctx).NoteDeclaredWrite()
+	}
+
 	if opts.RC == nil {
 		var err error
 		opts.RC, err = inClusterConfigFn()
 		if err != nil {
-			return map[string]any{}, nil
+			return abortedResolve(ctx, opts.Items)
 		}
 	}
 
@@ -1980,15 +2433,15 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		log.Error("unable to fetch user info from context", slog.Any("err", err))
-		return map[string]any{}, nil
+		log.ErrorContext(ctx, "unable to fetch user info from context", slog.Any("err", err))
+		return abortedResolve(ctx, opts.Items)
 	}
 
 	// Sort API by Depends
 	names, err := topologicalSort(opts.Items)
 	if err != nil {
-		log.Error("unable to sorted api by deps", slog.Any("error", err))
-		return map[string]any{}, nil
+		log.ErrorContext(ctx, "unable to sorted api by deps", slog.Any("error", err))
+		return abortedResolve(ctx, opts.Items)
 	}
 	log.Debug("sorted api by deps", slog.Any("names", names))
 
@@ -2008,20 +2461,39 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	// per-stage mutable primitives stay loop-local (see the resolveRun
 	// concurrency note).
 	r := newResolveRun(ctx, opts, log, user)
-	if opts.Provenance == ProvenanceCallerSupplied {
-		r.outcomes = stageOutcomesFrom(ctx)
-		r.outcomes.register(names)
-	}
+	// #603 PR-2 SHADOW — settle the interest of every list edge this resolve
+	// recorded, on every return below (narrow.go).
+	r.narrow = newNarrowRun(r)
+	defer r.commitNarrow()
+	r.outcomes = claimStageOutcomes(ctx)
+	r.outcomes.register(names)
 	// Each api stage runs through runStage in topological order. runStage
 	// returns stop=true on a truncating exit (R-1 caller-cancel, R-2 endpoint
 	// err, R-3 g.Wait hard error) — the orchestrator then returns the
 	// (truncated) dict; stop=false advances to the next stage. runStage owns
 	// the recordStageTiming()-before-every-exit invariant internally.
 	for _, id := range names {
+		// #1281 — a stage carrying userAccessFilter on a verb other than
+		// GET/HEAD (the CRD rule's set) would be sent as snowplow's
+		// ServiceAccount: refused here, before the #904 decision below and
+		// before any item is planned, so it is reported whatever the data
+		// (an iterator of zero items, a failed dependency) and nothing is sent
+		// (uaf_non_read.go).
+		if r.refuseUAFOnNonReadVerb(id, apiMap[id]) {
+			continue
+		}
+		// #904 — a write stage whose dependsOn stage did not succeed is not
+		// sent (dependent_write.go). Decided here, between stages, so no item
+		// of it is ever dispatched.
+		if dep, skip := r.dependentWriteBlocked(apiMap[id]); skip {
+			r.skipDependentWrite(id, apiMap[id], dep)
+			continue
+		}
 		r.outcomes.ran(id)
 		if r.runStage(id, apiMap) {
 			// A truncating exit: this stage failed (its own item errors, if
 			// any, already carry a more specific reason).
+			r.taintNarrow() // #603 PR-2
 			r.outcomes.fail(id, StageReasonError)
 			// #709 — a truncating exit is a failure of this stage whatever its
 			// continueOnError says. Reported by class only: the endpoint error
@@ -2231,13 +2703,13 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 			log.Info("cache.lazy_register.inner_call",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
-				slog.String("path", path),
+				redact.PathAttr("path", path),
 				slog.Duration("ensure_elapsed", elapsed),
 				slog.String("hint", "resolver inner-call first touch — informer registered + dep-tracker handlers wired"),
 			)
 		}
 		if elapsed > lazyRegisterSlowThreshold {
-			log.Warn("cache.lazy_register.slow",
+			log.WarnContext(ctx, "cache.lazy_register.slow",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
 				slog.Duration("elapsed", elapsed),

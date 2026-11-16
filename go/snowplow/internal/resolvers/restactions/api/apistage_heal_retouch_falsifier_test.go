@@ -122,7 +122,7 @@ func newHealRetouchWatcher(t *testing.T) *cache.ResourceWatcher {
 // GVR was not-servable, the state 1a must re-touch on the next HIT.
 func putHealContentEntry(store *cache.ResolvedCacheStore, gvr schema.GroupVersionResource, ns, name string) string {
 	key := cache.ComputeKey(contentKeyInputs(gvr, ns, name))
-	store.Put(key, &cache.ResolvedEntry{
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{
 		RawJSON: []byte(`{"apiVersion":"v1","kind":"List","items":[]}`),
 	})
 	return key
@@ -154,7 +154,7 @@ func TestFalsifierRetouchLIST_RegistersInformerOnContentHit(t *testing.T) {
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	_, _, ok, _ := apistageContentServe(ctx, store, call, false)
+	_, _, ok, _, _ := apistageContentServe(ctx, store, call, false)
 	if !ok {
 		t.Fatalf("apistageContentServe ok=false on the seeded LIST content HIT")
 	}
@@ -197,7 +197,7 @@ func TestFalsifierRetouchGET_DoesNotRegisterInformer(t *testing.T) {
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	_, _, ok, _ := apistageContentServe(ctx, store, call, false)
+	_, _, ok, _, _ := apistageContentServe(ctx, store, call, false)
 	if !ok {
 		t.Fatalf("apistageContentServe ok=false on the seeded GET-by-name content HIT")
 	}

@@ -164,6 +164,10 @@ type a548WidgetBranch struct {
 	annotations map[string]string
 	// query is appended to /call (the undeclared-extras shape).
 	query string
+	// spec, when set, is the widget CR's spec (nil: the bare h1 widget). The
+	// undeclared-extras case needs an extras-reading surface: since #777 b′ a
+	// widget with none is exempt from the F6 quarantine.
+	spec map[string]any
 	// extras is the SAME map the query encodes, so the arm derives the key the
 	// handler will derive.
 	extras map[string]any
@@ -239,7 +243,7 @@ func TestIssue548_Widgets_NoDeclineBranchArms(t *testing.T) {
 			user:        h1User,
 			annotations: map[string]string{externalCacheTTLAnnotation: "30"},
 			during: func(t *testing.T, ctx context.Context, _ string) {
-				cache.ExternalTouchedSinkFromContext(ctx).Bump()
+				cache.ExternalTouchedSinkFromContext(ctx).BumpThirdParty()
 			},
 			cellStored: true,
 		},
@@ -258,6 +262,7 @@ func TestIssue548_Widgets_NoDeclineBranchArms(t *testing.T) {
 			user:    h1User,
 			query:   `extras={"foo":"bar"}`,
 			extras:  map[string]any{"foo": "bar"},
+			spec:    map[string]any{"widgetDataTemplate": []any{map[string]any{"forPath": "foo", "expression": "${ .foo }"}}},
 			witness: func() uint64 { return widgetSkippedUndeclaredExtrasPutTotal.Load() },
 		},
 		{
@@ -271,7 +276,7 @@ func TestIssue548_Widgets_NoDeclineBranchArms(t *testing.T) {
 			user: h1User,
 			during: func(t *testing.T, _ context.Context, key string) {
 				c := cache.ResolvedCache()
-				c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+				c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 				c.DeleteForTest(key)
 			},
 		},
@@ -302,6 +307,9 @@ func TestIssue548_Widgets_NoDeclineBranchArms(t *testing.T) {
 			reqCtx := xcontext.BuildContext(context.Background(),
 				xcontext.WithUserInfo(jwtutil.UserInfo{Username: b.user, Groups: []string{"devs"}}))
 			cr := a548WidgetCR(t, b.annotations)
+			if b.spec != nil {
+				cr.Object["spec"] = b.spec
+			}
 
 			// The key the HANDLER will derive, from the production derivation.
 			// (For the inert case this runs on a non-inert ctx on purpose, to
@@ -527,7 +535,7 @@ func TestIssue548_RESTActions_NoDeclineBranchArms(t *testing.T) {
 			user: h1User,
 			during: func(t *testing.T, _ context.Context, key string) {
 				c := cache.ResolvedCache()
-				c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+				c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 				c.DeleteForTest(key)
 			},
 		},
@@ -736,7 +744,7 @@ func TestIssue548_L1Hit_StillArms(t *testing.T) {
 			t.Fatalf("PRECONDITION: live widgets key/handle expected")
 		}
 		warm := []byte(`{"warm":"widget-cell"}` + "\n")
-		handle.Put(key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
+		putFixture(handle, key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
 
 		restore := installWidgetFakes(t, cr, func() bool { return true },
 			func(context.Context, widgets.ResolveOptions) (*widgets.Widget, error) {
@@ -762,7 +770,7 @@ func TestIssue548_L1Hit_StillArms(t *testing.T) {
 			t.Fatalf("PRECONDITION: live restactions key/handle expected")
 		}
 		warm := []byte(`{"warm":"ra-cell"}` + "\n")
-		handle.Put(key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
+		putFixture(handle, key, &cache.ResolvedEntry{RawJSON: warm, Inputs: inputs})
 
 		restore := installRAFakes(t, h1RAUnstructured(), func() bool { return true },
 			func(context.Context, restactions.ResolveOptions) (*templatesv1.RESTAction, error) {

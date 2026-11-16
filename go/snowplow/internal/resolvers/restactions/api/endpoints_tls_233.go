@@ -8,6 +8,7 @@ package api
 // declarative "not our shape" site) — the two are deliberately distinct.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
@@ -50,7 +51,7 @@ var (
 // reach this branch are owned-CA apiserver dials (endpointNeedsOwnedCAClient) —
 // ServerURL is the endpoint URL and CertificateAuthorityData the public cluster
 // CA, neither a tenant credential; the token is the secret and is never logged.
-func warnUnparseableCADelegation(ep *endpoints.Endpoint) {
+func warnUnparseableCADelegation(ctx context.Context, ep *endpoints.Endpoint) {
 	unparseableCADelegationTotal.Add(1) // uncapped rate — the detector, always
 
 	sum := sha256.Sum256([]byte(ep.CertificateAuthorityData))
@@ -73,7 +74,7 @@ func warnUnparseableCADelegation(ep *endpoints.Endpoint) {
 	if seen {
 		return
 	}
-	slog.Warn("endpoints_tls.unparseable_ca_delegated",
+	slog.WarnContext(ctx, "endpoints_tls.unparseable_ca_delegated",
 		slog.String("subsystem", "cache"),
 		slog.String("server_url", redact.URL(ep.ServerURL)),
 		slog.String("ca_sha256", fp),

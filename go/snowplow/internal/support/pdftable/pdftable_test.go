@@ -1,0 +1,558 @@
+package pdftable
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/krateo-platformops/snowplow/internal/testsupport/pdfcheck"
+)
+
+// #970 — the table writer. Every document is parsed back with pdfcheck:
+// its structure is checked against the PDF specification and its text is
+// extracted by an independent reader.
+
+func render(t *testing.T, doc Document) pdfcheck.Doc {
+	t.Helper()
+	return pdfcheck.Parse(t, renderBytes(t, doc))
+}
+
+// renderBytes renders doc and returns the file as WriteTo writes it,
+// checking it is exactly Len bytes.
+func renderBytes(t testing.TB, doc Document) []byte {
+	t.Helper()
+	p, err := Render(doc)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	var b bytes.Buffer
+	n, err := p.WriteTo(&b)
+	if err != nil || int(n) != p.Len() || b.Len() != p.Len() {
+		t.Fatalf("WriteTo wrote %d bytes (err %v), Len is %d", n, err, p.Len())
+	}
+	return b.Bytes()
+}
+
+func rowsOf(n, cols int) [][]string {
+	rows := make([][]string, n)
+	for i := range rows {
+		rows[i] = make([]string, cols)
+		for c := range rows[i] {
+			rows[i][c] = fmt.Sprintf("r%05d-c%d", i, c)
+		}
+	}
+	return rows
+}
+
+func headerOf(cols int) []string {
+	h := make([]string, cols)
+	for i := range h {
+		h[i] = fmt.Sprintf("H%d", i)
+	}
+	return h
+}
+
+var created = time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+
+func hasLine(p pdfcheck.Page, want string) bool {
+	for _, l := range p.Lines {
+		if l == want {
+			return true
+		}
+	}
+	return false
+}
+
+// countCells counts every match of re over the whole document.
+func countCells(d pdfcheck.Doc, re *regexp.Regexp) map[string]int {
+	seen := map[string]int{}
+	for _, p := range d.Pages {
+		for _, m := range re.FindAllString(p.Text(), -1) {
+			seen[m]++
+		}
+	}
+	return seen
+}
+
+// TestRenderHeaderOnEveryPageEveryRowOnce: a table longer than a page
+// starts its table on every page with the header row, draws every row
+// exactly once and below the header, and numbers the pages.
+func TestRenderHeaderOnEveryPageEveryRowOnce(t *testing.T) {
+	const n = 250
+	header := []string{"First column", "Second, with comma", "Third"}
+	d := render(t, Document{Title: "Report", Created: created, Meta: []string{"meta line"}, Header: header, Rows: rowsOf(n, 3)})
+	if len(d.Pages) < 3 {
+		t.Fatalf("pages = %d, want a multi-page table", len(d.Pages))
+	}
+	wantHeader := strings.Join(header, pdfcheck.Sep)
+	cell := regexp.MustCompile(`r\d{5}-c0`)
+	for i, p := range d.Pages {
+		hdr := -1
+		for j, l := range p.Lines {
+			if l == wantHeader {
+				hdr = j
+				break
+			}
+		}
+		if hdr < 0 {
+			t.Fatalf("page %d has no header row %q:\n%s", i+1, wantHeader, p.Text())
+		}
+		for j, l := range p.Lines {
+			if j < hdr && cell.MatchString(l) {
+				t.Errorf("page %d: a row is drawn above the header: %q", i+1, l)
+			}
+		}
+		if want := fmt.Sprintf("Page %d of %d", i+1, len(d.Pages)); !hasLine(p, want) {
+			t.Errorf("page %d lacks %q", i+1, want)
+		}
+	}
+	seen := countCells(d, cell)
+	if len(seen) != n {
+		t.Errorf("distinct rows = %d, want %d", len(seen), n)
+	}
+	for r, c := range seen {
+		if c != 1 {
+			t.Errorf("row %s appears %d times, want once", r, c)
+		}
+	}
+	if got := d.Pages[0].Lines[:2]; got[0] != "Report" || got[1] != "meta line" {
+		t.Errorf("first page starts %q, want the title then the meta lines", got)
+	}
+	if a := d.ActiveContent(); len(a) != 0 {
+		t.Errorf("document carries active or external content: %v", a)
+	}
+	if !bytes.Contains(d.Dicts, []byte("/Title <FEFF005200650070006F00720074>")) {
+		t.Errorf("document info lacks the title")
+	}
+}
+
+// TestRenderUnicodeRoundTrip: text the embedded font covers extracts as
+// the same Unicode text; a character it has no glyph for extracts as
+// U+FFFD, never as a different character.
+func TestRenderUnicodeRoundTrip(t *testing.T) {
+	text := "Grüße — Ελληνικά — Кириллица — Łódź — €½±"
+	d := render(t, Document{Title: text, Created: created, Header: []string{"Ünïcødé"}, Rows: [][]string{{text}, {"東京 ok"}}})
+	page := d.Pages[0]
+	for _, want := range []string{text, "Ünïcødé", "\uFFFD\uFFFD ok"} {
+		if !hasLine(page, want) {
+			t.Errorf("no line %q in:\n%s", want, page.Text())
+		}
+	}
+}
+
+// TestRenderWrapsNeverClips: a long cell wraps inside its column — at
+// spaces, at line breaks, and between characters for a word wider than the
+// column — and every character is drawn.
+func TestRenderWrapsNeverClips(t *testing.T) {
+	long := strings.Repeat("lorem ipsum dolor ", 60) + "\nsecond paragraph\tafter a tab\r\nthird " + strings.Repeat("W", 600)
+	d := render(t, Document{Title: "t", Created: created, Header: []string{"long", "next"}, Rows: [][]string{{long, "neighbour"}}})
+	var lines []string
+	for _, p := range d.Pages {
+		for _, r := range p.Runs {
+			if r.S != "neighbour" && r.S != "long" && r.S != "next" && r.S != "t" && !strings.HasPrefix(r.S, "Page ") {
+				lines = append(lines, r.S)
+			}
+		}
+	}
+	if len(lines) < 6 {
+		t.Fatalf("long cell drawn on %d lines, want it wrapped:\n%s", len(lines), d)
+	}
+	want := strings.Join(strings.Fields(strings.ReplaceAll(long, "\t", " ")), "")
+	if got := strings.Join(strings.Fields(strings.Join(lines, " ")), ""); got != want {
+		t.Errorf("wrapped text lost or changed characters:\n got %q\nwant %q", trim(got), trim(want))
+	}
+	for _, l := range lines {
+		if strings.Contains(l, "\t") || strings.Contains(l, "\r") {
+			t.Errorf("a control character was drawn: %q", l)
+		}
+	}
+}
+
+func trim(s string) string {
+	if r := []rune(s); len(r) > 60 {
+		return string(r[:60]) + "…"
+	}
+	return s
+}
+
+// TestWrapParagraph pins the line-break rule on the face directly.
+func TestWrapParagraph(t *testing.T) {
+	reg, _, err := loadFonts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFace(reg, "F1")
+	w := f.width("aaaa bbbb", 10) // room for exactly "aaaa bbbb"
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"aaaa bbbb cccc", []string{"aaaa bbbb", "cccc"}},
+		{"aaaa bbbb", []string{"aaaa bbbb"}},
+		{"aaaabbbbccccdddd", nil}, // hard breaks, checked below
+		{"", []string{""}},
+		{"a\n\nb", []string{"a", "", "b"}},
+		{"x\ty", []string{"x y"}},
+	}
+	for _, c := range cases {
+		got := f.wrap(c.in, 10, w)
+		if c.want == nil {
+			if strings.Join(got, "") != c.in || len(got) < 2 {
+				t.Errorf("wrap(%q) = %q, want hard breaks keeping every rune", c.in, got)
+			}
+			for _, l := range got {
+				if f.width(l, 10) > w+widthEpsilon {
+					t.Errorf("wrap(%q): line %q wider than %v", c.in, l, w)
+				}
+			}
+			continue
+		}
+		if fmt.Sprint(got) != fmt.Sprint(c.want) {
+			t.Errorf("wrap(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// A column narrower than one glyph still makes progress: one rune a line.
+	if got := f.wrap("abc", 10, 0.1); fmt.Sprint(got) != "[a b c]" {
+		t.Errorf("wrap into a sub-glyph width = %q, want one rune per line", got)
+	}
+}
+
+// TestRenderRowTallerThanAPage: a row whose cell needs more lines than a
+// page holds continues on the next page, under a repeated header, and no
+// line is lost.
+func TestRenderRowTallerThanAPage(t *testing.T) {
+	var cell []string
+	for i := range 150 {
+		cell = append(cell, fmt.Sprintf("line-%03d", i))
+	}
+	d := render(t, Document{Title: "t", Created: created, Header: []string{"tall", "other"}, Rows: [][]string{{"before", "x"}, {strings.Join(cell, "\n"), "y"}, {"after", "z"}}})
+	if len(d.Pages) < 2 {
+		t.Fatalf("pages = %d, want the tall row split across pages", len(d.Pages))
+	}
+	for i, p := range d.Pages {
+		if !hasLine(p, "tall | other") {
+			t.Errorf("page %d lacks the header", i+1)
+		}
+	}
+	seen := countCells(d, regexp.MustCompile(`line-\d{3}`))
+	if len(seen) != 150 {
+		t.Errorf("lines drawn = %d, want 150", len(seen))
+	}
+	for l, c := range seen {
+		if c != 1 {
+			t.Errorf("%s drawn %d times", l, c)
+		}
+	}
+	text := d.String()
+	if !(strings.Index(text, "before") < strings.Index(text, "line-000") && strings.Index(text, "line-149") < strings.Index(text, "after")) {
+		t.Errorf("rows out of order:\n%s", text)
+	}
+}
+
+// TestRenderWideTablesSplitIntoColumnBands: columns that do not fit across
+// a page at the minimum width print as bands of adjacent columns, each
+// band with all the rows and its own header on every page.
+func TestRenderWideTablesSplitIntoColumnBands(t *testing.T) {
+	const cols, n = 70, 60
+	if bands := splitBands(cols); len(bands) < 2 {
+		t.Fatalf("bands = %v, want the %d columns split", bands, cols)
+	}
+	// Cells short enough not to wrap at the minimum width: two letters for
+	// the row, two digits for the column.
+	rows := make([][]string, n)
+	for r := range rows {
+		rows[r] = make([]string, cols)
+		for c := range rows[r] {
+			rows[r][c] = fmt.Sprintf("%c%c%02d", 'a'+r/26, 'a'+r%26, c)
+		}
+	}
+	d := render(t, Document{Title: "wide", Created: created, Header: headerOf(cols), Rows: rows})
+	seen := countCells(d, regexp.MustCompile(`\b[a-z]{2}\d{2}\b`))
+	if len(seen) != n*cols {
+		t.Errorf("cells drawn = %d, want %d", len(seen), n*cols)
+	}
+	for c, k := range seen {
+		if k != 1 {
+			t.Errorf("cell %s drawn %d times", c, k)
+		}
+	}
+	for i, p := range d.Pages {
+		if !strings.Contains(p.Text(), fmt.Sprintf("of %d", cols)) || !strings.Contains(p.Text(), " | ") {
+			t.Errorf("page %d lacks its band caption or header:\n%s", i+1, p.Text())
+		}
+	}
+}
+
+// TestRenderLongLabelsAlwaysRender: labels that would wrap taller than
+// half a page are set in a smaller type until they fit, so the table always
+// renders, with every label character drawn, the header on every page, and
+// at least the other half of every page left to rows. Shapes: 32 columns
+// of 120-character dot-paths (a band of narrow columns), and one 20,000-
+// character label (a full-width column).
+func TestRenderLongLabelsAlwaysRender(t *testing.T) {
+	path120 := func(c int) string {
+		return fmt.Sprintf("spec.c%02d.", c) + strings.Repeat("segment.", 14)[:110]
+	}
+	wide := make([]string, 32)
+	for c := range wide {
+		wide[c] = path120(c)
+	}
+	cases := []struct {
+		name   string
+		header []string
+	}{
+		{"32 columns of 120-character paths", wide},
+		{"one 20000-character label", []string{strings.Repeat("Lorem ipsum dolor sit amet ", 741)[:20000]}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			const n = 200
+			// Body cells short enough not to wrap in a 24-point column: the
+			// row number, then x.
+			rows := make([][]string, n)
+			for r := range rows {
+				rows[r] = make([]string, len(c.header))
+				for col := range rows[r] {
+					rows[r][col] = "x"
+				}
+				rows[r][0] = fmt.Sprintf("%03d", r)
+			}
+			d := render(t, Document{Title: "t", Created: created, Header: c.header, Rows: rows})
+			body := regexp.MustCompile(`^(\d{3}|x)$`)
+			seen := countCells(d, regexp.MustCompile(`\b\d{3}\b`))
+			if len(seen) != n {
+				t.Fatalf("rows drawn = %d, want %d", len(seen), n)
+			}
+			for i, p := range d.Pages {
+				// Header runs: everything above the first body run on the page.
+				var headerRuns []pdfcheck.Run
+				rowsHere := map[float64]bool{}
+				firstBodyY := -1.0
+				for _, r := range p.Runs {
+					if body.MatchString(r.S) {
+						rowsHere[r.Y] = true
+						firstBodyY = max(firstBodyY, r.Y)
+					}
+				}
+				for _, r := range p.Runs {
+					if r.Y > firstBodyY && !strings.HasPrefix(r.S, "Page ") && r.S != "t" {
+						headerRuns = append(headerRuns, r)
+					}
+				}
+				if len(headerRuns) == 0 {
+					t.Fatalf("page %d has no header", i+1)
+				}
+				// Reassemble each label from its column's runs (same X, top
+				// to bottom) and compare with the label.
+				byX := map[float64][]pdfcheck.Run{}
+				var xs []float64
+				for _, r := range headerRuns {
+					if _, ok := byX[r.X]; !ok {
+						xs = append(xs, r.X)
+					}
+					byX[r.X] = append(byX[r.X], r)
+				}
+				slices.Sort(xs)
+				if len(xs) != len(c.header) {
+					t.Fatalf("page %d: header columns = %d, want %d", i+1, len(xs), len(c.header))
+				}
+				top, bottom := 0.0, 1e9
+				for col, x := range xs {
+					var got strings.Builder
+					for _, r := range byX[x] {
+						got.WriteString(r.S)
+						top, bottom = max(top, r.Y+r.Size), min(bottom, r.Y)
+					}
+					if want := strings.ReplaceAll(c.header[col], " ", ""); strings.ReplaceAll(got.String(), " ", "") != want {
+						t.Fatalf("page %d column %d: label drawn as %q, want every character of %q", i+1, col, trim(got.String()), trim(c.header[col]))
+					}
+				}
+				// The contract is half the table area: a literal, not the
+				// constant under test.
+				if share := (top - bottom) / (bottomY - margin); share > 0.5 {
+					t.Errorf("page %d: the header takes %.0f%% of the table area, more than half", i+1, share*100)
+				}
+				if i < len(d.Pages)-1 && len(rowsHere) < 15 {
+					t.Errorf("page %d holds %d rows: the header left too little room", i+1, len(rowsHere))
+				}
+			}
+		})
+	}
+}
+
+// bandLayout is a layout positioned for one band of columns of the given
+// widths, as run sets it up.
+func bandLayout(t *testing.T, widths []float64) *layout {
+	t.Helper()
+	reg, bold, err := loadFonts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := &layout{reg: newFace(reg, "F1"), bold: newFace(bold, "F2")}
+	x := margin
+	l.colX = append(l.colX, x)
+	for _, w := range widths {
+		x += w
+		l.colX = append(l.colX, x)
+	}
+	return l
+}
+
+// TestHeaderSizeIsTheLargestThatFits: a header that does not fit at the
+// normal size is set at the LARGEST size whose wrapped height fits in half
+// the table area — not merely some size that fits.
+func TestHeaderSizeIsTheLargestThatFits(t *testing.T) {
+	half := (bottomY - margin) * 0.5 // the contract, literally
+	narrow := make([]float64, 32)
+	labels := make([]string, 32)
+	for c := range narrow {
+		narrow[c] = availW / 32
+		labels[c] = fmt.Sprintf("spec.c%02d.", c) + strings.Repeat("segment.", 14)[:110]
+	}
+	cases := []struct {
+		name   string
+		widths []float64
+		header []string
+	}{
+		{"32 narrow columns of 120-character paths", narrow, labels},
+		{"one 20000-character label", []float64{availW}, []string{strings.Repeat("Lorem ipsum dolor sit amet ", 741)[:20000]}},
+		{"20000 lines", []float64{availW}, []string{strings.Repeat("x\n", 20000) + "x"}},
+	}
+	for _, c := range cases {
+		l := bandLayout(t, c.widths)
+		s := l.headerSize(c.header)
+		if s <= 0 || s >= headSize {
+			t.Fatalf("%s: size %v, want a shrunk size in (0, %v)", c.name, s, headSize)
+		}
+		if h := l.headerHeightAt(c.header, s); h > half {
+			t.Errorf("%s: at %v pt the header is %.2f pt tall, more than half the table area (%.2f)", c.name, s, h, half)
+		}
+		// One step above the chosen size (well above the bisection's
+		// headSize/2^24 resolution) must no longer fit.
+		if up := s * 1.0001; l.headerHeightAt(c.header, up) <= half {
+			t.Errorf("%s: %v pt fits too, so %v pt is not the largest size that fits", c.name, up, s)
+		}
+	}
+}
+
+// TestBodyRowFailsWhenAFreshPageFitsNoRow: should the header ever leave a
+// fresh page no room for one row line (the header budget broken), the
+// layout returns an error instead of opening page after page forever.
+func TestBodyRowFailsWhenAFreshPageFitsNoRow(t *testing.T) {
+	l := bandLayout(t, []float64{availW})
+	l.hs = headSize
+	l.hlines = [][]string{make([]string, 1000)} // a header taller than the page
+	l.newPage()
+	l.tableStart("")
+	done := make(chan error, 1)
+	go func() { done <- l.bodyRow([]string{"a"}, "") }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errNoRoomForRows) {
+			t.Fatalf("bodyRow = %v, want errNoRoomForRows", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("bodyRow did not return: the layout pages forever")
+	}
+}
+
+// TestRenderTinyHeaderSizeIsWrittenPositive: a header shrunk far below
+// legibility (20,000 and 60,000 line breaks in one label) is still written
+// with a positive size — never "0 Tf" — and every label character is drawn.
+func TestRenderTinyHeaderSizeIsWrittenPositive(t *testing.T) {
+	sizeRe := regexp.MustCompile(`/F2 ([0-9.]+) Tf`)
+	for _, lines := range []int{20000, 60000} { // 60000 sets it below 0.005 pt
+		label := strings.Repeat("x\n", lines-1) + "x"
+		d := render(t, Document{Created: created, Header: []string{label}, Rows: [][]string{{"1"}}})
+		var sizes []float64
+		for _, st := range d.Streams {
+			if st.IsFontProgram() {
+				continue
+			}
+			for _, m := range sizeRe.FindAllSubmatch(st.Data, -1) {
+				v, err := strconv.ParseFloat(string(m[1]), 64)
+				if err != nil {
+					t.Fatal(err)
+				}
+				sizes = append(sizes, v)
+			}
+		}
+		if len(sizes) == 0 {
+			t.Fatalf("%d lines: no header text drawn", lines)
+		}
+		for _, v := range sizes {
+			if v <= 0 {
+				t.Fatalf("%d lines: header written at %v pt; a positive size must never print as 0", lines, v)
+			}
+		}
+		if got := strings.Count(d.Pages[0].Text(), "x"); got != lines {
+			t.Errorf("%d lines: %d label characters drawn, want %d", lines, got, lines)
+		}
+		t.Logf("%d lines: header at %v pt", lines, sizes[0])
+	}
+}
+
+// TestRenderEmptyShapes: no rows, and no columns, still give a valid
+// one-page document.
+func TestRenderEmptyShapes(t *testing.T) {
+	d := render(t, Document{Title: "empty", Created: created, Header: []string{"a", "b"}})
+	if len(d.Pages) != 1 || !hasLine(d.Pages[0], "a | b") {
+		t.Errorf("no-rows document:\n%s", d)
+	}
+	d = render(t, Document{Title: "nothing", Created: created})
+	if len(d.Pages) != 1 || !hasLine(d.Pages[0], "nothing") {
+		t.Errorf("no-columns document:\n%s", d)
+	}
+	if _, err := Render(Document{Header: []string{"a"}, Rows: [][]string{{"1", "2"}}}); err == nil {
+		t.Errorf("a row with more cells than columns must be an error")
+	}
+}
+
+// TestRenderConcurrent: documents render concurrently (the parsed fonts
+// are shared, each document has its own glyph state); run under -race.
+func TestRenderConcurrent(t *testing.T) {
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	outs := make([]*PDF, 8)
+	for i := range errs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			outs[i], errs[i] = Render(Document{Title: fmt.Sprint("doc ", i), Created: created, Header: headerOf(3), Rows: rowsOf(80, 3)})
+		}()
+	}
+	wg.Wait()
+	for i := range errs {
+		if errs[i] != nil {
+			t.Fatalf("render %d: %v", i, errs[i])
+		}
+		var b bytes.Buffer
+		if _, err := outs[i].WriteTo(&b); err != nil {
+			t.Fatal(err)
+		}
+		d := pdfcheck.Parse(t, b.Bytes())
+		if !hasLine(d.Pages[0], fmt.Sprint("doc ", i)) {
+			t.Errorf("render %d has the wrong title", i)
+		}
+	}
+}
+
+func BenchmarkRender50Kx10(b *testing.B) {
+	rows := rowsOf(50000, 10)
+	header := headerOf(10)
+	b.ResetTimer()
+	for range b.N {
+		out, err := Render(Document{Title: "bench", Created: created, Header: header, Rows: rows})
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.ReportMetric(float64(out.Len())/(1<<20), "MiB-pdf")
+	}
+}

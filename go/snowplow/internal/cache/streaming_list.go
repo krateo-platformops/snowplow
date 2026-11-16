@@ -128,6 +128,9 @@ func compositionStreamingListEnabled() bool {
 type streamingDynamicInformer struct {
 	informer clientcache.SharedIndexInformer
 	gvr      schema.GroupVersionResource
+	// verifier is the snapshot decorator, which judges against the GVR's
+	// delivery record once registration attaches it (#918).
+	verifier *verifyingListerWatcher
 }
 
 func (d *streamingDynamicInformer) Informer() clientcache.SharedIndexInformer {
@@ -186,6 +189,7 @@ var _ informers.GenericInformer = &streamingDynamicInformer{}
 // streaming LIST carries the SAME paging policy as every other informer
 // (no streaming-only page-limit constant — see the NOTE above).
 func newStreamingDynamicInformer(
+	ctx context.Context,
 	rc *rest.Config,
 	dyn dynamic.Interface,
 	gvr schema.GroupVersionResource,
@@ -197,7 +201,7 @@ func newStreamingDynamicInformer(
 	}
 	restClient, err := streamingRESTClient(rc)
 	if err != nil {
-		slog.Warn("cache.streaming_list.rest_client_failed",
+		slog.WarnContext(ctx, "cache.streaming_list.rest_client_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("error", err.Error()),
@@ -206,12 +210,19 @@ func newStreamingDynamicInformer(
 		return nil, false
 	}
 
+	// #870 (design v5.1 C4) — the context-aware fields, so the informer's own
+	// context reaches the LIST and the WATCH: stopping a copy (an aborted or
+	// superseded build, a retired one) cancels its in-flight LIST and decode
+	// instead of leaving them running until the apiserver answers. client-go's
+	// own dynamic and metadata informers already set these
+	// (dynamicinformer/informer.go, metadatainformer/informer.go); with only
+	// the context-free fields set, ListWatch hands them context.TODO().
 	lw := &clientcache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+		ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
 			if tweak != nil {
 				tweak(&options)
 			}
-			list, err := streamingList(context.TODO(), restClient, gvr, options)
+			list, err := streamingList(ctx, restClient, gvr, options)
 			if err != nil {
 				// Return an untyped nil on the error path — never a
 				// typed-nil *bytesObjectList wrapped in a non-nil
@@ -221,7 +232,7 @@ func newStreamingDynamicInformer(
 			}
 			return list, nil
 		},
-		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+		WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
 			// Standard dynamic watch — unchanged from
 			// NewFilteredDynamicInformer. A WATCH stream is already
 			// incremental (one event at a time); only the initial LIST
@@ -229,14 +240,14 @@ func newStreamingDynamicInformer(
 			if tweak != nil {
 				tweak(&options)
 			}
-			return dyn.Resource(gvr).Namespace(metav1.NamespaceAll).Watch(context.TODO(), options)
+			return dyn.Resource(gvr).Namespace(metav1.NamespaceAll).Watch(ctx, options)
 		},
 	}
 
 	// #237 deliverable B — the verifying decorator. THIS is the hook point,
 	// and it is the ListerWatcher rather than the ListFunc above for one
 	// reason: production takes the WATCH-LIST path, not the LIST path
-	// (WatchListClient defaults true at client-go v0.35.3 and nothing here
+	// (WatchListClient defaults true at client-go v0.36.5 and nothing here
 	// opts out), so a hook on ListFunc would only ever cover the fallback.
 	// The decorator sees both — see store_verify.go.
 	//
@@ -257,7 +268,7 @@ func newStreamingDynamicInformer(
 	// reads it existed — and so it never needs rw.mu on the reflector's own
 	// goroutine, which is the deadlock hazard reflector_path.go documents.
 	verifier.bind(informer)
-	return &streamingDynamicInformer{informer: informer, gvr: gvr}, true
+	return &streamingDynamicInformer{informer: informer, gvr: gvr, verifier: verifier}, true
 }
 
 // streamingRESTClient builds a rest.RESTClient for raw apiserver GETs
@@ -532,6 +543,7 @@ func decodeItemsArrayStreaming(
 		// the H1-stored shape (managedFields + last-applied removed).
 		stripped, serr := stripItemJSON(itemRaw)
 		if serr != nil {
+			// log-ctx-waiver: informer-event: a reflector LIST decoded on the reflector goroutine
 			slog.Warn("cache.streaming_list.item_strip_failed",
 				slog.String("subsystem", "cache"),
 				slog.Int("item_index", *totalItems),
@@ -548,6 +560,7 @@ func decodeItemsArrayStreaming(
 		// fresh, non-aliased slice — SB-4).
 		bo, berr := newBytesObjectFromRaw(stripped)
 		if berr != nil {
+			// log-ctx-waiver: informer-event: a reflector LIST decoded on the reflector goroutine
 			slog.Warn("cache.streaming_list.item_decode_failed",
 				slog.String("subsystem", "cache"),
 				slog.Int("item_index", *totalItems),

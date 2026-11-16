@@ -167,7 +167,7 @@ func TestSec95_ServeGuard_EmptyBindingCellNotServed(t *testing.T) {
 	// Represent the broad empty-identity's customer Put: populate the
 	// empty-identity cell (same key the narrow cohort derives — both fold
 	// BindingUID==empty). This is the shared cell #95 must NOT serve.
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"leaked":"broad-identity-content"}`), Inputs: inputs})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"leaked":"broad-identity-content"}`), Inputs: inputs})
 	if _, ok := handle.Get(key); !ok {
 		t.Fatalf("setup: the representative empty-identity cell Put did not land")
 	}
@@ -228,7 +228,7 @@ func TestSec95_PutGate_EmptyBindingCellNotPopulated(t *testing.T) {
 	// Run the real code path: Put IFF the gate passes.
 	putEligible := handle != nil && key != "" && serveFromCacheEligible(inputs)
 	if putEligible {
-		handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"resolved":"under-empty-identity"}`), Inputs: inputs})
+		putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"resolved":"under-empty-identity"}`), Inputs: inputs})
 	}
 
 	// (b) GREEN: the Put-gate is FALSE for a ""-BindingUID → no customer Put →

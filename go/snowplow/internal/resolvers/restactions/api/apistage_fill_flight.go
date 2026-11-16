@@ -43,6 +43,40 @@
 // its joiners. A joiner's ctx cancels only its own wait.
 //
 // No admission bound here: that is #710 PR-2.
+//
+// #765 option A — THE STAMP-GATED READER. A refresher re-resolve whose trigger
+// set holds the cell's GVR (contentStampGate.on) must be fresh only as of its
+// dequeue (need, cache.RefreshTriggerAsOf). It joins the current flight when
+// the epoch rule above admits it OR the flight's startSeq ≥ need (its read
+// began after every trigger the refresh consumed). Refused, a BACKGROUND-class
+// stamp-gated reader does not start a concurrent fill of the same list: it
+// joins the key's PENDING flight, creating it if none — a flight queued behind
+// the current one whose leader, once the current flight completes, captures its
+// own content sink (a fresh startSeq) and fills. Every pending joiner joined
+// before that capture, so the pending fill is never older than any joiner's
+// need: lossless. Per key that is at most one flight in flight plus one
+// pending, whatever the number of dependents a change dirtied. Customer- and
+// debt-class readers (#710: users never queue; #740 K5 customer-triggered
+// refreshes, #547 demand revalidation, the D2 refill) never wait on a pending
+// flight: they keep the path above.
+//
+// #882 F2 — ONE FILL PER INCREMENTAL LIST, WHATEVER THE EDIT RATE. Under churn
+// the epoch rule above refuses nearly every joiner of a LIST flight (at >=10
+// edits/s every reader's list has moved since the flight's startSeq), and each
+// refused reader led its own full fill: 22–28 concurrent 50K fills, the run-15
+// OOM. A LIST flight that will anchor an incremental cell (contentFlight.
+// incremental: anchoring is available and the GVR servable when the flight
+// is created) admits EVERY reader that can be served a snapshot (snapshotJoin):
+// its cell watches the GVR from before its listing, so an edit during the fill
+// is a pending key, not a stale body, and a joiner whose list moved is served
+// cell.Snapshot(its own seq) — the flight's body brought up to the joiner's own
+// sequence (apistage.go). Nobody is served older than its own fill would read,
+// exactly as the epoch rule guarantees, and a joiner waits only the remaining
+// fill time plus the drain of the edits since. If the flight ends without an
+// anchored cell, a joiner that joined a moved list is not served the flight's
+// body: it makes one more attempt under today's rule (errJoinedMovedFlight).
+// GET-by-name and lists that cannot anchor (passthrough, a dry run, a GVR not
+// servable when the flight is created) keep the epoch rule above unchanged.
 package api
 
 import (
@@ -50,6 +84,9 @@ import (
 	"sync"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -68,18 +105,51 @@ type contentFlightResult struct {
 	// err (#710 PR-2a) is the flight's admission failure: every reader in it
 	// errors with it (D1).
 	err error
+	// cell (#882 F2) is the incremental cell the leader anchored and stored,
+	// nil if none: a joiner takes Snapshot(its own seq) from it.
+	cell *cache.ListCell
+	// fallReason (#988) is, on a not-servable flight, the reason the leader's
+	// dispatch fell through: a joiner falls through on the same decision and
+	// sends its apiserver call with it.
+	fallReason cache.FallthroughReason
+}
+
+// contentStampGate is a stamp-gated (#765) reader's state: on for a refresher
+// read whose trigger set holds the cell's GVR, need the seq it must be fresh as
+// of.
+type contentStampGate struct {
+	on   bool
+	need uint64
+	// viewed (#799 fix 1): a viewed-tier refresh (cache.ViewedRefreshFromContext).
+	viewed bool
 }
 
 // contentFlight is one in-flight fill of one content key.
 type contentFlight struct {
-	key      string
+	key string
+	// gvr (#1054) is the flight's resource type, as a waiter's slow-call
+	// record names it. leaderClass and leaderWork are its LEADER's admission
+	// class and work class (customer, refresh, prewarm, fill_bg, ...), taken
+	// when the flight is created and never promoted, so a waiter's record says
+	// whose work it waited on. Immutable.
+	gvr                     string
+	leaderClass, leaderWork string
+	// startSeq is the flight's read epoch. A PENDING flight (#765) sets it only
+	// when it starts, under contentFlightsMu; it is read under the same lock, or
+	// after done is closed.
 	startSeq uint64
+	// prior (#765) is, for a pending flight, the flight it is queued behind.
+	prior *contentFlight
 	// ticket (#710 PR-2a) is the flight's place in the memory-admission gate;
 	// its class is the max over the flight's participants.
 	ticket *fillTicket
-	done   chan struct{}
-	once   sync.Once
-	res    contentFlightResult
+	// incremental (#882 F2) — the flight will anchor an incremental list cell,
+	// so a reader whose list moved since startSeq may still join it (see the
+	// file comment). Set when the flight is created; immutable.
+	incremental bool
+	done        chan struct{}
+	once        sync.Once
+	res         contentFlightResult
 }
 
 var (
@@ -89,39 +159,115 @@ var (
 	// here but still completes for the joiners it already has. Bounded by the
 	// concurrent fills.
 	contentFlights = map[string]*contentFlight{}
+	// contentPendingFlights (#765) is each content key's PENDING flight: queued
+	// behind the current one, joinable by background stamp-gated readers. At most
+	// one per key; bounded by the concurrent fills.
+	contentPendingFlights = map[string]*contentFlight{}
 )
 
 // enterContentFlight is the MISS branch's entry. It installs the content cell's
 // #375 (A) child dep-gen sink (fillCtx) BEFORE any data read — its startSeq is
 // the epoch of the flight this reader would lead — and joins or leads the key's
 // flight. fillCtx is meaningful only to a leader.
-func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason) (flight *contentFlight, fillCtx context.Context, lead bool) {
+//
+// #765 — a reader that LEADS a pending flight blocks here until the flight it is
+// queued behind completes, then captures its content sink and starts.
+//
+// #882 F2 — anchorable: a flight this reader leads will anchor an incremental
+// cell (a LIST, not a dry run, anchoring available on a servable GVR), so the
+// flight it creates is incremental. snapshotJoin: this reader may join an
+// incremental flight whatever its list did since the flight started (anchorable
+// AND a first attempt — a reader retrying after errJoinedMovedFlight keeps the
+// epoch rule, but a flight it LEADS is still incremental). movedJoin reports a
+// join the epoch rule alone would have refused: that joiner is served only from
+// the flight's cell.
+func enterContentFlight(ctx context.Context, key string, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, stamp contentStampGate, anchorable, snapshotJoin bool) (flight *contentFlight, fillCtx context.Context, lead, movedJoin bool) {
 	fillCtx = cache.WithContentDepGenSink(ctx, gvr, namespace, name)
 	startSeq, _ := cache.DepGenStartSeqFromContext(fillCtx)
-	flight, lead = joinOrLeadContentFill(key, startSeq, gvr, namespace, name, reason, contentFillClassOf(ctx))
-	return flight, fillCtx, lead
+	flight, lead, movedJoin = joinOrLeadContentFill(key, startSeq, gvr, namespace, name, reason, contentFillClassOf(ctx), workclass.Of(ctx).String(), stamp, anchorable, snapshotJoin)
+	if lead && flight.prior != nil {
+		// The prior flight is bounded by its own detached write deadline, so this
+		// wait is too; it is not cut by this reader's ctx, because the pending
+		// flight's joiners are waiting on THIS leader.
+		p := flight.prior
+		w := slowcall.StartLedWait(ctx, slowcall.PhaseFlightWait, "content_flight_pending", key, flight.gvr, p.leaderClass, p.leaderWork) // #1054
+		<-flight.prior.done
+		w.End()
+		fillCtx = cache.WithContentDepGenSink(ctx, gvr, namespace, name)
+		startSeq, _ = cache.DepGenStartSeqFromContext(fillCtx)
+		startPendingContentFlight(flight, startSeq)
+	}
+	return flight, fillCtx, lead, movedJoin
+}
+
+// startPendingContentFlight turns a pending flight into its key's current one
+// at read epoch startSeq. From here new readers judge it by the ordinary join
+// rule, and a refused background reader queues the NEXT pending flight behind
+// it.
+func startPendingContentFlight(f *contentFlight, startSeq uint64) {
+	contentFlightsMu.Lock()
+	defer contentFlightsMu.Unlock()
+	f.startSeq = startSeq
+	f.prior = nil
+	if contentPendingFlights[f.key] == f {
+		delete(contentPendingFlights, f.key)
+	}
+	contentFlights[f.key] = f
 }
 
 // joinOrLeadContentFill returns the flight the reader is in and whether it
 // LEADS it. startSeq is the leader-to-be's content-sink entry seq; it is used
 // only when the reader leads. (gvr, namespace, name) is the cell's own
 // coordinate (name "" = LIST).
-func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, class fillAdmissionClass) (*contentFlight, bool) {
+//
+// #765 — stamp (a stamp-gated refresher reader) adds the need-based join and,
+// for the background class only, the pending flight (see the file comment). A
+// returned flight with a non-nil prior that the reader LEADS is pending: the
+// caller (enterContentFlight) waits for prior before filling.
+//
+// #882 F2 — anchorable / snapshotJoin (see enterContentFlight): an incremental
+// current flight is joined whatever the coordinate did by a snapshotJoin reader;
+// a flight an anchorable reader creates is incremental; movedJoin marks the join
+// the epoch rule would have refused.
+//
+// #1054 — leaderWork is the reader's work class: a flight it creates records
+// it (and class) as its leader's.
+func joinOrLeadContentFill(key string, startSeq uint64, gvr schema.GroupVersionResource, namespace, name string, reason contentFillReason, class fillAdmissionClass, leaderWork string, stamp contentStampGate, anchorable, snapshotJoin bool) (flight *contentFlight, lead, movedJoin bool) {
 	contentFlightsMu.Lock()
 	defer contentFlightsMu.Unlock()
-	if cur := contentFlights[key]; cur != nil {
-		if !cache.ContentCoordinateMovedSince(gvr, namespace, name, cur.startSeq) {
+	cur := contentFlights[key]
+	if cur != nil {
+		epochOK := !cache.ContentCoordinateMovedSince(gvr, namespace, name, cur.startSeq) ||
+			(stamp.on && cur.startSeq >= stamp.need)
+		if epochOK || (cur.incremental && snapshotJoin) {
 			noteContentFillJoined(reason, gvr.String())
 			// #710 PR-2a — a joiner of a higher class promotes a queued flight, or
 			// coalescing would let a customer wait at background priority.
 			theContentFillGate().promote(cur.ticket, class)
-			return cur, false
+			return cur, false, !epochOK
 		}
 		noteContentFillJoinRefused(reason)
 	}
-	f := &contentFlight{key: key, startSeq: startSeq, done: make(chan struct{}), ticket: newFillTicket(class)}
+	// #799 fix 1 — a viewed-tier refresh (a passive viewer, no customer request
+	// waiting) coalesces too, at its own (debt) admission class: without it, N
+	// viewed refreshes under churn led N concurrent re-fills of the same list.
+	coalesce := stamp.on && (class == fillClassBackground || stamp.viewed)
+	if coalesce {
+		// A pending flight has not captured its read epoch yet: it will start
+		// after this reader's need, whatever that is.
+		if p := contentPendingFlights[key]; p != nil {
+			noteContentRefreshCoalesced(gvr.String())
+			return p, false, false
+		}
+		if cur != nil {
+			p := &contentFlight{key: key, gvr: gvr.String(), leaderClass: class.String(), leaderWork: leaderWork, prior: cur, done: make(chan struct{}), ticket: newFillTicket(class), incremental: anchorable}
+			contentPendingFlights[key] = p
+			return p, true, false
+		}
+	}
+	f := &contentFlight{key: key, gvr: gvr.String(), leaderClass: class.String(), leaderWork: leaderWork, startSeq: startSeq, done: make(chan struct{}), ticket: newFillTicket(class), incremental: anchorable}
 	contentFlights[key] = f
-	return f, true
+	return f, true, false
 }
 
 // complete publishes the flight's result to its joiners and retires it as the
@@ -134,6 +280,9 @@ func (f *contentFlight) complete(res contentFlightResult) {
 		if contentFlights[f.key] == f {
 			delete(contentFlights, f.key)
 		}
+		if contentPendingFlights[f.key] == f {
+			delete(contentPendingFlights, f.key)
+		}
 		contentFlightsMu.Unlock()
 		close(f.done)
 	})
@@ -144,10 +293,20 @@ func (f *contentFlight) complete(res contentFlightResult) {
 func (f *contentFlight) wait(ctx context.Context) (contentFlightResult, bool) {
 	contentFillJoinWaiting.Add(1)
 	defer contentFillJoinWaiting.Add(-1)
+	// #1054 — the joiner's wait on another reader's fill: the flight wait of
+	// its slow-call record, named by the content key's digest and released by
+	// the flight (with or without a servable result) or by its own ctx.
+	w := slowcall.StartLedWait(ctx, slowcall.PhaseFlightWait, "content_flight", f.key, f.gvr, f.leaderClass, f.leaderWork)
 	select {
 	case <-f.done:
+		if f.res.ok {
+			w.End()
+		} else {
+			w.EndRelease(slowcall.ReleaseLeaderFailed)
+		}
 		return f.res, f.res.ok
 	case <-ctx.Done():
+		w.EndRelease(slowcall.CauseOf(ctx.Err()))
 		return contentFlightResult{}, false
 	}
 }
@@ -156,7 +315,7 @@ func (f *contentFlight) wait(ctx context.Context) (contentFlightResult, bool) {
 // sinks, markers), none of its cancellation, bounded by the server write
 // deadline — so the joiners never inherit the leader's cancellation.
 func detachedFillContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), cache.DemandRevalidationDeadline())
+	return context.WithTimeout(pagebudget.Detach(ctx), cache.DemandRevalidationDeadline()) // #1115: and outside the reader's page budget
 }
 
 // resetContentFlightsForTest forgets every current flight, so a flight an
@@ -164,6 +323,7 @@ func detachedFillContext(ctx context.Context) (context.Context, context.CancelFu
 func resetContentFlightsForTest() {
 	contentFlightsMu.Lock()
 	contentFlights = map[string]*contentFlight{}
+	contentPendingFlights = map[string]*contentFlight{}
 	contentFlightsMu.Unlock()
 }
 

@@ -52,9 +52,55 @@ var ctxKeyExternalTouchedSink = ctxKeyExternalTouchedSinkType{}
 // errgroup workers of a multi-stage resolve, so all access is atomic.
 type ExternalTouchedSink struct {
 	count atomic.Int64
+	// thirdParty counts the touches among count that carried nothing of the
+	// requester (BumpThirdParty). The external-TTL opt-in needs every touch to be
+	// one (#1221). It only ever narrows that opt-in: every Put rule that declines
+	// on an external touch reads count.
+	thirdParty atomic.Int64
+	// declaredWrite (#903 F1, #915, #912 re-review): a RESTAction resolved under
+	// this sink DECLARES a write stage. It is NOT an external touch (count is
+	// untouched): it is its own input of the Put-gate verdict (PutGateVerdict,
+	// reason declared_write), which declines it on every Put path. It rides this
+	// sink only because this sink already travels with every resolve that may
+	// Put, child sinks included.
+	declaredWrite atomic.Bool
+	// startedIncomplete (#1233): the resolve under this sink began while the RBAC
+	// snapshot was incomplete. Set when the sink is installed (the resolve's
+	// start) and by a memo hit replaying a producer that began so. The store
+	// admits no write of such a resolve, whatever the snapshot is by its Put: what
+	// it read was filtered by the incomplete snapshot.
+	startedIncomplete atomic.Bool
 	// parent is the enclosing resolve's sink when this is a CHILD sink
 	// (WithChildPutGateSinks, #684); every bump is forwarded to it.
 	parent *ExternalTouchedSink
+}
+
+// newExternalTouchedSink is a sink for a resolve that starts now, under parent.
+func newExternalTouchedSink(parent *ExternalTouchedSink) *ExternalTouchedSink {
+	s := &ExternalTouchedSink{parent: parent}
+	if !rbacSnapshotComplete() {
+		s.startedIncomplete.Store(true)
+	}
+	return s
+}
+
+// markStartedIncomplete records that this resolve, and so every resolve that
+// encloses it, began on an incomplete snapshot (a memo hit replays it).
+func (s *ExternalTouchedSink) markStartedIncomplete() {
+	for cur := s; cur != nil; cur = cur.parent {
+		cur.startedIncomplete.Store(true)
+	}
+}
+
+// StartedIncomplete reports whether this resolve, or a resolve enclosing it,
+// began while the RBAC snapshot was incomplete. nil-receiver-safe (false).
+func (s *ExternalTouchedSink) StartedIncomplete() bool {
+	for cur := s; cur != nil; cur = cur.parent {
+		if cur.startedIncomplete.Load() {
+			return true
+		}
+	}
+	return false
 }
 
 // Bump records one external-fetch touch. nil-receiver-safe so the bump site
@@ -63,6 +109,46 @@ func (s *ExternalTouchedSink) Bump() {
 	for cur := s; cur != nil; cur = cur.parent {
 		cur.count.Add(1)
 	}
+}
+
+// BumpThirdParty records one external-fetch touch that carried nothing of the
+// requester: the dial presented a named endpoint's own credential and no requester
+// bearer, so the answer cannot depend on who asked (#1221). Every other touch is a
+// plain Bump, so a site that cannot prove this never qualifies for the opt-in.
+// count is written first, so a concurrent reader can only see fewer third-party
+// touches than touches, never more. nil-receiver-safe.
+func (s *ExternalTouchedSink) BumpThirdParty() {
+	for cur := s; cur != nil; cur = cur.parent {
+		cur.count.Add(1)
+		cur.thirdParty.Add(1)
+	}
+}
+
+// OnlyThirdParty reports whether the resolve touched an external endpoint and every
+// touch carried nothing of the requester. One requester-dialled touch among any
+// number of third-party ones is false: the body then holds that requester's answer.
+// nil-receiver-safe (false).
+func (s *ExternalTouchedSink) OnlyThirdParty() bool {
+	if s == nil {
+		return false
+	}
+	n := s.count.Load()
+	return n > 0 && s.thirdParty.Load() == n
+}
+
+// MarkDeclaredWrite (#903 F1) records that a RESTAction resolved under this
+// sink declares a write stage, here and in every parent sink (like Bump). It is
+// not counted as an external touch. nil-receiver-safe.
+func (s *ExternalTouchedSink) MarkDeclaredWrite() {
+	for cur := s; cur != nil; cur = cur.parent {
+		cur.declaredWrite.Store(true)
+	}
+}
+
+// DeclaredWrite reports whether a RESTAction resolved under this sink declares
+// a write stage (MarkDeclaredWrite). nil-receiver-safe (false).
+func (s *ExternalTouchedSink) DeclaredWrite() bool {
+	return s != nil && s.declaredWrite.Load()
 }
 
 // Count returns the number of external-fetch touches recorded.
@@ -87,7 +173,7 @@ func (s *ExternalTouchedSink) Count() int64 {
 // apiref chokepoint inherits it via the widget→apiref ctx. A resolve with no
 // sink installed bumps a nil receiver (no-op) and Puts as before.
 func WithExternalTouchedSink(ctx context.Context) (context.Context, *ExternalTouchedSink) {
-	sink := &ExternalTouchedSink{}
+	sink := newExternalTouchedSink(nil)
 	if ctx == nil {
 		return ctx, sink
 	}

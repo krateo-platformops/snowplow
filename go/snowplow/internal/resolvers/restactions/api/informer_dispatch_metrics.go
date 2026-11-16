@@ -19,6 +19,7 @@
 package api
 
 import (
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"log/slog"
 	"os"
 	"strconv"
@@ -132,6 +133,7 @@ func startDispatchSummary() {
 		dispatchSummaryWG.Add(1)
 		go func() {
 			defer dispatchSummaryWG.Done()
+			workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 			t := time.NewTicker(every)
 			defer t.Stop()
 			for {

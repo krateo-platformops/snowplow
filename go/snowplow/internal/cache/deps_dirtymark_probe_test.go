@@ -87,7 +87,7 @@ func probeFixture(t *testing.T, dep probeDepClass, selfRep bool) (*DepTracker, *
 	if selfRep {
 		own = name // the entry's resolved output IS the event's object
 	}
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, own)})
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, own)})
 	switch dep {
 	case probeExactDep:
 		d.Record(context.Background(), key, gvr, ns, name)
@@ -101,6 +101,8 @@ func probeFixture(t *testing.T, dep probeDepClass, selfRep bool) (*DepTracker, *
 // fan-out loop for every reachable cell. The short-circuit must not move a
 // single number here.
 func TestDirtyMarkProbe_BehaviourIdentity(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr, ns, name := gvrCompositions(), "ns", "obj"
 
 	for _, tc := range []struct {
@@ -232,6 +234,8 @@ func TestDirtyMarkProbe_BehaviourIdentity(t *testing.T) {
 // The non-vacuity half matters as much as the assertion: it proves the fixture
 // CAN produce a self mark, so a 0 here is the defect and not an inert fixture.
 func TestDirtyMarkProbe_SelfClassStaysReachable(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr, ns, name := gvrCompositions(), "ns", "obj"
 
 	d, _, _, _ := probeFixture(t, probeExactDep, true /* the entry IS the object */)
@@ -280,6 +284,8 @@ func TestDirtyMarkProbe_SelfClassStaysReachable(t *testing.T) {
 // bounded by the refresher's queue latency. This arm asserts both halves of
 // that deferral so a future change cannot quietly break the hand-off.
 func TestDirtyMarkProbe_SavingAndItsDeferredEvict(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr, name := gvrCompositions(), "obj"
 	const (
 		nListDeps = 8
@@ -308,11 +314,11 @@ func TestDirtyMarkProbe_SavingAndItsDeferredEvict(t *testing.T) {
 	for i := 0; i < nListDeps; i++ {
 		k := "L1list_" + itoa(i)
 		listKeys = append(listKeys, k)
-		store.Put(k, expired("listowner"+itoa(i)))
+		store.put(k, expired("listowner"+itoa(i)))
 		d.RecordList(context.Background(), k, gvr, "ns")
 	}
 	const controlKey = "L1exact_control"
-	store.Put(controlKey, expired("owner"))
+	store.put(controlKey, expired("owner"))
 	d.Record(context.Background(), controlKey, gvr, "ns", name)
 
 	if got := store.evictTTLTotal.Load(); got != 0 {

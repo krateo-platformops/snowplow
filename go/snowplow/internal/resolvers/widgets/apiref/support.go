@@ -2,6 +2,7 @@ package apiref
 
 import (
 	"encoding/json"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 	"net/http"
 
 	"github.com/krateo-platformops/plumbing/http/response"
@@ -67,9 +68,28 @@ func statusErrorFromResponse(st *response.Status, ref templatesv1.ObjectReferenc
 	}
 }
 
+// errorFromResult is the error of a failed objects.Get of the apiRef: the
+// read's own *statusdetails.TypeNotInstalledError when the read decided its
+// type is not installed (#1429), else statusErrorFromResponse of its status.
+func errorFromResult(res objects.Result, ref templatesv1.ObjectReference) error {
+	if res.TypeNotInstalled != nil {
+		return res.TypeNotInstalled
+	}
+	return statusErrorFromResponse(res.Err, ref)
+}
+
 func rawExtensionToMap(raw *runtime.RawExtension) (map[string]any, error) {
+	m, _, err := rawExtensionToMapEncoded(raw)
+	return m, err
+}
+
+// rawExtensionToMapEncoded is rawExtensionToMap plus the exact bytes it decoded
+// (#883 F4: the RESTAction's encoded result, which the resolve memo stores so a
+// hit is this same decode of these same bytes). The bytes are nil when nothing
+// was decoded (no status); the map is then the empty map, as before.
+func rawExtensionToMapEncoded(raw *runtime.RawExtension) (map[string]any, []byte, error) {
 	if raw == nil {
-		return map[string]any{}, nil
+		return map[string]any{}, nil, nil
 	}
 
 	var data []byte
@@ -79,14 +99,14 @@ func rawExtensionToMap(raw *runtime.RawExtension) (map[string]any, error) {
 		var err error
 		data, err = json.Marshal(raw.Object)
 		if err != nil {
-			return map[string]any{}, err
+			return map[string]any{}, nil, err
 		}
 	} else {
-		return map[string]any{}, nil
+		return map[string]any{}, nil, nil
 	}
 
 	var result map[string]any
 	err := json.Unmarshal(data, &result)
 
-	return result, err
+	return result, data, err
 }

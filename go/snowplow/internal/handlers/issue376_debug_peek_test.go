@@ -15,6 +15,8 @@ import (
 )
 
 func TestIssue376_DebugDepsKeyView_IsPurePeek(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "20")
@@ -33,9 +35,9 @@ func TestIssue376_DebugDepsKeyView_IsPurePeek(t *testing.T) {
 	// Non-seeded, body within TTL but lastRead COLD (aged past TTL): Put old then
 	// ReplaceIfGen fresh inherits the old lastRead — so the cell is in NEITHER warm
 	// bucket unless something stamps its lastRead.
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: &in, CreatedAt: time.Now().Add(-100 * time.Second)})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: &in, CreatedAt: time.Now().Add(-100 * time.Second)})
 	gen := c.CaptureGen(key)
-	if !c.ReplaceIfGen(context.Background(), key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
+	if !c.ReplaceResolvedIfGen(context.Background(), fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
 		t.Fatal("setup: ReplaceIfGen must succeed")
 	}
 

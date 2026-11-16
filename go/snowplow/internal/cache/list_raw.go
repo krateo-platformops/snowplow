@@ -45,6 +45,7 @@
 package cache
 
 import (
+	"context"
 	"encoding/json"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -72,7 +73,7 @@ import (
 // caller today only appends them into a fresh envelope buffer.
 //
 // Safe for concurrent use; takes rw.mu in read mode.
-func (rw *ResourceWatcher) ListRawServable(gvr schema.GroupVersionResource, namespace string) ([][]byte, bool) {
+func (rw *ResourceWatcher) ListRawServable(ctx context.Context, gvr schema.GroupVersionResource, namespace string) ([][]byte, bool) {
 	if rw == nil {
 		return nil, false
 	}
@@ -91,13 +92,13 @@ func (rw *ResourceWatcher) ListRawServable(gvr schema.GroupVersionResource, name
 	// THE SERVE. gi was just resolved by servableLocked so this holds by
 	// construction today; the assert is the guard that trips if a future
 	// refactor returns data,true here without the predicate.
-	if !rw.assertServeRequiresServableLocked(gvr, "ListRawServable") {
+	if !rw.assertServeRequiresServableLocked(ctx, gvr, "ListRawServable") {
 		return nil, false
 	}
 	raws, err := rawFromIndexer(gi, namespace)
 	if err != nil {
 		// #624: fail closed, counted — never a shorter list served as true.
-		recordUnrenderableStoreItem(unrenderableSiteListRaw, gvr, err)
+		recordUnrenderableStoreItem(ctx, unrenderableSiteListRaw, gvr, err)
 		return nil, false
 	}
 	return raws, true

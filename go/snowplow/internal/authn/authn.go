@@ -1,10 +1,11 @@
 // Package authn is a small client for the Kubernetes intra-service auth login
 // strategy: snowplow presents its own projected (audience-bound) ServiceAccount
 // token to authn's /serviceaccount/login endpoint and receives an authn-issued
-// JWT (signed by the Krateo authn issuer's jwt-sign-key). That JWT is the
+// JWT (RS256, signed with authn's private key). That JWT is the
 // Bearer the PREWARM SEED uses to authenticate a nested loopback `/call`
 // against snowplow's OWN auth-gated `/call` endpoint — the only credential
-// snowplow's middleware (jwtutil.Validate against jwt-sign-key) will accept
+// snowplow's middleware (jwtutil.ValidateWithKeySource against authn's JWKS)
+// will accept
 // (the projected apiserver SA token has a different issuer and is rejected;
 // see docs/rca-prewarm-nested-loopback-jwt-2026-06-26.md §4).
 //
@@ -68,7 +69,7 @@ func New(server, tokenPath string) *Client {
 		tokenPath: tokenPath,
 		// #723/#724: this client presents snowplow's projected SA token; it
 		// never follows a redirect (a same-host redirect would re-send it).
-		httpClient: credhttp.Client(&http.Client{Timeout: 30 * time.Second}),
+		httpClient: credhttp.CountConnectionsOn(credhttp.EgressAuthn, credhttp.Client(&http.Client{Timeout: 30 * time.Second})),
 		now:        time.Now,
 	}
 }

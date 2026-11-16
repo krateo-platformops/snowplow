@@ -93,6 +93,8 @@ func refreshExpvarFields(t *testing.T) map[string]any {
 }
 
 func TestRefreshEviction_S4_ExpvarsAfterRealCycle(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	// rate 1 / burst 1: the second key of a two-key eviction burst is
 	// guaranteed to be deferred, so evict_deferred must move.
 	t.Setenv(envRefreshEvictionPublishRatePerSecond, "1")
@@ -161,6 +163,8 @@ func TestRefreshEviction_S4_ExpvarsAfterRealCycle(t *testing.T) {
 // --- S10 — -race + lock order + no deliver-after-unsub ---------------------------
 
 func TestRefreshEviction_S10_LockFreeAtPublish(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store := evictionHarness(t, 100, time.Hour)
 	gvr := gvrFlexes()
 	var probed atomic.Int32
@@ -374,6 +378,8 @@ func holdEvictionClock707(t *testing.T) (release func()) {
 }
 
 func TestRefreshEviction_Pace_DeferredNeverDroppedDedup(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv(envRefreshEvictionPublishRatePerSecond, "100")
 	t.Setenv(envRefreshEvictionPublishBurst, "5")
 	d, store := evictionHarness(t, 1000, time.Hour)

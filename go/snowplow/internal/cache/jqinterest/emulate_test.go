@@ -293,6 +293,21 @@ func renderTemplate(tmpl string, data any) (string, error) {
 
 // emulate runs the chain on the tracked list items.
 func emulate(c Chain, items []any, env emuEnv) emuOutcome {
+	// #1116 (restactions/api reserved_extras.go): extras that name a key the
+	// resolver writes — a stage name, an errorKey (the model's stages carry
+	// none, so the default "error"), slice — refuse the resolve before any
+	// stage runs. The refusal reads no list, so it is the same outcome on
+	// both sides of any UPDATE.
+	for k := range env.extras {
+		if k == "slice" || k == "error" {
+			return failOutcome("refused: reserved extras key")
+		}
+		for i := range c.RA.Stages {
+			if c.RA.Stages[i].Name == k {
+				return failOutcome("refused: reserved extras key")
+			}
+		}
+	}
 	dict := map[string]any{}
 	for k, v := range env.extras {
 		dict[k] = deepCopy(v)

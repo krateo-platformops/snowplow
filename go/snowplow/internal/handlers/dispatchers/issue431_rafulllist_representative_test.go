@@ -10,8 +10,9 @@
 //
 // REAL BOUNDARY: the cell is minted by the real apiref.Resolve (customer) or the
 // real seedRAFullListForWidget (seed) over a real ResourceWatcher + published
-// RBAC snapshot; the RESTAction LISTs configmaps cluster-wide and the informer
-// pivot narrows each item per requester (filterListByRBAC). The dep change is a
+// RBAC snapshot; the RESTAction LISTs configmaps cluster-wide through a
+// userAccessFilter and the refilter narrows each item per requester (#961: a
+// cluster-wide LIST made as a namespace-only caller is the apiserver's 403). The dep change is a
 // real informer UPDATE; the refresh is the real refresher loop
 // (cache.StartRefresher → resolveAndPopulateL1 → resolveOnceProd). No customer
 // request runs between the mint and the assertion.
@@ -63,6 +64,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -103,7 +105,14 @@ func i431RACR(name string) *unstructured.Unstructured {
 		"metadata":   map[string]any{"name": name, "namespace": h1NS},
 		"spec": map[string]any{
 			"api": []any{
-				map[string]any{"name": "cms", "path": "/api/v1/configmaps", "continueOnError": true},
+				// #961: a cluster-wide LIST as a namespace-only caller is the
+				// apiserver's 403. The per-class cross-namespace view this
+				// fixture needs is a userAccessFilter's: the SA lists, the
+				// refilter keeps the items the caller may list in their own
+				// namespace.
+				map[string]any{"name": "cms", "path": "/api/v1/configmaps", "continueOnError": true,
+					"userAccessFilter": map[string]any{"verb": "list", "group": "", "resource": "configmaps",
+						"namespaceFrom": ".metadata.namespace"}},
 			},
 			"filter": i431SliceJQ,
 		},
@@ -156,6 +165,10 @@ func i431Fixture(t *testing.T, raName string) (*dynamicfake.FakeDynamicClient, *
 	}
 	srv := psFakeAPIServer(t, a, k423Counters())
 	psSeedClientconfigs(t, srv.URL)
+	// The userAccessFilter stage dials snowplow's ServiceAccount endpoint.
+	t.Cleanup(api.SetServiceAccountEndpointForTest(func() (*endpoints.Endpoint, error) {
+		return &endpoints.Endpoint{ServerURL: srv.URL, Token: "tok-sa"}, nil
+	}))
 	return dyn, &endpoints.Endpoint{ServerURL: srv.URL, Token: "tok-sa"}, &rest.Config{Host: srv.URL}
 }
 
@@ -439,7 +452,7 @@ func TestIssue431_SubGenMovesInsideRefresh_NoWrite(t *testing.T) {
 	dyn, saEP, saRC := i431Fixture(t, ra)
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, i431CMGVR}) // activates sub-gen deltas
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, i431CMGVR}) // activates sub-gen deltas
 	carol := i431Ctx(psCarol)
 	key, in := i431RAKey(t, carol, ra)
 	i431Serve(t, carol, ra, saRC)
@@ -452,7 +465,7 @@ func TestIssue431_SubGenMovesInsideRefresh_NoWrite(t *testing.T) {
 	var armed atomic.Bool
 	restore := setResolveOnceForTest(func(ctx context.Context, i cache.ResolvedKeyInputs) ([]byte, error) {
 		if armed.CompareAndSwap(false, true) {
-			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup([]string{psGroup}))
+			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psCarol, []string{psGroup}))
 			i431GrantWide(t, dyn, psCarol)
 			out, err := resolveOnceProd(ctx, i) // reads under the transient grant
 			i431RevokeWide(t, dyn, psCarol)
@@ -515,7 +528,7 @@ func TestIssue431_SeedAndCustomerRAKeyParity(t *testing.T) {
 		}},
 	}}
 	cohort := withCohortSeedContext(context.Background(), seedTarget{Username: "", Groups: []string{psGroup}}, *saEP, saRC)
-	seedRAFullListForWidget(cohort, widget, psAuthnNS, h1NS, "w431")
+	seedRAFullListForWidget(cohort, widget, psAuthnNS, h1NS, "w431", newPrewarmPagination(5, 1))
 	sKey, sIn := i431RAKey(t, cohort, ra)
 	se, ok := cache.ResolvedCache().Get(sKey)
 	if !ok || se.Inputs == nil {

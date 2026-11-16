@@ -247,6 +247,12 @@ func ResetEngineDeclinedExternalSetForTest() {
 
 // CFG-1: published only with the cache on.
 func init() {
+	// #890/#893 — a declined-external mark HOLDS its key's dep edges: its retire
+	// check (DepsMovedSinceUncovered) reads the buckets those edges anchor, and
+	// without them the GVR floor would retire it on any event of the type. Its
+	// retirement releases the key (SeedDeclinedExternalSet.ForgetCoordinate /
+	// Reset) or re-resolves the cell, whose end releases it.
+	RegisterEdgeHolder(func(l1Key string) bool { return EngineDeclinedExternalSet().Marked(l1Key) })
 	if Disabled() {
 		return
 	}

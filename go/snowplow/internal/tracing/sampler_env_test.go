@@ -37,6 +37,12 @@ import (
 // RED on main (8de5295): main has no chart value for the sampler at all
 // (SDK default = ParentBased(AlwaysSample) → arm 1 recorded), and the
 // pre-1.12.4 chart draft carried parentbased_traceidratio (arm 1 recorded).
+//
+// #1013: the chart now ships parentbased_always_on (Diego's ruling
+// 2026-10-30: the SLIs need 100% of server spans). The traceidratio arms stay
+// as SDK-family pins (what an operator gets by setting the ratio sampler
+// back); the S1013 arms at the bottom pin the shipped family's behaviour,
+// including the edge-sampling caveat: an UNSAMPLED parent drops the span.
 
 const (
 	// bytes 8..15 all 0xff → x ≈ 9.22e18 > 4.61e17 → Drop under traceidratio 0.05
@@ -80,6 +86,17 @@ func setupWithEnv(t *testing.T, sampler, arg string) {
 // sampled.
 func driveWithParent(t *testing.T, traceIDHex string) (recording, sampled bool, gotTraceID string) {
 	t.Helper()
+	if _, err := hex.DecodeString(traceIDHex); err != nil {
+		t.Fatalf("harness: bad trace id %q", traceIDHex)
+	}
+	return drive(t, "00-"+traceIDHex+"-"+spanIDParent+"-01")
+}
+
+// drive sends one request through the REAL otelhttp server handler with the
+// given traceparent header ("" = none: a root request) and reports what the
+// server span decided.
+func drive(t *testing.T, traceparent string) (recording, sampled bool, gotTraceID string) {
+	t.Helper()
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		span := trace.SpanFromContext(r.Context())
 		recording = span.IsRecording()
@@ -89,14 +106,13 @@ func driveWithParent(t *testing.T, traceIDHex string) (recording, sampled bool, 
 	})
 	h := otelhttp.NewHandler(inner, "snowplow")
 	req := httptest.NewRequest(http.MethodGet, "/call?resource=x", nil)
-	req.Header.Set("traceparent", "00-"+traceIDHex+"-"+spanIDParent+"-01")
+	if traceparent != "" {
+		req.Header.Set("traceparent", traceparent)
+	}
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	if rr.Code != 200 {
 		t.Fatalf("handler status %d", rr.Code)
-	}
-	if _, err := hex.DecodeString(traceIDHex); err != nil {
-		t.Fatalf("harness: bad trace id %q", traceIDHex)
 	}
 	return recording, sampled, gotTraceID
 }
@@ -152,5 +168,40 @@ func TestF3_SamplerEnvIsLive_AlwaysOn(t *testing.T) {
 	setupWithEnv(t, "always_on", "")
 	if rec, samp, _ := driveWithParent(t, traceIDHighTail); !rec || !samp {
 		t.Fatalf("always_on did not sample (recording=%v sampled=%v)", rec, samp)
+	}
+}
+
+// TestS1013_ParentBasedAlwaysOnSamplesEveryRootAndSampledParent — the shipped
+// family (#1013). A root request (no traceparent: in-cluster callers, the
+// LoadBalancer path) is always sampled, and a request whose parent says
+// sampled=1 (the agent gateway today) is sampled even when its trace id hashes
+// outside any ratio: the all-ff tail that traceidratio 0.05 DROPS in
+// TestF3_TraceIDRatioIgnoresSampledParent, so this arm is red under the old
+// chart's family.
+func TestS1013_ParentBasedAlwaysOnSamplesEveryRootAndSampledParent(t *testing.T) {
+	setupWithEnv(t, "parentbased_always_on", "")
+	for i := 0; i < 32; i++ {
+		if rec, samp, _ := drive(t, ""); !rec || !samp {
+			t.Fatalf("root request %d not sampled (recording=%v sampled=%v): the SLIs would miss it", i, rec, samp)
+		}
+	}
+	if rec, samp, _ := driveWithParent(t, traceIDHighTail); !rec || !samp {
+		t.Fatalf("sampled=1 parent with an all-ff trace id not sampled (recording=%v sampled=%v)", rec, samp)
+	}
+}
+
+// TestS1013_ParentBasedAlwaysOnDropsAnUnsampledParent pins the caveat the PR
+// documents for installer#402: once the gateway samples at its edge and
+// propagates sampled=0 for a request it dropped, parentbased_always_on drops
+// snowplow's Server span for that request too. If this arm ever flips, the
+// remedies described in tracing.go (SAMPLING) need re-reading.
+func TestS1013_ParentBasedAlwaysOnDropsAnUnsampledParent(t *testing.T) {
+	setupWithEnv(t, "parentbased_always_on", "")
+	rec, samp, tid := drive(t, "00-"+traceIDLowTail+"-"+spanIDParent+"-00")
+	if tid != traceIDLowTail {
+		t.Fatalf("propagator did not carry the incoming trace id (got %s)", tid)
+	}
+	if rec || samp {
+		t.Fatalf("sampled=0 parent was recording=%v sampled=%v under parentbased_always_on; the edge-sampling caveat no longer holds", rec, samp)
 	}
 }

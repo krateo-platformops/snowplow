@@ -52,8 +52,12 @@ func raFullListPinBytesThreshold() int64 {
 // (and re-pins via the refresher's own path — resolve_populate.go carries the
 // prior pin and re-Puts through the #189-guarded ReplaceIfGen). A nil/marshal-
 // fail full is a no-op returning (nil,false).
-func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs, full map[string]any) ([]byte, bool) {
-	if c == nil {
+//
+// v is the full list's Put-gate verdict (PutGateVerdict over the full list's
+// own sinks, #684): nothing is stored unless it allows the Put (#912
+// re-review — the write itself refuses a declined resolve).
+func (c *ResolvedCacheStore) PutRAFullList(v PutVerdict, key string, inputs ResolvedKeyInputs, full map[string]any) ([]byte, bool) {
+	if c == nil || !v.Store() {
 		return nil, false
 	}
 	encoded, err := json.Marshal(full)
@@ -107,16 +111,16 @@ func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs,
 	// quietly; one that reasons about a gate can.
 	//
 	// uaf-scope-waiver: capped here via UAFTTLOverrideForEntry; HasUAF is stamped by the sole caller apiref.raFullListServe (declared + observed limbs) — see the paragraphs above.
-	c.Put(key, &ResolvedEntry{
+	stored := c.put(key, &ResolvedEntry{
 		RawJSON:     encoded,
 		Inputs:      &in,
 		Pinned:      pin,
 		TTLOverride: UAFTTLOverrideForEntry(&in),
 	})
 	// #592 acceptance signal — counted AFTER the write, so it measures cells that
-	// exist rather than Puts attempted. Put is unconditional, so every HasUAF cell
-	// reaching here is stored.
-	if in.HasUAF {
+	// exist rather than Puts attempted. The store's admission (#1233) can refuse
+	// the write, so it is gated on `stored`.
+	if stored && in.HasUAF {
 		BumpRAFullListUAFCached()
 	}
 	return encoded, pin
@@ -133,17 +137,49 @@ func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs,
 // fail full is a no-op returning false. PutIfGen (insert-or-replace), not
 // ReplaceIfGen: raFullListServe is the SERVE path and first-populates the raKey
 // cell on a cold /call, so an insert-on-absent (gen 0) must succeed.
-func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, key string, inputs ResolvedKeyInputs, full map[string]any, capturedGen uint64) bool {
-	if c == nil {
-		return false
-	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
+//
+// v is the full list's Put-gate verdict, as for PutRAFullList.
+//
+// It reports only whether it wrote, so it compares nothing beyond #406's own
+// compare (#1321 M1); the production serve path uses PutRAFullListIfGenOutcome.
+func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, v PutVerdict, key string, inputs ResolvedKeyInputs, full map[string]any, capturedGen uint64) bool {
+	// #443 (a) — an inert (dry-run) resolve persists nothing. putIfGen runs the
+	// store's admission as well (#1233).
 	if Inert(ctx) {
 		return false
 	}
+	return c.putRAFullListIfGen(ctx, v, key, inputs, full, "", capturedGen, false).Stored()
+}
+
+// PutRAFullListIfGenOutcome is PutRAFullListIfGen reporting the write's
+// outcome (#1321). A raFullList key is armable: a /refreshes connection may
+// supply raFullList coordinates (DeriveSubscriptionKey mints the key through
+// apiref.RAFullListKey, #426), and the refresher publishes the key. So the
+// serve path's write, which can replace a resident cell, hands its outcome to
+// the publish gate (PublishPutIfSubscribed) like every write of an armable
+// cell (put_outcome.go, WRITE SITES).
+//
+// stageOutcomes (#1319) is the stored X-Snowplow-Stage-Outcomes value of the
+// unpaginated resolve that produced full ("" = every stage succeeded): a hit
+// of the cell hands it to the widget it is sliced for.
+func (c *ResolvedCacheStore) PutRAFullListIfGenOutcome(ctx context.Context, v PutVerdict, key string, inputs ResolvedKeyInputs, full map[string]any, stageOutcomes string, capturedGen uint64) PutOutcome {
+	// #443 (a) — as PutRAFullListIfGen.
+	if Inert(ctx) {
+		return PutRefused
+	}
+	return c.putRAFullListIfGen(ctx, v, key, inputs, full, stageOutcomes, capturedGen, true)
+}
+
+// putRAFullListIfGen is the write PutRAFullListIfGen and
+// PutRAFullListIfGenOutcome share (each checks cache.Inert first, #443 (a));
+// outcome as for putIfGenWrite.
+func (c *ResolvedCacheStore) putRAFullListIfGen(ctx context.Context, v PutVerdict, key string, inputs ResolvedKeyInputs, full map[string]any, stageOutcomes string, capturedGen uint64, outcome bool) PutOutcome {
+	if c == nil || !v.Store() {
+		return PutRefused
+	}
 	encoded, err := json.Marshal(full)
 	if err != nil {
-		return false
+		return PutRefused
 	}
 	pin := int64(len(encoded)) >= raFullListPinBytesThreshold()
 	in := inputs // copy onto the heap for the entry
@@ -162,20 +198,21 @@ func (c *ResolvedCacheStore) PutRAFullListIfGen(ctx context.Context, key string,
 	// (apiref.raFullListServe), same two stamp limbs, same arms holding it up.
 	//
 	// uaf-scope-waiver: capped here via UAFTTLOverrideForEntry; HasUAF is stamped by the sole caller apiref.raFullListServe (declared + observed limbs) — twin of PutRAFullList above.
-	stored := c.PutIfGen(ctx, key, &ResolvedEntry{
-		RawJSON:     encoded,
-		Inputs:      &in,
-		Pinned:      pin,
-		TTLOverride: UAFTTLOverrideForEntry(&in),
-	}, capturedGen)
+	put := c.putIfGenWrite(ctx, key, &ResolvedEntry{
+		RawJSON:       encoded,
+		Inputs:        &in,
+		Pinned:        pin,
+		TTLOverride:   UAFTTLOverrideForEntry(&in),
+		StageOutcomes: stageOutcomes, // #1319
+	}, capturedGen, outcome)
 	// #592 acceptance signal — gated on `stored`, NOT on reaching the Put: a
 	// generation-REFUSED write (a DELETE-eviction bumped the gen during the
 	// resolve) stored no cell, and counting it would report cached UAF bodies
 	// that do not exist.
-	if stored && in.HasUAF {
+	if put.Stored() && in.HasUAF {
 		BumpRAFullListUAFCached()
 	}
-	return stored
+	return put
 }
 
 // #323 — PutRAFullListPinned (an explicit-pin RAFullList re-Put) was REMOVED

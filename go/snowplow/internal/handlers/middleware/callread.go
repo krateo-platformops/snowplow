@@ -98,7 +98,8 @@ type callReadBody struct {
 // malformed body is likewise a 400. The body is consumed here; the downstream
 // resolve handlers read extras from the CONTEXT, not the body, and the
 // read-only Call fallthrough (handlers.CallRead) never reads a body — so
-// consuming it here is safe.
+// consuming it here is safe. A 400 names the route it was sent to (method
+// and path): POST /export decodes the same envelope here.
 //
 // The stash happens even when the decoded extras is nil (an empty or
 // extras-less body): that pins the read route to the body channel and stops a
@@ -109,7 +110,7 @@ func BodyExtrasDecode(next http.Handler) http.Handler {
 		if r.Body != nil {
 			dec := json.NewDecoder(io.LimitReader(r.Body, CallReadMaxBodyBytes))
 			if err := dec.Decode(&body); err != nil {
-				response.BadRequest(w, fmt.Errorf("invalid POST /call/read body (expected {\"extras\":{...}}): %w", err))
+				response.BadRequest(w, fmt.Errorf("invalid %s %s body (expected {\"extras\":{...}}): %w", r.Method, r.URL.Path, err))
 				return
 			}
 		}
@@ -117,7 +118,7 @@ func BodyExtrasDecode(next http.Handler) http.Handler {
 		if body.Object != nil {
 			obj, err := validateInlineObject(r.URL.Query(), body.Object)
 			if err != nil {
-				response.BadRequest(w, fmt.Errorf("invalid POST /call/read inline object: %w", err))
+				response.BadRequest(w, fmt.Errorf("invalid %s %s inline object: %w", r.Method, r.URL.Path, err))
 				return
 			}
 			// One of the two places allowed to mint the inert flag (the other

@@ -203,6 +203,8 @@ func TestACO14_NilSyncChDetectedOnTheInformerPath(t *testing.T) {
 // --- R3 — DeleteFunc dispatches OnDelete on the worker goroutine -------------
 
 func TestR3_DeleteFuncDispatchesViaWorker(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanDepWatch(t)
 	defer cleanup()
 
@@ -212,7 +214,7 @@ func TestR3_DeleteFuncDispatchesViaWorker(t *testing.T) {
 
 	gvr := gvrCompositions()
 	const l1Key = "L1_self_rep"
-	store.Put(l1Key, &ResolvedEntry{
+	store.put(l1Key, &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs:  inputsFor(gvr, "ns", "victim"),
 	})

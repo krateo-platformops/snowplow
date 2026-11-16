@@ -135,10 +135,11 @@ func walkMarkDeclinedExternal(resCtx context.Context, key string, in *unstructur
 	if set == nil {
 		return
 	}
-	// #681 C2 — the ONE external count: an own-credential apiserver 403 (F2)
-	// is not a genuine external touch.
-	if cache.GenuineExternal(cache.ExternalTouchedSinkFromContext(resCtx),
-		cache.PerIdentityForbiddenSinkFromContext(resCtx)) == 0 {
+	// The shared Put-gate verdict (cache.PutGateVerdict): mark only what no
+	// resolve can ever store — a genuine external touch (#681 C2: an
+	// own-credential apiserver 403 is not one) or a declared write (#903 F1).
+	// A transient stage error is retried, never marked.
+	if !cache.PutGateVerdict(cache.PutGateSinksFromContext(resCtx), "widgets").Permanent() {
 		return // observed touch only (I-5)
 	}
 	if errored && !walkErroredMarkableFn(in) {

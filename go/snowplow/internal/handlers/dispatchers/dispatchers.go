@@ -62,6 +62,7 @@ func All() map[string]http.Handler {
 func RegisterRefreshHandlers(saRC *rest.Config) {
 	var saEP *endpoints.Endpoint
 	if ep, err := idynamic.ServiceAccountEndpoint(); err != nil {
+		// log-ctx-waiver: boot: main wires the refresher once at start
 		slog.Warn("refresher.no_sa_transport",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
@@ -71,6 +72,7 @@ func RegisterRefreshHandlers(saRC *rest.Config) {
 		saEP = ep
 	}
 	if saRC == nil {
+		// log-ctx-waiver: boot: main wires the refresher once at start
 		slog.Warn("refresher.no_sa_rest_config",
 			slog.String("subsystem", "cache"),
 			slog.String("effect", "background refresh has no SA *rest.Config; object-fetch sites fall back to the per-user kubeconfig path which fails for a synthetic identity"),

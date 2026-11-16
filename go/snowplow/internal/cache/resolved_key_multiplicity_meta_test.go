@@ -47,7 +47,7 @@ func putInputs(t *testing.T, c *ResolvedCacheStore, in ResolvedKeyInputs, body s
 	t.Helper()
 	inputs := in
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(body), Inputs: &inputs})
 	return key
 }
 
@@ -66,6 +66,8 @@ func metaByKey(t *testing.T, c *ResolvedCacheStore) map[string]ResolvedEntryMeta
 // blindness capture. Four keys for one logical cell, each differing in exactly
 // one component; the surface must name which one for every pair.
 func TestResolvedMeta_AttributesKeyMultiplicityToANamedComponent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(20, 1<<20, time.Hour)
 
 	base := oneLogicalCell()
@@ -160,13 +162,15 @@ func TestResolvedMeta_AttributesKeyMultiplicityToANamedComponent(t *testing.T) {
 // the NEW body. The refresher re-Puts every cell it refreshes through exactly
 // this branch.
 func TestResolvedMeta_ExtrasHashTracksReplaceInPlace(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	in := oneLogicalCell()
 	key := ComputeKey(in)
 
 	first := in
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &first})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &first})
 	before := metaByKey(t, c)[key].ExtrasHash
 	if before == "" || before == "e0" {
 		t.Fatalf("precondition: expected a real extras hash on the first Put, got %q", before)
@@ -177,7 +181,7 @@ func TestResolvedMeta_ExtrasHashTracksReplaceInPlace(t *testing.T) {
 	// follows the entry the item currently holds, whatever put it there.)
 	second := in
 	second.Extras = map[string]any{"compositionId": "comp-REPLACED"}
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":2}`), Inputs: &second})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":2}`), Inputs: &second})
 
 	after := metaByKey(t, c)[key]
 	if after.ExtrasHash == before {
@@ -198,6 +202,8 @@ func TestResolvedMeta_ExtrasHashTracksReplaceInPlace(t *testing.T) {
 // so extras-equal ⟺ hash-equal. Two arms — insertion order must not matter,
 // and a same-cardinality VALUE change must be visible.
 func TestResolvedMeta_ExtrasHashIsTheComputeKeyDerivation(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	// Order-independence: two maps built in opposite insertion orders.
@@ -248,6 +254,8 @@ func TestResolvedMeta_ExtrasHashIsTheComputeKeyDerivation(t *testing.T) {
 // is what separates them. Every identity-free class must project a zero AND a
 // non-empty class on the same row.
 func TestResolvedMeta_SubGenZeroIsReadableOnlyWithClass(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(20, 1<<20, time.Hour)
 
 	// The classes whose construction sites never set RBACSubGen — enumerated
@@ -296,9 +304,11 @@ func TestResolvedMeta_SubGenZeroIsReadableOnlyWithClass(t *testing.T) {
 // between "no key-inputs record" ("") and "a record whose extras fold was
 // empty" ("e0"). Collapsing them makes an absent record read as a measured one.
 func TestResolvedMeta_NoInputsProjectsEmptyNotSentinel(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
-	c.Put("no-inputs-key", &ResolvedEntry{RawJSON: []byte(`{"ok":true}`)})
+	c.put("no-inputs-key", &ResolvedEntry{RawJSON: []byte(`{"ok":true}`)})
 
 	emptyExtras := oneLogicalCell()
 	emptyExtras.Extras = nil
@@ -320,9 +330,11 @@ func TestResolvedMeta_NoInputsProjectsEmptyNotSentinel(t *testing.T) {
 // page-independent raFullList fold. The only thing separating them is
 // CacheEntryClass == "" on the same row, so that separation must hold.
 func TestResolvedMeta_NilInputsZerosAreDiscriminatedByClass(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
-	c.Put("no-inputs-key", &ResolvedEntry{RawJSON: []byte(`{"ok":true}`)})
+	c.put("no-inputs-key", &ResolvedEntry{RawJSON: []byte(`{"ok":true}`)})
 
 	// A genuine raFullList fold: page-independent 0/0, WITH an Inputs record.
 	raFull := oneLogicalCell()
@@ -356,6 +368,8 @@ func TestResolvedMeta_NilInputsZerosAreDiscriminatedByClass(t *testing.T) {
 // field, the sibling of TestRangeMetadata_BehaviorallyEmitsNoBody. Extras can
 // carry per-identity values; the projection must never reproduce one.
 func TestResolvedMeta_ExtrasHashIsAHashNotTheExtras(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	const sentinel = "SECRET-EXTRAS-DO-NOT-LEAK-9c2b1"
@@ -465,7 +479,7 @@ func TestResolvedMeta_ExtrasHashRaceUnderConcurrentPutAndWalk(t *testing.T) {
 
 	// Seed every key so readers always find rows.
 	for k := 0; k < nKeys; k++ {
-		c.Put(keys[k], entryForVariant(k, 0, -1, -1))
+		c.put(keys[k], entryForVariant(k, 0, -1, -1))
 	}
 
 	keyIndex := map[string]int{}
@@ -523,7 +537,7 @@ func TestResolvedMeta_ExtrasHashRaceUnderConcurrentPutAndWalk(t *testing.T) {
 			defer wg.Done()
 			for r := 0; r < nRounds; r++ {
 				for k := 0; k < nKeys; k++ {
-					c.Put(keys[k], entryForVariant(k, (w+r)%nVariants, w, r))
+					c.put(keys[k], entryForVariant(k, (w+r)%nVariants, w, r))
 				}
 			}
 		}(w)

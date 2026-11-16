@@ -19,11 +19,13 @@ import (
 )
 
 func TestIssue375_C3_EventBetweenPutCheckAndPostPutRecord_RemarksOnce(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Run("event-in-window_remarks-once", func(t *testing.T) {
 		c, rl, hl := setup375(t)
 		const K = "c3-window"
 		ctx := WithL1KeyContext(context.Background(), K)
-		if !c.PutIfGen(ctx, K, body375(`{}`), c.CaptureGen(K)) {
+		if !c.putIfGen(ctx, K, body375(`{}`), c.CaptureGen(K)) {
 			t.Fatalf("setup: PutIfGen refused")
 		}
 		if n := rl.count(K); n != 0 {
@@ -61,7 +63,7 @@ func TestIssue375_C3_EventBetweenPutCheckAndPostPutRecord_RemarksOnce(t *testing
 		c, rl, _ := setup375(t)
 		const K = "c3-quiet"
 		ctx := WithL1KeyContext(context.Background(), K)
-		c.PutIfGen(ctx, K, body375(`{}`), c.CaptureGen(K))
+		c.putIfGen(ctx, K, body375(`{}`), c.CaptureGen(K))
 		Deps().Record(ctx, K, g375A, "ns", "obj")
 		Deps().Record(ctx, K, g375B, "ns", "obj2")
 		if n := rl.count(K); n != 0 {
@@ -75,7 +77,7 @@ func TestIssue375_C3_EventBetweenPutCheckAndPostPutRecord_RemarksOnce(t *testing
 		// A content cell: own coordinate pre-declared, Recorded only after the Put.
 		ctx := WithContentDepGenSink(WithL1KeyContext(context.Background(), "outer-c3"), g375A, "ns", "obj")
 		Deps().OnUpdate(g375A, "ns", "obj") // moves BEFORE the Put → the Put-check remarks
-		if !c.PutIfGen(ctx, K, body375(`{}`), c.CaptureGen(K)) {
+		if !c.putIfGen(ctx, K, body375(`{}`), c.CaptureGen(K)) {
 			t.Fatalf("setup: PutIfGen refused")
 		}
 		Deps().OnUpdate(g375A, "ns", "obj") // and again before the Record
@@ -90,7 +92,7 @@ func TestIssue375_C3_EventBetweenPutCheckAndPostPutRecord_RemarksOnce(t *testing
 		c, rl, _ := setup375(t)
 		const K = "c3-put"
 		ctx := WithL1KeyContext(context.Background(), K)
-		c.PutIfGen(ctx, K, body375(`{}`), c.CaptureGen(K))
+		c.putIfGen(ctx, K, body375(`{}`), c.CaptureGen(K))
 		Deps().OnUpdate(g375A, "ns", "obj")
 		Deps().Record(ctx, "c3-other-key", g375A, "ns", "obj")
 		if n := rl.count(K) + rl.count("c3-other-key"); n != 0 {

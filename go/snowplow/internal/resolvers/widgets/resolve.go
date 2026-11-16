@@ -20,6 +20,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	crdschema "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/resourcesrefs"
@@ -40,7 +41,13 @@ type ResolveOptions struct {
 	AuthnNS string
 	PerPage int
 	Page    int
-	Extras  map[string]any
+	// Cursor (#874) is the data source's own continuation token from the
+	// previous page (the RA-emitted slice.cursor, echoed in
+	// status.resourcesRefs.slice.cursor). It reaches the apiRef RESTAction as
+	// .slice.cursor. Empty on a first page and for every source that does not
+	// page by cursor.
+	Cursor string
+	Extras map[string]any
 }
 
 // resolveApiRefFn and validateObjectStatusFn are the two cross-boundary
@@ -66,6 +73,13 @@ var (
 
 func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	log := xcontext.Logger(ctx).With(loggerAttr(opts.In.Object))
+
+	// #1476 — this resolve is one failure-log round of the widget's cell; its
+	// apiRef RESTAction, resolved under the same cell key, joins it. A failure
+	// unchanged since the cell's previous round logs at DEBUG
+	// (api/failure_log.go).
+	ctx, endFailureRound := api.BeginFailureRound(ctx)
+	defer endFailureRound()
 
 	// A2 contract: server-trusted identity injection into the RESOLVE INPUT
 	// (definitive-cache-identity-architecture §1.3 + §2.4). For a widget whose CR
@@ -131,18 +145,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	// extras through filterDeclaredKeyExtras, which keeps ONLY
 	// spec.keyExtras-declared names, and every key stripped here is by
 	// construction outside that set.
-	opts.Extras = sanitizeUndeclaredIdentityExtras(opts.In.Object, opts.Extras)
-
-	if inj := DeclaredIdentity(ctx, opts.In.Object); len(inj) > 0 {
-		merged := make(map[string]any, len(opts.Extras)+len(inj))
-		for k, v := range opts.Extras {
-			merged[k] = v
-		}
-		for k, v := range inj { // injection wins on collision (quarantine)
-			merged[k] = v
-		}
-		opts.Extras = merged
-	}
+	opts.Extras = resolveInputExtras(ctx, opts.In.Object, opts.Extras)
 
 	// Ship 0.30.193 Checkpoint 1 — widget-resolve phase wall-clocks.
 	// Captured per-phase so seedOneWidget's deferred log can attribute
@@ -174,9 +177,19 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 
 	apirefStart := time.Now()
 	ds, err := resolveApiRefFn(ctx, opts)
+	// #1319 — the widget's stage outcomes are its apiRef RESTAction's, and that
+	// resolve is over: seal the caller's collector so a resolve that runs later
+	// on this ctx (an inline child's) keeps its own. A widget with no apiRef
+	// has no RESTAction stages and reads complete.
+	api.SealStageOutcomes(ctx)
 	phaseApirefMs = time.Since(apirefStart).Milliseconds()
 	if err != nil {
-		log.Error("unable to resolve api reference", slog.Any("err", err))
+		// #1116 — a reserved-extras refusal is the caller's error, logged once
+		// at WARN where it was decided (api.RefuseReservedExtras); any caller
+		// can send one, so it must not also write an ERROR line.
+		if _, refused := api.AsReservedExtrasError(err); !refused {
+			log.Log(ctx, apiRefFailureLevel(ctx, opts.In, err), "unable to resolve api reference", slog.Any("err", err))
+		}
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
 		return opts.In, cache.WrapResolveStage(cache.ResolveStageApiRef, "resolve apiRef "+stageObject(opts.In), err)
 	}
@@ -191,6 +204,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	// `if .slice then $sorted[0 : (.slice.page * .slice.perPage)] else …`)
 	// and silently falls through to "return all rows" when absent —
 	// materialising the unbounded list at the resolver layer.
+	//
+	// #874 — read the SOURCE's declared pagination BEFORE the injection: after
+	// it, ds.slice may be snowplow's own request echo, which declares nothing.
+	sourceMore, sourceCursor, _ := cache.SourcePagination(ds)
 	injectSlice(ds, opts.PerPage, opts.Page)
 
 	// extras-widgets parity (step 2): merge the per-request extras into
@@ -205,14 +222,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	widgetData, err := resolveWidgetData(ctx, opts.In, ds)
 	phaseWidgetDataMs = time.Since(widgetDataStart).Milliseconds()
 	if err != nil {
-		log.Error("unable to resolve widget data", slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to resolve widget data", slog.Any("err", err))
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
 		return opts.In, cache.WrapResolveStage(cache.ResolveStageWidgetData, "resolve widgetData "+stageObject(opts.In), err)
 	}
 
 	err = maps.SetNestedField(opts.In.Object, widgetData, "status", widgetDataKey)
 	if err != nil {
-		log.Error("unable to set status as unstructured.NestedMap",
+		log.ErrorContext(ctx, "unable to set status as unstructured.NestedMap",
 			slog.Any("err", err))
 		return opts.In, err
 	}
@@ -253,16 +270,28 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 			"items": tmp,
 		}
 		if opts.PerPage > 0 && opts.Page > 0 {
-			hasNext := (tot >= opts.PerPage)
+			// #874 — `continue` is the DATA SOURCE's answer (cache.SourcePagination:
+			// its slice.continue, else slice.cursor != "", else false), never an
+			// inference from the item count. The count rule (items >= perPage)
+			// made every source that ignores the window look endless; a source
+			// that does not paginate now yields exactly one page by construction.
+			hasNext := sourceMore
 			page := opts.Page
 			if hasNext {
 				page = page + 1
 			}
-			pig["slice"] = map[string]any{
+			sl := map[string]any{
 				"perPage":  opts.PerPage,
 				"page":     page,
 				"continue": hasNext,
 			}
+			// The next page's cursor. Today only the prewarm drain threads it;
+			// no /call handler reads a cursor yet (see
+			// docs/howto-frontend-source-declared-pagination.md §5).
+			if hasNext && sourceCursor != "" {
+				sl["cursor"] = sourceCursor
+			}
+			pig["slice"] = sl
 		}
 
 		err = maps.SetNestedField(opts.In.Object, pig, "status", resourcesRefsKey)
@@ -317,6 +346,24 @@ func stageObject(w *Widget) string {
 	return w.GroupVersionKind().String() + " " + w.GetNamespace() + "/" + w.GetName()
 }
 
+// apiRefFailureLevel is the level of the "unable to resolve api reference"
+// line of widget w (#1476, api/failure_log.go): an expected per-identity deny
+// — the apiRef read, or a stage of its RESTAction, denied for the caller's
+// identity — logs at WARN, any other failure at ERROR, and an unchanged repeat
+// in the widget cell's generation at DEBUG. Classified by the error's type
+// only; the target is the apiRef the widget names.
+func apiRefFailureLevel(ctx context.Context, w *Widget, err error) slog.Level {
+	own := slog.LevelError
+	if api.IsPerIdentityDenied(err) {
+		own = slog.LevelWarn
+	}
+	target := "widget.apiRef"
+	if ref, rerr := GetApiRef(w.Object); rerr == nil {
+		target += "\x00" + ref.Namespace + "/" + ref.Name
+	}
+	return api.FailureLogLevel(ctx, own, target, api.FailureClassOf(err))
+}
+
 func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	apiRef, err := GetApiRef(opts.In.Object)
 	if err != nil {
@@ -339,12 +386,51 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 	apiRefInline := GetApiRefExtras(opts.In.Object)
 	apiRefEff := mergeRequestWins(apiRefInline, opts.Extras)
 
-	return apiref.Resolve(ctx, apiref.ResolveOptions{
+	return apiref.Resolve(ctx, apirefOptionsFor(opts, apiRef, apiRefEff))
+}
+
+// resolveInputExtras is the request extras as Resolve hands them on: the
+// identity keys the widget has not declared stripped (A-3,
+// sanitizeUndeclaredIdentityExtras), then its declared identity injected,
+// injection winning on collision (A2, DeclaredIdentity). Resolve calls it once;
+// ApiRefExtras derives from it, so the two cannot drift.
+func resolveInputExtras(ctx context.Context, obj map[string]any, requestExtras map[string]any) map[string]any {
+	extras := sanitizeUndeclaredIdentityExtras(obj, requestExtras)
+	if inj := DeclaredIdentity(ctx, obj); len(inj) > 0 {
+		merged := make(map[string]any, len(extras)+len(inj))
+		for k, v := range extras {
+			merged[k] = v
+		}
+		for k, v := range inj { // injection wins on collision (quarantine)
+			merged[k] = v
+		}
+		extras = merged
+	}
+	return extras
+}
+
+// ApiRefExtras returns the extras a Resolve of the widget obj, given
+// requestExtras, threads into its apiRef RESTAction: spec.apiRef.extras under
+// the request extras as Resolve hands them on (resolveInputExtras), exactly
+// what resolveApiRef passes to apiref.Resolve. #1477: a background resolve
+// (requestExtras nil) asks it which keys the apiRef RESTAction's dict will
+// carry, to skip a resolve that needs keys it does not.
+func ApiRefExtras(ctx context.Context, obj map[string]any, requestExtras map[string]any) map[string]any {
+	return mergeRequestWins(GetApiRefExtras(obj), resolveInputExtras(ctx, obj, requestExtras))
+}
+
+// apirefOptionsFor builds the apiref.Resolve options for resolveApiRef: the
+// widget request's pagination (and, #874, the data source's cursor) plus the
+// effective extras. A pure function so the hand-off is testable without an
+// apiserver.
+func apirefOptionsFor(opts ResolveOptions, apiRef v1.ObjectReference, apiRefEff map[string]any) apiref.ResolveOptions {
+	return apiref.ResolveOptions{
 		RC:      opts.RC,
 		ApiRef:  apiRef,
 		AuthnNS: opts.AuthnNS,
 		PerPage: opts.PerPage,
 		Page:    opts.Page,
+		Cursor:  opts.Cursor,
 		// extras-widgets parity (step 1): thread the EFFECTIVE extras
 		// (apiRef-inline folded under request) into the apiRef fetch.
 		// extras flows widget → apiref → restactions.Resolve → api.Resolve,
@@ -357,7 +443,7 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 		// map deep-copies to an empty dict (no-op) — the prewarm/seed/refresher
 		// callers (no request extras, no inline) stay byte-identical.
 		Extras: apiRefEff,
-	})
+	}
 }
 
 func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map[string]any, error) {
@@ -383,7 +469,7 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 	// into the identity-free cell (#450 review).
 	wdt, err := GetWidgetDataTemplate(obj.Object)
 	if err != nil {
-		log.Warn("unable to get widgetDataTemplate", slog.Any("err", err))
+		log.WarnContext(ctx, "unable to get widgetDataTemplate", slog.Any("err", err))
 		return src, nil
 	}
 
@@ -392,7 +478,7 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 		DataSource: ds,
 	})
 	if err != nil {
-		log.Error("unable to resolve widgetDataTemplate", slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to resolve widgetDataTemplate", slog.Any("err", err))
 		return src, err
 	}
 	// #487: JQ eval VALUES are resolved data (stage bodies, per-user rows,
@@ -426,7 +512,7 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 
 		err = maps.SetNestedValue(src, fields, el.Value)
 		if err != nil {
-			log.Error("unable to set nested value",
+			log.ErrorContext(ctx, "unable to set nested value",
 				slog.Any("fields", fields),
 				redact.ValueAttr("value", &el.Value),
 				slog.Any("err", err))
@@ -444,14 +530,14 @@ func resolveResourceRefs(ctx context.Context, obj *Widget, ds map[string]any) ([
 
 	resrefs, err := GetResourcesRefs(obj.Object)
 	if err != nil {
-		log.Warn("unable to get resources references", slog.Any("err", err))
+		log.WarnContext(ctx, "unable to get resources references", slog.Any("err", err))
 	} else {
 		all = append(all, resrefs...)
 	}
 
 	resrefstpl, err := GetResourcesRefsTemplate(obj.Object)
 	if err != nil {
-		log.Warn("unable to get resource references template", slog.Any("err", err))
+		log.WarnContext(ctx, "unable to get resource references template", slog.Any("err", err))
 	}
 	if len(resrefstpl) > 0 {
 		resrefsExtra, err := resourcesrefstemplate.Resolve(ctx, resrefstpl, ds)

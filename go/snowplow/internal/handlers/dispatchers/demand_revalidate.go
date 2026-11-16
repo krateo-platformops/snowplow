@@ -20,15 +20,19 @@
 //     server's own write deadline, the longest any customer resolve may run. It
 //     runs on its own goroutine and never blocks the response.
 //   - TERMINAL: the cold path's own generation-guarded PutIfGen, which reports
-//     its outcome to the revalidation's sink; an accepted, un-remarked write
-//     closes the known-stale window (a dirty→fresh sample) and the cold path's
-//     publishIfSubscribed announces it over SSE.
+//     its outcome to the revalidation's sink; an accepted write ends the
+//     known-stale state and settles the revalidation (#884, owner ruling F5:
+//     known-stale means the last refresh FAILED). If the data moved during the
+//     resolve, the cell stays an ordinary open window the refresher replaces;
+//     otherwise the window closes (a dirty→fresh sample). The cold path's
+//     publishIfSubscribed announces the write over SSE.
 //   - FAILURE (owner ruling 1): no Put → the slot is released, the cell stays
 //     resident, served and counted; the next read or change retries. Never an
 //     eviction.
 //   - ABSORBED READ (#740): a read that finds the slot held earns the attempt
-//     in flight ONE rerun if it settles still known-stale (it may have read its
-//     inputs before the state that reader needs). The slot stays claimed across
+//     in flight ONE rerun if it settles still known-stale with no accepted Put
+//     (it may have read its inputs before the state that reader needs; #884: an
+//     accepted Put never reruns). The slot stays claimed across
 //     the rerun; with no absorbed read the first settle releases it.
 //   - SUPPRESSED (team ruling (b)): a key suppressed for a structurally-
 //     permanent reason (external endpoint, UAF, unsupported kind, sensitive
@@ -50,6 +54,9 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
 // isDemandRevalidation reports whether req is a #547 demand revalidation.
@@ -80,6 +87,12 @@ func revalidateKnownStale(h http.Handler, req *http.Request, key string) {
 	}
 	tpl := setDemandTemplate(key, req)
 	go func() {
+		// #871 — measurement only: detached work no user waits on. The
+		// goroutine was started by a customer dispatch and inherited its
+		// label; it is fill_bg (each attempt's re-entered ServeHTTP counts
+		// the unit).
+		_, endWork := workclass.Continue(context.Background(), workclass.FillBG)
+		defer endWork()
 		res := runDemandRevalidation(h, tpl, key, t0, reason)
 		demandAfterSettle(h, key, reason, res)
 	}()
@@ -186,7 +199,10 @@ type demandTemplate struct {
 var demandTemplates sync.Map // L1 key → *demandTemplate
 
 func setDemandTemplate(key string, req *http.Request) *demandTemplate {
-	clone := req.Clone(context.WithoutCancel(req.Context()))
+	// #1054 — the clone outlives the request it copies: its attempts' time is
+	// not that request's slow-call record. #1115 — nor is it under that
+	// request's page budget.
+	clone := req.Clone(slowcall.Detach(pagebudget.Detach(req.Context())))
 	v, _ := demandTemplates.LoadOrStore(key, &demandTemplate{})
 	t := v.(*demandTemplate)
 	t.mu.Lock()
@@ -223,12 +239,16 @@ func demandRevalidateOnce(h http.Handler, req *http.Request, key string, t0 time
 	// content and nested fills bypass like a debt's (top priority, never queued
 	// behind background work), ahead of any origin rule. #740 — stamped on EVERY
 	// attempt, the absorbed-read reruns included.
-	ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(context.WithoutCancel(req.Context())), cache.DemandRevalidationDeadline())
+	ctx, cancel := context.WithTimeout(cache.WithCustomerTriggeredRefresh(pagebudget.Detach(req.Context())), cache.DemandRevalidationDeadline())
 	defer cancel()
+	// #871 — measurement only: the template is a customer request and carries
+	// its label; the attempt is fill_bg. The re-entered ServeHTTP labels its
+	// goroutine from this ctx and restores it to this ctx's labels on return.
+	ctx = workclass.Label(ctx, workclass.FillBG)
 	ctx, settle := cache.BeginDemandRevalidation(ctx, key, t0)
 	defer func() {
 		if p := recover(); p != nil {
-			xcontext.Logger(ctx).Error("demand revalidation panicked; cell stays known-stale",
+			xcontext.Logger(ctx).ErrorContext(ctx, "demand revalidation panicked; cell stays known-stale",
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
 				slog.Any("panic", p),

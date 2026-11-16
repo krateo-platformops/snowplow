@@ -348,8 +348,12 @@ func ComputeProjectionDigest(r *rbac.RequesterProfile, d AccessDomain) (string, 
 //
 // A ClassExact with a literal Name != "" is name-pinned → P is faithful →
 // shareable. A collection-verb class (list/watch/create/deletecollection) is
-// never name-ambiguous: resourceNames cannot apply, so a name-free projection at
-// Name=="" is exactly what the real collection check evaluates. A verb-"*"
+// never name-ambiguous for a PLAIN collection URL: it names no object, so a
+// name-free projection at Name=="" is exactly what the real collection check
+// evaluates. (Since #1049 a list/watch whose `fieldSelector` requires
+// `metadata.name=<x>` is checked with Name x, as upstream; the deriver strips
+// the query and projects it name-free. That is a residual of this DARK
+// surface, which gates nothing — #1071.) A verb-"*"
 // wildcard IS name-ambiguous (it subsumes get) — this closes R1-m1 with no
 // atom-canonicalization change. IsNameSpecificVerb is reused verbatim from the
 // evaluator (rbac.IsNameSpecificVerb).

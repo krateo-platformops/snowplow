@@ -83,7 +83,7 @@ func start383(t *testing.T) (*ResolvedCacheStore, *i383Backing, *atomic.Int32) {
 		rctx := WithL1KeyContext(ctx, k)
 		v := b.get(used.Name)
 		Deps().Record(rctx, k, g383Dep, "ns", used.Name)
-		c.ReplaceIfGen(rctx, k, &ResolvedEntry{RawJSON: []byte(`"` + v + `"`), Inputs: &used}, gen0)
+		c.replaceIfGen(rctx, k, &ResolvedEntry{RawJSON: []byte(`"` + v + `"`), Inputs: &used}, gen0)
 		return nil
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -112,6 +112,8 @@ func body383(c *ResolvedCacheStore, k string) string {
 // remarks K through the hook — now resident → enqueued → the refresher
 // re-resolves → K converges FRESH (v1). Without the remark K stays STALE (v0).
 func TestIssue383_Arm1_DroppedMarkInFlightResolve_ConvergesFreshViaRemark(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, carrier := range []string{"customer-PutIfGen-375", "boot-PutThenRemark-408"} {
 		t.Run(carrier, func(t *testing.T) {
 			c, b, reResolves := start383(t)
@@ -135,11 +137,11 @@ func TestIssue383_Arm1_DroppedMarkInFlightResolve_ConvergesFreshViaRemark(t *tes
 			// R's Put of the pre-change body.
 			e := &ResolvedEntry{RawJSON: []byte(`"` + read + `"`), Inputs: &in}
 			if carrier == "customer-PutIfGen-375" {
-				if !c.PutIfGen(rctx, k, e, gen0) {
+				if !c.putIfGen(rctx, k, e, gen0) {
 					t.Fatal("setup: PutIfGen refused")
 				}
 			} else {
-				c.PutThenRemark(rctx, k, e)
+				c.putThenRemark(rctx, k, e)
 			}
 			deadline := time.Now().Add(3 * time.Second)
 			for time.Now().Before(deadline) && body383(c, k) != `"v1"` {
@@ -202,13 +204,15 @@ func TestIssue383_Arm2_CellLessStuckFalseRAKey_EnqueueDroppedButSSIStillFires(t 
 // arm 3 — a RESIDENT key is never dropped: its dep change is enqueued and the
 // refresher re-resolves it to the new value.
 func TestIssue383_Arm3_ResidentKey_NeverDropped_Refreshed(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, b, reResolves := start383(t)
 	k, in := key383("arm3")
 	b.set("arm3", "v0")
 	rctx := WithL1KeyContext(context.Background(), k)
 	gen0 := c.CaptureGen(k)
 	Deps().Record(rctx, k, g383Dep, "ns", "arm3")
-	if !c.PutIfGen(rctx, k, &ResolvedEntry{RawJSON: []byte(`"v0"`), Inputs: &in}, gen0) {
+	if !c.putIfGen(rctx, k, &ResolvedEntry{RawJSON: []byte(`"v0"`), Inputs: &in}, gen0) {
 		t.Fatal("setup: PutIfGen refused")
 	}
 	enq0, dropped0 := refresherSingleton().enqueueTotal.Load(), EnqueueDroppedNonResidentTotal()
@@ -232,6 +236,8 @@ func TestIssue383_Arm3_ResidentKey_NeverDropped_Refreshed(t *testing.T) {
 // dep bump precedes the fan-out (and so the Has check), so R's put-check sees the
 // dep moved and remarks K — now resident → enqueued → FRESH.
 func TestIssue383_Arm4_ResidentRightAfterHasCheck_CoveredByRemark(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, b, _ := start383(t)
 	k, in := key383("arm4")
 	b.set("arm4", "v0")
@@ -249,7 +255,7 @@ func TestIssue383_Arm4_ResidentRightAfterHasCheck_CoveredByRemark(t *testing.T) 
 		done := make(chan struct{})
 		go func() { // R's Put lands between Has()=false and the drop
 			defer close(done)
-			c.PutIfGen(rctx, k, &ResolvedEntry{RawJSON: []byte(`"` + read + `"`), Inputs: &in}, gen0)
+			c.putIfGen(rctx, k, &ResolvedEntry{RawJSON: []byte(`"` + read + `"`), Inputs: &in}, gen0)
 		}()
 		<-done
 		if !c.Has(k) {
@@ -271,6 +277,8 @@ func TestIssue383_Arm4_ResidentRightAfterHasCheck_CoveredByRemark(t *testing.T) 
 // enqueue_total delta 0, dropped delta N, queue length 0. Resident keys in the
 // same burst are still enqueued (the drop discriminates on residency only).
 func TestIssue383_Arm5_NonResidentBurst_OccupancyCut(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, _, _ := start383(t)
 	const nonResident, resident = 500, 20
 	for i := 0; i < nonResident; i++ {
@@ -278,7 +286,7 @@ func TestIssue383_Arm5_NonResidentBurst_OccupancyCut(t *testing.T) {
 	}
 	for i := 0; i < resident; i++ {
 		k, in := key383("arm5-res-" + strconv.Itoa(i))
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`"r"`), Inputs: &in})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`"r"`), Inputs: &in})
 		Deps().Record(context.Background(), k, g383Dep, "ns", "burst")
 	}
 	r := refresherSingleton()
@@ -304,6 +312,8 @@ func TestIssue383_Arm5_NonResidentBurst_OccupancyCut(t *testing.T) {
 // ungated merge would leave the earlier triggers orphaned in triggerGVRByKey
 // (consumed only by a dequeue that never comes).
 func TestIssue383_Arm6_MultiGVRRemark_NonResident_NoOrphanTriggers(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, _, _ := start383(t)
 	k, in := key383("arm6")
 	if c.Has(k) {
@@ -324,7 +334,7 @@ func TestIssue383_Arm6_MultiGVRRemark_NonResident_NoOrphanTriggers(t *testing.T)
 	}
 
 	// Control: resident → all three triggers merged and the key enqueued once.
-	c.Put(k, &ResolvedEntry{RawJSON: []byte(`"r"`), Inputs: &in})
+	c.put(k, &ResolvedEntry{RawJSON: []byte(`"r"`), Inputs: &in})
 	enq0 := r.enqueueTotal.Load()
 	Deps().enqueueRemark(k, []schema.GroupVersionResource{gA, gB, g383Dep})
 	if d := r.enqueueTotal.Load() - enq0; d != 1 {
@@ -344,9 +354,11 @@ func TestIssue383_Arm6_MultiGVRRemark_NonResident_NoOrphanTriggers(t *testing.T)
 // decisions, and a key evicted between them was resident for the merges and dropped at
 // the enqueue, which orphaned the merged triggers.
 func TestIssue383_Arm7_MultiGVRRemark_OneResidencyDecision(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, _, _ := start383(t)
 	k, in := key383("arm7")
-	c.Put(k, &ResolvedEntry{RawJSON: []byte(`"r"`), Inputs: &in})
+	c.put(k, &ResolvedEntry{RawJSON: []byte(`"r"`), Inputs: &in})
 	r := refresherSingleton()
 	StopRefresher() // no dequeue: the trigger set stays observable
 	var decisions atomic.Int32

@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -138,7 +139,13 @@ func TestContentFill710_ADM1_ConcurrentWeightNeverExceedsCeiling_AllComplete(t *
 	release()
 }
 
-func TestContentFill710_ADM2_FirstMeasuredFillCalibratesExpansionWithin2x(t *testing.T) {
+// adm2Tolerance is how far a calibrated expansion and the next fill's weight
+// may sit from the measured ratio (#780 issuecomment-6284877941): 1%. "Within
+// 2×" let a HALVED learned expansion through (1.5 is not < 3.0/2), which is the
+// gate undercharging every later fill by half.
+const adm2Tolerance = 0.01
+
+func TestContentFill710_ADM2_FirstMeasuredFillCalibratesExpansionToTheMeasuredRatio(t *testing.T) {
 	fill710Admission(t)
 	const (
 		gvr       = "adm2.example/v1, Resource=things"
@@ -160,15 +167,17 @@ func TestContentFill710_ADM2_FirstMeasuredFillCalibratesExpansionWithin2x(t *tes
 	release()
 
 	got := ContentFillAdmissionStatsSnapshot().Expansion[gvr]
-	if got < realRatio/2 || got > realRatio*2 {
-		t.Fatalf("F-ADM2 RED: after one measured fill the expansion is %.2f, want within 2× of the real %.1f (seed %.0f)", got, realRatio, contentFillExpansionSeed)
+	if math.Abs(got-realRatio) > adm2Tolerance*realRatio {
+		t.Fatalf("F-ADM2 RED: after one measured fill the expansion is %.4f, want the measured %.1f within %.0f%% (seed %.0f)",
+			got, realRatio, adm2Tolerance*100, contentFillExpansionSeed)
 	}
 	release2, _, err := admitContentFillForTest(context.Background(), gvr, raw, fillClassCustomer)
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
-	if w, _ := contentFillGateStateForTest(); float64(w) > 2*realRatio*float64(raw) || float64(w) < realRatio/2*float64(raw) {
-		t.Fatalf("F-ADM2: the next fill's weight %d does not track the measured expansion", w)
+	want := realRatio * float64(raw)
+	if w, _ := contentFillGateStateForTest(); math.Abs(float64(w)-want) > adm2Tolerance*want {
+		t.Fatalf("F-ADM2 RED: the next fill's weight %d is not raw × the measured expansion (%.0f) within %.0f%%", w, want, adm2Tolerance*100)
 	}
 	release2()
 
@@ -349,6 +358,11 @@ func newFill710MultiNSWatcher(t *testing.T, nsCount, perNS int) {
 	waitOwnRBACPublish(t, rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
+	// #854 — as newFill710Watcher: these arms gate FILLS, and their refresh
+	// bursts force a fill only on the plain path (an incremental cell drains
+	// the change instead). TestContentFill710_FMEM_SeedChargeCoversAnAnchoringFill
+	// turns anchoring back on to check the gate's charge for a fill that anchors.
+	t.Cleanup(cache.SetListCellAnchoringForTest(false))
 }
 
 func fill710NS(n int) string { return fmt.Sprintf("fill710-ns-%02d", n) }
@@ -379,7 +393,7 @@ func TestContentFill710_ADM1_RealPath_DistinctListsStayUnderCeiling(t *testing.T
 
 	// Learn one envelope's size and the GVR's calibration, then size the ceiling for 2.5 fills.
 	envLen := fill710SpyDispatch(t, nil, nil, nil)
-	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
+	if _, _, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710NSListCall(0), false); !ok {
 		t.Fatalf("PRECONDITION: list 0 not content-servable")
 	}
 	store.DeleteForTest(cache.ComputeKey(contentKeyInputs(r1FsaGVR, fill710NS(0), "")))
@@ -402,7 +416,7 @@ func TestContentFill710_ADM1_RealPath_DistinctListsStayUnderCeiling(t *testing.T
 		go func(n int) {
 			defer wg.Done()
 			<-start
-			if _, s, ok, _ := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(n), false); ok && s {
+			if _, s, ok, _, _ := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(n), false); ok && s {
 				served.Add(1)
 			}
 		}(n)
@@ -477,7 +491,7 @@ func TestContentFill710_D1_AdmissionTimeoutErrorsTheFlightNeverFallsThrough(t *t
 
 	var dispatches atomic.Int64
 	orig := dispatchViaInformerFn
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		dispatches.Add(1)
 		return orig(ctx, call)
 	}
@@ -490,7 +504,7 @@ func TestContentFill710_D1_AdmissionTimeoutErrorsTheFlightNeverFallsThrough(t *t
 	results := make(chan out, 3)
 	for i := 0; i < 3; i++ {
 		go func() {
-			_, s, ok, err := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(0), false)
+			_, s, ok, _, err := apistageContentServe(fill710BgCtx(), store, fill710NSListCall(0), false)
 			results <- out{ok, s, err}
 		}()
 	}
@@ -538,7 +552,7 @@ func TestContentFill710_D1_ACustomerNeverGetsTheAdmissionTimeout(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(r1Ctx(), 500*time.Millisecond)
 	defer cancel()
-	_, s, ok, err := apistageContentServe(ctx, store, fill710NSListCall(0), false)
+	_, s, ok, _, err := apistageContentServe(ctx, store, fill710NSListCall(0), false)
 	if err != nil {
 		t.Fatalf("D1 RED: a customer read got %v — users never queue, so no customer may receive the admission timeout", err)
 	}

@@ -33,6 +33,8 @@ import (
 )
 
 func TestIssue354_P3_DOTLP_DriverSeriesReachOTLP(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
@@ -62,7 +64,7 @@ func TestIssue354_P3_DOTLP_DriverSeriesReachOTLP(t *testing.T) {
 	in := cache.ResolvedKeyInputs{CacheEntryClass: "restactions", Group: gvr.Group, Version: gvr.Version,
 		Resource: gvr.Resource, Namespace: "p3", Name: "o", BindingUID: "uid", Page: 2, PerPage: 10}
 	key := cache.ComputeKey(in)
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in})
 	cache.Deps().Record(context.Background(), key, gvr, "p3", "o")
 
 	gate := make(chan struct{})
@@ -70,7 +72,7 @@ func TestIssue354_P3_DOTLP_DriverSeriesReachOTLP(t *testing.T) {
 	cache.RegisterRefreshFunc("restactions", func(ctx context.Context, k string, in cache.ResolvedKeyInputs) error {
 		<-gate
 		rctx := cache.WithL1KeyContext(ctx, k)
-		ok := store.ReplaceIfGen(rctx, k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":2}`), Inputs: &in}, store.CaptureGen(k))
+		ok := store.ReplaceResolvedIfGen(rctx, fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(`{"v":2}`), Inputs: &in}, store.CaptureGen(k))
 		cache.NoteRefreshWrite(rctx, k, ok)
 		done.Add(1)
 		return nil

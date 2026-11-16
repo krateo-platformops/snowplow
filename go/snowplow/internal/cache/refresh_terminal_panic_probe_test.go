@@ -10,6 +10,8 @@ import (
 )
 
 func TestRefreshTerminal_PanicProbe_NoRefresherAndDegenerateInputs(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	resetRefresherForTest()
 	refresherInstance.Store(nil)
 	t.Cleanup(resetRefresherForTest)
@@ -49,7 +51,7 @@ func TestRefreshTerminal_PanicProbe_NoRefresherAndDegenerateInputs(t *testing.T)
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "probe"}
 	k := ComputeKey(in)
 	NoteRefreshDecline(k, "uaf", true)
-	c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+	c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 	if _, ok := RefreshSuppressedReason(k); ok {
 		t.Fatal("Put did not clear the marker")
 	}

@@ -36,7 +36,7 @@ func obsHarvestWidget(h *navWidgetHarvester, ns, name string, perPage, page int)
 	w.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: obsWidgetGVR().Group, Version: obsWidgetGVR().Version, Kind: "Flex",
 	})
-	h.harvestNavWidget(w, obsWidgetGVR(), perPage, page, perPage, page)
+	h.harvestNavWidget(w, obsWidgetGVR(), newPrewarmPagination(perPage, page))
 }
 
 func TestIssue1127Obs_HarvestForgotten_CountsRemovalsNotHookFirings(t *testing.T) {

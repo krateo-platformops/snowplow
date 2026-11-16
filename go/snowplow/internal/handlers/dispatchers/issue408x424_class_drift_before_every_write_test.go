@@ -63,7 +63,7 @@ func TestIssue408x424_ClassDriftDeclinesBeforeEveryWriteCarrier(t *testing.T) {
 				t.Fatalf("PRECONDITION: readyz=%v must select guarded=%v (got %+v)", tc.readyz, tc.readyz, cg)
 			}
 			rctx := cache.WithL1KeyContext(cohort, ckey)
-			if !seedTerminalPut(rctx, chandle, ckey, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: cinputs}, cg) {
+			if !seedTerminalPut(rctx, chandle, fixtureStoreVerdict, ckey, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: cinputs}, cg) {
 				t.Fatalf("CONTROL (%s): an unchanged class must be written via %s", tc.name, tc.carrier)
 			}
 			if _, hit := chandle.Get(ckey); !hit {
@@ -79,7 +79,7 @@ func TestIssue408x424_ClassDriftDeclinesBeforeEveryWriteCarrier(t *testing.T) {
 			remarks = 0
 			mu.Unlock()
 			dctx := cache.WithL1KeyContext(cohort, key)
-			if seedTerminalPut(dctx, handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs}, g) {
+			if seedTerminalPut(dctx, handle, fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs}, g) {
 				t.Fatalf("#408x#424 RED (%s): seedTerminalPut wrote through %s under a key minted for the "+
 					"cohort's PRE-grant class — the class-drift guard must run before every write carrier",
 					tc.name, tc.carrier)

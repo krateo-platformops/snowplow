@@ -52,6 +52,7 @@ package dispatchers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -64,7 +65,6 @@ import (
 	"github.com/krateo-platformops/snowplow/apis"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -86,29 +86,16 @@ const (
 	// real headline data source while still tripping on a pathological
 	// over-large one.
 	defaultPrewarmContentMaxBytes = 32 * 1024 * 1024
-
-	// envPrewarmPageLimit (Ship 0.30.127) is the bounded per-widget
-	// pagination DEFAULT the Phase-1 discovery walk resolves a widget
-	// under WHEN that widget's `/call` Path carries no explicit
-	// page/perPage `slice`. A widget that DOES declare a slice overrides
-	// it. It is never -1 — -1 is the unbounded value that, with the
-	// iterator cap removed, drives the 49K-row resolution storm.
-	envPrewarmPageLimit = "PREWARM_PAGE_LIMIT"
-
-	// defaultPrewarmPageLimit — a small bounded default. The discovery
-	// walk only needs to traverse navigation STRUCTURE + discover
-	// informers (GVR-scoped); a handful of resolved rows per widget
-	// exercises the apiRef chain as well as the full LIST would.
-	defaultPrewarmPageLimit = 5
 )
 
 // PrewarmContentEnabled reports whether the F2 Step-7.5 content pass runs.
 // FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md): the
 // standalone PREWARM_CONTENT_ENABLED env read is RETIRED (registered in
 // cache.retiredFlags). It is now IMPLICIT-ON-CACHE — the content pass runs
-// whenever prewarm runs, mirroring #57. (The sizing knobs PREWARM_CONTENT_MAX_BYTES
-// / PREWARM_PAGE_LIMIT are NOT folded — they are observability/pagination
-// params, not on/off gates.)
+// whenever prewarm runs, mirroring #57. (The sizing knob PREWARM_CONTENT_MAX_BYTES
+// is NOT folded — it is an observability param, not an on/off gate. The
+// pagination knob PREWARM_PAGE_LIMIT is RETIRED by #966: prewarm resolves each
+// widget with the pagination its cell is keyed with — see prewarmPagination.)
 func PrewarmContentEnabled() bool {
 	return cache.PrewarmEnabled() // implicit-on-cache (#57); was env "PREWARM_CONTENT_ENABLED"=="true"
 }
@@ -117,18 +104,6 @@ func PrewarmContentEnabled() bool {
 // observability threshold, defaulting to defaultPrewarmContentMaxBytes.
 func prewarmContentMaxBytes() int {
 	return env.Int(envPrewarmContentMaxBytes, defaultPrewarmContentMaxBytes)
-}
-
-// prewarmPageLimit returns the bounded per-widget pagination default the
-// Phase-1 discovery walk uses for a widget whose `/call` Path declares no
-// explicit page/perPage slice (Ship 0.30.127). A non-positive env value
-// falls back to defaultPrewarmPageLimit — the walk is NEVER unbounded.
-func prewarmPageLimit() int {
-	n := env.Int(envPrewarmPageLimit, defaultPrewarmPageLimit)
-	if n <= 0 {
-		return defaultPrewarmPageLimit
-	}
-	return n
 }
 
 // contentPrewarmHarvester accumulates the deduplicated data-source
@@ -309,6 +284,16 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) {
 
 	log := slog.Default()
+	// #1233 — the pass writes the cache: run it on a complete RBAC snapshot, or
+	// its writes would be refused and its cells left cold.
+	if err := cache.WaitRBACSnapshotComplete(ctx); err != nil {
+		log.WarnContext(ctx, "content.prewarm.skipped",
+			slog.String("subsystem", "cache"),
+			slog.String("reason", "the RBAC snapshot did not complete before the pass's deadline"),
+			slog.Any("err", err),
+		)
+		return
+	}
 	refs := h.snapshot()
 	if len(refs) == 0 {
 		log.Info("content.prewarm.skipped",
@@ -326,7 +311,9 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 	// (oversize ones are still warm — see the oversize branch). oversize
 	// counts how many of those tripped the observability WARN. failed
 	// counts resolve failures (those alone leave a content entry cold).
-	var warmed, oversize, failed int
+	// skipped (#1477) counts data sources not resolved because they need
+	// request extras this resolve does not carry.
+	var warmed, oversize, failed, skipped int
 	log.Info("content.prewarm.started",
 		slog.String("subsystem", "cache"),
 		slog.Int("data_sources", len(refs)),
@@ -337,17 +324,21 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 		if ctx.Err() != nil {
 			// Phase-1 budget exhausted — stop the pass; whatever is left
 			// is lazy-warmed on first request.
-			log.Warn("content.prewarm.ctx_cancelled",
+			log.WarnContext(ctx, "content.prewarm.ctx_cancelled",
 				slog.String("subsystem", "cache"),
 				slog.Int("warmed", warmed),
-				slog.Int("remaining", len(refs)-warmed-failed),
+				slog.Int("remaining", len(refs)-warmed-failed-skipped),
 			)
 			break
 		}
 		envelopeBytes, err := prewarmOneRESTAction(rctx, ref, authnNS)
+		if errors.Is(err, errContentPrewarmNeedsRequestExtras) {
+			skipped++
+			continue
+		}
 		if err != nil {
 			failed++
-			log.Warn("content.prewarm.resolve_failed",
+			log.WarnContext(ctx, "content.prewarm.resolve_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("restaction", ref.Namespace+"/"+ref.Name),
 				slog.Any("err", err),
@@ -366,7 +357,7 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 			// PREWARM_CONTENT_MAX_BYTES against the real data-source
 			// sizes. The entry IS warm; the pass continues normally.
 			oversize++
-			log.Warn("content.prewarm.envelope_oversize",
+			log.WarnContext(ctx, "content.prewarm.envelope_oversize",
 				slog.String("subsystem", "cache"),
 				slog.String("restaction", ref.Namespace+"/"+ref.Name),
 				slog.Int("envelope_bytes", envelopeBytes),
@@ -385,9 +376,14 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 		slog.Int("warmed", warmed),
 		slog.Int("oversize_warned", oversize),
 		slog.Int("failed", failed),
+		slog.Int("skipped_needs_request_extras", skipped),
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 	)
 }
+
+// errContentPrewarmNeedsRequestExtras is prewarmOneRESTAction's skip (#1477):
+// the RESTAction needs request extras this resolve does not carry.
+var errContentPrewarmNeedsRequestExtras = errors.New("content prewarm: the RESTAction needs request extras this resolve does not carry")
 
 // prewarmOneRESTAction resolves ONE data-source RESTAction under the
 // content-prewarm SA context. The resolve's side effect — F1's
@@ -408,11 +404,16 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 // fewer entries and re-introduce cold misses. (The discovery walk is the
 // opposite case — it must honour the declared per-widget slice; see
 // phase1_walk.go.)
+//
+// #1477 — a RESTAction this no-extras resolve cannot render (its templated
+// endpointRef reads a request extra) is not resolved: the return is
+// errContentPrewarmNeedsRequestExtras, which the pass counts as skipped, not
+// failed.
 func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference, authnNS string) (int, error) {
-	got := objects.Get(rctx, ref)
+	got := backgroundRESTActionGetFn(rctx, ref)
 	if got.Err != nil {
 		// #630 — keep the apiserver status typed; the text is unchanged.
-		return 0, fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResponse(got.Err))
+		return 0, fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
 	}
 	if got.Unstructured == nil {
 		return 0, fmt.Errorf("fetch RESTAction %s/%s: nil object", ref.Namespace, ref.Name)
@@ -426,6 +427,16 @@ func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference,
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(
 		got.Unstructured.Object, &cr); err != nil {
 		return 0, fmt.Errorf("unstructured -> RESTAction %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	// #1477 — the #113 rule: this resolve carries NO extras (the harvest keeps
+	// the RESTAction ref, not the widgets' inline extras, and the resolve below
+	// passes none), so a templated endpointRef that reads a request extra
+	// renders a Secret no customer's request selects: the stage misses its
+	// endpoint and warms nothing a customer's resolve could hit. Not resolved.
+	if restactionNeedsRequestExtras(&cr, nil) {
+		logBackgroundResolveSkip(bgSkipSiteContentPrewarm, "restaction", ref.Namespace+"/"+ref.Name)
+		return 0, errContentPrewarmNeedsRequestExtras
 	}
 
 	// #250 — resolve under the BARE rctx: do NOT thread a restactions-class
@@ -452,7 +463,7 @@ func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference,
 	// fail-fresh remark every warmed cell + bump unguarded_put_total on each boot /
 	// keepwarm cycle). No L1 key is set, so no phantom restactions edge is recorded.
 	rctx = cache.WithDepGenSink(rctx)
-	res, err := restactions.Resolve(rctx, restactions.ResolveOptions{
+	res, err := restactionsResolveFn(rctx, restactions.ResolveOptions{
 		In: &cr,
 		// Ship 0.30.230 fix-at-root: SArc threaded from ctx — the
 		// content prewarm runs under withContentPrewarmSAContext which

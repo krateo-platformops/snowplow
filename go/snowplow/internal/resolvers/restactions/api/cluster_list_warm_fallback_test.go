@@ -64,7 +64,7 @@ func TestClusterListCollapse_ColdMissReturnsGate8(t *testing.T) {
 	)
 
 	tmp, useCluster, gate := attemptClusterListCollapse(
-		ctx, clusterListLogger(t), apiCall, map[string]any{},
+		ownClusterCtx(ctx), clusterListLogger(t), apiCall, map[string]any{},
 		endpoints.Endpoint{}, store, true)
 
 	if useCluster {
@@ -94,7 +94,7 @@ func TestClusterListCollapse_ColdMissReturnsGate8(t *testing.T) {
 
 	// Second call — cell-warm fast-path.
 	tmp2, useCluster2, gate2 := attemptClusterListCollapse(
-		ctx, clusterListLogger(t), apiCall, map[string]any{},
+		ownClusterCtx(ctx), clusterListLogger(t), apiCall, map[string]any{},
 		endpoints.Endpoint{}, store, true)
 	if !useCluster2 {
 		t.Fatalf("post-populate: expected useCluster=true; got useCluster=false gate=%d", gate2)
@@ -151,7 +151,7 @@ func TestClusterListCollapse_CustomerPathNonBlocking(t *testing.T) {
 
 	t0 := time.Now()
 	_, _, gate := attemptClusterListCollapse(
-		ctx, clusterListLogger(t), apiCall, map[string]any{},
+		ownClusterCtx(ctx), clusterListLogger(t), apiCall, map[string]any{},
 		endpoints.Endpoint{}, store, true)
 	elapsed := time.Since(t0)
 	// AC-P3.2.1 reference: customer goroutine MUST return in well

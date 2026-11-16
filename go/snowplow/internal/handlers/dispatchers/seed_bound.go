@@ -41,8 +41,9 @@
 //
 // TRANSPARENT when GOMEMLIMIT is unset (math.MaxInt64 → cache.AdmissionCeiling
 // returns unlimited): admit immediately, release is a no-op — byte-identical to
-// no bound (project_caching_is_provisional: cleanly removable). The chart sets
-// GOMEMLIMIT (7GiB); with it unset there is no soft ceiling to protect.
+// no bound (project_caching_is_provisional: cleanly removable). A pod runs with
+// a soft limit (internal/memlimit: 7/8 of the container's cgroup memory limit,
+// unless GOMEMLIMIT is set); with none there is no soft ceiling to protect.
 package dispatchers
 
 import (

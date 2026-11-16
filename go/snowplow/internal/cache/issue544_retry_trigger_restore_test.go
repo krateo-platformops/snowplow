@@ -71,6 +71,8 @@ type i544Triggers struct{ a, b bool }
 // and the retry comes from the real AddRateLimited re-queue
 // (feedback_falsifier_must_drive_real_boundary_not_install_crossed_state).
 func TestIssue544_RetryStillForcesContentMiss(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	// Tight backoff so the retry lands inside the arm's budget; the floor is
@@ -85,7 +87,7 @@ func TestIssue544_RetryStillForcesContentMiss(t *testing.T) {
 	}
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "i544-retry"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
 	Deps().Record(context.Background(), key, g544A, "ns", "a")
 	Deps().Record(context.Background(), key, g544B, "ns", "b")
 
@@ -169,6 +171,8 @@ func TestIssue544_RetryStillForcesContentMiss(t *testing.T) {
 // fix that restored on every exit (rather than only on the retry) would leave
 // the set resident and force-miss every subsequent refresh of the key.
 func TestIssue544_FirstAttemptSuccessLeavesNoRestoredTrigger(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	resetRefresherForTest()
@@ -179,7 +183,7 @@ func TestIssue544_FirstAttemptSuccessLeavesNoRestoredTrigger(t *testing.T) {
 	}
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "i544-success"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
 	Deps().Record(context.Background(), key, g544A, "ns", "a")
 
 	var sawA atomic.Bool
@@ -227,6 +231,8 @@ func TestIssue544_FirstAttemptSuccessLeavesNoRestoredTrigger(t *testing.T) {
 // it passes before and after, and a fix that moved the LoadAndDelete to after
 // processOne (the other candidate) is what it exists to catch.
 func TestIssue544_FloorDeferredKeyConsumesTriggerAtEventualDispatch(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	// Floor ON (seconds granularity, so 1s is the shortest real deferral).
@@ -240,7 +246,7 @@ func TestIssue544_FloorDeferredKeyConsumesTriggerAtEventualDispatch(t *testing.T
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "i544-floored"}
 	key := ComputeKey(in)
 	// FRESH CreatedAt → the first dequeue is inside the floor and is deferred.
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now()})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now()})
 	Deps().Record(context.Background(), key, g544A, "ns", "a")
 
 	var attempts atomic.Int32

@@ -15,8 +15,19 @@ type readyzInfo struct {
 	// Phase1Done mirrors cache.IsPhase1Done() — the Tag B startup
 	// informer-warmup signal.
 	Phase1Done bool `json:"phase1Done"`
+	// RBACSnapshotComplete (#1231) is cache.RBACReadiness: the RBAC snapshot the
+	// evaluator reads is complete. Ready needs it as well as Phase1Done.
+	RBACSnapshotComplete bool `json:"rbacSnapshotComplete"`
+	// UnsyncedRBACInformers (#1231, warming only) names the RBAC informers that
+	// have not finished their initial LIST, by resource.
+	UnsyncedRBACInformers []string `json:"unsyncedRBACInformers,omitempty"`
+	// RBACRebuildPanics (#1231, with ReasonRBACInitialPublishPending only) is
+	// how many RBAC snapshot rebuilds have panicked (#691): the usual reason a
+	// publish stays pending once every informer has synced.
+	RBACRebuildPanics uint64 `json:"rbacRebuildPanics,omitempty"`
 	// Reason (#397, warming only) is the phase-1 stage the pod is in, from a
-	// closed code-defined set (e.g. "informer_sync", "boot_seed_in_progress").
+	// closed code-defined set (e.g. "informer_sync", "boot_seed_in_progress"),
+	// or, once Phase 1 is done, ReasonRBACSnapshotIncomplete (#1231).
 	Reason string `json:"reason,omitempty"`
 	// ElapsedS (#397, warming only) is the whole seconds since process start.
 	ElapsedS *int64 `json:"elapsed_s,omitempty"`
@@ -38,14 +49,29 @@ type readyzInfo struct {
 	SeedMs               *int64 `json:"seed_ms,omitempty"`
 }
 
+// The warming reasons once Phase 1 is done and readiness's RBAC half does not
+// hold yet (#1231).
+const (
+	// ReasonRBACSnapshotIncomplete: an RBAC informer has not finished its
+	// initial LIST; the body names it.
+	ReasonRBACSnapshotIncomplete = "rbac_snapshot_incomplete"
+	// ReasonRBACInitialPublishPending: every RBAC informer has synced and the
+	// initial publish has not completed; the body carries the rebuild panics.
+	ReasonRBACInitialPublishPending = "rbac_initial_publish_pending"
+)
+
 // ReadyCheck is the 0.30.102 Tag B probe-gated readiness endpoint.
 //
-// It returns 200 iff cache.IsPhase1Done() is true — the Phase 1
-// SA-credentialed resolution walk has finished AND every registered
-// informer (including the CRD-watch-spawned composition informers
-// present at boot) has reached HasSynced. Until then it returns 503 so
-// the Kubernetes readinessProbe / startupProbe withhold traffic from a
-// pod whose navigated informers are still cold.
+// It returns 200 iff both hold:
+//   - cache.IsPhase1Done(): the Phase 1 SA-credentialed resolution walk has
+//     finished and every registered informer (including the CRD-watch-spawned
+//     composition informers present at boot) has reached HasSynced;
+//   - cache.RBACReadiness() (#1231): the RBAC snapshot the evaluator reads is
+//     complete, built after all four RBAC informers synced. No timer decides
+//     it: a pod whose RBAC LISTs never complete stays 503, naming them.
+//
+// Until then it returns 503 so the readinessProbe withholds traffic from a pod
+// that cannot yet answer correctly.
 //
 // Behavior-neutral under cache-off: when the cache subsystem is OFF
 // (CACHE_ENABLED unset/false), prewarm is implicit-off (#57 — prewarm is
@@ -71,11 +97,12 @@ type readyzInfo struct {
 func ReadyCheck() http.HandlerFunc {
 	return func(wri http.ResponseWriter, req *http.Request) {
 		done := cache.IsPhase1Done()
+		rbac := cache.RBACReadiness()
 
-		body := readyzInfo{Phase1Done: done}
+		body := readyzInfo{Phase1Done: done, RBACSnapshotComplete: rbac.Complete}
 		code := http.StatusServiceUnavailable
 		body.Status = "warming"
-		if done {
+		if done && rbac.Complete {
 			code = http.StatusOK
 			body.Status = "ready"
 			body.Outcome = dispatchers.Phase1ReadinessExitOutcome()
@@ -85,6 +112,14 @@ func ReadyCheck() http.HandlerFunc {
 			}
 		} else {
 			body.Reason = dispatchers.Phase1WarmingReason()
+			switch {
+			case done && rbac.PublishPending:
+				body.Reason = ReasonRBACInitialPublishPending
+				body.RBACRebuildPanics = cache.RBACRebuildPanicsTotal()
+			case done:
+				body.Reason = ReasonRBACSnapshotIncomplete
+			}
+			body.UnsyncedRBACInformers = rbac.Unsynced
 			elapsed := int64(dispatchers.Phase1SinceProcessStart().Seconds())
 			body.ElapsedS = &elapsed
 		}

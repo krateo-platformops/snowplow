@@ -46,6 +46,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // envRefreshSessionCookie names the cookie RefreshAuth reads the JWT from on
@@ -109,25 +110,35 @@ func RefreshAuth(keys jwtutil.KeySource) func(http.Handler) http.Handler {
 				return
 			}
 
+			// #1076 — every 401 here is pre-dispatch and carries the same
+			// closed-set cause and challenge UserConfig's does
+			// (credential_status.go).
 			token, ok := refreshTokenFromRequest(req)
 			if !ok {
-				response.Unauthorized(wri, fmt.Errorf("missing credentials: no bearer header or session cookie"))
+				tokenMissing(wri, fmt.Errorf("missing credentials: no bearer header or session cookie"))
 				return
 			}
 
-			// The IDENTICAL stateless validation UserConfig performs at
-			// userconfig.go:151. Both expired + generic-invalid map to 401
-			// (jwtutil.Validate returns ErrTokenExpired / ErrTokenInvalid);
-			// a key we cannot fetch is OUR fault, so it maps to 503 instead.
+			// The IDENTICAL stateless validation UserConfig performs. A
+			// retired signing key, an expired token and a generic-invalid one
+			// map to 401 (jwtutil returns ErrKeyNotPublished /
+			// ErrTokenExpired / ErrTokenInvalid; tokenRejected names which);
+			// a key we cannot fetch is OUR fault, so it maps to 503 instead,
+			// with no cause.
 			userInfo, err := jwtutil.ValidateWithKeySource(keys, token)
 			if err != nil {
 				if errors.Is(err, jwtutil.ErrKeyUnavailable) {
 					response.ServiceUnavailable(wri, err)
 					return
 				}
-				response.Unauthorized(wri, err)
+				tokenRejected(wri, err)
 				return
 			}
+			// The caller is verified from here on, as UserConfig names it: an
+			// audited route behind this middleware (POST /debug/shadow-parity)
+			// records them whatever exit the request takes, DebugAuthz's
+			// included.
+			audit.SetCaller(req.Context(), userInfo)
 
 			// IDENTICAL identity placement to UserConfig (userconfig.go:231).
 			// We intentionally do NOT call WithUserConfig / the Secret lookup —

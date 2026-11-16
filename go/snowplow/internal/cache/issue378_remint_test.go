@@ -43,20 +43,24 @@ import (
 	"time"
 )
 
-// r378RefreshPutter is the #378 refresher-terminal carrier, reached through an
-// interface so this file compiles where it does not exist yet.
+// r378RefreshPutter is the #378 refresher-terminal carrier
+// (ResolvedCacheStore.replaceIfGenRefresh, resolved.go). It is reached through
+// an interface so the arm was RED, not a compile failure, on a tree without
+// the method; it exists now, and losing it reads as the #378 RED below.
 type r378RefreshPutter interface {
-	ReplaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool
+	replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome
 }
 
 func r378RefreshPut(t testing.TB, c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
 	t.Helper()
 	rp, ok := any(c).(r378RefreshPutter)
 	if !ok {
-		t.Fatalf("#378 RED: *ResolvedCacheStore has no ReplaceIfGenRefresh — the refresher terminal has no re-mint carrier, " +
+		t.Fatalf("#378 RED: *ResolvedCacheStore has no replaceIfGenRefresh — the refresher terminal has no re-mint carrier, " +
 			"so a warm cell the refresher keeps body-fresh still reaches the C5 cap under a customer")
 	}
-	return rp.ReplaceIfGenRefresh
+	return func(ctx context.Context, key string, entry *ResolvedEntry, gen uint64) bool {
+		return rp.replaceIfGenRefresh(ctx, key, entry, gen).Stored()
+	}
 }
 
 // r378Stat reads one snowplow_resolved_cache stat; an absent stat is RED.
@@ -71,36 +75,45 @@ func r378Stat(t testing.TB, c *ResolvedCacheStore, name string) int64 {
 	return v
 }
 
-func r378SleepUntil(at time.Time) {
-	if d := time.Until(at); d > 0 {
-		time.Sleep(d)
-	}
+// r378StoreClock installs a virtual store clock (ResolvedCacheStore.clock, #930)
+// on c for the rest of the test. #1166: D1, D2 and F2c used to sleep through
+// their windows (≈ 12 s of real time); every stamp they put and every age they
+// read is the store's, so they now age their cells on this clock, at exact
+// instants.
+func r378StoreClock(t *testing.T, c *ResolvedCacheStore) *r378Clock {
+	t.Helper()
+	clk := &r378Clock{at: time.Unix(1_700_000_000, 0)}
+	t.Cleanup(c.SetClockForTest(clk.now))
+	return clk
 }
 
 // TestIssue378_D1_WarmCustomerMaxAgeEvict_ReadsNonZeroDuringDefect — K=3 × M=4.
 func TestIssue378_D1_WarmCustomerMaxAgeEvict_ReadsNonZeroDuringDefect(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const maxAge = 3 * time.Second
 	c := newResolvedCache(0, 0, 30*time.Second)
 	c.maxEntryAge = maxAge
+	clk := r378StoreClock(t, c)
 	var keys []string
 	for _, class := range []string{"restactions", "widgets", CacheEntryClassRAFullList} {
 		for m := 0; m < 4; m++ {
 			in := ResolvedKeyInputs{CacheEntryClass: class, Namespace: "d1", Name: class + "-" + string(rune('a'+m))}
 			k := ComputeKey(in)
-			c.Put(k, &ResolvedEntry{RawJSON: []byte(`{"d1":1}`), Inputs: &in})
+			c.put(k, &ResolvedEntry{RawJSON: []byte(`{"d1":1}`), Inputs: &in})
 			keys = append(keys, k)
 		}
 	}
-	t0 := time.Now()
+	t0 := clk.now()
 	// Customer traffic keeps every cell warm across its lifetime.
-	r378SleepUntil(t0.Add(1500 * time.Millisecond))
+	clk.set(t0.Add(1500 * time.Millisecond))
 	for _, k := range keys {
 		if _, ok := c.Get(k); !ok {
 			t.Fatalf("SETUP: %s must still be served before the cap", k)
 		}
 	}
-	// Cross the cap by real elapse (lifetime is whole seconds: > maxAge needs ≥ maxAge+1s).
-	r378SleepUntil(t0.Add(maxAge + 1200*time.Millisecond))
+	// Cross the cap on the store clock (lifetime is whole seconds: > maxAge needs ≥ maxAge+1s).
+	clk.set(t0.Add(maxAge + 1200*time.Millisecond))
 	c.reapPastMaxEntryAge()
 	if got := c.Stats().WarmPastMaxAge; got != 12 {
 		t.Fatalf("SETUP: the reaper must keep all 12 warm past-cap cells (C3), warm_past_max_age=%d", got)
@@ -130,9 +143,12 @@ func TestIssue378_D1_WarmCustomerMaxAgeEvict_ReadsNonZeroDuringDefect(t *testing
 
 // TestIssue378_D2_Discrimination — cold vs warm, customer vs internal, maxAge vs TTL.
 func TestIssue378_D2_Discrimination(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const ttl, maxAge = 2 * time.Second, 3 * time.Second
 	c := newResolvedCache(0, 0, ttl)
 	c.maxEntryAge = maxAge
+	clk := r378StoreClock(t, c)
 	key := func(n string) string {
 		return ComputeKey(ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "d2-" + n})
 	}
@@ -140,13 +156,13 @@ func TestIssue378_D2_Discrimination(t *testing.T) {
 		return &ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "d2-" + n}
 	}
 	cold, seeded, warm, ttlWarm := key("cold"), key("seeded"), key("warm"), key("ttl")
-	c.Put(cold, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("cold")})
-	c.Put(seeded, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("seeded"), SeededAtBoot: true})
-	c.Put(warm, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("warm")})
-	c.Put(ttlWarm, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("ttl")})
-	t0 := time.Now()
+	c.put(cold, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("cold")})
+	c.put(seeded, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("seeded"), SeededAtBoot: true})
+	c.put(warm, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("warm")})
+	c.put(ttlWarm, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: in("ttl")})
+	t0 := clk.now()
 
-	r378SleepUntil(t0.Add(1200 * time.Millisecond))
+	clk.set(t0.Add(1200 * time.Millisecond))
 	if _, ok := c.Get(warm); !ok {
 		t.Fatal("SETUP: warm must be served")
 	}
@@ -155,7 +171,7 @@ func TestIssue378_D2_Discrimination(t *testing.T) {
 	}
 
 	// (c) a WARM customer-read cell whose BODY expired: evict_ttl_warm_customer_total.
-	r378SleepUntil(t0.Add(2300 * time.Millisecond))
+	clk.set(t0.Add(2300 * time.Millisecond))
 	ttlW0 := r378Stat(t, c, "evict_ttl_warm_customer_total")
 	ttl0 := c.Stats().EvictTTLTotal
 	if _, ok := c.Get(ttlWarm); ok {
@@ -171,7 +187,7 @@ func TestIssue378_D2_Discrimination(t *testing.T) {
 	// BornAt and lastRead), and re-read `warm` so it stays customer-warm.
 	for name, k := range map[string]string{"cold": cold, "seeded": seeded, "warm": warm} {
 		e := &ResolvedEntry{RawJSON: []byte(`2`), Inputs: in(name), SeededAtBoot: k == seeded}
-		if !c.ReplaceIfGen(context.Background(), k, e, c.CaptureGen(k)) {
+		if !c.replaceIfGen(context.Background(), k, e, c.CaptureGen(k)) {
 			t.Fatalf("SETUP: refresh-style re-Put of %s refused", name)
 		}
 	}
@@ -179,7 +195,7 @@ func TestIssue378_D2_Discrimination(t *testing.T) {
 		t.Fatal("SETUP: warm must be served after its re-Put")
 	}
 
-	r378SleepUntil(t0.Add(maxAge + 300*time.Millisecond))
+	clk.set(t0.Add(maxAge + 300*time.Millisecond))
 	cust0 := r378Stat(t, c, "evict_max_age_warm_customer_total")
 	int0 := r378Stat(t, c, "evict_max_age_warm_internal_total")
 	age0 := c.Stats().EvictMaxAgeTotal
@@ -241,6 +257,10 @@ func r378SynthArgs(t *testing.T, c *ResolvedCacheStore, m reflect.Method, key st
 			args = append(args, reflect.ValueOf(in))
 		case pt == reflect.TypeOf(map[string]any{}):
 			args = append(args, reflect.ValueOf(map[string]any{"items": []any{map[string]any{"v": "rewrite"}}}))
+		case pt == reflect.TypeOf(PutVerdict{}):
+			// #912 re-review — a verdict-gated write: a STORING verdict, so the
+			// write lands and its re-mint behaviour is what is judged.
+			args = append(args, reflect.ValueOf(fixtureStoreVerdict))
 		default:
 			t.Errorf("#378 F2c: write method %s has a parameter of type %s this enumeration cannot synthesize — "+
 				"extend it so the method is DRIVEN, never silently skipped", m.Name, pt)
@@ -256,9 +276,12 @@ func r378SynthArgs(t *testing.T, c *ResolvedCacheStore, m reflect.Method, key st
 // #258 / customer carriers all write through these. Only ReplaceIfGenRefresh
 // (the refresher terminal) resets it.
 func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const maxAge = 4 * time.Second // L = min(TTL=60s, maxAge/2) = 2s → window [2s, 4s)
 	c := newResolvedCache(0, 0, 60*time.Second)
 	c.maxEntryAge = maxAge
+	clk := r378StoreClock(t, c)
 	st := reflect.TypeOf(c)
 	type cell struct {
 		m    reflect.Method
@@ -269,13 +292,20 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 	var cells []cell
 	for i := 0; i < st.NumMethod(); i++ {
 		m := st.Method(i)
-		if !(strings.HasPrefix(m.Name, "Put") || strings.HasPrefix(m.Name, "Replace")) || m.Name == "ReplaceIfGenRefresh" {
+		// The refresher terminal's re-mint and its verdict-gated wrapper (#912
+		// re-review) are the one allowed re-mint.
+		if !(strings.HasPrefix(m.Name, "Put") || strings.HasPrefix(m.Name, "Replace")) ||
+			m.Name == "ReplaceIfGenRefresh" || m.Name == "ReplaceResolvedIfGenRefresh" {
 			continue
 		}
 		in := ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Namespace: "f2c", Name: m.Name}
+		if m.Name == "PutContentIfGen" {
+			// It writes only an apistage entry under its own key (TestIssue912_V3).
+			in.CacheEntryClass = CacheEntryClassApistage
+		}
 		k := ComputeKey(in)
 		inCopy := in
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"born"}]}`), Inputs: &inCopy})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{"items":[{"v":"born"}]}`), Inputs: &inCopy})
 		e, _ := c.GetNoTouch(k)
 		cells = append(cells, cell{m: m, key: k, in: in, born: e.BornAt})
 	}
@@ -283,12 +313,15 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 	for _, x := range cells {
 		names[x.m.Name] = true
 	}
-	for _, must := range []string{"Put", "PutIfGen", "ReplaceIfGen", "PutThenRemark", "PutRAFullList", "PutRAFullListIfGen"} {
+	// #912 delta-3 item 3 — the ungated primitives are unexported; these exported
+	// writes wrap every one of them and are the only way another package reaches one.
+	for _, must := range []string{"PutResolved", "PutResolvedIfGen", "ReplaceResolvedIfGen", "PutResolvedThenRemark",
+		"PutResolvedEndingKnownStale", "PutRAFullList", "PutRAFullListIfGen", "PutContentIfGen"} {
 		if !names[must] {
 			t.Fatalf("#378 F2c: the enumeration did not find %s — the filter is broken (found %v)", must, names)
 		}
 	}
-	time.Sleep(maxAge/2 + 300*time.Millisecond) // every cell is now inside [maxAge-L, maxAge)
+	clk.set(clk.now().Add(maxAge/2 + 300*time.Millisecond)) // every cell is now inside [maxAge-L, maxAge)
 
 	for _, x := range cells {
 		before, ok := c.GetNoTouch(x.key)
@@ -323,9 +356,9 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 	put := r378RefreshPut(t, c)
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "f2c", Name: "refresh"}
 	k := ComputeKey(in)
-	c.Put(k, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: &in})
+	c.put(k, &ResolvedEntry{RawJSON: []byte(`1`), Inputs: &in})
 	e0, _ := c.GetNoTouch(k)
-	time.Sleep(maxAge/2 + 300*time.Millisecond)
+	clk.set(clk.now().Add(maxAge/2 + 300*time.Millisecond))
 	if !put(context.Background(), k, &ResolvedEntry{RawJSON: []byte(`2`), Inputs: &in}, c.CaptureGen(k)) {
 		t.Fatal("ReplaceIfGenRefresh refused a live in-window cell")
 	}
@@ -335,29 +368,70 @@ func TestIssue378_F2c_OnlyTheRefresherTerminalReMints(t *testing.T) {
 	}
 }
 
+// r378Clock is a virtual store clock (ResolvedCacheStore.clock): it reads the
+// instant the arm last set, and nothing else moves it.
+type r378Clock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+func (k *r378Clock) now() time.Time { k.mu.Lock(); defer k.mu.Unlock(); return k.at }
+func (k *r378Clock) set(at time.Time) {
+	k.mu.Lock()
+	k.at = at
+	k.mu.Unlock()
+}
+
+// r378F4aTicks are the arm's reaper ticks, as offsets from the cells' birth: one
+// per second like the 1 s summary ticker the arm used to sleep through, at the
+// half second so no tick sits on a whole-second edge of the truncated
+// TTLRemainingSeconds / LifetimeSeconds. Ticks 6.5 … 11.5 s are the six inside
+// the lead window [6 s, 12 s); the last stops before the earliest possible
+// SECOND window entry of a re-minted cell (6.5 s + 6 s).
+func r378F4aTicks() []time.Duration {
+	var out []time.Duration
+	for s := 1; s <= 11; s++ {
+		out = append(out, time.Duration(s)*time.Second+500*time.Millisecond)
+	}
+	return out
+}
+
 // r378RunF4aArm runs one F4a harness: 2,000 boot-born cells × 3 classes through
-// the REAL refresher pool and the REAL reaper tick (#316 proactive enqueue), for
-// ≥ 4 ticks across the lead window. write is the refresher terminal under test.
-// Returns real resolves (Δcompleted − Δskipped_no_entry) and BornAt resets per key.
-func r378RunF4aArm(t *testing.T, writeFor func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool) (real int64, resets map[string]int, cells int) {
+// the REAL refresher pool and the REAL reaper pass (#316 proactive enqueue,
+// reapPastMaxEntryAge — the body of the summary tick), across the lead window.
+// write is the refresher terminal under test.
+//
+// #930 — DETERMINISTIC. The store reads a virtual clock the arm sets to each
+// tick's instant; the arm runs the reaper pass itself at that instant, then
+// waits for the refresher to have NO key queued or in a worker's hands
+// (WaitRefresherQuiescentForTest) before the next tick. So every tick sees every
+// refresh the previous one caused, and no count depends on how fast this host
+// runs: a reaper tick can no longer drift across the window edge, and the
+// control can no longer fall short of the cells because the real window closed
+// first (the two failure types of #930).
+//
+// Returns real resolves (Δcompleted − Δskipped_no_entry), BornAt resets per key,
+// the cell count, and the handler calls made by each tick's pass.
+func r378RunF4aArm(t *testing.T, writeFor func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool) (real int64, resets map[string]int, cells int, perTick []int64) {
 	t.Helper()
 	cleanup := withCleanRefresher(t, 4, 0)
 	defer cleanup()
 	t.Setenv(envResolvedCacheTTLSeconds, "8")          // refresh enqueued past 3/4·TTL = 6s
 	t.Setenv(envResolvedCacheMaxEntryAgeSeconds, "12") // L = min(8, 6) = 6 → window [6s, 12s)
-	t.Setenv(envResolvedCacheSummaryEvery, "1")        // the reaper tick
 	c := ResolvedCache()
+	clk := &r378Clock{at: time.Now()}
+	c.SetClockForTest(clk.now) // the store is reset with the refresher on cleanup
 	write := writeFor(c)
 
 	const perClass = 2000
 	classes := []string{"restactions", "widgets", CacheEntryClassWidgetContent}
-	born := time.Now()
+	born := clk.now()
 	var keys []string
 	for _, class := range classes {
 		for i := 0; i < perClass; i++ {
 			in := ResolvedKeyInputs{CacheEntryClass: class, Namespace: "f4a", Name: class + "-" + itoa378(i)}
 			k := ComputeKey(in)
-			c.Put(k, &ResolvedEntry{RawJSON: []byte(`{"boot":1}`), Inputs: &in, SeededAtBoot: true, CreatedAt: born, BornAt: born})
+			c.put(k, &ResolvedEntry{RawJSON: []byte(`{"boot":1}`), Inputs: &in, SeededAtBoot: true, CreatedAt: born, BornAt: born})
 			keys = append(keys, k)
 		}
 	}
@@ -386,9 +460,17 @@ func r378RunF4aArm(t *testing.T, writeFor func(c *ResolvedCacheStore) func(conte
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	StartRefresher(ctx)
-	// Run past the window start, across ≥ 4 reaper ticks inside [6s, 12s), and
-	// stop before the earliest possible SECOND window entry of a re-minted cell.
-	r378SleepUntil(born.Add(11500 * time.Millisecond))
+	base := RefresherWorkSnapshot()
+	for _, at := range r378F4aTicks() {
+		before := calls.Load()
+		clk.set(born.Add(at))
+		c.reapPastMaxEntryAge()
+		if w, err := WaitRefresherQuiescentForTest(base, time.Minute); err != nil {
+			t.Fatalf("SETUP: after the reaper tick at +%v: %v (outstanding=%d floored Δ=%d retried Δ=%d)",
+				at, err, w.Outstanding, w.Floored-base.Floored, w.Retried-base.Retried)
+		}
+		perTick = append(perTick, calls.Load()-before)
+	}
 	r1 := RefresherStatsByStat()
 	real = (r1["completed"] - r0["completed"]) - (r1["skipped_no_entry"] - r0["skipped_no_entry"])
 	resets = map[string]int{}
@@ -397,9 +479,9 @@ func r378RunF4aArm(t *testing.T, writeFor func(c *ResolvedCacheStore) func(conte
 		resets[k] = len(births[k]) - 1
 	}
 	mu.Unlock()
-	t.Logf("F4a arm: cells=%d handler calls=%d real resolves=%d (completed Δ=%d skipped_no_entry Δ=%d)",
-		len(keys), calls.Load(), real, r1["completed"]-r0["completed"], r1["skipped_no_entry"]-r0["skipped_no_entry"])
-	return real, resets, len(keys)
+	t.Logf("F4a arm: cells=%d handler calls=%d per tick %v real resolves=%d (completed Δ=%d skipped_no_entry Δ=%d)",
+		len(keys), calls.Load(), perTick, real, r1["completed"]-r0["completed"], r1["skipped_no_entry"]-r0["skipped_no_entry"])
+	return real, resets, len(keys), perTick
 }
 
 func itoa378(i int) string {
@@ -437,35 +519,41 @@ func itoa378(i int) string {
 // 300s pass — rests on two mechanisms measured here all the same: a successful
 // re-mint moves BornAt out of the window, and the refresher re-Put drops
 // SeededAtBoot while a seeded insert never stamped lastRead, so the cell goes
-// COLD and the warm gate excludes it from every later pass. Measured on the #506
-// item 2 tree: 6,000 cells, 6,000 handler calls, 6,000 real resolves in both
-// arms.
+// COLD and the warm gate excludes it from every later pass.
+//
+// #930 — COUNTS, NOT A REAL-TIME WINDOW. The arm used to sleep through the
+// window and require every cell to refresh before it closed in real time; on a
+// loaded host the control fell short (5,507 < 6,000) or a tick drifted across
+// the window edge and the arms differed by one or two. Both arms now run the
+// same 11 reaper ticks at exact virtual instants, each settled before the next
+// (r378RunF4aArm), so the counts are exact: every cell is refreshed exactly once,
+// at the window-entry tick (+6.5 s), in BOTH arms, tick for tick.
 func TestIssue378_F4a_NoAmplification_MultiTick(t *testing.T) {
-	if testing.Short() {
-		t.Skip("F4a runs two ~12s real-elapse arms")
-	}
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	// Control: the window predicate forced false — the same terminal write minus
 	// the re-mint is exactly ReplaceIfGen (test-only seam: chosen here, never in
 	// production code).
-	ctlReal, ctlResets, n := r378RunF4aArm(t, func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
-		return c.ReplaceIfGen
+	ctlReal, ctlResets, n, ctlTicks := r378RunF4aArm(t, func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
+		return c.replaceIfGen
 	})
 	for k, r := range ctlResets {
 		if r != 0 {
 			t.Fatalf("CONTROL: the window-false twin reset BornAt of %s %d times", k, r)
 		}
 	}
-	gotReal, resets, _ := r378RunF4aArm(t, func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
+	if ctlReal != int64(n) {
+		t.Fatalf("SETUP: the control ran %d real resolves over %d cells, want exactly one each — the ticks must "+
+			"carry every cell through the window entry once (per tick %v)", ctlReal, n, ctlTicks)
+	}
+	gotReal, resets, _, gotTicks := r378RunF4aArm(t, func(c *ResolvedCacheStore) func(context.Context, string, *ResolvedEntry, uint64) bool {
 		return r378RefreshPut(t, c)
 	})
-	if ctlReal < int64(n) {
-		t.Fatalf("SETUP: the control refreshed %d < %d cells — the arm never reached the window", ctlReal, n)
-	}
-	if gotReal != ctlReal {
-		t.Fatalf("#378 F4a RED: the re-mint arm ran %d real resolves vs %d with the window predicate forced false — "+
-			"the re-mint WRITE must ride refreshes that happen anyway, never add one (0.30.185 amplification). "+
-			"Note this compares the write, not the #506 deadline TRIGGER, which runs in both arms and "+
-			"deliberately does add refreshes", gotReal, ctlReal)
+	if gotReal != ctlReal || !reflect.DeepEqual(gotTicks, ctlTicks) {
+		t.Fatalf("#378 F4a RED: the re-mint arm ran %d real resolves (per tick %v) vs %d (per tick %v) with the window "+
+			"predicate forced false — the re-mint WRITE must ride refreshes that happen anyway, never add one "+
+			"(0.30.185 amplification). Note this compares the write, not the #506 deadline TRIGGER, which runs in "+
+			"both arms and deliberately does add refreshes", gotReal, gotTicks, ctlReal, ctlTicks)
 	}
 	bad := 0
 	for _, r := range resets {
@@ -480,6 +568,8 @@ func TestIssue378_F4a_NoAmplification_MultiTick(t *testing.T) {
 
 // TestIssue378_F4b_DepMovesMidResolve_ReMintIsRemarked — #375 carried.
 func TestIssue378_F4b_DepMovesMidResolve_ReMintIsRemarked(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envResolvedCacheTTLSeconds, "60")
@@ -488,7 +578,7 @@ func TestIssue378_F4b_DepMovesMidResolve_ReMintIsRemarked(t *testing.T) {
 	put := r378RefreshPut(t, c)
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "f4b"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 	e0, _ := c.GetNoTouch(key)
 	time.Sleep(2300 * time.Millisecond) // into the window by real elapse
 

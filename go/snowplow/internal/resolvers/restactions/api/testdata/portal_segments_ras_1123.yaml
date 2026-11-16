@@ -1,0 +1,1627 @@
+# The 7 RESTActions that hold the 8 stages #1123 declares with segments(), for
+# path_template_portal_iterators_1123_test.go. helm template of portal main
+# 6dbb40bf2d3fd45a1f771e6599b8b19796d5b4a0, charts compositions-page,
+# resources-page, reviews-page and service-desk-page, unedited.
+# Source: compositions-page/templates/restaction.composition-architecture.yaml
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: composition-architecture
+  namespace: krateo-compositions
+  annotations:
+    krateo.io/verbose: "true"
+spec:
+  api:
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    - name: arch
+      dependsOn:
+        name: ""
+        iterator: '[ { namespace: ((.compositionNamespace // .namespace) // ""), name: ((.compositionName // .name) // "") } | select(.namespace != "" and .name != "") ]'
+      path: ${ "/api/v1/namespaces/" + .namespace + "/configmaps/" + .name + "-architecture" }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: archErr
+      filter: |
+        ((.extras.compositionName // .extras.name) // "") as $n
+        | (.arch.metadata.labels // {}) as $l
+        | (try (.arch.data.graph | fromjson) catch null) as $g
+        | if $n != "" and ($l["krateo.io/composition-name"] // "") == $n and ($g | type) == "object" and $g.v == 1
+          then {graph: $g, compositionId: ($l["krateo.io/composition-id"] // "")}
+          else null end
+    
+    
+    
+    - name: comp
+      dependsOn:
+        name: arch
+        iterator: '[ .arch.graph.composition? | select(. != null and (.apiVersion // "") != "" and (.resource // "") != "" and (.name // "") != "") | select((.apiVersion // "") | test("^[^/]+/[^/]+$")) | . + ((.apiVersion | split("/")) as $p | { group: $p[0], version: $p[1] }) ]'
+      
+      path: ${ "/apis/" + .group + "/" + .version + "/namespaces/" + .namespace + "/" + .resource + "/" + .name }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: compErr
+      filter: |
+        [ (.comp // .) | select(type == "object" and (.metadata.name // "") != "")
+          | { uid: (.metadata.uid // ""),
+              managed: [ .status.managed[]? | {apiVersion: (.apiVersion // ""), name: (.name // ""), path: (.path // "")} ],
+              conditions: (.status.conditions // []) } ]
+    
+    
+    - name: objs
+      dependsOn:
+        name: comp
+        
+        
+        iterator: |
+          def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+          def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+            | if ($p[1] // "") == "apis" then true
+              elif ($p[1] // "") == "api" then
+                ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+                | ($res == "" or (fetchableCore | index($res)) != null)
+              else false end;
+          . as $r
+          | ($r.comp[0].managed // []) as $m
+          | [ ($r.arch.graph.nodes // [])[]
+              | select(.present == true and ((.lifecycle // "") == "")) as $nd
+              | $nd.names[] as $nm
+              | $m[] | select(.name == $nm and .apiVersion == $nd.apiVersion and .path != "")
+              | select(.path | fetchablePath) | {path} ]
+          | unique
+      path: ${ .path }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: objErr
+      filter: |
+        [ (.objs // .) | select(type == "object" and (.metadata.name // "") != "")
+          | { apiVersion: (.apiVersion // ""),
+              metadata: { name: .metadata.name, namespace: (.metadata.namespace // ""), creationTimestamp: (.metadata.creationTimestamp // "") },
+              status: (.status // {}) } ]
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  filter: |
+    # Input: snowplow's resolve dict — the request extras at the top level, each stage's (step-filtered)
+    # output under its name, and each stage's errors, accumulated as a list, under its errorKey.
+    def truthy: . != null and . != false and . != "" and . != 0 and . != [] and . != {};  # Helm `if`
+    # readyWhen has TWO forms and both have to evaluate here, because Helm's `readinessGuard` compiles both
+    # (see the builder's readyWhen.ts). Reading only the field form leaves a condition-form node waiting
+    # forever on a resource that is ready, with nothing to search for. `[capture(...)] | first` rather than
+    # a bare capture: on no match capture emits NOTHING, which drops the whole node from the array around it.
+    def condType($rw): [ $rw | capture("^\\.status\\.conditions\\[\\] \\| select\\(\\.type == \"(?<t>\\w+)\"\\) \\| \\.status == \"True\"$") ] | first | .t;
+    def readyBy($rw):                          # the condition's truth, or the field's Helm-truthiness
+      if ($rw // "") == "" then true
+      else condType($rw) as $t
+      | if $t != null then any((.status.conditions // [])[]; .type == $t and .status == "True")
+        else ((try getpath($rw | ltrimstr(".") | split(".")) catch null) | truthy) end
+      end;
+    def readyValue($rw):                       # what the check READ: the condition's status, or the field
+      if ($rw // "") == "" then null
+      else condType($rw) as $t
+      | if $t != null then ([ (.status.conditions // [])[] | select(.type == $t) | .status ] | first)
+        else (try getpath($rw | ltrimstr(".") | split(".")) catch null) end
+      end;
+    def errKind:
+      if type == "object" then
+        (if (.code // 0) == 403 or .reason == "Forbidden" then "forbidden"
+         elif (.code // 0) == 404 or .reason == "NotFound" then "notfound" else "error" end)
+      elif type == "string" then
+        (if test("forbidden|not authorized"; "i") then "forbidden"
+         elif test("not found"; "i") then "notfound" else "error" end)
+      else "error" end;
+    def nameIn: [capture("\"(?<n>[^\"]+)\" (is forbidden|not found)")][0].n // null;
+    def errName:
+      if type == "object" then (.details.name // ((.message // "") | nameIn))
+      elif type == "string" then nameIn
+      else null end;
+    def errs($k): [ ($k // []) | if type == "array" then .[] else . end ];
+    def exception:                                         # K8s-native tokens, exception-only
+      (.status.conditions // []) as $c
+      | ([ $c[] | select(.type == "Synced" and .status == "False") ][0]) as $s
+      | ([ $c[] | select((.type == "Ready" or .type == "Available") and .status == "False") ][0]) as $r
+      | if $s != null then {label: "NotSynced", reason: ($s.reason // ""), message: ($s.message // "")}
+        elif $r != null then {label: "NotReady", reason: ($r.reason // ""), message: ($r.message // "")}
+        else null end;
+
+    (.arch.graph // null) as $g
+    | (errs(.archErr) | map(errKind)) as $archErrs
+    | if $g == null then
+        { architecture: false,
+          access: (if any($archErrs[]; . == "forbidden") then "forbidden"
+                   elif any($archErrs[]; . == "error") then "error" else null end) }
+      elif (.comp[0]? // null) == null then
+        { architecture: true, chart: $g.chart, composition: ($g.composition.name? // ""), readable: false, states: $g.states,
+          access: (if any(errs(.compErr)[]; errKind == "forbidden") then "forbidden" else "error" end),
+          level: null, state: null, allReady: null, waitingOn: [], progress: null, since: null, next: [],
+          nodes: [ ($g.nodes // [])[] | select((.lifecycle // "") == "")
+                   | {id, kind, apiVersion, class, level, present, forEach: (.forEach // false), readyWhen: (.readyWhen // null),
+                      parents: [ .dependsOn[]? | select(.active) | .ref ], expected: (.names | length),
+                      phase: (if .present then "unknown" else "absent" end)} ] }
+      else
+      (.comp[0]? // null) as $comp
+      | ($comp.managed // []) as $managed
+      | ([ .objs ] | flatten | map(select(type == "object" and (.metadata.name // "") != ""))) as $got
+      | (errs(.objErr) | map(select(errKind == "forbidden") | errName) | map(select(. != null))) as $denied
+      | (errs(.objErr) | map(select(errKind == "notfound") | errName) | map(select(. != null))) as $missing
+      | [ ($g.nodes // [])[] | select((.lifecycle // "") == "") ] as $seq
+      # 1. each instance, from what was rendered (status.managed) and what the caller could read
+      | [ $seq[] | . as $n
+          | [ .names[]? as $nm
+              | ([ $got[] | select(.metadata.name == $nm and (.apiVersion == "" or .apiVersion == $n.apiVersion)) ][0]) as $o
+              | (any($managed[]; .name == $nm and .apiVersion == $n.apiVersion)) as $rendered
+              | { name: $nm,
+                  read: (if $o != null then "ok"
+                         elif ($rendered | not) then "withheld"
+                         elif ($denied | index($nm)) != null then "unreadable"
+                         elif ($missing | index($nm)) != null then "missing"
+                         else "unavailable" end),
+                  satisfied: (if $o == null then null else ($o | readyBy($n.readyWhen)) end),
+                  value: (if $o != null then ($o | readyValue($n.readyWhen)) else null end),
+                  since: (if $o != null then ($o.metadata.creationTimestamp // null) else null end),
+                  exception: (if $o != null then ($o | exception) else null end) } ] as $inst
+          | $n + { instances: $inst } ] as $nodes0
+      # 2. a rendered dependent proves its ready: true dependencies held at the last render (gate parity)
+      | ([ $nodes0[] | select(.present)
+           | select(any(.instances[]; .read != "withheld"))
+           | .dependsOn[]? | select(.active and .ready) | .ref ] | unique) as $proven
+      | [ $nodes0[] | . as $n
+          | (($proven | index($n.id)) != null) as $isProven
+          | (($n.readyWhen // "") == "") as $existence
+          | [ .instances[] | . + { ok: (if .satisfied == true then true
+                                       elif .read == "ok" then false
+                                       elif .read == "withheld" then false
+                                       elif .read == "missing" then false
+                                       elif $existence or $isProven then true
+                                       else null end) } ] as $inst
+          | { id, kind, apiVersion, class, level, present, forEach: (.forEach // false), readyWhen: (.readyWhen // null),
+              parents: [ .dependsOn[]? | select(.active) | .ref ],
+              waits: [ .dependsOn[]? | select(.active and .ready) | {ref, all: (.all // false)} ],
+              expected: ($inst | length),
+              rendered: ([ $inst[] | select(.read != "withheld") ] | length),
+              satisfied: ([ $inst[] | select(.ok == true) ] | length),
+              unknown: ([ $inst[] | select(.ok == null) ] | length),
+              unreadable: ([ $inst[] | select(.read == "unreadable") ] | length),
+              inferred: any($inst[]; .ok == true and .read != "ok"),
+              since: ([ $inst[] | .since | select(. != null) ] | min),
+              exception: ([ $inst[] | .exception | select(. != null) ][0]),
+              instances: $inst } ] as $nodes
+      # 3. the level: the first level (of those this composition uses) whose nodes are not all satisfied
+      | ([ $nodes[] | select(.present) | .level ] | unique) as $levels
+      | ([ $levels[] as $l | select(any($nodes[]; .present and .level == $l and .satisfied < .expected)) | $l ][0]) as $cur
+      | ($cur == null) as $all
+      | (if $all then ($levels | max) else $cur end) as $level
+      | [ $nodes[] | . + { phase: (if (.present | not) then "absent"
+                                   elif .satisfied == .expected then "done"
+                                   elif .unknown > 0 and .unreadable > 0 then "unreadable"
+                                   elif .unknown > 0 then "unavailable"
+                                   elif .rendered == 0 and .expected > 0 then "withheld"
+                                   else "waiting" end) } ] as $nodes2
+      # 4. a withheld node whose every parent is done has an OPEN gate: the chart would render it now.
+      #    It is "not created" — yet (CDC re-renders within its resync), or because the render failed
+      #    (the composition's own Synced/Ready=False says why) — never "waits for" parents that are done.
+      | [ $nodes2[] | . + { gateOpen: (.phase == "withheld" and (.parents | length) > 0
+                                       and all(.parents[]; . as $p | any($nodes2[]; .id == $p and .phase == "done"))) } ] as $nodes2
+      | { architecture: true,
+          chart: $g.chart,
+          composition: ($g.composition.name? // ""),
+          readable: ($comp != null),
+          states: $g.states,
+          level: $level,
+          state: (if $level == null then null else ($g.states[$level] // null) end),
+          allReady: $all,
+          waitingOn: (if $all then [] else [ $nodes2[] | select(.present and .level == $cur and .satisfied < .expected)
+                       | {id, kind, pending: (.expected - .satisfied), phase, gateOpen} ] end),
+          progress: (if $all then null else ([ $nodes2[] | select(.present and .level == $cur) ]
+                       | {satisfied: (map(.satisfied) | add), expected: (map(.expected) | add)}) end),
+          since: (if $all then null else ([ $nodes2[] | select(.present and .level == $cur) | .since | select(. != null) ] | min) end),
+          next: (if $all then [] else [ $nodes2[] | select(.present and .level == ($levels | map(select(. > $cur)) | min)) | .id ] end),
+          # Only Synced=False: the render or apply failed. Ready=False is a composition still converging.
+          compositionNotSynced: ({status: {conditions: ($comp.conditions // [])}} | exception | if . != null and .label == "NotSynced" then . else null end),
+          nodes: $nodes2 }
+      end
+---
+# Source: compositions-page/templates/restaction.composition-resources.yaml
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: composition-resources
+  namespace: krateo-compositions
+  annotations:
+    krateo.io/verbose: "true"
+spec:
+  api:
+    
+    
+    
+    
+    
+    
+    
+    - name: crds
+      path: /apis/core.krateo.io/v1alpha1/compositiondefinitions
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      userAccessFilter:
+        verb: list
+        group: core.krateo.io
+        resource: compositiondefinitions
+        namespaceFrom: .metadata.namespace
+      filter: "[.crds.items[]? | select(.status.resource != null and .status.apiVersion != null) | {plural: .status.resource, version: (.status.apiVersion | split(\"/\")[1])}]"
+      continueOnError: true
+    - name: found
+      dependsOn:
+        name: crds
+        iterator: 'if (.namespace // "") == "" or (.name // "") == "" then [] else [ .crds | arrays | .[] | objects ] | unique_by([.version, .plural]) end'
+      
+      
+      
+      
+      
+      
+      
+      path: ${ "/apis/composition.krateo.io/" + (.version) + "/" + (.plural) }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      userAccessFilter:
+        verb: list
+        group: composition.krateo.io
+        resourcesFrom: "[ (.crds // [])[] | .plural ]"
+        namespaceFrom: .metadata.namespace
+      
+      
+      
+      filter: >
+        (["clusterroles","clusterrolebindings","namespaces","customresourcedefinitions","clusterissuers","persistentvolumes","storageclasses","nodes","priorityclasses","validatingwebhookconfigurations","mutatingwebhookconfigurations","apiservices","certificatesigningrequests","podsecuritypolicies","ingressclasses","runtimeclasses","csidrivers","csinodes","volumeattachments"]) as $clusterKinds
+        | (.extras.name // "") as $n | (.extras.namespace // "") as $ns
+        | [ .found.items[]?
+            | select(.metadata.name == $n and .metadata.namespace == $ns)
+            | . as $comp
+            | ($comp.metadata.name) as $cn
+            | ($comp.metadata.namespace) as $cns
+            | ($comp.status.managed // [])[]
+            | . as $m
+            | ($m.path | split("/")) as $p
+            | ($p[-2]) as $res | ($p[-1]) as $nm | ($p[0:-2] | join("/")) as $pre
+            | ($clusterKinds | index($res)) as $cluster
+            # The parent's workload projection rides on every row (_wh/_whMsg): the final
+            # aggregate folds it in, and this step filter is the only place that sees $comp.
+            | { _cn: $cn, _cns: $cns, _kind: $res, _name: $nm,
+                _wh: $comp.status.workloadHealthy, _whMsg: ($comp.status.healthMessage // ""),
+                # Real group/version for the resource-view route ($p[1] = "api" for the core group
+                # → group "core", version $p[2]; "apis" → group $p[2], version $p[3]) + cluster-scope.
+                _grp: (if ($p[1] // "") == "apis" then ($p[2] // "") else "core" end),
+                _ver: (if ($p[1] // "") == "apis" then ($p[3] // "v1") else ($p[2] // "v1") end),
+                _cluster: ($cluster != null),
+                # core-provider's .status.managed[].path now ALREADY carries /namespaces/<ns>/ for
+                # namespaced kinds (verified live: /api/v1/namespaces/<ns>/serviceaccounts/<n>), so
+                # inject it ONLY when absent — else the URL doubles the namespace segment → 404, and
+                # the fetch-miss silently defaults the resource to healthy (issue #152). Idempotent
+                # for both path shapes (old omitted-ns and new included-ns).
+                _getpath: (if $cluster != null or ($m.path | contains("/namespaces/")) then $m.path
+                           else ($pre + "/namespaces/" + $cns + "/" + $res + "/" + $nm) end) } ]
+    - name: resources
+      dependsOn:
+        name: found
+        
+        
+        
+        iterator: |
+          def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+          def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+            | if ($p[1] // "") == "apis" then true
+              elif ($p[1] // "") == "api" then
+                ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+                | ($res == "" or (fetchableCore | index($res)) != null)
+              else false end;
+          .name as $n | .namespace as $ns | [ .found[] | select(._cn == $n and ._cns == $ns) | select(._getpath | fetchablePath) ]
+      path: ${ ._getpath }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: resErr
+      
+      
+      
+      filter: >
+        [ (.resources // .)
+          | select(type == "object" and (.kind // "") != "Status" and (.metadata.name // "") != "")
+          | { rkind: (.kind // ""), rname: .metadata.name, rns: (.metadata.namespace // ""), conditions: (.status.conditions // []) } ]
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  filter: |
+    def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+    def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+      | if ($p[1] // "") == "apis" then true
+        elif ($p[1] // "") == "api" then
+          ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+          | ($res == "" or (fetchableCore | index($res)) != null)
+        else false end;
+    (.name) as $n | (.namespace) as $ns
+    | ({"serviceaccounts":"ServiceAccount","configmaps":"ConfigMap","secrets":"Secret","services":"Service","endpoints":"Endpoints","persistentvolumeclaims":"PersistentVolumeClaim","deployments":"Deployment","replicasets":"ReplicaSet","statefulsets":"StatefulSet","daemonsets":"DaemonSet","pods":"Pod","jobs":"Job","cronjobs":"CronJob","clusterroles":"ClusterRole","clusterrolebindings":"ClusterRoleBinding","roles":"Role","rolebindings":"RoleBinding","ingresses":"Ingress","networkpolicies":"NetworkPolicy","namespaces":"Namespace"}) as $kindMap
+    | ( [ .found[]? | select(._cn == $n and ._cns == $ns) ] ) as $managed
+    | ( [ .resources ] | flatten | map(select(type == "object" and (.rname // "") != "")) ) as $fetched
+    | ( $managed | map(
+          . as $m
+          | ( [ $fetched[] | select(.rname == $m._name and ((.rns == $m._cns) or (.rns == ""))) ][0] ) as $obj
+          | ($obj != null) as $found
+          | (($obj.conditions) // []) as $c
+          | ([ $c[]? | select(.type == "Ready" or .type == "Available") ][0]) as $rc
+          | ($rc.status == "True") as $ready
+          | ($rc.status == "False") as $notready
+          
+          | ($rc.status == "Unknown") as $unknownReady
+          | ($rc.reason // "") as $reason
+          
+          | (($reason == "NotObserved") or ($reason == "ObserveFailed")) as $observeFailed
+          
+          | (($reason == "Pending") or ($reason == "Updating")) as $converging
+          | (($reason == "DriftNotConverging") or ($reason == "AuthorizationDenied")) as $terminal
+          | (any($c[]?; .type == "Synced" and .status == "False")) as $unsynced
+          | (($c | length) == 0) as $noconds
+          | ($m._getpath | fetchablePath) as $readable
+          | {
+              kind: ($kindMap[$m._kind] // (if (($obj.rkind) // "") != "" then $obj.rkind else (($m._kind | .[0:1] | ascii_upcase) + ($m._kind[1:] | sub("s$"; ""))) end)),
+              name: $m._name,
+              ns: $m._cns,
+              # healthy-by-presence applies ONLY to a child we actually FETCHED (a conditionless kind
+              # like ServiceAccount/ConfigMap that exists). A managed child we could NOT fetch
+              # ($found=false — 404 / API error) is NOT healthy: report it "pending" (issue #152), so
+              # it neither shows a green tag nor counts toward convergence.
+              state: (if ($readable | not) then "unread"
+                      elif ($found | not) then "pending"
+                      elif $noconds then "healthy"
+                      elif $ready and ($unsynced | not) then "healthy"
+                      elif $ready and $unsynced then "drift"
+                      elif $notready and $converging then "converging"
+                      elif $notready and $terminal then "terminal"
+                      elif $notready then "failed"
+                      elif $unknownReady and $observeFailed and $unsynced then "notObserved"
+                      elif $unknownReady and $observeFailed then "readyNotSet"
+                      elif $unknownReady then "unknown"
+                      else "pending" end),
+              
+              stateLabel: (if ($readable | not) then "Unread"
+                           elif ($found | not) then "Pending"
+                           elif $noconds or ($ready and ($unsynced | not)) then "Healthy"
+                           elif $ready and $unsynced then "Drift"
+                           
+                           elif $notready and ($converging or $terminal) then $reason
+                           elif $notready then "NotReady"
+                           elif $unknownReady and $observeFailed and $unsynced then $reason
+                           
+                           elif $unknownReady and $observeFailed then "ReadyNotSetAfterObserve"
+                           elif $unknownReady then "Unknown"
+                           else "Pending" end),
+              
+              healthPercent: (if ($readable | not) then 0
+                              elif ($found | not) then 50
+                              elif $noconds or ($ready and ($unsynced|not)) then 100
+                              elif $ready and $unsynced then 70
+                              elif $notready and $converging then 50
+                              
+                              elif $notready and $terminal then 15
+                              elif $notready then 20
+                              elif $unknownReady and $observeFailed and $unsynced then 40
+                              elif $unknownReady and $observeFailed then 60
+                              elif $unknownReady then 50
+                              else 50 end),
+              # IA F5 + F5-full: composition.krateo.io children drill into the first-class
+              # /compositions detail; EVERY other kind drills into the generic /resources view
+              # (namespaced → its ns; cluster-scoped → the "cluster" filler; core group → "core").
+              # The last-mile is now closed for every managed child, whatever its kind.
+              navHref: (if ($readable | not) then ""
+                        elif ($m._grp == "composition.krateo.io")
+                        then ("/compositions/" + $m._cns + "/" + $m._name)
+                        else ("/resources/" + (if $m._cluster then "cluster" else $m._cns end) + "/" + $m._grp + "/" + $m._ver + "/" + $m._kind + "/" + $m._name) end)
+            } )
+      ) as $rows
+    | ($rows | map(select(.state != "unread"))) as $checked
+    | ($checked | length) as $total
+    | ($checked | map(select(.state == "healthy")) | length) as $healthy
+    # Workload projection of the COMPOSITION itself (ridden in on _wh/_whMsg): resources can
+    # all match declared-vs-actual while the pods behind them crashloop — `converged` must not
+    # claim full convergence then, and the rail widget caps/annotates from these two keys.
+    # ($managed[0] on an empty list is null → null._wh == false → false: safe when the comp
+    # declares no managed resources.)
+    | ($managed[0]._wh == false) as $whBad
+    | (if $whBad then ($managed[0]._whMsg // "") else "" end) as $whMsg
+    | {
+        resources: $rows,
+        total: $total,
+        healthyCount: $healthy,
+        unreadCount: (($rows | length) - $total),
+        driftCount: ($rows | map(select(.state == "drift")) | length),
+        failedCount: ($rows | map(select(.state == "failed")) | length),
+        pendingCount: ($rows | map(select(.state == "pending")) | length),
+        
+        
+        notObservedCount: ($rows | map(select(.state == "notObserved")) | length),
+        terminalCount: ($rows | map(select(.state == "terminal")) | length),
+        convergingCount: ($rows | map(select(.state == "converging")) | length),
+        readyNotSetCount: ($rows | map(select(.state == "readyNotSet")) | length),
+        unknownCount: ($rows | map(select(.state == "unknown")) | length),
+        convergencePercent: (if $total > 0 then (($healthy * 100 / $total) | floor) else 0 end),
+        converged: (($rows | length) > 0 and $healthy == $total and ($whBad | not)),
+        workloadUnhealthy: $whBad,
+        workloadMessage: $whMsg
+      }
+---
+# Source: resources-page/templates/restaction.resource-detail.yaml
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: resource-detail
+  namespace: krateo-resources
+  annotations:
+    krateo.io/verbose: "true"
+spec:
+  api:
+    
+    
+    
+    
+    - name: disco
+      dependsOn:
+        name: ""
+        iterator: |
+          def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+          def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+            | if ($p[1] // "") == "apis" then true
+              elif ($p[1] // "") == "api" then
+                ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+                | ($res == "" or (fetchableCore | index($res)) != null)
+              else false end;
+          [ { g: (.group // ""), v: (.version // "v1"), pl: (.plural // ""), nm: (.name // "") } | select(.pl != "" and .nm != "") | { base: (if (.g == "" or .g == "core") then ("/api/" + .v) else ("/apis/" + .g + "/" + .v) end) } | select(.base | fetchablePath) ]
+      path: ${ .base }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: discoError
+    
+    
+    
+    
+    
+    
+    
+    - name: object
+      dependsOn:
+        name: disco
+        
+        
+        iterator: |
+          def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+          def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+            | if ($p[1] // "") == "apis" then true
+              elif ($p[1] // "") == "api" then
+                ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+                | ($res == "" or (fetchableCore | index($res)) != null)
+              else false end;
+          (.group // "") as $g | (.version // "v1") as $v | (.plural // "") as $pl
+          | (.namespace // "") as $ns | (.name // "") as $nm
+          | (if ($g == "" or $g == "core") then ("/api/" + $v) else ("/apis/" + $g + "/" + $v) end) as $base
+          # NB jq `//` treats `false` as absent, so `.namespaced // true` would wrongly map a
+          # cluster-scoped resource (namespaced:false) to true. Use `!= false`: false→cluster,
+          # true→namespaced, null(unknown)→namespaced (the common default).
+          | (([ (.disco.resources // [])[] | select((.name // "") == $pl) ][0].namespaced) != false) as $nsd
+          | [ select($pl != "" and $nm != "" and ($ns != "" or ($nsd | not)))
+              | { path: (if $nsd then ($base + "/namespaces/" + $ns + "/" + $pl + "/" + $nm) else ($base + "/" + $pl + "/" + $nm) end) }
+              | select(.path | fetchablePath) ]
+      path: ${ .path }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: objectError
+  
+  
+  
+  
+  
+  filter: >
+    def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+    def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+      | if ($p[1] // "") == "apis" then true
+        elif ($p[1] // "") == "api" then
+          ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+          | ($res == "" or (fetchableCore | index($res)) != null)
+        else false end;
+    (.object // {}) as $o
+    | (.group // "") as $g
+    | (.plural // "") as $pl
+    | ([ (.disco.resources // [])[] | select((.name // "") == $pl) ][0]) as $res
+    | (($res.namespaced) != false) as $nsd
+    | ($res.kind // $o.kind // $pl) as $kind
+    | ($o.status.conditions // []) as $conds
+    | {
+        found: (($o.metadata.name // "") != ""),
+        kindName: ($kind + " · " + ($o.metadata.name // (.name // ""))),
+        eyebrow: ($o.apiVersion // (if $g == "" then (.version // "") else ($g + "/" + (.version // "")) end)),
+        subtitle: (if (($o.metadata.name // "") != "") then
+            ([ (if $nsd then ("namespace " + ($o.metadata.namespace // (.namespace // ""))) else "cluster-scoped" end),
+               (if ($o.metadata.creationTimestamp // "") != "" then ("created " + ($o.metadata.creationTimestamp)) else empty end) ] | join(" · "))
+          else
+            (if ([ .objectError ] | flatten | map(select(type == "object") | .code // 0) | any(. == 403))
+             then "Not readable with your access"
+             elif (((if ($g == "" or $g == "core") then "/api/" else "/apis/" + $g + "/" end) + (.version // "v1") + "/" + $pl) | fetchablePath | not)
+             then ("Not read: the portal does not read " + $pl)
+             else ("Not found" + (if (.namespace // "") != "" then (" in namespace " + .namespace) else "" end)) end)
+          end),
+        conditions: [ $conds[] | { type: (.type // ""), status: (.status // ""), reason: (.reason // ""),
+                                   state: (if (.status // "") == "True" then "healthy" elif (.status // "") == "False" then "failed" else "pending" end) } ],
+        # THE STUCK-CREATE ANNOTATION.
+        #
+        # krateo.io/external-create-pending is written by a provider before it calls the external
+        # API and cleared when the call returns. If the process dies in between, it is never
+        # cleared and the resource is wedged: the controller refuses to retry and reports
+        #   "cannot determine creation result - remove the krateo.io/external-create-pending
+        #    annotation if it is safe to proceed"
+        # — an instruction addressed to a human with kubectl, printed on a page that offered no
+        # way to act on it. Two publishes sat like this for 30 hours on krateo-057.
+        #
+        # EXCEPTION-ONLY: every field below is empty on a healthy object, so the page composes
+        # nothing. The annotation being ABSENT is the normal case and says nothing.
+        # NOT "the annotation is present" — that was the first cut and it was wrong. On krateo-057
+          # ALL 17 LocalResources carry it and 8 are Synced=True/ReconcileSuccess: this provider
+          # simply never clears it on the happy path. Firing on the annotation alone would have put
+          # a scary warning and a DANGEROUS button on every healthy resource, where clearing it can
+          # produce a duplicate external object. The annotation is necessary, not sufficient.
+          #
+          # The real signal is the annotation PLUS a condition that is actually False. A wedged
+          # object reports one; a healthy one that merely still carries the marker does not.
+          createPending: (
+            ((($o.metadata.annotations // {})["krateo.io/external-create-pending"] // "") != "")
+            and (([ $conds[] | select((.status // "") == "False") ] | length) > 0)),
+        createPendingSince: (($o.metadata.annotations // {})["krateo.io/external-create-pending"] // ""),
+        # The controller's own words, when it is saying this. Quoted rather than paraphrased so
+        # the page never invents a diagnosis the cluster did not make.
+        createPendingMessage: ([ $conds[] | select((.message // "") | test("external-create-pending")) | (.message // "") ] | first // ""),
+        # Identity for the PATCH that clears it. A generic page cannot hardcode a GVR, so the
+        # button resolves its target through resourcesRefsTemplate from exactly these four.
+        patchApiVersion: ($o.apiVersion // (if $g == "" then (.version // "") else ($g + "/" + (.version // "")) end)),
+        patchResource: $pl,
+        patchName: ($o.metadata.name // (.name // "")),
+        patchNamespace: (if $nsd then ($o.metadata.namespace // (.namespace // "")) else "" end),
+        conditionsCount: ($conds | length),
+        manifestJson: (if (($o.metadata.name // "") != "") then (($o | del(.metadata.managedFields, .metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"])) | tojson) else "" end)
+      }
+---
+# Source: reviews-page/templates/restaction.platform-reviews.yaml
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: platform-reviews
+  namespace: krateo-reviews
+  annotations:
+    "krateo.io/verbose": "true"
+spec:
+  api:
+    - name: proposals
+      path: /apis/review.krateo.io/v1alpha1/namespaces/default/proposals
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      userAccessFilter:
+        verb: list
+        group: review.krateo.io
+        resource: proposals
+        namespaceFrom: .metadata.namespace
+      
+      continueOnError: true
+      errorKey: proposalsError
+    - name: runs
+      path: /apis/review.krateo.io/v1alpha1/namespaces/default/reviewruns
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      userAccessFilter:
+        verb: list
+        group: review.krateo.io
+        resource: reviewruns
+        namespaceFrom: .metadata.namespace
+      continueOnError: true
+      errorKey: runsError
+    
+    
+    
+    - name: cronjob
+      path: /apis/batch/v1/namespaces/default/cronjobs/nightly-review
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: cronjobError
+    - name: apis
+      path: /apis
+      verb: GET
+      dependsOn:
+        name: proposals
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: apisError
+      filter: '[ (.apis.groups // [])[] | (.versions // [])[] | .groupVersion ] + ["v1"]'
+    - name: kinds
+      dependsOn:
+        name: apis
+        iterator: >-
+          def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+          def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+            | if ($p[1] // "") == "apis" then true
+              elif ($p[1] // "") == "api" then
+                ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+                | ($res == "" or (fetchableCore | index($res)) != null)
+              else false end;
+          (.apis // []) as $served | [ (.proposals | if type == "object" and has("items") then .items else [.] end)[]?
+            | select((.spec.change.format // "") == "yaml") | (.spec.change.content // "")
+            | ([ match("(?m)^apiVersion:[ \\t]*[\"']?([^\\s\"'#]+)") ][0].captures[0].string // "") ]
+          | unique | map(select(. != "" and (. as $g | any($served[]; . == $g))))
+          | map({ gv: ., discovery: (if (. | contains("/")) then "/apis/" + . else "/api/" + . end) })
+          | map(select(.discovery | fetchablePath))
+      path: ${ .discovery }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: kindsError
+      filter: '[ { gv: (.kinds.groupVersion // ""), kinds: [ (.kinds.resources // [])[] | select((.name // "") | contains("/") | not) | .kind ] } ]'
+  filter: |
+    def rv_ts: if (. // "") == "" then null else (.[0:19] + "Z") end;
+    def rv_epoch: rv_ts | if . == null then null else (fromdateiso8601? // null) end;
+    def rv_when: if (. // "") == "" then "—" else (.[0:10] + " " + .[11:16] + " UTC") end;
+    def rv_dur($a; $b):
+      ($a | rv_epoch) as $s | ($b | rv_epoch) as $e
+      | if $s == null or $e == null then "—"
+        else ($e - $s) as $d
+        | if $d < 1 then "under 1 s"
+          elif $d < 60 then (($d | floor | tostring) + " s")
+          else ((($d / 60) | floor | tostring) + " m " + ((($d | floor) % 60) | tostring) + " s") end
+        end;
+    def rv_num: tostring as $s
+      | if ($s | test("^[0-9]{4,}$")) then ([ range(($s | length); 0; -3) | $s[([. - 3, 0] | max):.] ] | reverse | join(",")) else $s end;
+    def rv_phase:
+      (.status.phase // "") as $s
+      | if $s == "Merged" then $s
+        else (.spec.decision.phase // (if $s == "" then "Proposed" else $s end)) end;
+    def rv_decision:
+      { phase: rv_phase,
+        by: (.spec.decision.decidedBy // .status.decidedBy // ""),
+        at: (.spec.decision.decidedAt // .status.decidedAt // ""),
+        reason: (.spec.decision.reason // .status.reason // ""),
+        claim: (.spec.decision.claim // "") };
+    def rv_has($x): any(.[]?; . == $x);
+    def rv_gvk:
+      if ((.spec.change.format // "") != "yaml") then null
+      else (.spec.change.content // "") as $c
+        | { gv: ([ $c | match("(?m)^apiVersion:[ \\t]*[\"']?([^\\s\"'#]+)") ][0].captures[0].string // ""),
+            kind: ([ $c | match("(?m)^kind:[ \\t]*[\"']?([^\\s\"'#]+)") ][0].captures[0].string // "") }
+        | if .gv == "" or .kind == "" then null else . end
+      end;
+    def rv_kindcheck($served; $kinds):
+      (.spec.change.format // "") as $f
+      | if $f == "markdown" or $f == "diff" then { state: "na" }
+        else rv_gvk as $g
+        | if $g == null or $served == null then { state: "unknown" }
+          elif ($served | rv_has($g.gv) | not) then ($g + { state: "notServed" })
+          elif ($kinds[$g.gv] // null) == null then ($g + { state: "unknown" })
+          elif ($kinds[$g.gv] | rv_has($g.kind) | not) then ($g + { state: "notServed" })
+          else ($g + { state: "served" }) end
+        end;
+    def rv_target:
+      ([ (.status.conditions // [])[] | select(.type == "TargetResolved") ][0] // null) as $c
+      | if $c == null then { state: "none" }
+        elif $c.status == "True" then { state: "found", message: ($c.message // "") }
+        elif $c.reason == "NotFoundOrPrivate" then { state: "unverified", message: ($c.message // "") }
+        elif $c.reason == "InvalidRepo" then { state: "invalid", message: ($c.message // "") }
+        else { state: "unanswered", message: ($c.message // ""), reason: ($c.reason // "") } end;
+    def rv_pills($served; $kinds):
+      rv_kindcheck($served; $kinds) as $k | rv_target as $t
+      | [ (if $k.state == "notServed" then { type: "Kind not served", status: "False", color: "orange" }
+           elif $k.state == "na" then { type: "Kind check n/a", status: "Unknown", color: "gray" }
+           else empty end),
+          (if $t.state == "unverified" then { type: "Target unverified", status: "Unknown", color: "gray" }
+           elif $t.state == "invalid" then { type: "Target invalid", status: "False", color: "orange" }
+           else empty end) ];
+    def rv_phase_color:
+      if . == "Merged" then "green" elif . == "PrOpen" then "blue" elif . == "Failed" then "red" else "gray" end;
+    def rv_run_color:
+      if . == "PartiallyCompleted" then "orange"
+      elif . == "Failed" then "red" elif . == "Running" then "blue" else "gray" end;
+    def rv_sources:
+      [ (.spec.evidence // [])[] | (.source // "unknown") ] | group_by(.)
+      | map(.[0] + (if length > 1 then " ×" + (length | tostring) else "" end)) | join(" · ");
+    def rv_root($up; $n):
+      if $n > 32 then . elif ($up[.] // null) != null then ($up[.] | rv_root($up; $n + 1)) else . end;
+    def rv_not_read:
+      [ (.status.evidence // {}) | to_entries[]
+        | select(.value.ok == false or .value.empty == true)
+        | .key + ": " + ((.value.error // .value.note // (if .value.empty == true then "returned nothing" else "not read" end)) | rtrimstr("; ")) ]
+      | join(" · ");
+    def rv_served_gvs: if (.apisError // null) != null then null else (.apis // null) end;
+    def rv_kinds_by_gv:
+      (.kinds // []) | if type == "array" then . else [.] end
+      | map(select(type == "object" and (.gv // "") != "") | { key: .gv, value: (.kinds // []) }) | from_entries;
+    def rv_claim: "review-" + ((.metadata.name // "") | ltrimstr("p-"));
+    rv_served_gvs as $served
+    | rv_kinds_by_gv as $kinds
+    | ((.proposalsError // null) | if . == null then "" else tostring end) as $perr
+    | ([ ((.proposals.items) // [])[] | select((.status.phase // "Proposed") != "Refused") ]) as $all
+    | ([ ((.proposals.items) // [])[] | select((.status.phase // "") == "Refused") ] | length) as $refused
+    | ([ $all[] | select((.status.phase // "") == "Superseded" and (.status.supersededBy // "") != "")
+         | { key: .metadata.name, value: .status.supersededBy } ] | from_entries) as $up
+    | ([ $all[] | select((.status.phase // "") != "Superseded") | .metadata.name ]) as $live
+    | ([ $all[] | select((.status.phase // "") == "Superseded") | .metadata.name | rv_root($up; 0) ]
+       | map(select(. as $r | $live | rv_has($r))) | group_by(.) | map({ key: .[0], value: length }) | from_entries) as $under
+    | ([ $all[] | select((.status.phase // "") != "Superseded"
+                         or (((.metadata.name | rv_root($up; 0)) as $r | $live | rv_has($r)) | not)) ]) as $visible
+    | def row:
+        rv_phase as $ph | rv_decision as $d
+        | { name: .metadata.name,
+            title: (.spec.title // .metadata.name),
+            subject: (.spec.subject // "—"),
+            kind: (.spec.kind // "—"),
+            sources: (rv_sources | if . == "" then "—" else . end),
+            checks: (rv_pills($served; $kinds) | tojson),
+            phase: $ph,
+            phaseColor: ($ph | rv_phase_color),
+            superseded: (($under[.metadata.name] // 0) | if . == 0 then "—" else (tostring + " earlier") end),
+            created: (.metadata.creationTimestamp // ""),
+            target: (.spec.target.repo // "—"),
+            decidedBy: (if $d.by == "" then "—" else $d.by end),
+            decidedAt: $d.at,
+            outcome: (if (.status.pullRequest.url // "") != "" then .status.pullRequest.url
+                      elif $d.reason != "" then $d.reason else (.status.error // "—") end) };
+      def grouped:
+        group_by(.spec.subject // ("~" + .metadata.name))
+        | map(sort_by(.metadata.creationTimestamp // "") | reverse)
+        | sort_by(.[0].metadata.creationTimestamp // "") | reverse | add // [];
+      ([ $visible[] | select(rv_phase as $p | $p == "Proposed" or $p == "PrOpen") ] | grouped | map(row)) as $open
+    | ([ $visible[] | select(rv_phase as $p | $p == "Merged" or $p == "Rejected" or $p == "Failed") ] | grouped | map(row)) as $decided
+    | ([ ((.runs.items) // [])[] ] | sort_by(.status.startedAt // .metadata.creationTimestamp // "") | reverse) as $runs
+    | ($runs[0] // null) as $last
+    | ((.cronjob // {}) | if type == "object" and (.kind // "") == "CronJob" and ((.metadata.name // "") != "") and (.spec.jobTemplate.spec != null) then . else null end) as $cron
+    | { installed: ($perr | test("404|not found|could not find"; "i") | not),
+        denied: ($perr | test("403|forbidden"; "i")),
+        readError: $perr,
+        open: ($open | length),
+        rows: $open,
+        decided: $decided,
+        decidedCount: ($decided | length),
+        refused: $refused,
+        supersededHidden: ([ $under[] ] | add // 0),
+        openCaption: (
+          ([ (($open | length) | tostring) + " open"
+           , (if ([ $under[] ] | add // 0) > 0 then (([ $under[] ] | add | tostring) + " superseded, counted on the proposal that replaced them") else empty end)
+           , "newest first"
+           , (if $refused > 0 then ($refused | tostring) + " historical Refused records not listed" else empty end) ]
+           | join(" · "))
+          + (if $last == null then "" else
+              " · last review " + $last.metadata.name + " on " + ($last.status.startedAt | rv_when)
+              + " (" + ($last.status.phase // "Pending") + ")" end)),
+        decidedCaption: ([ ([ $decided[] | select(.phase == "Merged") ] | length | tostring) + " merged"
+                         , ([ $decided[] | select(.phase == "Rejected") ] | length | tostring) + " rejected"
+                         , ([ $decided[] | select(.phase == "Failed") ] | length | tostring) + " failed" ] | join(" · ")),
+        runRows: [ $runs[] | (.status.phase // "Pending") as $ph
+                   | { name: .metadata.name,
+                       phase: $ph,
+                       phaseColor: ($ph | rv_run_color),
+                       started: (.status.startedAt // "" | rv_ts // ""),
+                       took: rv_dur(.status.startedAt; .status.finishedAt),
+                       result: (if $ph == "Failed" then (.status.error // "failed, no error recorded")
+                                elif $ph == "Running" or $ph == "Pending" then "in progress"
+                                else (((.status.proposals.created // 0) | tostring) + " proposed"
+                                      + (if (.status.proposals.superseded // 0) > 0 then " · " + (.status.proposals.superseded | tostring) + " superseded" else "" end)
+                                      + (if (.status.proposals.deduplicated // 0) > 0 then " · " + (.status.proposals.deduplicated | tostring) + " duplicate" else "" end)) end),
+                       notRead: (rv_not_read | if . == "" then "—" else . end) } ],
+        runCaption: (([ $runs | group_by(.status.phase // "Pending")[] | ((length | tostring) + " " + (.[0].status.phase // "Pending")) ] | join(" · "))
+                     + (if ($runs | length) > 0 then " · since " + ($runs[-1].status.startedAt | rv_when) else "" end)),
+        runCount: ($runs | length),
+        lastRun: (if $last == null then null else { name: $last.metadata.name, phase: ($last.status.phase // "Pending"), started: ($last.status.startedAt | rv_when) } end),
+        
+        reviewCronJob: (if $cron == null then null else
+          { name: $cron.metadata.name, namespace: ($cron.metadata.namespace // "default"), uid: ($cron.metadata.uid // ""),
+            jobTemplate: { metadata: ($cron.spec.jobTemplate.metadata // {}), spec: $cron.spec.jobTemplate.spec } } end),
+        
+        banner: (
+          if ($perr | test("404|not found|could not find"; "i")) then
+            { type: "info", title: "The nightly review is not installed on this cluster",
+              description: "This page lists review.krateo.io proposals and review runs, and this cluster serves no such API. Once the nightly review component is installed, its first run's proposals appear here." }
+          elif ($perr | test("403|forbidden"; "i")) then
+            { type: "warning", title: "Your role cannot read review proposals",
+              description: "Listing review.krateo.io proposals in this namespace was refused for your account. An administrator can grant read access to proposals and reviewruns." }
+          elif $last == null then
+            { type: "info", title: "No review has run yet",
+              description: "The nightly review reads the last 24 hours of this platform's telemetry and agent sessions. Its proposals appear here, and nothing is applied." }
+          elif (($last.status.phase // "Pending") == "Running" or ($last.status.phase // "Pending") == "Pending") then
+            { type: "info", title: ("A review is running: " + $last.metadata.name),
+              description: ("Started " + ($last.status.startedAt | rv_when)
+                            + ([ ($last.status.steps // [])[] | select(.phase == "Running") | " · current step: " + .name ][0] // "")
+                            + ". The proposals below come from runs that finished.") }
+          elif ($last.status.phase // "") == "Failed" then
+            { type: "error", title: ("The last review failed: " + $last.metadata.name),
+              description: ("It stopped after " + rv_dur($last.status.startedAt; $last.status.finishedAt) + ": "
+                            + ($last.status.error // "no error recorded") + ". The proposals below come from earlier runs.") }
+          elif ($last.status.phase // "") == "PartiallyCompleted" then
+            { type: "warning", title: ("The last review saw part of the platform: " + $last.metadata.name),
+              description: (($last | rv_not_read | if . == "" then "Some evidence sources were not read." else . end)
+                            + ". Anything it proposed rests on incomplete evidence.") }
+          else null end) }
+---
+# Source: reviews-page/templates/restaction.review-proposal.yaml
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: review-proposal
+  namespace: krateo-reviews
+  annotations:
+    "krateo.io/verbose": "true"
+spec:
+  api:
+    
+    
+    
+    - name: proposal
+      dependsOn:
+        name: ""
+        iterator: '[ { name: (.name // "") } | select(.name != "") ]'
+      path: ${ "/apis/review.krateo.io/v1alpha1/namespaces/default/proposals/" + .name }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: proposalError
+    - name: all
+      path: /apis/review.krateo.io/v1alpha1/namespaces/default/proposals
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: allError
+    - name: apis
+      path: /apis
+      verb: GET
+      dependsOn:
+        name: proposal
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: apisError
+      filter: '[ (.apis.groups // [])[] | (.versions // [])[] | .groupVersion ] + ["v1"]'
+    - name: kinds
+      dependsOn:
+        name: apis
+        iterator: >-
+          def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+          def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+            | if ($p[1] // "") == "apis" then true
+              elif ($p[1] // "") == "api" then
+                ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+                | ($res == "" or (fetchableCore | index($res)) != null)
+              else false end;
+          (.apis // []) as $served | [ (.proposal | if type == "object" and has("items") then .items else [.] end)[]?
+            | select((.spec.change.format // "") == "yaml") | (.spec.change.content // "")
+            | ([ match("(?m)^apiVersion:[ \\t]*[\"']?([^\\s\"'#]+)") ][0].captures[0].string // "") ]
+          | unique | map(select(. != "" and (. as $g | any($served[]; . == $g))))
+          | map({ gv: ., discovery: (if (. | contains("/")) then "/apis/" + . else "/api/" + . end) })
+          | map(select(.discovery | fetchablePath))
+      path: ${ .discovery }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: kindsError
+      filter: '[ { gv: (.kinds.groupVersion // ""), kinds: [ (.kinds.resources // [])[] | select((.name // "") | contains("/") | not) | .kind ] } ]'
+    
+    
+    - name: bp
+      path: /apis/core.krateo.io/v1alpha1/namespaces/default/compositiondefinitions/builder-publish
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: bpError
+    
+    
+    
+    
+    - name: claim
+      dependsOn:
+        name: bp
+        iterator: '[ { apiVersion: (.bp.status.apiVersion // ""), resource: (.bp.status.resource // ""), claim: ("review-" + ((.name // "") | ltrimstr("p-"))) } | select(.apiVersion != "" and .resource != "" and .claim != "review-") | select((.apiVersion // "") | test("^[^/]+/[^/]+$")) | . + ((.apiVersion | split("/")) as $p | { group: $p[0], version: $p[1] }) ]'
+      
+      path: ${ "/apis/" + .group + "/" + .version + "/namespaces/default/" + .resource + "/" + .claim }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: claimError
+    - name: prs
+      path: /apis/github.krateo.io/v2022-11-28/namespaces/default/pullrequests
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: prsError
+  filter: |
+    def rv_ts: if (. // "") == "" then null else (.[0:19] + "Z") end;
+    def rv_epoch: rv_ts | if . == null then null else (fromdateiso8601? // null) end;
+    def rv_when: if (. // "") == "" then "—" else (.[0:10] + " " + .[11:16] + " UTC") end;
+    def rv_dur($a; $b):
+      ($a | rv_epoch) as $s | ($b | rv_epoch) as $e
+      | if $s == null or $e == null then "—"
+        else ($e - $s) as $d
+        | if $d < 1 then "under 1 s"
+          elif $d < 60 then (($d | floor | tostring) + " s")
+          else ((($d / 60) | floor | tostring) + " m " + ((($d | floor) % 60) | tostring) + " s") end
+        end;
+    def rv_num: tostring as $s
+      | if ($s | test("^[0-9]{4,}$")) then ([ range(($s | length); 0; -3) | $s[([. - 3, 0] | max):.] ] | reverse | join(",")) else $s end;
+    def rv_phase:
+      (.status.phase // "") as $s
+      | if $s == "Merged" then $s
+        else (.spec.decision.phase // (if $s == "" then "Proposed" else $s end)) end;
+    def rv_decision:
+      { phase: rv_phase,
+        by: (.spec.decision.decidedBy // .status.decidedBy // ""),
+        at: (.spec.decision.decidedAt // .status.decidedAt // ""),
+        reason: (.spec.decision.reason // .status.reason // ""),
+        claim: (.spec.decision.claim // "") };
+    def rv_has($x): any(.[]?; . == $x);
+    def rv_gvk:
+      if ((.spec.change.format // "") != "yaml") then null
+      else (.spec.change.content // "") as $c
+        | { gv: ([ $c | match("(?m)^apiVersion:[ \\t]*[\"']?([^\\s\"'#]+)") ][0].captures[0].string // ""),
+            kind: ([ $c | match("(?m)^kind:[ \\t]*[\"']?([^\\s\"'#]+)") ][0].captures[0].string // "") }
+        | if .gv == "" or .kind == "" then null else . end
+      end;
+    def rv_kindcheck($served; $kinds):
+      (.spec.change.format // "") as $f
+      | if $f == "markdown" or $f == "diff" then { state: "na" }
+        else rv_gvk as $g
+        | if $g == null or $served == null then { state: "unknown" }
+          elif ($served | rv_has($g.gv) | not) then ($g + { state: "notServed" })
+          elif ($kinds[$g.gv] // null) == null then ($g + { state: "unknown" })
+          elif ($kinds[$g.gv] | rv_has($g.kind) | not) then ($g + { state: "notServed" })
+          else ($g + { state: "served" }) end
+        end;
+    def rv_target:
+      ([ (.status.conditions // [])[] | select(.type == "TargetResolved") ][0] // null) as $c
+      | if $c == null then { state: "none" }
+        elif $c.status == "True" then { state: "found", message: ($c.message // "") }
+        elif $c.reason == "NotFoundOrPrivate" then { state: "unverified", message: ($c.message // "") }
+        elif $c.reason == "InvalidRepo" then { state: "invalid", message: ($c.message // "") }
+        else { state: "unanswered", message: ($c.message // ""), reason: ($c.reason // "") } end;
+    def rv_pills($served; $kinds):
+      rv_kindcheck($served; $kinds) as $k | rv_target as $t
+      | [ (if $k.state == "notServed" then { type: "Kind not served", status: "False", color: "orange" }
+           elif $k.state == "na" then { type: "Kind check n/a", status: "Unknown", color: "gray" }
+           else empty end),
+          (if $t.state == "unverified" then { type: "Target unverified", status: "Unknown", color: "gray" }
+           elif $t.state == "invalid" then { type: "Target invalid", status: "False", color: "orange" }
+           else empty end) ];
+    def rv_phase_color:
+      if . == "Merged" then "green" elif . == "PrOpen" then "blue" elif . == "Failed" then "red" else "gray" end;
+    def rv_run_color:
+      if . == "PartiallyCompleted" then "orange"
+      elif . == "Failed" then "red" elif . == "Running" then "blue" else "gray" end;
+    def rv_sources:
+      [ (.spec.evidence // [])[] | (.source // "unknown") ] | group_by(.)
+      | map(.[0] + (if length > 1 then " ×" + (length | tostring) else "" end)) | join(" · ");
+    def rv_root($up; $n):
+      if $n > 32 then . elif ($up[.] // null) != null then ($up[.] | rv_root($up; $n + 1)) else . end;
+    def rv_not_read:
+      [ (.status.evidence // {}) | to_entries[]
+        | select(.value.ok == false or .value.empty == true)
+        | .key + ": " + ((.value.error // .value.note // (if .value.empty == true then "returned nothing" else "not read" end)) | rtrimstr("; ")) ]
+      | join(" · ");
+    def rv_served_gvs: if (.apisError // null) != null then null else (.apis // null) end;
+    def rv_kinds_by_gv:
+      (.kinds // []) | if type == "array" then . else [.] end
+      | map(select(type == "object" and (.gv // "") != "") | { key: .gv, value: (.kinds // []) }) | from_entries;
+    def rv_claim: "review-" + ((.metadata.name // "") | ltrimstr("p-"));
+    rv_served_gvs as $served
+    | rv_kinds_by_gv as $kinds
+    | (.name // "") as $name
+    | (if (.proposal.kind // "") == "Proposal" then .proposal else null end) as $p
+    | ((.proposalError // null) | if . == null then "" else tostring end) as $perr
+    | ([ ((.all.items) // [])[] ]) as $all
+    | ([ $all[] | select((.status.phase // "") == "Superseded" and (.status.supersededBy // "") != "")
+         | { key: .metadata.name, value: .status.supersededBy } ] | from_entries) as $up
+    | ([ $all[] | select((.metadata.name | rv_root($up; 0)) == $name and .metadata.name != $name) ]
+       | sort_by(.metadata.creationTimestamp // "") | reverse) as $earlier
+    | (if $p == null then null else ($p.status.supersededBy // "") end) as $by
+    | ([ $all[] | select(.metadata.name == $by) ][0] // null) as $byP
+    | (if (.claim.kind // "") != "" and (.claim.metadata.name // "") != "" then .claim else null end) as $claim
+    | (if $p == null then "" else ($p.spec.decision.claim // ($p | rv_claim)) end) as $claimRef
+    | ([ ((.prs.items) // [])[] | select(((.metadata.labels["krateo.io/publish"]) // "") == $claimRef) ][0] // null) as $pr
+    | if $p == null then
+        { found: false, name: $name,
+          title: (if ($perr | test("403|forbidden"; "i")) then "You cannot read this proposal"
+                  else "Proposal not found" end),
+          message: (if ($perr | test("403|forbidden"; "i")) then "Reading review.krateo.io proposals was refused for your account."
+                    else ("No proposal named " + $name + " exists. It may have expired after being decided.") end) }
+      else
+        ($p | rv_phase) as $ph
+        | ($p | rv_decision) as $d
+        | ($p | rv_kindcheck($served; $kinds)) as $kc
+        | ($p | rv_target) as $tc
+        | ($p.spec.target.repo // "") as $repo
+        | ($p.spec.change.format // "yaml") as $fmt
+        | ($p.spec.change.content // "") as $content
+        | (if ($content | test("```")) then "~~~~" else "```" end) as $fence
+        | $claimRef as $claimName
+        | ("review/" + (($p.spec.kind // "change") | ascii_downcase) + "-" + ($name | ltrimstr("p-") | .[0:12])) as $branch
+        | { found: true,
+            name: $name,
+            title: ($p.spec.title // $name),
+            kind: ($p.spec.kind // "—"),
+            phase: $ph,
+            phaseColor: ($ph | rv_phase_color),
+            subject: ($p.spec.subject // ""),
+            run: ($p.spec.producedBy.runRef // ""),
+            proposedAt: ($p.metadata.creationTimestamp | rv_when),
+            runPath: (if ($p.spec.producedBy.runRef // "") == "" then "" else "/reviews/runs/" + $p.spec.producedBy.runRef end),
+            rationale: ($p.spec.rationale // "No rationale recorded."),
+            
+            evidenceRows: [ ($p.spec.evidence // [])[] | { source: (.source // "unknown"), summary: (.summary // "—"),
+                            counted: (if .observedCount == null then "—" else ("the model counted " + (.observedCount | rv_num)) end) } ],
+            evidenceCount: (($p.spec.evidence // []) | length),
+            facts: ([
+              { label: "Proposed target", value: (if $repo == "" then "—" else $repo + " · " + ($p.spec.target.path // "no path given") + " (the model's choice; the pull request settles where it lands)" end) },
+              { label: "Target check", value: (
+                  if $tc.state == "found" then "Repository found (public)"
+                  elif $tc.state == "unverified" then "Target unverified: " + $tc.message
+                  elif $tc.state == "invalid" then "Target invalid: " + $tc.message
+                  elif $tc.state == "unanswered" then "Not answered (" + $tc.reason + ")"
+                  else "Not checked (proposal predates the check)" end) },
+              { label: "Model says", value: (($p.spec.confidence // "—") + " (unverified)") },
+              { label: "Produced by", value: (($p.spec.producedBy.runRef // "—") + (if ($p.spec.producedBy.agent // "") != "" then " · " + $p.spec.producedBy.agent else "" end)) },
+              { label: "Decision", value: (
+                  if $ph == "Rejected" then ("Rejected" + (if $d.by != "" then " by " + $d.by else "" end)
+                                             + (if $d.at != "" then " · " + ($d.at | rv_when) else "" end)
+                                             + (if $d.reason != "" then " · " + $d.reason else "" end))
+                  elif $ph == "Merged" or $ph == "Failed" then ($ph + (if $d.by != "" then " · change request opened by " + $d.by else "" end))
+                  elif $ph == "PrOpen" or $claim != null then ("Change request opened (" + $claimName + ")"
+                                             + (if $d.by != "" then " by " + $d.by else "" end)
+                                             + (if $d.at != "" then " · " + ($d.at | rv_when) else "" end)
+                                             + "; decided when its pull request is merged or closed")
+                  elif $ph == "Superseded" then "Superseded before a decision"
+                  else "Not decided" end) }
+            ] + (if $claim != null then [
+              { label: "Change request", value: ($claimName + " · branch " + ($claim.spec.branch // $branch)
+                  + (if $pr == null then " · pull request not opened yet"
+                     else " · pull request #" + (($pr.status.number // 0) | tostring) + " " + ($pr.status.state // "pending")
+                          + (if ($pr.status.html_url // "") != "" then " · " + $pr.status.html_url else "" end) end)) } ] else [] end)
+               + (if ($p.status.error // "") != "" then [ { label: "Error", value: $p.status.error } ] else [] end)),
+            format: $fmt,
+            changeMeta: ("format: " + $fmt + " · " + (($content | utf8bytelength) | tostring) + " bytes"),
+            changeMarkdown: (if $fmt == "markdown" then $content
+                             else ($fence + (if $fmt == "diff" then "diff" else "yaml" end) + "\n" + $content + "\n" + $fence) end),
+            kindCheck: $kc,
+            kindAlert: (if $kc.state == "notServed" then
+                          ("The change is a " + $kc.gv + " " + $kc.kind + ". This cluster serves no such kind, so applying the file here would fail. The pull request can still be opened for a reviewer to rework.")
+                        else "" end),
+            targetAlert: (if $tc.state == "unverified" then
+                            ("The proposed repository " + $repo + " did not resolve: " + $tc.message + " Correct the repository in the change request dialog if it belongs elsewhere.")
+                          elif $tc.state == "invalid" then ("The proposed target " + $repo + " is not an owner/name repository. Correct it in the change request dialog.")
+                          else "" end),
+            lineageAlert: (if $byP != null then ("Superseded by " + $by + " (" + ($byP.spec.title // $by) + "), a later run's proposal for the same finding. Nothing here is open.")
+                           elif $by != "" then ("Superseded by " + $by + ", which no longer exists.")
+                           elif ($earlier | length) > 0 then ("Replaces " + (($earlier | length) | tostring) + " earlier proposal" + (if ($earlier | length) > 1 then "s" else "" end) + " for the same finding, listed under Earlier proposals.")
+                           else "" end),
+            supersededByPath: (if $byP != null then "/reviews/proposals/" + $by else "" end),
+            earlierRows: [ $earlier[] | { name: .metadata.name, title: (.spec.title // .metadata.name), run: (.spec.producedBy.runRef // "—"),
+                                          created: (.metadata.creationTimestamp // ""), target: (.spec.target.repo // "—") } ],
+            
+            canOpen: (($ph == "Proposed") and $claim == null and ((.bpError // null) == null)),
+            
+            
+            canReject: ($ph == "Proposed" or $ph == "PrOpen"),
+            
+            
+            canRecord: ($ph == "Proposed" and $claim != null and (($p.spec.decision // null) == null)),
+            claimName: $claimName,
+            branch: $branch,
+            prTitle: ("review: " + ($p.spec.title // $name)),
+            prBody: ("Proposed by the Krateo nightly review (" + ($p.spec.producedBy.runRef // "?") + "), proposal " + $name + ".\n\n"
+                     + ($p.spec.rationale // "") + "\n\nEvidence, as the model reported it (unverified):\n"
+                     + ([ ($p.spec.evidence // [])[] | "- " + (.source // "?") + ": " + (.summary // "") ] | join("\n"))),
+            repository: $repo,
+            file: ($p.spec.target.path // ""),
+            content: $content,
+            bpApiVersion: (.bp.status.apiVersion // ""),
+            bpResource: (.bp.status.resource // "builderpublishes"),
+            dialogFacts: [
+              { label: "Branch", value: $branch },
+              { label: "Pull request title", value: ("review: " + ($p.spec.title // $name)) },
+              { label: "Created as", value: ("BuilderPublish " + $claimName + " · builder: review · repository.create: false") },
+              { label: "Change", value: ("format: " + $fmt + " · " + (($content | utf8bytelength) | tostring) + " bytes") } ],
+            askHref: ("/reviews/proposals/" + $name + "?ask=" + (("Review the nightly-review proposal " + $name + " (\"" + ($p.spec.title // $name) + "\"): check its evidence against the platform's telemetry, say whether the proposed change fits this platform, and what I should do with it.") | @uri)) }
+      end
+---
+# Source: reviews-page/templates/restaction.review-run.yaml
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: review-run
+  namespace: krateo-reviews
+  annotations:
+    "krateo.io/verbose": "true"
+spec:
+  api:
+    
+    
+    - name: run
+      dependsOn:
+        name: ""
+        iterator: '[ { name: (.name // "") } | select(.name != "") ]'
+      path: ${ "/apis/review.krateo.io/v1alpha1/namespaces/default/reviewruns/" + .name }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: runError
+    - name: all
+      path: /apis/review.krateo.io/v1alpha1/namespaces/default/proposals
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: allError
+    - name: apis
+      path: /apis
+      verb: GET
+      dependsOn:
+        name: all
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: apisError
+      filter: '[ (.apis.groups // [])[] | (.versions // [])[] | .groupVersion ] + ["v1"]'
+    - name: kinds
+      dependsOn:
+        name: apis
+        iterator: >-
+          def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+          def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+            | if ($p[1] // "") == "apis" then true
+              elif ($p[1] // "") == "api" then
+                ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+                | ($res == "" or (fetchableCore | index($res)) != null)
+              else false end;
+          (.apis // []) as $served | [ (.all | if type == "object" and has("items") then .items else [.] end)[]?
+            | select((.spec.change.format // "") == "yaml") | (.spec.change.content // "")
+            | ([ match("(?m)^apiVersion:[ \\t]*[\"']?([^\\s\"'#]+)") ][0].captures[0].string // "") ]
+          | unique | map(select(. != "" and (. as $g | any($served[]; . == $g))))
+          | map({ gv: ., discovery: (if (. | contains("/")) then "/apis/" + . else "/api/" + . end) })
+          | map(select(.discovery | fetchablePath))
+      path: ${ .discovery }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      errorKey: kindsError
+      filter: '[ { gv: (.kinds.groupVersion // ""), kinds: [ (.kinds.resources // [])[] | select((.name // "") | contains("/") | not) | .kind ] } ]'
+  filter: |
+    def rv_ts: if (. // "") == "" then null else (.[0:19] + "Z") end;
+    def rv_epoch: rv_ts | if . == null then null else (fromdateiso8601? // null) end;
+    def rv_when: if (. // "") == "" then "—" else (.[0:10] + " " + .[11:16] + " UTC") end;
+    def rv_dur($a; $b):
+      ($a | rv_epoch) as $s | ($b | rv_epoch) as $e
+      | if $s == null or $e == null then "—"
+        else ($e - $s) as $d
+        | if $d < 1 then "under 1 s"
+          elif $d < 60 then (($d | floor | tostring) + " s")
+          else ((($d / 60) | floor | tostring) + " m " + ((($d | floor) % 60) | tostring) + " s") end
+        end;
+    def rv_num: tostring as $s
+      | if ($s | test("^[0-9]{4,}$")) then ([ range(($s | length); 0; -3) | $s[([. - 3, 0] | max):.] ] | reverse | join(",")) else $s end;
+    def rv_phase:
+      (.status.phase // "") as $s
+      | if $s == "Merged" then $s
+        else (.spec.decision.phase // (if $s == "" then "Proposed" else $s end)) end;
+    def rv_decision:
+      { phase: rv_phase,
+        by: (.spec.decision.decidedBy // .status.decidedBy // ""),
+        at: (.spec.decision.decidedAt // .status.decidedAt // ""),
+        reason: (.spec.decision.reason // .status.reason // ""),
+        claim: (.spec.decision.claim // "") };
+    def rv_has($x): any(.[]?; . == $x);
+    def rv_gvk:
+      if ((.spec.change.format // "") != "yaml") then null
+      else (.spec.change.content // "") as $c
+        | { gv: ([ $c | match("(?m)^apiVersion:[ \\t]*[\"']?([^\\s\"'#]+)") ][0].captures[0].string // ""),
+            kind: ([ $c | match("(?m)^kind:[ \\t]*[\"']?([^\\s\"'#]+)") ][0].captures[0].string // "") }
+        | if .gv == "" or .kind == "" then null else . end
+      end;
+    def rv_kindcheck($served; $kinds):
+      (.spec.change.format // "") as $f
+      | if $f == "markdown" or $f == "diff" then { state: "na" }
+        else rv_gvk as $g
+        | if $g == null or $served == null then { state: "unknown" }
+          elif ($served | rv_has($g.gv) | not) then ($g + { state: "notServed" })
+          elif ($kinds[$g.gv] // null) == null then ($g + { state: "unknown" })
+          elif ($kinds[$g.gv] | rv_has($g.kind) | not) then ($g + { state: "notServed" })
+          else ($g + { state: "served" }) end
+        end;
+    def rv_target:
+      ([ (.status.conditions // [])[] | select(.type == "TargetResolved") ][0] // null) as $c
+      | if $c == null then { state: "none" }
+        elif $c.status == "True" then { state: "found", message: ($c.message // "") }
+        elif $c.reason == "NotFoundOrPrivate" then { state: "unverified", message: ($c.message // "") }
+        elif $c.reason == "InvalidRepo" then { state: "invalid", message: ($c.message // "") }
+        else { state: "unanswered", message: ($c.message // ""), reason: ($c.reason // "") } end;
+    def rv_pills($served; $kinds):
+      rv_kindcheck($served; $kinds) as $k | rv_target as $t
+      | [ (if $k.state == "notServed" then { type: "Kind not served", status: "False", color: "orange" }
+           elif $k.state == "na" then { type: "Kind check n/a", status: "Unknown", color: "gray" }
+           else empty end),
+          (if $t.state == "unverified" then { type: "Target unverified", status: "Unknown", color: "gray" }
+           elif $t.state == "invalid" then { type: "Target invalid", status: "False", color: "orange" }
+           else empty end) ];
+    def rv_phase_color:
+      if . == "Merged" then "green" elif . == "PrOpen" then "blue" elif . == "Failed" then "red" else "gray" end;
+    def rv_run_color:
+      if . == "PartiallyCompleted" then "orange"
+      elif . == "Failed" then "red" elif . == "Running" then "blue" else "gray" end;
+    def rv_sources:
+      [ (.spec.evidence // [])[] | (.source // "unknown") ] | group_by(.)
+      | map(.[0] + (if length > 1 then " ×" + (length | tostring) else "" end)) | join(" · ");
+    def rv_root($up; $n):
+      if $n > 32 then . elif ($up[.] // null) != null then ($up[.] | rv_root($up; $n + 1)) else . end;
+    def rv_not_read:
+      [ (.status.evidence // {}) | to_entries[]
+        | select(.value.ok == false or .value.empty == true)
+        | .key + ": " + ((.value.error // .value.note // (if .value.empty == true then "returned nothing" else "not read" end)) | rtrimstr("; ")) ]
+      | join(" · ");
+    def rv_served_gvs: if (.apisError // null) != null then null else (.apis // null) end;
+    def rv_kinds_by_gv:
+      (.kinds // []) | if type == "array" then . else [.] end
+      | map(select(type == "object" and (.gv // "") != "") | { key: .gv, value: (.kinds // []) }) | from_entries;
+    def rv_claim: "review-" + ((.metadata.name // "") | ltrimstr("p-"));
+    rv_served_gvs as $served
+    | rv_kinds_by_gv as $kinds
+    | (.name // "") as $name
+    | (if (.run.kind // "") == "ReviewRun" then .run else null end) as $r
+    | ((.runError // null) | if . == null then "" else tostring end) as $rerr
+    | if $r == null then
+        { found: false, name: $name,
+          title: (if ($rerr | test("403|forbidden"; "i")) then "You cannot read this review run" else "Review run not found" end),
+          message: (if ($rerr | test("403|forbidden"; "i")) then "Reading review.krateo.io review runs was refused for your account."
+                    else ("No review run named " + $name + " exists. Finished runs are kept until their expiry date.") end) }
+      else
+        ($r.status.phase // "Pending") as $ph
+        | ($r.status // {}) as $st
+        | ([ ($st.conditions // [])[] | select(.type == "ValidationNotes") | (.message // "") | split(" | ")[] | select(. != "") ]) as $notes
+        | ([ ($st.evidence // {}) | to_entries[] | select((.value.queries // null) != null)
+             | .key as $src | (.value.queries | to_entries[]) | { source: $src, name: .key, sql: .value } ]) as $queries
+        | { found: true,
+            name: $name,
+            phase: $ph,
+            phaseColor: ($ph | rv_run_color),
+            subtitle: ("Reviewed " + ($r.spec.window.from | rv_when) + " to " + ($r.spec.window.to | rv_when)
+                       + " · took " + rv_dur($st.startedAt; $st.finishedAt)
+                       + (if ($st.expiresAt // "") != "" then " · kept until " + ($st.expiresAt | .[0:10]) else "" end)),
+            alert: (if $ph == "Failed" then { type: "error", title: "This run failed", description: ($st.error // "No error was recorded.") }
+                    elif $ph == "PartiallyCompleted" then { type: "warning", title: "This run saw part of the platform",
+                         description: (($r | rv_not_read | if . == "" then "Some evidence sources were not read." else . end) + ". Anything it proposed rests on incomplete evidence.") }
+                    elif $ph == "Running" or $ph == "Pending" then { type: "info", title: "This run is in progress", description: "Steps and results fill in as it goes." }
+                    else null end),
+            summary: ($st.summary // ""),
+            steps: [ ($st.steps // [])[] | {
+                       title: ((.name // "step") | if . == "gather" then "Gather" elif . == "ask" then "Ask Autopilot" elif . == "validate" then "Validate"
+                               elif . == "publish" then "Publish" elif . == "record" then "Record" else . end),
+                       subTitle: (.phase // ""),
+                       description: ((.message // "") + (if (.startedAt // "") != "" and (.finishedAt // "") != "" then (if (.message // "") != "" then " · " else "" end) + rv_dur(.startedAt; .finishedAt) else "" end)),
+                       status: ((.phase // "") | if . == "Succeeded" then "finish" elif . == "Failed" then "error" elif . == "Running" then "process" else "wait" end) } ],
+            sourceRows: [ ($st.evidence // {}) | to_entries[] | .key as $k | .value as $v
+                          | { source: $k,
+                              state: (if $v.ok == false then "Not read" elif $v.empty == true then "Empty" else "Read" end),
+                              stateColor: (if $v.ok == false then "red" elif $v.empty == true then "orange" else "gray" end),
+                              queried: (($v.queried // 0) | tostring),
+                              returned: (($v.returned // 0) | tostring),
+                              detail: ([ ($v.error // empty | rtrimstr("; ")), ($v.note // empty),
+                                         (if $k == "kagent-sessions" and ($v.agentsDeployed // null) != null then
+                                            (($v.agentsDeployed | tostring) + " agents deployed · " + (($v.agentsActiveInWindow // 0) | tostring) + " active in window · "
+                                             + (($v.agentsIdle7d // 0) | tostring) + " idle 7 days · " + (($v.agentsNeverUsed // 0) | tostring) + " never used") else empty end),
+                                         (if ($v.scope // "") != "" then "Scope: " + $v.scope else empty end),
+                                         (if $v.truncated == true then "Truncated at " + (($v.truncatedAtChars // 0) | tostring) + " characters" else empty end) ]
+                                       | join(" · ") | if . == "" then "—" else . end) } ],
+            queriesMarkdown: ([ $queries[] | "**" + .source + " · " + .name + "**\n\n```sql\n" + .sql + "\n```" ] | join("\n\n")),
+            notesMarkdown: ([ $notes[] | "- " + . ] | join("\n")),
+            proposalRows: [ ((.all.items) // [])[] | select((.spec.producedBy.runRef // "") == $name) | (.status.phase // "Proposed") as $pph
+                            | { name: .metadata.name, title: (.spec.title // .metadata.name), kind: (.spec.kind // "—"),
+                                phase: $pph, phaseColor: ($pph | rv_phase_color), checks: (rv_pills($served; $kinds) | tojson) } ],
+            facts: [
+              { label: "Started", value: ($st.startedAt | rv_when) },
+              { label: "Finished", value: ($st.finishedAt | rv_when) },
+              { label: "Sources", value: (($r.spec.sources // []) | if length == 0 then "all" else join(", ") end) },
+              { label: "Proposals", value: (if $st.proposals == null then "none recorded"
+                  else ((($st.proposals.created // 0) | tostring) + " written · " + (($st.proposals.superseded // 0) | tostring) + " superseded · "
+                        + (($st.proposals.deduplicated // 0) | tostring) + " duplicate" + (if ($st.proposals.refused // 0) > 0 then " · " + ($st.proposals.refused | tostring) + " refused" else "" end)) end) },
+              { label: "Tokens", value: (if ($st.model.totalTokens // 0) > 0 then
+                  ((($st.model.inputTokens // 0) | tostring) + " in · " + (($st.model.outputTokens // 0) | tostring) + " out · " + ($st.model.totalTokens | tostring) + " total")
+                  else "not recorded" end) } ] }
+      end
+---
+# Source: service-desk-page/templates/restaction.ticket-detail.yaml
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: ticket-detail
+  namespace: krateo-service-desk
+  annotations:
+    "krateo.io/verbose": "true"
+spec:
+  api:
+    - name: ticket
+      dependsOn:
+        name: ""
+        iterator: '[ { namespace: (.namespace // "krateo-service-desk"), name: (.name // "") } | select(.name != "") ]'
+      path: ${ "/apis/servicedesk.krateo.io/v1alpha1/namespaces/" + .namespace + "/tickets/" + .name }
+      verb: GET
+      continueOnError: true
+      errorKey: ticketError
+    
+    - name: object
+      dependsOn:
+        name: ticket
+        iterator: |
+          def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+          def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+            | if ($p[1] // "") == "apis" then true
+              elif ($p[1] // "") == "api" then
+                ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+                | ($res == "" or (fetchableCore | index($res)) != null)
+              else false end;
+          [ ((.ticket.spec.objectRef)? // {})
+            | { apiVersion: (.apiVersion // ""), kind: (.kind // ""), name: (.name // ""), namespace: (.namespace // "") }
+            | select(.apiVersion != "" and .kind != "" and .name != "" and .namespace != "")
+            | (.kind | ascii_downcase) as $k
+            | (if ($k | test("(s|x|ch|sh)$")) then ($k + "es")
+               elif ($k | test("[^aeiou]y$")) then ($k | sub("y$"; "ies"))
+               else ($k + "s") end) as $plural
+            | { path: ((if (.apiVersion | test("/")) then "/apis/" else "/api/" end)
+                       + .apiVersion + "/namespaces/" + .namespace + "/" + $plural + "/" + .name) }
+            | select(.path | fetchablePath) ]
+      path: ${ .path }
+      verb: GET
+      continueOnError: true
+      errorKey: objectError
+  
+  filter: |
+    def fetchableCore: ["configmaps", "serviceaccounts", "services", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "namespaces", "nodes", "events", "limitranges", "resourcequotas", "replicationcontrollers", "podtemplates"];
+    def fetchablePath: (tostring | (split("?") | .[0] // "") | split("/")) as $p
+      | if ($p[1] // "") == "apis" then true
+        elif ($p[1] // "") == "api" then
+          ((if ($p[3] // "") == "namespaces" then ($p[5] // "") else ($p[3] // "") end)) as $res
+          | ($res == "" or (fetchableCore | index($res)) != null)
+        else false end;
+    # The same plural rule and the same path the `object` step's iterator builds — repeated here
+    # because the note under the card has to say WHY there are no conditions, and "the guard
+    # refused this path" is one of the answers. Two copies of one rule is a real cost; the
+    # alternative is a note that cannot tell "unreadable" from "deliberately not read".
+    def refplural: (. // "") | ascii_downcase
+      | if test("(s|x|ch|sh)$") then . + "es" elif test("[^aeiou]y$") then sub("y$"; "ies") else . + "s" end;
+    def refpath($ref): ($ref.kind // "" | refplural) as $pl
+      | (if (($ref.apiVersion // "") | test("/")) then "/apis/" else "/api/" end)
+        + ($ref.apiVersion // "") + "/namespaces/" + ($ref.namespace // "") + "/" + $pl + "/" + ($ref.name // "");
+    # The label mirror rule, from the Ticket CRD: lowercased, spaces to `-`. The CRD mirrors
+    # spec.state and spec.assignee this way because a label VALUE cannot hold a space, and
+    # `Waiting on requester` is one of the five states.
+    def slug: (. // "") | ascii_downcase | gsub(" "; "-");
+    # The same rule for an IDENTITY, which a state does not need: a username is not drawn from a
+    # five-value enum, and `claude-user1@krateo.io` is not a legal label value. Everything outside
+    # [a-z0-9._-] becomes `-`, the ends are trimmed to alphanumerics and the result is cut to 63
+    # characters — the apiserver's own bound. spec.assignee keeps the identity VERBATIM; only the
+    # mirror is cleaned up, so a drift between the two is visible in `kubectl get tickets`, which
+    # reads the spec.
+    def labelslug: slug | gsub("[^a-z0-9._-]"; "-") | sub("^[^a-z0-9]+"; "") | sub("[^a-z0-9]+$"; "") | .[0:63];
+    # Where the ticket's five states sit in the palette (status-pill spec, and table.tickets-table
+    # carries the same map for the queue — the two must not drift):
+    #   Open                  slate   a non-health state, the neutral-blue family
+    #   In progress           gold    transitional
+    #   Waiting on requester  gold    also transitional — it is waiting, not resting
+    #   Resolved / Closed     faint   RECEDE
+    # Resolved is NOT green. Green is health only, the portal's indicators are exception-only, and
+    # a ticket never asserts health. These are palette NAMES, resolved per theme by getColorCode.
+    def statecolor: { "Open": "slate", "In progress": "gold", "Waiting on requester": "gold", "Resolved": "faint", "Closed": "faint" }[.] // "slate";
+    # A condition's colour, by the same exception-only rule. A True condition RECEDES (`faint`): it
+    # is the absence of a problem, and marking it would make the healthy case the loud one. False
+    # is `red`, anything else (Unknown, or a condition with no status) is `gold` — not knowing is
+    # its own state and is not the same as being fine.
+    #
+    # POLARITY IS NOT DECLARED ANYWHERE IN KUBERNETES. A condition type carries no sign, so `True`
+    # cannot be read as good in general: `Degraded=True` is an exception. The types below are the
+    # negative-polarity ones this platform actually writes; the list cannot be complete, and a
+    # negative type missing from it recedes at True. Stated here rather than discovered on a page.
+    # `. as $t` first, and not a bare `index(.)`: inside `index` the input is the ARRAY, so
+    # `index(.)` asks the list whether it contains ITSELF — which it does, at 0 — making every
+    # type negative and inverting every colour on this page. It read correctly and was wrong.
+    def negative: . as $t | ["Degraded", "Unhealthy", "Failed", "Error", "Stalled"] | index($t) != null;
+    def condcolor($type; $status):
+      if $status == "True" then (if ($type | negative) then "red" else "faint" end)
+      elif $status == "False" then (if ($type | negative) then "faint" else "red" end)
+      else "gold" end;
+    (.name // "") as $n
+    | (.namespace // "krateo-service-desk") as $ns
+    # The authenticated principal, injected by snowplow for a widget declaring
+    # identityContext: [username] (the two write buttons and the reply form do). NEVER a client
+    # parameter: a username a browser could choose would be a claim, not a fact. Absent on the
+    # prewarm walk, where every `can…` below must come out false rather than erroring.
+    | ((.username // "") | if type == "string" then . else "" end) as $me
+    | ((.ticket // {}) | if type == "object" and ((.metadata.name // "") != "") then . else {} end) as $t
+    | (($t | length) > 0) as $exists
+    | ($t.spec // {}) as $sp
+    | ($sp.state // "Open") as $state
+    | ($sp.summary // "") as $summary
+    | ($sp.assignee // "") as $assignee
+    | ($sp.objectRef // {}) as $ref
+    # The live read, or nothing. A step that failed leaves its error under `objectError` and its
+    # own key absent, but a non-object here would make every `.status…` below a jq error on a page
+    # that is otherwise fine, so the type is checked rather than assumed.
+    | ((.object // {}) | if type == "object" and ((.metadata.name // "") != "") then . else null end) as $obj
+    | ($obj != null) as $objRead
+    | (if $objRead then ($obj.status.conditions // []) else [] end) as $conds
+    # TWO BINDINGS, AND THEY MUST NOT BE COLLAPSED INTO ONE. Read this before using either.
+    #
+    #   $acts     spec.activity ONLY — what the reply form patches back (see activityExisting).
+    #   $allActs  what the page DISPLAYS. Identical to $acts today; see below.
+    #
+    # The split exists because the reply form patches `spec.activity` WHOLESALE — a merge-patch
+    # replaces an array, so every existing entry is resent with the new one. Anything that did not
+    # come from spec must therefore be kept OUT of the form's payload, or on the next reply it gets
+    # copied into spec and becomes user-written.
+    #
+    # THIS IS WHERE AN EXTERNAL CONVERSATION LEG GOES, and the reason both bindings survive even
+    # though they currently hold the same thing. A deployment reading replies live from a ticketing
+    # system (the CMP's Zendesk design) adds its shaped entries as a second term:
+    #
+    #     | (($acts + $externalActs) | sort_by(.at // "")) as $allActs
+    #
+    # with $acts FIRST. jq's sort_by is stable, so an exact timestamp tie puts the human reply before
+    # the external one — verified against a fixture of five entries interleaved across both sources
+    # with a deliberate tie at one timestamp. Reorder that concatenation and you silently change which
+    # of two simultaneous replies reads first, with nothing failing.
+    #
+    # An earlier version sourced the second term from `status.activity`, written by a bridge
+    # controller through the /status endpoint. That design was dropped and the status subresource went
+    # with it (see crd.tickets.yaml), so reading it here would mean reading a field the CRD no longer
+    # declares: harmless under the `// []` guard, and a lie in the comment above it.
+    #
+    # Sorting: the CRD says the array is stored oldest-first, and sorting here means the page does not
+    # depend on every writer having kept that promise.
+    | (($sp.activity // []) | sort_by(.at // "")) as $acts
+    | ($acts | sort_by(.at // "")) as $allActs
+    | {
+        exists: $exists,
+        # The summary is the page title; the id is its one line of context. An absent ticket says
+        # so in the title rather than rendering a page about nothing.
+        title: (if $exists then (if $summary != "" then $summary else $n end) else "Ticket not found" end),
+        subtitle: (if $exists then ("Ticket " + $n + (if ($sp.kind // "") != "" then (" · " + $sp.kind) else "" end))
+                   elif $n != "" then ("No ticket " + $n + " in " + $ns + ", or you cannot read it")
+                   else "This ticket does not exist, or you cannot read it" end),
+        state: $state,
+        stateColor: ($state | statecolor),
+        # What was asked, VERBATIM. Rendered by a Paragraph and not a Markdown: nobody writes a
+        # ticket in Markdown, and interpreting a pasted `#` or `*` as markup would rewrite what the
+        # requester said. The cost is that blank lines collapse — see paragraph.ticket-detail.yaml.
+        detailText: (if ($sp.detail // "") != "" then $sp.detail else "No detail was given — the summary above is the whole request." end),
+        # Ask Autopilot: this page's own route with an ?ask seed the rail consumes on mount. Built
+        # here, @uri-encoded, so the Button is a plain literal navigate.
+        askHref: (if $exists then ("/service-desk/" + $ns + "/" + $n + "?ask="
+          + (("This service-desk ticket (\"" + $n + "\" in namespace \"" + $ns + "\"): " + $summary
+             + ". Explain what is being asked, what the object it refers to is doing now,"
+             + " and what the desk should do next — grounded in the evidence on this page.") | @uri)) else "" end),
+        # The write target of every action on this page, named from the route params and written
+        # with the caller's own token. `patch` and not `update`: the page edits one field at a time,
+        # and a merge-patch cannot clobber a concurrent edit to a different field.
+        ticketGvr: { apiVersion: "servicedesk.krateo.io/v1alpha1", resource: "tickets", name: $n, namespace: $ns },
+        # Assign to me: only when there is a me to assign, and not when it would be a no-op. A
+        # Resolved or Closed ticket is not picked up.
+        canAssign: ($exists and $me != "" and $assignee != $me and ($state | IN("Resolved", "Closed") | not)),
+        canResolve: ($exists and ($state | IN("Resolved", "Closed") | not)),
+        # Both patches carry the spec field AND its label mirror, because the queue's reads are
+        # label selectors (restaction.tickets-list) — a spec written without its mirror is a ticket
+        # that disappears from the chip it belongs to.
+        assignPatch: { metadata: { labels: { "krateo.io/ticket-assignee": ($me | labelslug) } }, spec: { assignee: $me } },
+        resolvePatch: { metadata: { labels: { "krateo.io/ticket-state": ("Resolved" | slug) } }, spec: { state: "Resolved" } },
+        # The object the ticket is about: its identity from the ref (always available when the ref
+        # is set) and its conditions from the live read (only when that read came back).
+        objectRef: $ref,
+        objectItems: ([ (if ($ref.name // "") != "" then { label: "Name", value: $ref.name } else empty end),
+                        (if ($ref.kind // "") != "" then { label: "Kind", value: $ref.kind } else empty end),
+                        (if ($ref.apiVersion // "") != "" then { label: "API version", value: $ref.apiVersion } else empty end),
+                        (if ($ref.namespace // "") != "" then { label: "Namespace", value: $ref.namespace } else { label: "Namespace", value: "cluster-scoped" } end) ]),
+        # K8s vocabulary VERBATIM — `Synced=False`, `Ready=True` — not a re-worded "Out of sync".
+        # The reader is looking at a Kubernetes object and these are the words it uses about itself.
+        conditionRows: ($conds | map({
+          label: ((.type // "") + "=" + (.status // "Unknown")),
+          color: condcolor((.type // ""); (.status // "")),
+          reason: (.reason // ""),
+          since: (.lastTransitionTime // "") })),
+        # Why there are no conditions, when there are none: a ref that cannot be addressed, a read
+        # that did not come back, or an object that simply declares none.
+        conditionsNote: (if ($ref | length) == 0 then ""
+          elif ($ref.namespace // "") == "" then "Cluster-scoped — this page reads namespaced objects only, so its conditions are not shown."
+          elif (($ref.kind // "") | refplural) == "secrets" then "This portal does not read Secrets, so this object's conditions are not shown."
+          elif ((refpath($ref) | fetchablePath) | not) then "This page does not read this kind, so its conditions are not shown."
+          elif ($objRead | not) then "Its conditions could not be read: the object may be gone, or you may not have access to it."
+          elif ($conds | length) == 0 then "The object reports no conditions."
+          else "" end),
+        activityRows: ($allActs | map({
+          text: (.text // ""),
+          who: (.who // "unknown"),
+          at: (.at // ""),
+          # An autopilot entry is MARKED as one: the wand that every Autopilot surface uses, and
+          # the word, because a glyph alone carries meaning by colour and shape only.
+          kindKey: ((.kind // "comment") | ascii_downcase),
+          tag: (if ((.kind // "") | ascii_downcase) == "autopilot" then "Autopilot" else "" end),
+          icon: ({ "autopilot": "fa-wand-magic-sparkles", "assigned": "fa-user-check", "state-change": "fa-arrow-right-arrow-left" }[(.kind // "comment") | ascii_downcase] // "fa-comment") })),
+        # What the reply form PATCHES. A merge-patch replaces an array wholesale, so the existing
+        # entries have to be sent back with the new one — the array declares no
+        # x-kubernetes-list-type, so it is atomic and there is no per-item patch for it (a
+        # JSON-Patch `add /spec/activity/-` would be the right request and the Form widget cannot
+        # build one: its body is always an object).
+        #
+        # THE CONSEQUENCE, so nobody finds it the hard way: a reply written against a page served
+        # before someone else replied OVERWRITES their entry. Two people replying at the same
+        # moment lose one of the two. Nothing here can fix that — it needs a controller that
+        # appends, or a resourceVersion precondition the Form cannot send. At desk pace it is
+        # unlikely; at desk pace it is also not acceptable to pretend it cannot happen.
+        activityExisting: $acts,
+        activityCount: ($allActs | length),
+        # A fallback `at` for the new entry, so the stub is valid even if the submit-time override
+        # does not land. It is the time the page was SERVED, which is why it is only a fallback:
+        # the form overrides it with the time the reply was sent.
+        servedAt: (now | todate),
+        me: $me,
+        sections: {
+          object: (($ref | length) > 0),
+          # The conditions TABLE, separately from the card that holds it: an object with no
+          # readable conditions still has an identity worth showing, and an empty table saying
+          # "No data" says nothing about why. The card's own note says why instead.
+          conditions: (($conds | length) > 0),
+          activity: (($allActs | length) > 0),
+          # Gated on the ticket only, NOT on `me`. The page root does not declare
+          # identityContext — identity would multiply its cache cell per person for nothing — so
+          # `me` is empty in the root's own resolution. The form declares it and resolves its own.
+          reply: $exists
+        }
+      }

@@ -517,19 +517,22 @@ func (e *f608Env) seedCell(t *testing.T, in cache.ResolvedKeyInputs) string {
 	t.Helper()
 	key := cache.ComputeKey(in)
 	cp := in
-	e.store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(f608StaleBody), Inputs: &cp})
+	e.store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(f608StaleBody), Inputs: &cp})
 	return key
 }
 
 // settled reports whether every key has either been accepted or left L1
 // (dropped and evicted) — the two ends a refresh can reach.
-func (e *f608Env) settled(keys []string) bool {
+// unsettled counts the keys still resident without an accepted body that
+// have not reached the drop point.
+func (e *f608Env) unsettled(keys []string, w *refreshTerminalWatch) int {
+	n := 0
 	for _, k := range keys {
-		if _, ok := e.store.Get(k); ok && !e.accepted(k) {
-			return false
+		if _, ok := e.store.Get(k); ok && !e.accepted(k) && !w.dropped(k) {
+			n++
 		}
 	}
-	return true
+	return n
 }
 
 func (e *f608Env) accepted(key string) bool {
@@ -553,17 +556,28 @@ func f608CohortInputs(k f608Kind, name, user string, groups []string) cache.Reso
 }
 
 // f608Run drives the real refresher for `class` until every key is settled
-// (or a generous deadline) and returns how many handler invocations and
-// refresher.failed increments the run produced. The counters are read BEFORE
-// the pool is torn down: ResetRefresherForTest zeroes them.
+// (failing the test at a 20s deadline) and returns how many handler
+// invocations and refresher.failed increments the run produced. The counters
+// are read BEFORE the pool is torn down: ResetRefresherForTest zeroes them.
 func f608Run(t *testing.T, e *f608Env, class string, keys []string) (invocations, failed int64) {
 	t.Helper()
+	w, restoreLog := watchRefreshTerminal()
+	defer restoreLog()
 	inv, stop := i1126Loop(t, class, e.saEP, e.saRC)
 	for _, k := range keys {
 		cache.EnqueueRefresh(k)
 	}
+	// A key settles when it is gone, accepted, or dropped: a forbidden refresh
+	// reaches the drop point on its first attempt and stays resident with its
+	// old body, so it is never accepted. Only a key's OWN drop settles it. The
+	// deadline is the failure bound, never the normal exit (#790).
 	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) && !e.settled(keys) {
+	for e.unsettled(keys, w) > 0 {
+		if !time.Now().Before(deadline) {
+			stop()
+			t.Fatalf("#790: %d of %d keys neither accepted, gone nor dropped within 20s",
+				e.unsettled(keys, w), len(keys))
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	// Let any in-flight requeue settle before the pool is torn down.
@@ -925,6 +939,8 @@ func TestIssue608_F3_ForbiddenValidateIsClassifiedNotRelabelled(t *testing.T) {
 // and the next dirty mark re-resolves it and is accepted. Under an
 // evict-on-forbidden drop this is a cold navigation after one blip.
 func TestIssue608_F3b_TransientForbiddenKeepsTheCellResidentThenRecovers(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	const user, group = "cohort-f3b", "team-f3b"
 	k := f608Kinds[1]
 	e := f608Setup(t, []string{group}, map[f608Kind][]string{k: {"f3b-panel"}})

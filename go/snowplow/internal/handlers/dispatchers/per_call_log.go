@@ -5,8 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	xcontext "github.com/krateo-platformops/plumbing/context"
-	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 )
 
 // perCallState carries the per-/call timing + observability state that
@@ -47,21 +46,19 @@ func beginPerCall(r *http.Request, handler string) (*perCallState, func()) {
 	}
 	ctx := r.Context()
 	return st, func() {
-		// #453: the requester as its redact label, never the username.
-		var user redact.Label = redact.Anonymous
-		if ui, err := xcontext.UserInfo(ctx); err == nil {
-			user = redact.Label(redact.User(ui.Username))
-		}
 		// #490 review: []slog.Attr, not []any, so no raw key/value can be
 		// appended past the guards.
 		attrs := []slog.Attr{
 			slog.String("handler", handler),
 			slog.String("path", st.path),
 			slog.String("method", st.method),
-			slog.String("user", user.String()),
 			slog.String("l1_hit", st.l1Hit),
 			slog.String("gvr", st.gvr),
 			slog.Int64("total_ms", time.Since(st.start).Milliseconds()),
+			// #1115 — what the request's page budget did to its network
+			// exchanges (none / within / retried / not_sent /
+			// exhausted_connect / exhausted_answer).
+			slog.String("budget", pagebudget.Outcome(ctx).String()),
 		}
 		// OTel log-correlation: since 1.12.4 the trace_id/span_id pair is
 		// attached to EVERY *Context record by the trace-correlation

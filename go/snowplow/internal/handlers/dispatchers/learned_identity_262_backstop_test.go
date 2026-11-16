@@ -35,6 +35,7 @@ func TestS262_PreLatchLearnedWorkFitsTheBackstop(t *testing.T) {
 	clk := l262VirtualClock(t)
 	l262Stubs(t, l262StubOpts{sleep: unit, clock: clk})
 	l262WaitLearned(t, 5)
+	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR, l262TargetGVR) // #841: the base cohort's group-only member is a known requester
 
 	var mu sync.Mutex
 	resolves := map[string][]time.Time{} // learned user → widget resolve instants

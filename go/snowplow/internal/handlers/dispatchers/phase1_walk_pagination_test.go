@@ -357,11 +357,9 @@ func runIterateApiRefPagesForTest(t *testing.T, ctx context.Context) string {
 		newPhase1Walker(nil, "test-authn-ns"),
 		in,
 		gvr,
-		fakePage1Driven(), // page1Res — wants continue
-		1,                 // depth
-		5,                 // perPage
-		5,                 // keyPerPage
-		5,                 // keyPage (Task #318 Step 1 — page-1 KEY page)
+		fakePage1Driven(),          // page1Res — wants continue
+		1,                          // depth
+		newPrewarmPagination(5, 1), // #966: the first page's one pagination
 		"test-authn-ns",
 	)
 	return buf.String()

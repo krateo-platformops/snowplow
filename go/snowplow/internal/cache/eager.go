@@ -75,7 +75,7 @@ func EagerRegisterAll(ctx context.Context, rw *ResourceWatcher, resourceTypes []
 			defer func() { <-sem }()
 			defer func() {
 				if r := recover(); r != nil {
-					slog.Error("cache.eager.add_resource_type_panic",
+					slog.ErrorContext(ctx, "cache.eager.add_resource_type_panic",
 						slog.String("subsystem", "cache"),
 						slog.String("gvr", g.String()),
 						slog.Any("recovered", r),
@@ -88,7 +88,7 @@ func EagerRegisterAll(ctx context.Context, rw *ResourceWatcher, resourceTypes []
 			// here because EagerRegisterAll's separate
 			// WaitForCacheSync below covers the bulk-sync semantics
 			// the eager-register caller actually wants.
-			_, _ = rw.EnsureResourceType(g)
+			_, _ = rw.ensureResourceType(ctx, g)
 		}(gvr)
 	}
 	wg.Wait()
@@ -120,7 +120,7 @@ func EagerRegisterAll(ctx context.Context, rw *ResourceWatcher, resourceTypes []
 		// broken (mirror of audit 0.25.329 walk-back when
 		// registerFromRedis was empty). We log loud so it's visible
 		// at every restart and the dev gate catches it pre-bench.
-		slog.Warn("cache.eager.inventory_empty",
+		slog.WarnContext(ctx, "cache.eager.inventory_empty",
 			slog.String("subsystem", "cache"),
 			slog.String("walker", "CollectResourceTypesFromRestActions"),
 			slog.String("hint", "no RestActions in cluster OR walker is broken — audit 0.25.329"),

@@ -80,7 +80,6 @@ import (
 	"log/slog"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // errSeedTerminalPutRefused is returned (wrapped) by a seed primitive whose
@@ -227,15 +226,24 @@ func seedTerminalGuardFor(mode seedScopeMode, handle cacheHandle, key string) se
 // (the refresh-overwrite case above converges fresh). A sink-less ctx would make
 // every accepted keepwarm / gvr-discovered seed Put a nil-sink drift
 // (unguarded_put_total++ plus a fail-fresh remark = refresher amplification).
-func seedTerminalPut(ctx context.Context, handle cacheHandle, key string, entry *cache.ResolvedEntry, g seedTerminalGuard) bool {
+//
+// v is the seed resolve's Put-gate verdict (cache.PutGateVerdict): the writes
+// below take it and store nothing unless it allows the Put (#912 re-review).
+func seedTerminalPut(ctx context.Context, handle cacheHandle, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, g seedTerminalGuard) bool {
 	// #424 — the cohort's RBAC class must still be the one key was minted for
 	// (a grant/revoke on the representative mid-resolve makes the body another
 	// class's). Refused like a generation move: no cell, no dep Record. Applies
 	// to boot seeds too — #323's boot exemption is about LRU eviction, not about
 	// writing a body into the wrong identity class. Runs BEFORE every write below,
 	// the pre-readyz PutThenRemark included (#408).
-	// #398 — a seed resolve that read a sensitive resource writes nothing.
+	// #398 — a seed resolve that read a sensitive resource writes nothing, and
+	// (#1255) evicts an older entry: no writer stores this key's current body.
 	if cache.DeclineSensitivePut(ctx) {
+		var inputs *cache.ResolvedKeyInputs
+		if entry != nil {
+			inputs = entry.Inputs
+		}
+		evictUnstorable(ctx, inClassEvicter(ctx, handle, inputs), key, cache.UnstorableSensitive)
 		return false
 	}
 	if entry != nil {
@@ -244,17 +252,28 @@ func seedTerminalPut(ctx context.Context, handle cacheHandle, key string, entry 
 			return false
 		}
 	}
+	var put cache.PutOutcome
 	if g.guarded || (g.boot && cache.IsPhase1Done()) {
 		// Post-readyz (any mode, or a boot unit whose Put crossed the /readyz
 		// flip): gen-guarded. The IfGen method runs the #375 remark on accept.
-		return handle.PutIfGen(ctx, key, entry, g.gen)
+		put = handle.PutResolvedIfGenOutcome(ctx, v, key, entry, g.gen)
+	} else {
+		// Pre-readyz boot: plain, so an LRU-evicted cell is never refused (#323), but
+		// with the #375 remark (#408). A dep that moved during this resolve dirty-
+		// marked a key that was not resident yet, so the refresher skipped it; the
+		// remark re-marks it now that it is.
+		put = handle.PutResolvedThenRemark(ctx, v, key, entry)
 	}
-	// Pre-readyz boot: plain, so an LRU-evicted cell is never refused (#323), but
-	// with the #375 remark (#408). A dep that moved during this resolve dirty-
-	// marked a key that was not resident yet, so the refresher skipped it; the
-	// remark re-marks it now that it is.
-	handle.PutThenRemark(ctx, key, entry)
-	return true
+	// #1321 B1 — a seed write that changed a resident cell's bytes announces the
+	// change itself. A keepwarm, gvr-discovered or rbac-shift seed re-Puts an
+	// ALREADY-RESIDENT cell (#507 above), and a /refreshes stream can be armed on
+	// it. If it stored new bytes without a frame, the refresher's later Put of
+	// those same bytes is identical and publishes nothing, so a tab holding the
+	// old bytes would never be told. The gate (publishIfSubscribed) announces a
+	// PutChanged to an armed stream and nothing else: a no-op when none is armed
+	// (every pre-readyz boot Put) or the bytes did not change.
+	publishIfSubscribed(key, put)
+	return put.Stored()
 }
 
 // seedTerminalGuardCtxKey carries the captured seedTerminalGuard from
@@ -299,14 +318,13 @@ func logSeedTerminalPutRefused(class, target string) {
 // own it from here. Any other error from the re-seed is returned unchanged for
 // the caller's normal classification. Never routed through failedSet (see
 // errSeedTerminalPutRefused).
-func reseedAfterTerminalPutRefusal(kind, label string, cohort redact.Label, reseed func() error) error {
+func reseedAfterTerminalPutRefusal(kind, label string, reseed func() error) error {
 	err := reseed()
 	if errors.Is(err, errSeedTerminalPutRefused) {
 		slog.Default().Info("prewarm.engine.seed.terminal_put_refused_twice",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", kind),
 			slog.String(kind, label),
-			slog.String("target", cohort.String()),
 			slog.String("effect", "#394 the one-shot re-seed was refused again (the cell was removed during "+
 				"the re-seed resolve too); leaving the cell alone — not re-enqueued, not a failure"),
 		)

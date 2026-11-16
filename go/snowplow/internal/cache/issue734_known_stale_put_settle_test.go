@@ -22,9 +22,10 @@
 //	    no longer known-stale, a customer Get counts no known-stale serve, and
 //	    no substrate read-through fires. After the settle the window is closed
 //	    with ONE dirty→fresh sample (the dequeue's, not a second one).
-//	K2  a mark that lands DURING the resolve (the dep moved after it began) keeps
-//	    the cell known-stale through the Put: the body was read from a state the
-//	    latest mark has superseded, so nothing may report it fresh.
+//	K2  #884 (owner ruling F5; this arm asserted the opposite before) — a mark
+//	    that lands DURING the resolve does not keep the cell known-stale: the
+//	    accepted re-Put ends the flag (known-stale means the last refresh
+//	    FAILED), and the newer change stays an ordinary open window.
 package cache
 
 import (
@@ -71,7 +72,7 @@ func k734KnownStaleCell(t *testing.T) (c *ResolvedCacheStore, key string, ok *at
 		if fn := during.Load(); fn != nil {
 			(*fn)()
 		}
-		stored := c.ReplaceIfGenRefresh(rctx, k, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &in}, gen)
+		stored := c.replaceIfGenRefresh(rctx, k, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &in}, gen).Stored()
 		NoteRefreshWrite(rctx, k, stored)
 		// Still inside the dequeue: processNext has not settled the window.
 		served0 := ResolvedCacheStatsByStat()["known_stale_served_dropped_total"]
@@ -131,6 +132,8 @@ func k734Await(t *testing.T, seen chan k734Seen) k734Seen {
 }
 
 func TestIssue734_K1_AcceptedRePutEndsKnownStaleBeforeTheDequeueSettles(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, key, ok, _, seen := k734KnownStaleCell(t)
 	samples0 := refresherSingleton().dirtyStats.samples.Load()
 	completed0 := refresherSingleton().completedTotal.Load()
@@ -174,7 +177,9 @@ func TestIssue734_K1_AcceptedRePutEndsKnownStaleBeforeTheDequeueSettles(t *testi
 	}
 }
 
-func TestIssue734_K2_AMarkDuringTheResolveKeepsTheCellKnownStaleThroughThePut(t *testing.T) {
+func TestIssue734_K2_AMarkDuringTheResolveEndsKnownStaleAndKeepsAnOpenWindow(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	_, key, ok, during, seen := k734KnownStaleCell(t)
 
 	var once atomic.Bool
@@ -189,9 +194,24 @@ func TestIssue734_K2_AMarkDuringTheResolveKeepsTheCellKnownStaleThroughThePut(t 
 	terminalMark([]string{key})
 	s := k734Await(t, seen)
 
-	if !s.knownStale {
-		t.Fatalf("K2 RED: a re-Put whose resolve began BEFORE the latest mark ended the known-stale state — that " +
-			"body was read from a state the mark superseded, and nothing may report it fresh")
+	// #884 (owner ruling F5) — known-stale means the last refresh FAILED. This
+	// refresh was accepted, so the flag ends in the Put's critical section even
+	// though a newer mark overtook the resolve; that newer change stays an
+	// ordinary open window. Before #884 this arm asserted the opposite, and under
+	// steady churn a hot cell therefore never left the state.
+	if s.knownStale {
+		t.Fatalf("K2 RED: the refresher's ACCEPTED re-Put left the cell known-stale because a newer mark overtook " +
+			"its resolve (#884)")
+	}
+	if s.servedDelta != 0 {
+		t.Fatalf("K2 RED: a customer Get after the accepted re-Put counted a known-stale serve (+%d)", s.servedDelta)
+	}
+	k734Drain(t)
+	if _, _, ks := KnownStale(key); ks {
+		t.Fatalf("K2 RED: the cell is known-stale after the accepted re-Put settled")
+	}
+	if _, open := dirtySince(key); !open {
+		t.Fatalf("K2: the mark that landed during the resolve left no open window — its change is not in this body")
 	}
 }
 
@@ -201,6 +221,8 @@ func TestIssue734_K2_AMarkDuringTheResolveKeepsTheCellKnownStaleThroughThePut(t 
 // the end ran after the Put's unlock (CloseKnownStaleAfterPut), a microsecond
 // window this arm samples across many rounds.
 func TestIssue734_K4_ExternalTTLPlainPutEndsKnownStaleInTheWritesCriticalSection(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)
 	resetRefresherForTest()
@@ -216,7 +238,7 @@ func TestIssue734_K4_ExternalTTLPlainPutEndsKnownStaleInTheWritesCriticalSection
 	const rounds = 2000
 	torn := 0
 	for i := 0; i < rounds; i++ {
-		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"old"}`), Inputs: &inputs})
+		c.put(key, &ResolvedEntry{RawJSON: []byte(`{"body":"old"}`), Inputs: &inputs})
 		r.dirty.Store(key, &dirtyStamp{t0: time.Now(), stale: knownStaleDropped, seq: depEventSeq.Load()})
 		ctx := WithL1KeyContext(context.Background(), key) // the resolve began after the mark
 		saw := make(chan bool, 1)
@@ -237,7 +259,7 @@ func TestIssue734_K4_ExternalTTLPlainPutEndsKnownStaleInTheWritesCriticalSection
 			}
 		}()
 		<-spinning
-		c.PutEndingKnownStale(ctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &inputs})
+		c.putEndingKnownStale(ctx, key, &ResolvedEntry{RawJSON: []byte(`{"body":"new"}`), Inputs: &inputs})
 		if <-saw {
 			torn++
 		}

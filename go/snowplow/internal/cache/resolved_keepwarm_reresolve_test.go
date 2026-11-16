@@ -21,10 +21,12 @@ import (
 // content. This is the mechanism c1 relies on: the sweep re-resolves before TTL
 // and the re-Put keeps the cell warm with current data.
 func TestKeepwarm_ReResolvePutSlidesCreatedAtWithFreshContent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Second) // 1s standard TTL
 
 	// Warm cell, backdated 2s → already past the 1s TTL (would MISS on Get).
-	c.Put("k", &ResolvedEntry{
+	c.put("k", &ResolvedEntry{
 		RawJSON:   []byte(`{"v":"stale"}`),
 		CreatedAt: time.Now().Add(-2 * time.Second),
 	})
@@ -34,7 +36,7 @@ func TestKeepwarm_ReResolvePutSlidesCreatedAtWithFreshContent(t *testing.T) {
 
 	// The SWEEP action: a genuine re-resolve Put with FRESH bytes (CreatedAt
 	// left zero → the store stamps time.Now(), resolved.go:807-808).
-	c.Put("k", &ResolvedEntry{
+	c.put("k", &ResolvedEntry{
 		RawJSON: []byte(`{"v":"fresh"}`),
 	})
 	got, ok := c.Get("k")
@@ -63,11 +65,13 @@ func TestKeepwarm_ReResolvePutSlidesCreatedAtWithFreshContent(t *testing.T) {
 // (1) directly (CreatedAt changes on read) and arm (2) if the slide precedes the
 // expiry check — either way RED, with no wall-clock dependence.
 func TestKeepwarm_ReadDoesNotSlideCreatedAt_QuietCellStillExpires(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour) // long TTL — arm (1) is timing-free
 
 	// (1) A HIT must not move CreatedAt. Put a fresh entry, capture CreatedAt,
 	// Get it several times, assert CreatedAt is byte-identical after each read.
-	c.Put("hot", &ResolvedEntry{RawJSON: []byte(`{"v":1}`)})
+	c.put("hot", &ResolvedEntry{RawJSON: []byte(`{"v":1}`)})
 	got, ok := c.Get("hot")
 	if !ok {
 		t.Fatalf("setup: fresh entry must be a HIT")
@@ -93,7 +97,7 @@ func TestKeepwarm_ReadDoesNotSlideCreatedAt_QuietCellStillExpires(t *testing.T) 
 	// does not rescue it (only a re-resolve Put would). Deterministic via a
 	// short TTL + backdated CreatedAt (no sleep).
 	c2 := newResolvedCache(10, 1<<20, time.Second)
-	c2.Put("quiet", &ResolvedEntry{
+	c2.put("quiet", &ResolvedEntry{
 		RawJSON:   []byte(`{"v":1}`),
 		CreatedAt: time.Now().Add(-2 * time.Second), // aged 2s under a 1s TTL
 	})

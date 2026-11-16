@@ -77,11 +77,10 @@ func TestFalsifier341_EndpointRefName_JQError_Surfaced(t *testing.T) {
 	r := newResolveRun(context.Background(), ResolveOptions{}, nondial341Logger(), jwtutil.UserInfo{})
 
 	before := NondialJQErrorByReason(nondialEndpointRefName)
-	got, templated, err := r.evalEndpointRef(&templates.Reference{Name: "${1/0}"})
+	// #1025: evalEndpointRef no longer returns an error at all, so a jq-error
+	// name cannot become a new error class there.
+	got, templated := r.evalEndpointRef(&templates.Reference{Name: "${1/0}"})
 
-	if err != nil {
-		t.Fatalf("#341 honest-error posture: a jq-error name must NOT become a new error class; got err=%v", err)
-	}
 	if !templated {
 		t.Fatalf("#341: a templated name must report templated=true")
 	}
@@ -98,10 +97,7 @@ func TestFalsifier341_EndpointRefName_JQError_Surfaced(t *testing.T) {
 
 	// Control: a VALID templated name does not bump; resolves normally.
 	beforeOK := NondialJQErrorByReason(nondialEndpointRefName)
-	gotOK, _, errOK := r.evalEndpointRef(&templates.Reference{Name: `${ "resolved-name" }`})
-	if errOK != nil {
-		t.Fatalf("#341 control: a valid templated name must resolve; got err=%v", errOK)
-	}
+	gotOK, _ := r.evalEndpointRef(&templates.Reference{Name: `${ "resolved-name" }`})
 	if d := NondialJQErrorByReason(nondialEndpointRefName) - beforeOK; d != 0 {
 		t.Fatalf("#341 control: a VALID templated name must NOT bump the jq-error counter; got delta %d", d)
 	}

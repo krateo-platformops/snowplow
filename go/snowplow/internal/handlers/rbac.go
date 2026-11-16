@@ -29,6 +29,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
@@ -105,7 +106,7 @@ func RBAC() http.Handler {
 
 		var cr templatesv1.RESTAction
 		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); err != nil {
-			log.Error("rbac: unable to convert unstructured to typed RESTAction",
+			log.ErrorContext(req.Context(), "rbac: unable to convert unstructured to typed RESTAction",
 				slog.String("name", name),
 				slog.String("namespace", namespace),
 				slog.Any("err", err))
@@ -114,10 +115,16 @@ func RBAC() http.Handler {
 		}
 
 		readSet, unresolved, err := rbacInspectReadSetFn(req.Context(), &cr, extras)
+		// #1116 — extras that name a key the resolver writes: the same 400 a
+		// /call of this RESTAction answers, naming the keys. InspectReadSet
+		// refused before it enumerated anything (and logged it once).
+		if dispatchers.WriteReservedExtrasRefusal(wri, err) {
+			return
+		}
 		if err != nil {
 			// A structural failure (cyclic api[], SA rest.Config unavailable):
 			// the read-set cannot be trusted — fail loud.
-			log.Error("rbac: inspect pass failed",
+			log.ErrorContext(req.Context(), "rbac: inspect pass failed",
 				slog.String("name", name),
 				slog.String("namespace", namespace),
 				slog.Any("err", err))
@@ -128,7 +135,7 @@ func RBAC() http.Handler {
 			// At least one stage could not be enumerated from the empty dict.
 			// Returning a partial read-set would silently under-grant RBAC at
 			// the first /call — fail loud, naming every unresolvable stage.
-			log.Warn("rbac: RESTAction has unresolvable stage(s); refusing partial read-set",
+			log.WarnContext(req.Context(), "rbac: RESTAction has unresolvable stage(s); refusing partial read-set",
 				slog.String("name", name),
 				slog.String("namespace", namespace),
 				slog.Any("unresolved", unresolved))

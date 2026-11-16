@@ -319,7 +319,7 @@ func TestSkip119_S4NonRegression_ServedGroupResourceHeals(t *testing.T) {
 			"confirm-ticker MUST heal the GVR to servable; it did not — the " +
 			"register-then-heal path is broken (S4/stale-delete regression)")
 	}
-	if _, servable := rw.ListObjectsServable(skip119PendingResourceGVR, ""); !servable {
+	if _, servable := rw.ListObjectsServable(context.Background(), skip119PendingResourceGVR, ""); !servable {
 		t.Fatalf("S4 step 3: healed GVR must be servable via ListObjectsServable too")
 	}
 	t.Logf("S4 NON-REGRESSION: post-startup CRD registered (step1) → not-servable-while-unconfirmed " +

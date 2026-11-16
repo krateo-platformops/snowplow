@@ -34,10 +34,18 @@ var ctxKeyServiceAccountDial = ctxKeyServiceAccountDialType{}
 // → client-go NewCachedFileTokenSource, self-reloading) instead of a read-once
 // static token — the #267 fix. A nil ctx is returned unchanged.
 func WithServiceAccountDial(ctx context.Context) context.Context {
+	return WithServiceAccountDialValue(ctx, true)
+}
+
+// WithServiceAccountDialValue sets the mark to sa, true OR false. The mark is
+// per stage: a stage sets it to its own provenance every time, so a ctx a
+// nested resolve inherits from an outer SA stage never makes a nested stage
+// with its own endpoint dial as the ServiceAccount (#1019 review F2).
+func WithServiceAccountDialValue(ctx context.Context, sa bool) context.Context {
 	if ctx == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, ctxKeyServiceAccountDial, true)
+	return context.WithValue(ctx, ctxKeyServiceAccountDial, sa)
 }
 
 // ServiceAccountDialFromContext reports whether ctx was marked by

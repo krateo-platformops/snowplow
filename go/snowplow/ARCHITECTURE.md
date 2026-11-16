@@ -88,9 +88,13 @@ L3 informer cache  ─▶  L1 resolved-entry cache  ─▶  dispatcher cache
   `PROACTIVE_RA_SEED_ENABLED`) is **retired** into `CACHE_ENABLED` (`retired_flags.go` audits stale
   values); the legacy global-cohort `runPIPSeed` path is **deleted**. Back-out is
   `CACHE_ENABLED=false`.
-- **`/readyz` gates on prewarm-complete**: the seed runs *before* `MarkPhase1Done`; readiness flips
-  when every cohort's nav widgets are warm (the first-nav latch), with fire-regardless backstops
-  (Ready-degraded, never not-Ready-forever). Steady-state re-prewarm is object CRUD → refresher
+- **`/readyz` gates on prewarm-complete and on the complete RBAC snapshot**: the seed runs *before*
+  `MarkPhase1Done`; Phase 1's part flips when every cohort's nav widgets are warm (the first-nav
+  latch), with fire-regardless backstops (Ready-degraded, never not-Ready-forever on Phase 1's
+  account). Readiness also needs the RBAC snapshot the evaluator reads to be complete, built after
+  all four RBAC informers synced (#1231). No timer decides that part: an RBAC LIST that never
+  completes keeps the pod NotReady, and `/readyz`, `snowplow_rbac_snapshot_complete` and a boot WARN
+  name the informer. Liveness (`/health`) reads neither. Steady-state re-prewarm is object CRUD → refresher
   re-resolve, new-GVR → engine re-walk, and a TTL-cadenced keepwarm sweep; widget-CR-triggered
   subtree re-walk is still a **placeholder**.
 

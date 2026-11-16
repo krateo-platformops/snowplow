@@ -113,10 +113,14 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 			Inline: in.Inline,
 		}
 
+		// #1046 — the ref is about the object it names: a resourceNames-scoped
+		// grant on in.Name is honoured for a name-specific verb (UserCan builds
+		// the check through rbac.ObjectCheck, cache on and off alike).
 		el.Allowed = rbac.UserCan(ctx, rbac.UserCanOptions{
 			Verb:          verb,
 			GroupResource: gvr.GroupResource(),
 			Namespace:     in.Namespace,
+			Name:          in.Name,
 		})
 		if !el.Allowed {
 			// #214: a resourceRef RBAC denial is EXPECTED on the prewarm walk
@@ -139,20 +143,15 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 			origin := cache.RefDenialOrigin(ctx)
 			cache.RecordRefDenied(origin)
 			if origin == cache.RefDenialOriginServe {
-				// #563 — the one denial that may be a REAL access problem is
-				// also the one that was unactionable: it named the verb, the
-				// resource and the namespace but never WHO was denied. The
-				// identity goes in as its redact label, never in clear (#453);
-				// a ctx with no UserInfo (the fail-closed denial) labels as
-				// anonymous.
-				ui, _ := xcontext.UserInfo(ctx)
-				log.Warn("resource ref action not allowed",
+				// #563 — the one denial that may be a REAL access problem. WHO
+				// was denied is on the audit record, not here (#1192): the
+				// line's traceId joins the two.
+				log.WarnContext(ctx, "resource ref action not allowed",
 					slog.String("id", in.ID),
 					slog.String("verb", verb),
 					slog.String("group", gvr.Group),
 					slog.String("resource", gvr.Resource),
-					slog.String("namespace", in.Namespace),
-					slog.String("user", redact.User(ui.Username)))
+					slog.String("namespace", in.Namespace))
 			} else {
 				log.Debug("resource ref action not allowed",
 					slog.String("id", in.ID),
@@ -185,7 +184,7 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 			slog.String("name", in.Name),
 			slog.String("namespace", in.Namespace),
 			slog.String("verb", verb),
-			slog.String("path", el.Path),
+			redact.PathAttr("path", el.Path),
 			slog.Bool("allowed", el.Allowed),
 		)
 	}
@@ -207,8 +206,19 @@ func buildPath(gvr schema.GroupVersionResource, in *templatesv1.ResourceRef) str
 		q.Set("name", in.Name)
 	}
 
-	if slice := in.Slice; slice != nil {
-		q.Set("page", strconv.Itoa(slice.Page))
+	// The child's declared window, in its CANONICAL form (#966): the shape the
+	// dispatcher's paginationInfo normalizes a request to. A slice that declares
+	// only perPage means page 1 (normalizePagination's rule), so the path says
+	// page=1, not page=0: the browser requests exactly this URL, and the prewarm
+	// walk derives the pagination it resolves and keys the child with from it
+	// (dispatchers.prewarmPaginationFor), so the two must read the same window.
+	// A slice with no positive perPage windows nothing and emits no pagination.
+	if slice := in.Slice; slice != nil && slice.PerPage > 0 {
+		page := slice.Page
+		if page <= 0 {
+			page = 1
+		}
+		q.Set("page", strconv.Itoa(page))
 		q.Set("perPage", strconv.Itoa(slice.PerPage))
 	}
 

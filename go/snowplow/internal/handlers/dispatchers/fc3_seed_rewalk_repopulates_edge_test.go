@@ -1,16 +1,22 @@
 // fc3_seed_rewalk_repopulates_edge_test.go — #279 F-C3 NO-REGRESSION guard.
 //
-// WHAT C3 IS (the DEFERRED defect, #279 stays OPEN). The iterator-empty
-// short-circuit in the resolver (restactions/api resolve.go — the `len(tmp)==0`
-// / crds.items[]-empty continue): when a stage's iterator evaluates to zero
-// items on a cold first pass (e.g. before a CompositionDefinition's CRD is
-// registered), the stage records NO LIST dep edge. The cell can be warm yet
-// carry no (gvr, ns, "*") edge, so a later CR ADD against that GVR dirty-marks
-// NOTHING → a stale-negative. The close-now fix stays DEFERRED (a narrow,
-// TTL-bounded residual); #279 remains OPEN.
+// WHAT C3 IS. The iterator-empty short-circuit in the resolver
+// (restactions/api resolve.go — the `len(tmp)==0` / crds.items[]-empty
+// continue): when a stage's iterator evaluates to zero items on a cold first
+// pass (e.g. before a CompositionDefinition's CRD is registered), the per-item
+// recorder never runs. Before #279 the stage then recorded NO LIST dep edge, so
+// a warm cell carried no (gvr, ns, "*") edge and a later CR ADD against that
+// GVR dirty-marked NOTHING → a stale-negative.
 //
-// WHAT THIS GUARD PINS (not a fix — a regression fence). The EXISTING mitigation
-// is the seed RE-WALK: the GVR-discovered re-prewarm (prewarm_engine_boot.go's
+// #279 is fixed (closed 2026-09-30): that branch now records the LIST edge from
+// the path skeleton (cache.ParseAPIServerListDepSkeleton), pinned by
+// TestFC3_IteratorEmpty_RecordsFannedListEdge (restactions/api). The residual
+// is a path whose version or resource is templated, or a namespaced resource
+// whose namespace is templated: the skeleton parser returns ok=false, no edge
+// is recorded, and the seed re-walk below is still what re-populates it.
+//
+// WHAT THIS GUARD PINS (not a fix — a regression fence). The mitigation for
+// that residual is the seed RE-WALK: the GVR-discovered re-prewarm (prewarm_engine_boot.go's
 // "Ship 2 Stage 2" note) re-resolves already-warm cells with NO skip, so the
 // resolve re-runs over the now-populated iterator and re-records the LIST edge.
 // The PM required a no-regression guard so the edge-3 fix (#277/#281) — and the
@@ -67,7 +73,7 @@ func TestFC3_SeedRewalk_GVRDiscovered_ReResolvesWarmCell_RepopulatesEdge(t *test
 	// Install a LIVE cell under the production key — the "already warm from the
 	// iterator-empty first pass" state (warm, but the empty iterator recorded no
 	// LIST edge).
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
 	if _, live := handle.Get(key); !live {
 		t.Fatal("F-C3 setup: the seeded cell must be live under the production key")
 	}
@@ -77,12 +83,12 @@ func TestFC3_SeedRewalk_GVRDiscovered_ReResolvesWarmCell_RepopulatesEdge(t *test
 	// re-records the edge), while a boot re-pass DOES fresh-skip it (the residual
 	// #279 gap that stays OPEN). If the two agree, the re-walk's re-population
 	// guarantee is gone.
-	if seedSkipDecision(granted, seedModeGVRDiscovered, handle, key, "widgets", "dashboard-flex", "cohort") {
+	if seedSkipDecision(granted, seedModeGVRDiscovered, handle, key, "widgets", "dashboard-flex") {
 		t.Fatalf("F-C3 REGRESSION: seedModeGVRDiscovered SKIPPED a live/warm cell — the re-walk would " +
 			"NOT re-resolve it, so the LIST edge an iterator-empty first pass missed can never be " +
 			"re-populated (the #279 mitigation is broken). It must NEVER skip (F4-C3 boundary).")
 	}
-	if !seedSkipDecision(granted, seedModeBoot, handle, key, "widgets", "dashboard-flex", "cohort") {
+	if !seedSkipDecision(granted, seedModeBoot, handle, key, "widgets", "dashboard-flex") {
 		t.Fatalf("F-C3 CONTROL: seedModeBoot must fresh-skip the SAME live cell (the discriminator that " +
 			"proves the modes genuinely differ). It did not — the control arm is inert, so the Part-A " +
 			"never-skip assertion would not discriminate a regression.")

@@ -100,13 +100,13 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
-	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/clock"
 )
 
 // phase1SAUsername resolves the CANONICAL Kubernetes ServiceAccount
@@ -286,6 +286,7 @@ func resolveEngineProcessCtx() context.Context {
 		return engineProcessCtx
 	}
 	engineProcessCtxMissingOnce.Do(func() {
+		// log-ctx-waiver: boot: the engine lookup that found no process context, once
 		slog.Error("engine.process_ctx.missing — falling back to context.Background()",
 			slog.String("subsystem", "cache"),
 			slog.String("hint", "main.go must call dispatchers.SetEngineProcessContext(cacheCtx) before Phase1Warmup; under unit-test wiring this fallback keeps the engine alive but the production wiring is broken if this fires in production logs"),
@@ -334,7 +335,7 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 
 	saEP, saErr := idynamic.ServiceAccountEndpoint()
 	if saErr != nil {
-		log.Error("phase1.warmup.no_sa_endpoint",
+		log.ErrorContext(ctx, "phase1.warmup.no_sa_endpoint",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", saErr),
 			slog.String("effect", "Phase 1 cannot resolve under SA identity; readiness is released "+
@@ -353,27 +354,15 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		return saErr
 	}
 
-	// #120: build the roots-read client from an UN-THROTTLED shallow copy of
-	// rc. The shared rc carries client-go's default client-side rate limiter
-	// (QPS 5 / Burst 10) — main.go's rest.InClusterConfig() sets neither QPS
-	// nor RateLimiter, so NewForConfig synthesises the 5/10 token bucket
-	// (client-go rest/config.go:373-382). On a slow-apiserver boot the very
-	// first roots read (the frontend-config ConfigMap Get in
-	// listNavigationRootsFromConfigMap) can lose its tryThrottle Wait to the
-	// startupProbe ctx deadline BEFORE the request is ever sent — no nav
-	// roots, no recursive walk, proactive informer registration starved.
-	// Disabling the limiter (QPS=-1/Burst=0) makes tryThrottleWithInfo return
-	// nil immediately (rest/request.go:667 nil-limiter short-circuit; -1 QPS
-	// leaves RateLimiter nil at config.go:380 `qps > 0`), so the boot-critical
-	// roots path can never deadline on the throttle. Server-side API Priority
-	// & Fairness remains authoritative. This mirrors the SA-client posture
-	// (internal/dynamic/sa_client.go:170-171). rootsReadRESTConfig copies rc
-	// (rest.CopyConfig) before tuning so the shared rc — which also backs the
-	// informer factory, metadata, discovery, config-vars-watch, secrets and
-	// controller-health clients — keeps its throttling untouched.
-	dynCli, dynErr := credhttp.Dynamic(rootsReadRESTConfig(rc))
+	// #120: the boot-critical roots read must never wait on a client-side
+	// rate limiter: on a slow-apiserver boot the frontend-config ConfigMap Get
+	// lost client-go's 5/s token-bucket Wait to the startupProbe deadline before
+	// the request was sent, so no roots were walked. #920: credhttp builds every
+	// client without that limiter, this one included, so server-side Priority &
+	// Fairness is authoritative here as everywhere else.
+	dynCli, dynErr := credhttp.Dynamic(rc)
 	if dynErr != nil {
-		log.Error("phase1.warmup.no_dyn_client",
+		log.ErrorContext(ctx, "phase1.warmup.no_dyn_client",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", dynErr),
 			slog.String("effect", "Phase 1 cannot read the navigation roots; readiness is released "+
@@ -724,7 +713,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// Composition GVRs are discovered by one-shot apiserver discovery
 	// (cache.DiscoverGroupResources) invoked synchronously from the
 	// walker the first time it reaches a templated apiserver path.
-	rw.RegisterMetaQuerySeeds()
+	rw.RegisterMetaQuerySeeds(ctx)
 
 	// Step 2 — (Ship 0 / 0.30.222) the explicit StartCRDWatch call that
 	// lived here was DELETED. Ship 0.5 / 0.30.223 (v6) DELETED the CRD
@@ -761,7 +750,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 		// (Step 7) and the flip (Step 7.6/8) are unchanged and byte-identical
 		// for the deps-present-at-boot path (this branch is not even entered
 		// then). project_readyz_gates_on_prewarm_complete is intact.
-		log.Warn("phase1.warmup.roots_list_failed",
+		log.WarnContext(ctx, "phase1.warmup.roots_list_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", listErr),
 			slog.String("effect", "no roots to walk YET; the config-vars ConfigMap informer will drive a "+
@@ -805,7 +794,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 			break
 		}
 		if err := resolve(ctx, root); err != nil {
-			log.Warn("phase1.warmup.root_resolve_failed",
+			log.WarnContext(ctx, "phase1.warmup.root_resolve_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("root", rootKey(root.Root)),
 				slog.Any("err", err),
@@ -861,6 +850,18 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// informer (meta-query seeds + resolution-discovered + CRD-watch-
 	// spawned) reaches HasSynced, bounded by ctx.
 	syncErr := rw.WaitAllInformersSynced(ctx)
+	// Step 7.1 — #1233: every step below writes the cache, and the store admits
+	// no write of a resolve that began on an incomplete RBAC snapshot. The RBAC
+	// informers can be synced while the complete snapshot is not published yet
+	// (the initial publish runs under the rebuild slot), so wait for the publish
+	// itself, or a unit resolved now would be refused and never redone (#506).
+	if err := cache.WaitRBACSnapshotComplete(ctx); err != nil {
+		log.WarnContext(ctx, "phase1.rbac_snapshot_incomplete",
+			slog.String("subsystem", "cache"),
+			slog.Any("err", err),
+			slog.String("effect", "the content prewarm and the seeds below write nothing until the RBAC snapshot completes"),
+		)
+	}
 	steps.syncWait = time.Since(syncStart)
 
 	// Step 7.5 — Ship F2 (0.30.125): the SA content-population pass. Runs
@@ -956,7 +957,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 			defer func() {
 				if r := recover(); r != nil {
 					seedPanicked = true
-					log.Error("phase1.seed.panic",
+					log.ErrorContext(ctx, "phase1.seed.panic",
 						slog.String("subsystem", "cache"),
 						slog.Any("panic", r),
 						slog.String("effect", "per-cohort SYNC seed aborted; readiness flips to "+
@@ -978,7 +979,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 			seedErr = pipSeed(seedCtx)
 			parentErrAtExit, seedCtxErrAtExit = ctx.Err(), seedCtx.Err()
 			if err := seedErr; err != nil {
-				log.Warn("phase1.seed.sync_incomplete",
+				log.WarnContext(seedCtx, "phase1.seed.sync_incomplete",
 					slog.String("subsystem", "cache"),
 					slog.Any("err", err),
 					slog.String("effect", "readiness flips (backstop); first /call per affected "+
@@ -1023,7 +1024,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Error("phase1.pagination_drain.panic",
+					log.ErrorContext(ctx, "phase1.pagination_drain.panic",
 						slog.String("subsystem", "cache"),
 						slog.Any("panic", r),
 						slog.String("effect", "background apiRef pagination drain aborted; "+
@@ -1064,27 +1065,42 @@ const phase1SettleWindow = 750 * time.Millisecond
 // phase1SettlePoll is the poll cadence for the settle check.
 const phase1SettlePoll = 150 * time.Millisecond
 
+// settleClock (#1166) is the clock settleRegisteredSet keeps its window on: the
+// stableSince stamp, the poll ticker and the window's age are all read from it.
+// nil is the wall clock (clock.RealClock: time.Now, time.NewTicker, time.Since),
+// which is all production ever uses. A test installs a virtual clock so the same
+// window logic runs on exact instants instead of 750 ms of real time per pass.
+var settleClock atomic.Pointer[clock.WithTicker]
+
+func settleClockOrReal() clock.WithTicker {
+	if c := settleClock.Load(); c != nil {
+		return *c
+	}
+	return clock.RealClock{}
+}
+
 // settleRegisteredSet polls the watcher's registered-GVR count until it
 // holds steady for phase1SettleWindow, or ctx is cancelled. This lets
 // the CRD-watch's asynchronous per-GVR registrations land before the
 // sync barrier snapshots the informer set.
 func settleRegisteredSet(ctx context.Context, rw *cache.ResourceWatcher) {
+	clk := settleClockOrReal()
 	last := rw.RegisteredCount()
-	stableSince := time.Now()
-	t := time.NewTicker(phase1SettlePoll)
+	stableSince := clk.Now()
+	t := clk.NewTicker(phase1SettlePoll)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 			now := rw.RegisteredCount()
 			if now != last {
 				last = now
-				stableSince = time.Now()
+				stableSince = clk.Now()
 				continue
 			}
-			if time.Since(stableSince) >= phase1SettleWindow {
+			if clk.Since(stableSince) >= phase1SettleWindow {
 				return
 			}
 		}
@@ -1109,44 +1125,6 @@ func rootKey(root *unstructured.Unstructured) string {
 // pathological CR graph that the visited-set somehow fails to dedupe. It
 // is NOT a per-resource policy — it is a uniform recursion-safety bound.
 const phase1MaxWalkDepth = 32
-
-// rootsReadRESTConfig returns a shallow copy of rc with the client-side
-// rate limiter disabled (QPS=-1 / Burst=0), for the boot-critical
-// navigation-roots read only.
-//
-// #120: the shared rc (main.go's rest.InClusterConfig()) has no QPS /
-// RateLimiter set, so k8sdynamic.NewForConfig gives it client-go's default
-// 5-QPS / 10-burst token bucket. On a slow-apiserver boot the roots
-// ConfigMap Get can lose its tryThrottle Wait to the startupProbe ctx
-// deadline before the request is sent — starving the recursive walk and the
-// proactive informer registration it drives. QPS<=0 leaves the copy's
-// RateLimiter nil (client-go rest/config.go:373-382 only builds a bucket
-// when qps > 0), so tryThrottleWithInfo returns nil immediately
-// (rest/request.go:667). Server-side API Priority & Fairness stays
-// authoritative. Mirrors the SA-client posture (internal/dynamic/
-// sa_client.go:170-171).
-//
-// The COPY is load-bearing: the caller passes the SAME rc to the informer
-// factory, metadata / discovery, config-vars-watch, secrets and
-// controller-health clients; mutating rc in place would strip throttling
-// from all of them. rest.CopyConfig duplicates the config by value (QPS and
-// Burst are scalars), so tuning the copy leaves rc untouched.
-//
-// RateLimiter is cleared on the COPY: CopyConfig duplicates RateLimiter by
-// POINTER, and NewForConfig honours a non-nil RateLimiter verbatim — QPS<=0
-// only takes effect when RateLimiter is nil (client-go rest/config.go:370).
-// In production rc.RateLimiter is nil (rest.InClusterConfig leaves it unset,
-// as sa_client.go likewise assumes) so this is a no-op there; clearing it
-// makes the un-throttled posture hold unconditionally even if rc ever
-// carries a pre-built limiter, and keeps the shared rc's limiter untouched
-// (we clear the field on our private copy, not the shared limiter object).
-func rootsReadRESTConfig(rc *rest.Config) *rest.Config {
-	c := rest.CopyConfig(rc)
-	c.QPS = -1
-	c.Burst = 0
-	c.RateLimiter = nil
-	return c
-}
 
 // resolveNavigationRoot resolves one navigation-root CR through the
 // STANDARD widget resolver under the snowplow SA identity, then
@@ -1401,7 +1379,7 @@ func installSeedLoopbackToken(ctx context.Context) context.Context {
 		// ctx cancelled, budget/steps exhausted, or (defensively) empty token:
 		// degrade to token-less, exactly as the pre-shape-A fire-once path did.
 		seedLoopbackTokenErrTotal.Add(1)
-		slog.Warn("prewarm.seed_loopback_token_unavailable",
+		slog.WarnContext(ctx, "prewarm.seed_loopback_token_unavailable",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", waitErr),
 			slog.String("effect", "prewarm loopback ran token-less after bounded retry; a nested loopback "+
@@ -1452,25 +1430,27 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 	// cyberjoker requesting the same root via dispatcher will hit the
 	// SAME cell.
 	//
-	// The root has no /call Path of its own, so it resolves under the
-	// bounded PREWARM_PAGE_LIMIT default; each descended child overrides
-	// with its own declared slice when present (Ship 0.30.127).
-	//
-	// Ship 0.30.187 D2: the seed-key tuple for a root navigation widget
-	// is (-1, -1). The frontend's first request URL for a root widget
-	// carries no slice params so the dispatcher's paginationInfo returns
-	// (-1, -1); the seed Put must use the same tuple. Resolution tuple
-	// stays = prewarmPageLimit() (the 0.30.127 storm guard).
-	//
-	// Ship 0.30.199 (Change A): the page NUMBER must be 1, NOT
-	// prewarmPageLimit(). injectSlice (widgets/resolve.go:268) computes the
-	// list-windowing `offset = (page-1)*perPage`. Passing page == perPage ==
-	// prewarmPageLimit() (=5) windowed the children at offset (5-1)*5 = 20,
-	// so a small nav root (e.g. the 3-item sidebar-nav-menu) sliced at
-	// offset 20 yielded ZERO children and the walk never descended below the
-	// roots. The page SIZE stays prewarmPageLimit() — the 0.30.127 bounded
-	// fan-out guard is untouched; only the page-NUMBER overshoot is fixed.
-	return w.walk(rctx, root, gvr, 0, 1, prewarmPageLimit(), -1, -1)
+	return w.walkRoot(rctx, root, gvr)
+}
+
+// walkRoot is the ONE entry of a walk into a navigation root, shared by the
+// phase-1 walk (resolveNavigationRoot) and the engine's boot re-walk
+// (rePrewarmBootScoped), so the two cannot choose different paginations (#966
+// review F2). The root has no /call Path of its own: the frontend requests it
+// with no page/perPage, so prewarmPaginationFor("") is the unpaginated
+// (-1,-1), and the walk both resolves the root and keys its cell with it.
+func (w *phase1Walker) walkRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource) error {
+	return w.walk(ctx, root, gvr, 0, prewarmPaginationFor(ctx, ""))
+}
+
+// walkChild is the ONE entry of a walk into a child widget reached through a
+// resourcesRefs item, shared by the page-1 children loop (descendChildren) and
+// the deep-page drain's children loop (iterateApiRefPages), so the two cannot
+// choose different paginations (#966 review F2). got is the child CR the
+// caller fetched; the child's pagination comes from child.Path — the URL the
+// browser requests for it — and the walk resolves AND keys with it.
+func (w *phase1Walker) walkChild(ctx context.Context, child navChildRef, got objects.Result, depth int) error {
+	return w.walk(ctx, got.Unstructured, got.GVR, depth+1, prewarmPaginationFor(ctx, child.Path))
 }
 
 // Ship 0.30.127: the per-(parent,GVR) sample cap — phase1PerGVRSampleLimit,
@@ -1478,11 +1458,11 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 // falsifier — were ALL DELETED. That count-cap heuristic (0.30.105,
 // re-keyed 0.30.126) was the wrong mechanism: it pruned distinct
 // navigation widgets by a sibling-count guess. The real data-fan-out
-// bound is now the DECLARED per-widget pagination — each widget resolves
-// under the `slice` it declares (carried on its `/call` Path) or the
-// bounded PREWARM_PAGE_LIMIT default — so the walk recurses EVERY
-// distinct navigation child and never the per-row data fan-out, with no
-// count heuristic. See walk()'s page/perPage threading.
+// bound is the DECLARED per-ref pagination — each widget resolves under the
+// `slice` its parent's ref declares (carried on its `/call` Path), or
+// unpaginated when none is declared, exactly as the browser requests it
+// (#966 removed the PREWARM_PAGE_LIMIT default, which keyed a perPage=5 body
+// as unpaginated). See walk()'s pg.
 
 // phase1Walker carries the per-root recursive-walk state. A fresh walker
 // is created per navigation root so the dedupe state never crosses roots
@@ -1545,31 +1525,29 @@ type phase1Walker struct {
 // top-level root resolve failure, so the caller (phase1WarmupWith) can
 // log a root as failed.
 //
-// page/perPage are the pagination declared for THIS widget — extracted
-// from the `/call` Path that led to it (Ship 0.30.127). They are passed
-// to widgets.Resolve so the walk honours each widget's own declared
-// `slice` instead of the old hardcoded -1/-1. The root call passes the
-// PREWARM_PAGE_LIMIT default; a child whose `/call` Path carries explicit
-// page/perPage overrides it.
+// pg is THE pagination of this widget's cell (#966): the walk resolves the
+// widget with it AND keys the widget's content cell, its harvested seed entry
+// and its deep-page job with it. The caller derives it once, from the `/call`
+// Path that led here, with prewarmPaginationFor: the declared page/perPage when
+// the Path carries them, otherwise the unpaginated (-1,-1) — exactly what the
+// dispatcher's paginationInfo derives for a browser request of the same URL, so
+// the stored body is the body that request would resolve.
 //
-// keyPerPage/keyPage are the dispatcher-lookup KEY tuple (Ship 0.30.187
-// D2). They are DECOUPLED from page/perPage: for a widget reached via a
-// /call Path with no declared slice, page/perPage = prewarmPageLimit()
-// (the 0.30.127 storm guard) but keyPerPage/keyPage = (-1, -1) — what
-// the dispatcher's paginationInfo returns at serve time for a request
-// with no URL slice params. For a widget reached via a /call Path with
-// declared page/perPage the two tuples are equal. The decoupling fixes
-// the 0.30.186 14/17 first-nav-hit defect where the PIP seed Put landed
-// in cell (5, 5) but the serve-time dispatcher looked up (-1, -1).
+// Before #966 the walk took TWO tuples: a resolve tuple bounded at
+// page=1/perPage=5 for a widget with no declared slice (the 0.30.127 fan-out
+// bound) and a key tuple of (-1,-1) (0.30.187 D2, so the cell matched the
+// serve-time lookup). The cell then held a body resolved at perPage=5 under the
+// unpaginated key: windowed rows for any jq that reads `.slice`, plus a
+// status.resourcesRefs.slice the request never asked for. The bound on a list
+// now comes from where the browser's bound comes from — the slice the chart
+// declares on the ref.
 //
 // gvr is THIS widget's GroupVersionResource (Ship G, 0.30.16x) — threaded
 // from the root site (passed by resolveNavigationRoot) and from the
 // recursive site (got.GVR from objects.Get at the child fetch). It feeds
 // populateWidgetContentL1's identity-free cache key so the F2 walker's
-// Put MATCHES the serve-time dispatcher's key composition. The content
-// L1 key uses the KEY tuple symmetrically (same dispatcher-match
-// invariant).
-func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, gvr schema.GroupVersionResource, depth int, page, perPage int, keyPerPage, keyPage int) error {
+// Put MATCHES the serve-time dispatcher's key composition.
+func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, gvr schema.GroupVersionResource, depth int, pg prewarmPagination) error {
 	log := slog.Default()
 	if in == nil {
 		return nil
@@ -1578,7 +1556,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		return ctx.Err()
 	}
 	if depth > phase1MaxWalkDepth {
-		log.Warn("phase1.walk.max_depth",
+		log.WarnContext(ctx, "phase1.walk.max_depth",
 			slog.String("subsystem", "cache"),
 			slog.Int("depth", depth),
 			slog.String("widget", rootKey(in)),
@@ -1594,18 +1572,27 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	w.apiRefHarvester.harvestApiRef(in)
 
 	// Ship PIP (0.30.173) Step 7.6a — harvest this navigation widget CR
-	// together with the GVR + pagination tuples it was reached under so
+	// together with the GVR + the pagination it was reached under so
 	// the per-cohort seed loop (runPIPSeed) can Put a widgets top-level
 	// L1 entry per cohort × widget. Sibling of apiRefHarvester; rides
 	// the EXISTING walk, no second traversal. nil-safe — flag-off is a
-	// clean no-op.
-	//
-	// Ship 0.30.187 D2: TWO tuples are passed — the RESOLUTION tuple
-	// (perPage, page) is the bounded prewarm pagination used by
-	// widgets.Resolve; the KEY tuple (keyPerPage, keyPage) is the
-	// dispatcher-lookup tuple the seed Put uses so the cell matches
-	// serve-time.
-	w.navWidgetHarvester.harvestNavWidget(in, gvr, perPage, page, keyPerPage, keyPage)
+	// clean no-op. #966: the seed resolves AND keys with this same pg.
+	w.navWidgetHarvester.harvestNavWidget(in, gvr, pg)
+
+	// #1477 — the #113 rule, inherited from the widget's apiRef RESTAction: the
+	// walk resolves with no request extras, so a templated endpointRef that
+	// reads one the widget does not supply inline renders a Secret no
+	// customer's request selects. The widgetContent cell this resolve would Put
+	// has no extras in its key, and every request that renders the template
+	// carries the extra, so nothing can serve it. Not resolved, and so not
+	// descended: the subtree below a widget whose body needs request extras is
+	// reached by the navigation that carries them (lazy register-on-navigation).
+	// The harvests above still run: the widget seed and the content prewarm
+	// apply the same predicate to what they resolve.
+	if widgetNeedsRequestExtras(ctx, in) {
+		logBackgroundResolveSkip(bgSkipSiteWalk, "widget", rootKey(in))
+		return nil
+	}
 
 	// Ship G defect-fix (AC-G.5): install the widgetContent L1 key on the
 	// ctx BEFORE widgets.Resolve. The resolver's inner-call dep recording
@@ -1620,11 +1607,8 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// populateWidgetContentL1 Puts under — both call widgetContentL1Key
 	// with the SAME tuple.
 	//
-	// Ship 0.30.187 D2: widgetContentL1Key uses the KEY tuple
-	// (keyPerPage, keyPage) — symmetric with the per-user PIP seed —
-	// so the content cell matches the dispatcher's serve-time lookup
-	// (which composes its key from paginationInfo's URL-derived tuple).
-	wcKey, _ := widgetContentL1Key(gvr, in.GetNamespace(), in.GetName(), keyPerPage, keyPage)
+	// #966: that tuple is pg — the one the resolve below also uses.
+	wcKey, _ := widgetContentL1Key(gvr, in.GetNamespace(), in.GetName(), pg.PerPage, pg.Page)
 	// #323 — capture the content cell's generation BEFORE widgets.Resolve below, so
 	// populateWidgetContentL1's post-readyz PutIfGen refuses (rather than
 	// resurrecting) if a DELETE lands during this keep-warm / gvr-discovered
@@ -1657,6 +1641,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	resolveCtx := ctx
 	if wcKey != "" {
 		resolveCtx = cache.WithL1KeyContext(ctx, wcKey)
+		defer cache.Deps().ReleaseUnstored(resolveCtx, wcKey) // #890/#893
 	}
 	// #643 PR-B2 — name the walked widget and its apiRef RESTAction on the
 	// resolve ctx so a declined-external mark records what it retires on.
@@ -1680,19 +1665,17 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// apiRef-bearing leaf such as the Compositions Page DataGrid) and
 	// returns status.resourcesRefs.items[] — the child widget endpoints.
 	//
-	// Ship 0.30.127: page/perPage are the pagination DECLARED for this
-	// widget — its own `slice` carried on the `/call` Path that led here,
-	// or the PREWARM_PAGE_LIMIT bounded default. The old hardcoded -1/-1
-	// resolved every widget unbounded, which (with the iterator cap
-	// removed) is the 49K-row storm. Honouring the declared slice keeps
-	// the discovery walk's fan-out bounded by what the portal itself
-	// declared per widget.
+	// #966: resolved with pg, the pagination wcKey above folds and the
+	// populate below Puts under — the pagination the browser's request for
+	// this widget carries. A widget whose ref declares a slice resolves
+	// windowed; one whose ref declares none resolves unpaginated, as that
+	// request does.
 	res, err := widgets.Resolve(resolveCtx, widgets.ResolveOptions{
 		In:      in,
 		RC:      w.rc,
 		AuthnNS: w.authnNS,
-		PerPage: perPage,
-		Page:    page,
+		PerPage: pg.PerPage,
+		Page:    pg.Page,
 	})
 	if err != nil {
 		// A resolution error at depth>0 is non-fatal — log and stop
@@ -1704,7 +1687,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		// #643 PR-B2 ruling (c): an external-touched resolve that errored is
 		// marked only on a structural LEAF (replayed as this same error path).
 		walkMarkDeclinedExternal(resolveCtx, wcKey, in, walkUID, walkRV, nil, true)
-		log.Warn("phase1.walk.child_resolve_failed",
+		log.WarnContext(ctx, "phase1.walk.child_resolve_failed",
 			slog.String("subsystem", "cache"),
 			slog.Int("depth", depth),
 			slog.String("widget", rootKey(in)),
@@ -1732,15 +1715,13 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// entry and fall through to the existing per-user L1, the correct
 	// degraded posture.
 	//
-	// Ship 0.30.187 D2: populateWidgetContentL1 uses the KEY tuple — the
-	// content L1 cell must match the dispatcher's serve-time lookup
-	// (which composes its key from paginationInfo's URL-derived tuple).
+	// #966: the cell is keyed with pg, the pagination res was resolved with.
 	//
 	// Ship 0.30.257 (#313): pass resolveCtx (NOT the bare ctx) so the
 	// stage-error sink installed above — and bumped by this widget's
 	// apiRef RESTAction resolve — reaches populateWidgetContentL1's
 	// Cache-A gate. The bare ctx carries no sink; resolveCtx does.
-	populateWidgetContentL1(resolveCtx, gvr, in, keyPerPage, keyPage, res, wcGen0)
+	populateWidgetContentL1(resolveCtx, gvr, in, pg.PerPage, pg.Page, res, wcGen0)
 
 	// Path 3.2.2.b (0.30.221) — DEFERRED apiRef pagination. Path 3.2.2
 	// (0.30.220) ran iterateApiRefPages INLINE here on the Phase 1
@@ -1762,17 +1743,14 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// resolverWantsContinue) at collect time, so the collected set
 	// contains ONLY work that would actually paginate.
 	w.pagCollector.collect(apiRefPaginationJob{
-		In:         in,
-		GVR:        gvr,
-		Page1Res:   res,
-		Depth:      depth,
-		PerPage:    perPage,
-		KeyPerPage: keyPerPage,
-		// Task #318 Step 1: thread page-1's KEY page so the drain can
-		// reconstruct page-1's KEY tuple (keyPerPage, keyPage) instead of
-		// substituting the raw loop counter — see drainKeyPageFor.
-		KeyPage: keyPage,
-		AuthnNS: w.authnNS,
+		In:       in,
+		GVR:      gvr,
+		Page1Res: res,
+		Depth:    depth,
+		// #966: the drain resolves AND keys each next page from this one
+		// pagination (pg.pageAfter).
+		Pagination: pg,
+		AuthnNS:    w.authnNS,
 	})
 
 	// Read status.resourcesRefs.items[] — the child widget endpoints.
@@ -1855,39 +1833,11 @@ func (w *phase1Walker) descendChildren(ctx context.Context, gvr schema.GroupVers
 			// Already walked (cycle-safety + shared-subtree dedup). The
 			// visited-set + phase1MaxWalkDepth are the ONLY recursion
 			// bounds — Ship 0.30.127 removed the per-(parent,GVR) sample
-			// cap; fan-out is bounded by the declared slice / the
-			// PREWARM_PAGE_LIMIT default each widget resolves under.
+			// cap; a list's fan-out is bounded by the slice its ref
+			// declares, as the browser's request for it is.
 			continue
 		}
 		w.visited[key] = struct{}{}
-
-		// Ship 0.30.127 — honour the child's DECLARED pagination. The
-		// child's `/call` Path carries page/perPage when the parent
-		// declared a `slice` (resourcesrefs writes them). Extract them;
-		// when absent, fall back to the bounded PREWARM_PAGE_LIMIT default
-		// — NEVER the unbounded -1 (which, with the iterator cap removed,
-		// is the 49K-row storm).
-		//
-		// Ship 0.30.199 (Change A): the no-declared-slice default page
-		// NUMBER is 1, NOT prewarmPageLimit(). Same overshoot as the root
-		// site: injectSlice's `offset = (page-1)*perPage` windowed a child
-		// nav list at offset (5-1)*5 = 20, dropping every child of a small
-		// list to ZERO so the recursion never descended. The page SIZE
-		// stays prewarmPageLimit() (the 0.30.127 bounded fan-out guard). A
-		// child whose /call Path DOES declare a slice still overrides both
-		// values below.
-		childPage, childPerPage := 1, prewarmPageLimit()
-		if p, pp, hasPg := util.ParseCallPathPagination(child.Path); hasPg {
-			childPage, childPerPage = p, pp
-		}
-
-		// Ship 0.30.187 D2 — derive the dispatcher-lookup KEY tuple from
-		// the child's /call Path. The KEY tuple is what paginationInfo
-		// returns at serve time for a request hitting the same URL:
-		// (-1, -1) for no-slice paths, the declared (perPage, page) for
-		// sliced paths. The resolution tuple stays bounded by
-		// prewarmPageLimit() (above) — the 0.30.127 storm guard.
-		childKeyPerPage, childKeyPage := deriveSeedKeyTuple(child.Path)
 
 		// Fetch the child widget CR under the SA-credentialed ctx. The
 		// resolver mutates the object in place, so a fresh fetch per
@@ -1917,7 +1867,7 @@ func (w *phase1Walker) descendChildren(ctx context.Context, gvr schema.GroupVers
 			// widget only the routes loader would have found (#220). F6b is
 			// the closer — it needs no walk at all.
 			gone := w.forgetChildIfGone(ctx, ref, got.Err)
-			log.Warn("phase1.walk.child_fetch_failed",
+			log.WarnContext(ctx, "phase1.walk.child_fetch_failed",
 				slog.String("subsystem", "cache"),
 				slog.Int("depth", depth),
 				slog.String("child", key),
@@ -1929,18 +1879,14 @@ func (w *phase1Walker) descendChildren(ctx context.Context, gvr schema.GroupVers
 		if got.Unstructured == nil {
 			continue
 		}
-		// Recurse into the child widget subtree. childPage/childPerPage
-		// are the pagination the child resolves under — its declared
-		// `slice` from the `/call` Path, or the PREWARM_PAGE_LIMIT default
-		// (Ship 0.30.127). childKeyPerPage/childKeyPage are the
-		// dispatcher-lookup KEY tuple — decoupled from the resolution
-		// tuple per Ship 0.30.187 D2 so the seed cell matches serve-time.
+		// Recurse into the child widget subtree (#966: walkChild takes the
+		// child's one pagination from child.Path).
 		//
 		// Ship G (0.30.16x): got.GVR is the child widget's GVR — threaded
 		// from objects.Get's return shape (internal/objects/get.go:22-26)
 		// so populateWidgetContentL1 down the recursion has the GVR the
 		// serve-time dispatcher will compose its key under.
-		_ = w.walk(ctx, got.Unstructured, got.GVR, depth+1, childPage, childPerPage, childKeyPerPage, childKeyPage)
+		_ = w.walkChild(ctx, child, got, depth)
 	}
 	return nil
 }

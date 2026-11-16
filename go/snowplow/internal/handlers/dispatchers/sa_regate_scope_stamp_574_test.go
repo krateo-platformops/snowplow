@@ -25,7 +25,6 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -58,7 +57,7 @@ func installScopeStamp574Recorder(t *testing.T, seen *scopeStamp574Seen) {
 		seen.rec(ctx)
 		return nil
 	}
-	seedOneRestactionFn = func(ctx context.Context, _ redact.Label, _ templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
+	seedOneRestactionFn = func(ctx context.Context, _ templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
 		seen.rec(ctx)
 		return nil
 	}
@@ -145,7 +144,7 @@ func TestIssue574Scope_S2_BootScopeHandlerStampsScope_RBACShift(t *testing.T) {
 
 	navHarv := newNavWidgetHarvester()
 	w := reseedWidgetEntry()
-	navHarv.harvestNavWidget(w.W, w.GVR, w.PerPage, w.Page, w.KeyPerPage, w.KeyPage)
+	navHarv.harvestNavWidget(w.W, w.GVR, w.Pagination)
 	deps := rePrewarmDeps{harvester: newContentPrewarmHarvester(), navHarv: navHarv, authnNS: h1NS}
 
 	seen := &scopeStamp574Seen{}

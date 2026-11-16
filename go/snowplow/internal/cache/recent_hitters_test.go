@@ -51,13 +51,15 @@ func TestRecentHitters_RepeatFrontHitAllocatesNothing(t *testing.T) {
 }
 
 func TestRecentHitters_CarriedAcrossReplaceInPlace(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(64, 1<<20, time.Hour)
 	const key = "k444"
 	first := &ResolvedEntry{RawJSON: []byte(`1`)}
-	c.Put(key, first)
+	c.put(key, first)
 	first.NoteHitter("dave", []string{"portal"})
 	gen := c.CaptureGen(key)
-	if !c.ReplaceIfGen(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`2`)}, gen) {
+	if !c.replaceIfGen(context.Background(), key, &ResolvedEntry{RawJSON: []byte(`2`)}, gen) {
 		t.Fatalf("replace refused")
 	}
 	got, _ := c.Get(key)
@@ -67,11 +69,13 @@ func TestRecentHitters_CarriedAcrossReplaceInPlace(t *testing.T) {
 }
 
 func TestEvictUnrefreshable_SparesALaterPut(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(64, 1<<20, time.Hour)
 	const key = "k444e"
 	decided := &ResolvedEntry{RawJSON: []byte(`old`)}
-	c.Put(key, decided)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`customer-refill`)}) // lands after the decision
+	c.put(key, decided)
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`customer-refill`)}) // lands after the decision
 	if c.EvictUnrefreshable(key, decided) {
 		t.Fatalf("must not evict a body put after the refresher's decision")
 	}

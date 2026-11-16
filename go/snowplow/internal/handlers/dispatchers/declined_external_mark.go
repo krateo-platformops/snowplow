@@ -11,8 +11,10 @@
 // fall-through), in BOTH decline branches: a fetch abandoned at the
 // boot-readiness bound bumps the stage-error sink as well, and those abandoned
 // fetches are the bulk of the load. A stage error with NO external touch never
-// marks. apiref.DeclaresExternalEndpoint is never the criterion (I-5): an
-// endpointRef can point at the apiserver and dispatch internally.
+// marks. apiref.DeclaresExternalEndpoint is never the criterion (I-5): a
+// declared external stage need not be dialled (an iterator over no items, a
+// stage skipped after a failed dependency). Since #1017 a named endpointRef is
+// always sent to its endpoint, never answered from this cluster.
 //
 // THE RE-CHECK (I-1, zero cold navigation). Before a mark suppresses a resolve
 // every recorded fact is re-read; any change, and any failed read, retires the
@@ -51,7 +53,6 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -232,7 +233,7 @@ func declinedExternalMarkHolds(ctx context.Context, m *cache.DeclinedExternalMar
 // declinedExternalSkip is the consult (brief §1(b)): true iff key is marked and
 // every fact behind the mark still holds. A mark that no longer holds is
 // retired here and the cell is resolved.
-func declinedExternalSkip(ctx context.Context, key, class, target string, cohortLabel redact.Label) bool {
+func declinedExternalSkip(ctx context.Context, key, class, target string) bool {
 	set := cache.SeedDeclinedExternalSetFromContext(ctx)
 	m, ok := set.Lookup(key)
 	if !ok {
@@ -246,7 +247,6 @@ func declinedExternalSkip(ctx context.Context, key, class, target string, cohort
 			slog.String("subsystem", "cache"),
 			slog.String("class", class),
 			slog.String("target", target),
-			slog.String("cohort", cohortLabel.String()),
 			slog.String("reason", reason),
 			slog.String("effect", "a fact the declined-external mark was taken under changed; the mark is "+
 				"retired and the cell is resolved (it may now be cacheable)"),

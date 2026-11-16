@@ -21,7 +21,7 @@ func TestIssue376_SeedSkipDecision_UsesGetNoTouch(t *testing.T) {
 	key := cache.ComputeKey(in)
 
 	hKW := &getRecordingHandle{}
-	if seedSkipDecision(context.Background(), seedModeKeepwarm, hKW, key, "widgets", "ns/kw", "") {
+	if seedSkipDecision(context.Background(), seedModeKeepwarm, hKW, key, "widgets", "ns/kw") {
 		t.Fatal("keepwarm: a MISS must not be skipped (must re-resolve)")
 	}
 	if !hKW.sawGetNoTouch(key) {
@@ -34,7 +34,7 @@ func TestIssue376_SeedSkipDecision_UsesGetNoTouch(t *testing.T) {
 	// seedModeBoot with an empty ctx → the declined-external set is nil → not Marked →
 	// the decision reaches the liveness read (now GetNoTouch).
 	hBoot := &getRecordingHandle{}
-	if seedSkipDecision(context.Background(), seedModeBoot, hBoot, key, "widgets", "ns/kw", "") {
+	if seedSkipDecision(context.Background(), seedModeBoot, hBoot, key, "widgets", "ns/kw") {
 		t.Fatal("boot: an unmarked MISS must not be skipped")
 	}
 	if !hBoot.sawGetNoTouch(key) || hBoot.sawGetTouch(key) {
@@ -48,6 +48,8 @@ func TestIssue376_SeedSkipDecision_UsesGetNoTouch(t *testing.T) {
 // with a fresh BornAt re-seats the cell (pop-A 24h self-heal). The reaper never cold-
 // evicts a warm cell, so this Get-path evict is the ONLY thing bounding it at maxAge.
 func TestIssue376_KeepwarmSweep_EvictsPastMaxAge_ThenReseatsFresh(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "3600")
@@ -66,12 +68,12 @@ func TestIssue376_KeepwarmSweep_EvictsPastMaxAge_ThenReseatsFresh(t *testing.T) 
 	// A WARM (SeededAtBoot) cell already past maxEntryAge (BornAt 48h ago). The reaper
 	// would KEEP this (warm → not cold-evicted, counted in warm_past_max_age), so the
 	// seed sweep's GetNoTouch is the only maxAge bound.
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: &in, SeededAtBoot: true, BornAt: time.Now().Add(-48 * time.Hour), CreatedAt: time.Now()})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: &in, SeededAtBoot: true, BornAt: time.Now().Add(-48 * time.Hour), CreatedAt: time.Now()})
 
 	evBefore := c.Stats().EvictMaxAgeTotal
 	missBefore := c.Stats().MissTotal
 
-	if seedSkipDecision(context.Background(), seedModeKeepwarm, c, key, "widgets", "ns/warmstale", "") {
+	if seedSkipDecision(context.Background(), seedModeKeepwarm, c, key, "widgets", "ns/warmstale") {
 		t.Fatal("#376 keep-evict: a past-maxAge cell must NOT be skipped — it must re-resolve")
 	}
 	if got := c.Stats().EvictMaxAgeTotal; got != evBefore+1 {
@@ -86,7 +88,7 @@ func TestIssue376_KeepwarmSweep_EvictsPastMaxAge_ThenReseatsFresh(t *testing.T) 
 
 	// Model the sweep's re-resolve + re-Put with a FRESH BornAt (zero → cold-fill now):
 	// the cell is re-seated within the cap and no longer evicts (pop-A self-heal).
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, SeededAtBoot: true, CreatedAt: time.Now()})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, SeededAtBoot: true, CreatedAt: time.Now()})
 	if _, ok := c.GetNoTouch(key); !ok {
 		t.Fatal("#376 keep-evict: after re-Put with a fresh BornAt the cell must be resident (not immediately re-evicted)")
 	}
@@ -99,6 +101,8 @@ func TestIssue376_KeepwarmSweep_EvictsPastMaxAge_ThenReseatsFresh(t *testing.T) 
 // read were a touching Get (it would stamp lastRead → the cell lands in warm_lastread,
 // defeating the gauge's "collapse toward ~0 on an unbrowsed cluster" purpose).
 func TestIssue376_WarmGauge_KeepwarmSweepLeavesNeitherBucket(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "20")
@@ -117,14 +121,14 @@ func TestIssue376_WarmGauge_KeepwarmSweepLeavesNeitherBucket(t *testing.T) {
 	// Non-seeded, body within TTL (age-skippable) but lastRead COLD (aged past TTL):
 	// Put old (lastRead=CreatedAt=-100s), ReplaceIfGen fresh (CreatedAt=-1s) inherits the
 	// old lastRead. In neither warm bucket (not seeded; lastRead age 100s > TTL 20s).
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: &in, CreatedAt: time.Now().Add(-100 * time.Second)})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"old"}`), Inputs: &in, CreatedAt: time.Now().Add(-100 * time.Second)})
 	gen := c.CaptureGen(key)
-	if !c.ReplaceIfGen(context.Background(), key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
+	if !c.ReplaceResolvedIfGen(context.Background(), fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"v":"fresh"}`), Inputs: &in, CreatedAt: time.Now().Add(-1 * time.Second)}, gen) {
 		t.Fatal("setup: ReplaceIfGen must succeed")
 	}
 
 	// The real keepwarm sweep reads via GetNoTouch and age-skips (young body) — no stamp.
-	if !seedSkipDecision(context.Background(), seedModeKeepwarm, c, key, "widgets", "ns/sweepcold", "") {
+	if !seedSkipDecision(context.Background(), seedModeKeepwarm, c, key, "widgets", "ns/sweepcold") {
 		t.Fatal("setup: a body-young cell must be keepwarm age-skipped (the sweep read happened via GetNoTouch)")
 	}
 	c.ReapPastMaxEntryAgeForTest()

@@ -66,6 +66,8 @@ func p3RefresherStat(name string) int64 {
 // --- F6f ---------------------------------------------------------------------
 
 func TestIssue354_P3_F6f_B3KeyShapeGaugesCountWarmCellsOnly(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := p3CacheEnv(t)
 	classes := map[string]string{
 		"restactions":             "restactions",
@@ -81,9 +83,9 @@ func TestIssue354_P3_F6f_B3KeyShapeGaugesCountWarmCellsOnly(t *testing.T) {
 		if !warm {
 			// COLD: the fill was read two TTLs ago (a cold fill stamps lastRead at
 			// its CreatedAt) and the refresh re-Put below inherits that lastRead.
-			c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-2 * c.ttl)})
+			c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-2 * c.ttl)})
 		}
-		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+		c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 		if warm {
 			if _, ok := c.Get(key); !ok { // a customer read stamps lastRead: WARM
 				t.Fatalf("PRE: Put cell not resident")
@@ -128,7 +130,8 @@ func TestIssue354_P3_StaleServeNoteCoversEveryCountedHit(t *testing.T) {
 		t.Fatal(err)
 	}
 	var hitBumpFns []string
-	getNotes := false
+	notes := map[string]bool{}
+	getDelegates := false
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
@@ -160,10 +163,17 @@ func TestIssue354_P3_StaleServeNoteCoversEveryCountedHit(t *testing.T) {
 				}
 				return true
 			})
-			if fd.Name.Name == "Get" && fd.Recv != nil {
+			// #1265: Get is GetReportingMiss folded to a bool, so the note may sit
+			// in either, as long as Get reaches it.
+			if (fd.Name.Name == "Get" || fd.Name.Name == "GetReportingMiss") && fd.Recv != nil {
 				ast.Inspect(fd.Body, func(n ast.Node) bool {
-					if id, ok := n.(*ast.Ident); ok && id.Name == "noteServeWhileDirty" {
-						getNotes = true
+					if id, ok := n.(*ast.Ident); ok {
+						switch {
+						case id.Name == "noteServeWhileDirty":
+							notes[fd.Name.Name] = true
+						case fd.Name.Name == "Get" && id.Name == "GetReportingMiss":
+							getDelegates = true
+						}
 					}
 					return true
 				})
@@ -174,7 +184,7 @@ func TestIssue354_P3_StaleServeNoteCoversEveryCountedHit(t *testing.T) {
 		t.Fatalf("SS: hit_total must be bumped ONLY in getCore (the customer Get funnel), found %v — a new customer "+
 			"hit path must go through Get, which notes a stale serve", hitBumpFns)
 	}
-	if !getNotes {
+	if !notes["Get"] && !(getDelegates && notes["GetReportingMiss"]) {
 		t.Fatalf("SS: ResolvedCacheStore.Get must call noteServeWhileDirty — every counted hit is a candidate stale serve")
 	}
 }

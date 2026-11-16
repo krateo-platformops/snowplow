@@ -5,18 +5,19 @@ package apiref
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jwtutil"
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"k8s.io/client-go/rest"
 )
 
@@ -26,7 +27,12 @@ type ResolveOptions struct {
 	AuthnNS string
 	PerPage int
 	Page    int
-	Extras  map[string]any
+	// Cursor (#874) — the data source's continuation token for THIS page (see
+	// widgets.ResolveOptions.Cursor). A cursor page is not a function of
+	// (perPage, page): it is resolved page-keyed, bypassing the Ship-4a
+	// full-list serve and the seed resolve memo (both keyed by page alone).
+	Cursor string
+	Extras map[string]any
 }
 
 // shouldServeRAFullList is the SINGLE gate for the Ship-4a page-independent
@@ -55,9 +61,9 @@ type ResolveOptions struct {
 // The nav-STRUCTURE harvest needs ONLY the widget's bounded page-1
 // resourcesRefs.items[] (child nav endpoints), NOT composition DATA, and has no
 // use for a serve-time page-independent slice cache. Excluding it here falls
-// straight through to the bounded page-keyed resolveRA(ctx, PerPage, Page) in
-// Resolve (perPage=prewarmPageLimit()=5, page=1) — the composition GVR is LISTed
-// bounded/informer-served (the #121 1a branch), never a 60K materialization.
+// straight through to the page-keyed resolveRA(ctx, PerPage, Page) in Resolve,
+// at the walk's own pagination for that widget (#966: the slice its ref
+// declares — the walk resolves and keys each cell with the same pagination).
 //
 // SCOPE-PRECISE, NOT a resource/scale special-case (feedback_no_special_cases):
 // the exclusion reads the EXISTING generic discovery-walk scope marker, so ANY
@@ -187,14 +193,20 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// errors.As. The wrapped chain also preserves the upstream
 		// message + adds a `apiref resolve <group>/<resource>/<name>`
 		// context prefix for log-side observability.
-		statusErr := statusErrorFromResponse(res.Err, opts.ApiRef)
+		statusErr := errorFromResult(res, opts.ApiRef)
+		// #1476 — a Forbidden for the ctx identity (objects.Get decided it)
+		// stays an expected per-identity deny on its way to the widget's log
+		// site. The mark unwraps, so the StatusError chain is unchanged.
+		if res.PerIdentityDenied {
+			statusErr = api.MarkPerIdentityDenied(statusErr)
+		}
 		wrapped := fmt.Errorf("apiref resolve %s/%s/%s: %w",
 			res.GVR.Group, res.GVR.Resource, opts.ApiRef.Name, statusErr)
 		// Falsifier slog WARN: the runtime artifact tester / observer
 		// uses to verify the StatusError chain is preserved. Single
 		// emission per apiref error — no per-request fan-out.
 		if log := xcontext.Logger(ctx); log != nil {
-			log.Warn("apiref.resolve.error_preserved",
+			log.WarnContext(ctx, "apiref.resolve.error_preserved",
 				slog.Int("upstream_code", res.Err.Code),
 				slog.String("upstream_reason", string(res.Err.Reason)),
 				slog.String("gvr_group", res.GVR.Group),
@@ -222,23 +234,33 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// declaration is visible at all. Bumping here makes the sink non-empty for the
 	// whole enclosing widget resolve, so the widget's Put declines.
 	//
-	// WHY THE DECLARATION AND NOT THE REFILTER ITSELF: the refilter's own bump
-	// (cache.BumpUAFTouched at the top of applyUserAccessFilterOnPig,
-	// internal/resolvers/restactions/api/refilter.go) is owned by another dev and
-	// DOES NOT EXIST YET ON THIS BRANCH — it lands on fix/1.12.3-authz-hardening
-	// and is a HARD TAG CONDITION for 1.12.3. Until it merges, the bump below is
-	// the ONLY one, which leaves the nested-chain case open — the blindness is
-	// asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild in this package,
-	// and the refilter's own marking by TestA4_RefilterBumpsUAFTouchedSink in
-	// internal/resolvers/restactions/api. The two bumps are COMPLEMENTARY, not
-	// duplicates, and both are wanted:
+	// THE DECLARATION LIMB, ONE OF TWO. The refilter has its own,
+	// execution-based bump (cache.BumpUAFTouched at the top of
+	// applyUserAccessFilterOnPig, internal/resolvers/restactions/api/refilter.go;
+	// TestA4_RefilterBumpsUAFTouchedSink pins that a refilter run marks the ctx
+	// it runs under). Both shipped
+	// in 1.12.3 (PR #173). The nested-chain case — a parent RA that declares
+	// nothing but consumes a UAF child — is invisible to THIS bump (pinned by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild in this package). What
+	// covers it depends on the shape:
+	//   - IN-PROCESS nesting (a direct apiserver path with `resolve: true`): the
+	//     child resolves under the outer resolve's ctx, so the refilter's bump
+	//     marks the outer sink.
+	//   - HTTP SELF-LOOPBACK (a named snowplow endpoint calling /call — TestM1's
+	//     fixture shape): the child is a separate request and the refilter's
+	//     bump marks only that request's sink. The outer Put is declined by the
+	//     external-touched gate instead (the dial bumps the ExternalTouchedSink),
+	//     except for a widget that opts into
+	//     krateo.io/external-cache-ttl-seconds, whose verdict turns an
+	//     external-only decline into a store.
+	// The two UAF bumps are COMPLEMENTARY, not duplicates, and both are wanted:
 	//   - THIS bump is declaration-based and fires whenever an apiRef'd RA
 	//     DECLARES a UAF stage — even if the refilter then narrows nothing (an
 	//     empty result set still means the body is requester-dependent), and even
 	//     if a future short-circuit skips the refilter for some input.
-	//   - THEIR bump is execution-based and fires wherever a refilter actually
-	//     runs, including chains this frame never sees (a nested RA→RA hop that
-	//     does not pass through apiref).
+	//   - THE REFILTER'S bump is execution-based and fires wherever a refilter
+	//     actually runs under this ctx, including an in-process nested RA→RA
+	//     hop that does not pass through apiref.
 	// Double-bumping is harmless: the gate reads Count()>0, never an exact count.
 	//
 	// No-op when no sink is installed on ctx (BumpUAFTouched is nil-safe), so
@@ -258,7 +280,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// dirty-mark). Dep recording is idempotent (sync.Map LoadOrStore), so a
 	// page-keyed resolve under the widget's own L1 key and an unpaginated
 	// resolve under the RAFullList key coexist safely.
-	resolveRA := func(rctx context.Context, perPage, page int) (map[string]any, error) {
+	//
+	// resolveRAEncoded also returns the exact bytes the Status map was decoded
+	// from (#883 F4: what the resolve memo stores); resolveRA drops them.
+	resolveRAEncoded := func(rctx context.Context, perPage, page int) (map[string]any, []byte, error) {
 		local := ra
 		local.Status = nil
 		raopts := restactions.ResolveOptions{
@@ -268,11 +293,27 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			PerPage: perPage,
 			Page:    page,
 			Extras:  opts.Extras,
+			// #874 — a non-empty cursor skips 4a (below), so it only ever
+			// reaches the page-keyed resolve of the requested page.
+			Cursor: opts.Cursor,
 		}
-		if _, rerr := restactions.Resolve(rctx, raopts); rerr != nil {
-			return nil, rerr
+		_, tree, exact, rerr := restactions.ResolveStatusTree(rctx, raopts)
+		if rerr != nil {
+			return nil, nil, rerr
 		}
-		return rawExtensionToMap(local.Status)
+		// #1079 — the RESTAction's filter output is already a Go tree; the
+		// bytes in Status.Raw were encoded from it a moment ago. When the tree
+		// is exactly what decoding those bytes yields, take it instead of
+		// re-parsing them (on run 20's refresher that decode was ~12% of all
+		// CPU). Otherwise decode, as always.
+		if exact {
+			return tree, local.Status.Raw, nil
+		}
+		return rawExtensionToMapEncoded(local.Status)
+	}
+	resolveRA := func(rctx context.Context, perPage, page int) (map[string]any, error) {
+		m, _, err := resolveRAEncoded(rctx, perPage, page)
+		return m, err
 	}
 
 	// #130 F4 — the RA-resolve memo. Installed on the boot-seed context
@@ -301,12 +342,26 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	l1Key := cache.L1KeyFromContext(ctx)
 
 	memo := cache.SeedResolveMemoFromContext(ctx)
+	if opts.Cursor != "" {
+		memo = nil // #874: the memo key has no cursor dimension
+	}
 	var memoKey string
 	var capBuf *[]cache.DepKey
 	var layerMark int
 	// #398 — the producing resolve's own sensitive-read sink (a child: every bump
 	// still reaches the caller's sink, so the caller's Put declines as before).
 	var memoSensitive *cache.SensitiveTouchedSink
+	// #912 N1 — the producing resolve's own Put-gate sinks (children: every bump
+	// still reaches the caller's sinks), so the memo stores what it recorded and
+	// a hit replays it.
+	var memoEffects *cache.PutGateCapture
+	// memoProduce is the miss's measurement-only in-flight record.
+	var memoProduce *cache.MemoProduce
+	// #1319 — the producing resolve's own stage outcomes (a child collector),
+	// stored with the memo entry; outcomesCtx is the caller's ctx, whose
+	// collector a hit (or the producer, when it returns) reports into.
+	var memoOutcomes *api.StageOutcomes
+	outcomesCtx := ctx
 	if memo != nil {
 		username, groups := identityForMemo(ctx)
 		memoKey = memo.Key(opts.ApiRef.Namespace, opts.ApiRef.Name,
@@ -316,12 +371,22 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// after the body was produced but before THIS resolve's entry is
 		// invisible to this resolve's own #375 Put-check, so a stale entry is a
 		// MISS here: fall through, resolve fresh, and storeMemo replaces it.
-		if body, deps, stamp, layers, ok := memo.LoadLayered(memoKey); ok {
+		if body, deps, states, stamp, layers, effects, ok := memo.LoadLayeredWithStates(memoKey, l1Key); ok {
+			// #912 N1 — a hit is indistinguishable from the resolve it replaces:
+			// replay what the producer recorded on the Put-gate sinks (stage
+			// errors, per-identity forbiddens, external touches and the declared-
+			// write mark, UAF refilters) onto THIS caller's sinks, so every Put rule
+			// judges the memo-served body exactly as it judged the producer's.
+			effects.Replay(ctx)
+			// #1319 — and report the producer's stage outcomes as this
+			// resolve's, so the widget cell the hitter stores (and its /call
+			// header) reads exactly what the producer's did.
+			api.ReplayStageOutcomes(ctx, effects.StageOutcomes)
 			// #277 / edge-3: replay the deps captured when this body was first
 			// produced onto THIS widget's L1 key, so a memo-served widget cell
 			// carries the same backing-GVR edges a real resolve would have
-			// recorded (else it goes stale on a backing mutation). Load returns
-			// a fresh deep copy; safe to hand straight back.
+			// recorded (else it goes stale on a backing mutation). Load decodes
+			// the stored bytes afresh (#883); safe to hand straight back.
 			//
 			// #411 C1: replay AS OF the entry's stamp, so this resolve's own
 			// Put-check judges the reused deps from when the body was produced,
@@ -329,13 +394,24 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			// [depEventSeq.Add → bucket stamp] window, where this resolve's
 			// startSeq already counts an event whose bucket stamp this Load
 			// did not yet see.
-			cache.Deps().ReplayEdgesAsOf(ctx, l1Key, deps, stamp)
+			//
+			// #765 B: and carry the producer's per-edge interest states, so a
+			// sibling narrows exactly when the producer did (a memo body is the
+			// same RESTAction output the producer's read set was derived for).
+			cache.Deps().ReplayEdgesAsOfWithStates(ctx, l1Key, deps, states, stamp, cache.ReplaySiteMemo)
 			// #406: the body is a slice of the raKey version(s) the producer sliced —
 			// carry them to THIS widget's Put too, so it is checked and recorded like
 			// the producer (the memo-HIT seed driver).
 			cache.ReplayRAFullListSlices(ctx, layers)
 			return body, nil
 		}
+		// MEASUREMENT ONLY: this miss's produce is in flight until Resolve
+		// returns. A produce of the same memo key starting meanwhile would
+		// have joined it, and counts as a would-join if the body this produce
+		// stores passes the memo's freshness rule when it ends
+		// (cache.SeedResolveMemo.BeginProduce). Nothing joins.
+		memoProduce = memo.BeginProduce(memoKey)
+		defer memoProduce.End()
 		layerMark = cache.LayeredSourcesMark(ctx)
 		// #277 / edge-3: open a capture over the PRODUCING block below so the
 		// deps recorded under l1Key (including edge-3 REPLAYED by the 4a fast
@@ -352,15 +428,26 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// sensitive read is never STORED in the memo (which also keeps the Secret
 		// out of the per-pass memo itself); every sibling re-resolves live.
 		ctx, memoSensitive = cache.WithSensitiveTouchedSink(ctx)
+		ctx, memoEffects = cache.WithPutGateEffectsCapture(ctx)
+		// #1319 — the producer reports into a child collector so the memo can
+		// store its outcomes; when this resolve returns, error or not, they are
+		// handed to the caller's collector exactly as a direct resolve would
+		// have reported them.
+		ctx, memoOutcomes = api.WithStageOutcomes(ctx)
+		defer func() { api.ReplayStageOutcomes(outcomesCtx, api.StorableStageOutcomes(memoOutcomes)) }()
 	}
 
-	// storeMemo deep-copies the resolved body (JSON-native round-trip, C-F4-3 —
-	// panics AT THIS SEAM on a non-JSON-native value rather than aliasing a bad
-	// value into the shared memo), closes the edge-3 capture, and records BOTH
-	// under memoKey so sibling widgets in the pass hit the body AND replay its
-	// deps. No-op when no memo is installed (nil memo / empty key). Called
-	// exactly once per resolve.
-	storeMemo := func(out map[string]any) {
+	// storeMemo stores the resolved body ENCODED (#883 F4), closes the edge-3
+	// capture, and records BOTH under memoKey so sibling widgets hit the body AND
+	// replay its deps. `encoded` is the RESTAction's own encoded result — the
+	// bytes `out` was decoded from — when the caller has them (the page-keyed
+	// resolve), so a hit is the miss path's decode of the miss path's bytes. The
+	// Ship 4a serve hands nil (its body is a Go-slice of a decoded full list) and
+	// the body is encoded here. Either way a hit decodes once, with the decoder
+	// the miss path uses, and the memo holds no decoded tree between hits. No-op
+	// when no memo is installed (nil memo / empty key). Called exactly once per
+	// resolve.
+	storeMemo := func(out map[string]any, encoded []byte) {
 		if memo == nil || memoKey == "" || out == nil {
 			return
 		}
@@ -381,7 +468,22 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 				deps = append(deps, raDep)
 			}
 		}
-		memo.StoreLayered(memoKey, pmaps.DeepCopyJSON(out), deps, memoStamp, cache.LayeredSourcesSince(ctx, layerMark))
+		// #765 B (C2): snapshot the producer's per-edge interest states HERE —
+		// after the producing restactions.Resolve returned, so its commit (deferred
+		// inside Resolve) has settled every edge it recorded.
+		states := cache.Deps().EdgeNarrowStates(l1Key, deps)
+		if encoded == nil {
+			b, err := json.Marshal(out)
+			if err != nil {
+				return // not encodable: never memoise a body a hit could not reproduce
+			}
+			encoded = b
+		}
+		memoProduce.Produced(deps, memoStamp) // measurement only: what a joiner would have taken
+		effects := memoEffects.Effects()
+		effects.StageOutcomes = api.StorableStageOutcomes(memoOutcomes) // #1319
+		memo.StoreLayeredWithStates(memoKey, l1Key, encoded, deps, states, memoStamp, cache.LayeredSourcesSince(ctx, layerMark),
+			effects)
 	}
 
 	// Ship 4a (0.30.198) — page-independent RAFullList serve at the apiRef
@@ -390,22 +492,22 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// full list, shared across pages AND widgets. On a miss / not-cleanly-
 	// sliceable shape it transparently falls back to today's page-keyed resolve
 	// below — NEVER a wrong result.
-	if shouldServeRAFullList(ctx, opts.PerPage, opts.Page) {
+	if opts.Cursor == "" && shouldServeRAFullList(ctx, opts.PerPage, opts.Page) {
 		if served, ok, serr := raFullListServe(ctx, res.GVR, opts.ApiRef.Namespace,
 			opts.ApiRef.Name, &ra, opts.PerPage, opts.Page, opts.Extras, resolveRA); serr != nil {
 			return map[string]any{}, serr
 		} else if ok {
-			storeMemo(served)
+			storeMemo(served, nil)
 			return served, nil
 		}
 		// served=false, no error — fall through to the page-keyed resolve.
 	}
 
-	out, err := resolveRA(ctx, opts.PerPage, opts.Page)
+	out, encoded, err := resolveRAEncoded(ctx, opts.PerPage, opts.Page)
 	if err != nil {
 		return map[string]any{}, err
 	}
-	storeMemo(out)
+	storeMemo(out, encoded)
 	return out, nil
 }
 

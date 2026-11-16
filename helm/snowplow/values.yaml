@@ -4,7 +4,8 @@
 # needed to run the cache-enabled fork at 50K-composition scale:
 #   - image points at ghcr.io/krateo-platformops/snowplow
 #   - resources pre-sized for informer + in-process cache + GC headroom
-#   - env carries GOMEMLIMIT/GOGC for cgroup-aware GC
+#   - no GOMEMLIMIT/GOGC in env: snowplow derives its Go soft memory limit
+#     from the container's cgroup memory limit and runs the default GOGC
 #   - envFrom picks up the external snowplow-api-override ConfigMap
 #     (managed by the portal blueprint) in addition to the chart's
 #     own snowplow ConfigMap
@@ -105,6 +106,29 @@ rbac:
   # - viewers
   impersonateServiceAccounts: []
 
+# #1334 — the public identity. OFF by default.
+#
+# When enabled, a request that carries NO Authorization header is served as user
+# krateo:public with the single group system:unauthenticated. snowplow has no
+# credential for it and acts for it only by impersonation, so this value also
+# renders the ClusterRole rule that permits exactly that: impersonate on users
+# [krateo:public] and groups [system:unauthenticated], by resourceNames. With
+# system:unauthenticated impersonated the apiserver adds no
+# system:authenticated, so the identity reaches only RoleBindings naming the
+# USER krateo:public plus what any anonymous caller of the apiserver already
+# has. Grant a page by binding a Role (get + resourceNames on its widgets and
+# RESTActions) to that user; never bind a group for it.
+#
+# A request with any Authorization header (expired, invalid, revoked, ...) is
+# never served as the public identity: it is refused 401 as before. Set this
+# value, never env.PUBLIC_IDENTITY_ENABLED (the chart refuses that key).
+#
+# REQUIRES THE CACHE: snowplow enables the impersonation only with the cache on,
+# so the chart refuses enabled: true unless env.CACHE_ENABLED is "true" (or "1"
+# / "yes"). With the cache off every token-less request would be 503.
+publicIdentity:
+  enabled: false
+
 podAnnotations: {}
 podLabels: {}
 
@@ -152,6 +176,11 @@ ingress:
 #     attempts OOMed because GOMEMLIMIT was set >= container limit and
 #     the runtime never saw memory pressure. Validate at 50K under
 #     Phase-6 load before treating this as the new baseline.
+#   - Run 23 follow-up (runtime default GOGC + cgroup memory limit): the soft
+#     limit is no longer hand-set: snowplow reads its cgroup memory limit at
+#     startup and sets 7/8 of it (7 GiB under this 8Gi limit), so it moves
+#     with resources.limits.memory by itself. env.GOMEMLIMIT, if set, still
+#     wins.
 resources:
   limits:
     cpu: 4
@@ -200,7 +229,10 @@ livenessProbe:
   timeoutSeconds: 5
   failureThreshold: 6
 
-# Readiness probe: /readyz flips to 200 once Phase1Done is set. As of
+# Readiness probe: /readyz flips to 200 once Phase1Done is set AND the RBAC
+# snapshot is complete, i.e. all four RBAC informers have synced (#1231; no
+# timer decides this, liveness above does not read it, and with the cache off
+# there are no RBAC informers to wait for). As of
 # 1.5.29 (shape A prewarm-gated readiness) Phase1Done is set AFTER the
 # per-cohort prewarm seed completes (or its pipGlobalTimeout backstop, ~8min),
 # NOT merely at informer-sync — so the pod is withheld from Service endpoints
@@ -263,16 +295,20 @@ env:
   # verbose logs + HTTP request tracing.
   BLIZZARD: "false"
   JQ_MODULES_PATH: /jq-modules
-  # Go runtime: trigger proactive GC at 7 GiB so we stay under the
-  # 8 Gi cgroup limit (~1 GiB headroom). Stress test peak was 3.9 GB at
-  # 1000 users.
-  # Must be BELOW the container memory limit (8 Gi) so the Go runtime
-  # backpressures via GC before Linux OOM-kills the pod. Setting this
-  # at or above the container limit is a misconfiguration that has
-  # caused OOM-kill incidents.
-  GOMEMLIMIT: 7GiB
-  # Lower GOGC (default 100) trades ~1% CPU for tighter memory headroom.
-  GOGC: "50"
+  # Go GC: neither GOMEMLIMIT nor GOGC is set here, on purpose.
+  #   - Soft memory limit: snowplow reads the container's cgroup memory limit
+  #     at startup (v2 memory.max / v1 memory.limit_in_bytes) and sets 7/8 of
+  #     it, leaving 1/8 for memory outside the heap goal (run 23 measured
+  #     ~1 GiB of it in an 8 GiB container). Under resources.limits.memory=8Gi
+  #     that is 7 GiB, and it follows the limit when you change it. Setting
+  #     GOMEMLIMIT here overrides the derivation; it must then stay BELOW the
+  #     container limit, or Linux OOM-kills the pod before the GC
+  #     back-pressures (a past incident).
+  #   - GOGC: the runtime default (100). The old GOGC=50 was not "~1% CPU":
+  #     paired run 23 (50K compositions x 1000 users, 4 cores) measured GC at
+  #     ~40% of CPU and GC assist at 28% of customer-path CPU under it.
+  # The effective values are on /debug/vars (snowplow_go_runtime) and OTLP
+  # (snowplow_go_gc_percent, snowplow_go_memory_limit_bytes).
   CACHE_ENABLED: "true"
   # #367 — boot-time backing for the DARK v7 shadow-parity measurement. DEFAULT
   # OFF: leave "false" for normal operation and for any latency-acceptance window.
@@ -311,16 +347,18 @@ env:
   # http://otel-collector-daemonset-opentelemetry-collector.<ns>.svc.cluster.local:4318
   # and $(HOST_IP) simply goes unused.
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://$(HOST_IP):4318"
-  # SAMPLER FAMILY — read before changing. "traceidratio" makes snowplow's
-  # OWN root decision. NOT "parentbased_traceidratio": snowplow sits behind
-  # the agent gateway whose tracing policy samples 100% and propagates
-  # sampled=1, so a parent-based sampler would span 100% of customer
-  # /call — exactly the traffic the ratio is meant to bound. Trade: 5%
-  # complete end-to-end traces + 95% gateway-only traces, partial BY
-  # DESIGN. The SDK default with no sampler is 100%, so these two ship
-  # together with OTEL_ENABLED — never flip one without the other.
-  OTEL_TRACES_SAMPLER: "traceidratio"
-  OTEL_TRACES_SAMPLER_ARG: "0.05"
+  # SAMPLER — read before changing (#1013, Diego's ruling 2026-10-30). The
+  # platform API SLIs (availability, p95) are computed over snowplow's
+  # Server spans and are COUNTS, so every request's span must be kept:
+  # "parentbased_always_on" samples every root span (no traceparent) and
+  # follows the parent's sampled flag otherwise. Behind the agent gateway
+  # (randomSampling "100", propagates sampled=1) that is 100% of requests.
+  # Once the gateway samples at its edge (installer#402) a dropped request
+  # arrives with sampled=0 and gets NO snowplow span; see
+  # internal/tracing/tracing.go SAMPLING for the three remedies. No
+  # OTEL_TRACES_SAMPLER_ARG: parentbased_always_on takes none. Installer
+  # override: componentValues.snowplow.env.OTEL_TRACES_SAMPLER.
+  OTEL_TRACES_SAMPLER: "parentbased_always_on"
   # Explicit override DOWN from the master: the collector agent's logs
   # pipeline accepts filelog only (no OTLP logs receiver), so an OTLP log
   # export has no consumer. Logs stay stdout → filelog as for every other
@@ -413,12 +451,6 @@ env:
   #
   # Set to "0" to disable (UAF cells then use the standard TTL).
   UAF_RESOLVED_TTL_SECONDS: "300"
-  # 1.12.6 C2 — relist delta bridge: how long the bridge waits for a
-  # schema-relisted informer to sync before giving up (it then enqueues
-  # nothing; relist_bridge_timeout_total counts it and the 1.12.5 post-sync
-  # re-fire keeps covering the window). Matches the re-fire's own 2-minute
-  # wait. String (installer plumbing is string-only); unset/unparseable → 120.
-  DEPS_RELIST_BRIDGE_TIMEOUT_SECONDS: "120"
   # 1.12.6 C3 — the sampled reconcile audit (deps_reconcile.go): every
   # DEPS_RECONCILE_PERIOD_SECONDS, sample DEPS_RECONCILE_SAMPLE resident L1
   # entries, probe each entry's own object against the informer indexer and

@@ -10,14 +10,16 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// The four GVR-lifecycle dirty-mark handlers are CRD add, CRD delete, schema relist
-// and store repair. Each fires INSIDE a resolve's [read, Put] window, and the
+// The GVR-lifecycle dirty-mark handlers are CRD add and CRD delete (#870 deleted the
+// schema-relist and store-repair ones: both swap the store in and mark only M). Each fires INSIDE a resolve's [read, Put] window, and the
 // resolve's accepted Put must remark. Its type-level mark can be consumed while the
 // key is not resident (skipped_no_entry), which is exactly the #375 race. The arm
 // covers a warm LIST bucket, a warm exact bucket (skipped for CRD_ADD, which is
 // LIST-only by contract) and a COLD LIST bucket (reached via the GVR floor).
 // RED on the pre-ruling tree. NEUTER: drop the bumpResourceTypeGen calls.
 func TestIssue375_TypeLevelDirtyMarkInsideWindow_Remarks(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	type src struct {
 		name     string
 		fire     func(d *DepTracker, g schema.GroupVersionResource) int
@@ -26,8 +28,6 @@ func TestIssue375_TypeLevelDirtyMarkInsideWindow_Remarks(t *testing.T) {
 	for _, s := range []src{
 		{"CRD_ADD", (*DepTracker).OnResourceTypeAvailable, true},
 		{"CRD_DELETE", (*DepTracker).OnResourceTypeRemoved, false},
-		{"SCHEMA_RELIST", (*DepTracker).OnResourceTypeSchemaRelisted, false},
-		{"STORE_REPAIR", (*DepTracker).OnResourceTypeStoreRepaired, false},
 	} {
 		t.Run(s.name, func(t *testing.T) {
 			c, rl, _ := setup375(t)
@@ -57,7 +57,7 @@ func TestIssue375_TypeLevelDirtyMarkInsideWindow_Remarks(t *testing.T) {
 					continue
 				}
 				Deps().Record(o.ctx, cs.key, g375A, "ns", cs.name)
-				if !c.PutIfGen(o.ctx, cs.key, body375(`{}`), o.gen0) {
+				if !c.putIfGen(o.ctx, cs.key, body375(`{}`), o.gen0) {
 					t.Fatalf("setup: PutIfGen refused")
 				}
 				if got := rl.count(cs.key); got != 1 {

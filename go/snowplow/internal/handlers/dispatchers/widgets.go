@@ -1,7 +1,6 @@
 package dispatchers
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,9 +11,11 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/maps"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/client-go/rest"
 )
 
@@ -46,7 +47,17 @@ var _ http.Handler = (*widgetsHandler)(nil)
 func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// #443 (j) ingest — FIRST, before observeLiveCaller and the L1 key mint.
 	req = reseedInertFromHeaders(req)
+	req = reseedBackgroundFromHeaders(req) // #903
+	// #871 — measurement only: the dispatch's work class (customer, or a
+	// demand revalidation's fill_bg, or a background caller's class across a
+	// self-loopback) as a pprof label on req's context and goroutine.
+	req, endWork := beginServeWorkClass(req)
+	defer endWork()
 	start := time.Now()
+	// #1265 P0 — one serve outcome per top-level customer call (counter +
+	// header). First, so the inline-object 400 below counts as refused.
+	serve, serveEnd := beginCustomerServe(wri, req, serveHandlerWidgets)
+	defer serveEnd()
 
 	// #443 part 2 — an inline object is a RESTAction only. BodyExtrasDecode
 	// already refuses one addressed at the widgets group; this is the
@@ -113,8 +124,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// dispatch by EvaluateRBAC. Cache=off skips the gate — fetchObject
 	// already ran per-user against apiserver.
 	if !cache.Disabled() {
-		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured.GetNamespace()) {
-			log.Warn("widget dispatch denied by EvaluateRBAC",
+		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured) {
+			log.WarnContext(req.Context(), "widget dispatch denied by EvaluateRBAC",
 				slog.String("gvr", got.GVR.String()),
 			)
 			response.Encode(wri, response.New(http.StatusForbidden,
@@ -148,7 +159,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 				writeResolvedJSON(wri, encoded)
 				return
 			}
-			response.Encode(wri, response.New(http.StatusLoopDetected,
+			response.Encode(wri, credhttp.FailureStatus(http.StatusLoopDetected,
 				fmt.Errorf("nested resolve depth limit exceeded (%d) for %s/%s/%s over HTTP self-loopback",
 					cache.NestedCallMaxDepth(), got.GVR.Resource,
 					got.Unstructured.GetNamespace(), got.Unstructured.GetName())))
@@ -215,13 +226,29 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			perPage, page, keyExtras)
 		if contentHandle != nil {
 			if entry, ok := contentHandle.Get(contentKey); ok {
-				if gated, served := gateWidgetEnvelope(req.Context(), entry.RawJSON); served {
+				gated, served, fillServedView := gateNotingServedView(req.Context(), entry, func() ([]byte, bool) {
+					return gateWidgetEnvelope(req.Context(), entry.RawJSON)
+				})
+				if served {
 					cache.RecordApiserverFallthrough(req.Context(),
 						cache.ReasonWidgetContentHit, got.GVR.String())
 					emitResolvedCacheLookup(log, "widgetContent", got.GVR.String(),
 						contentKey, true, entry.SeededAtBoot, len(gated))
 					pcs.l1Hit = "content-hit"
 					setRefreshKeyHeader(wri, contentKey, "widgetContent")
+					// #1324 — the GATED bytes this requester is served, not the shared shell.
+					// #1430 — and that digest is what this identity's next arm compares.
+					stampRefreshDigest(wri, func() string {
+						d := cache.AnswerDigest(gated, entry.StageOutcomes)
+						fillServedView(d)
+						return d
+					})
+					// #1319 — the outcomes the walker's resolve stored with the shell.
+					setWidgetStageOutcomesHeader(wri, entry.StageOutcomes)
+					// #1062 — an armed hit on a dirty shared shell is an l1 stale
+					// serve, timed until its replacing frame is written.
+					cache.NoteStaleHit(req.Context(), contentKey, entry, staleSubjectOf)
+					serve.servedCell(contentKey, entry)
 					writeResolvedJSON(wri, gated)
 					// #547 (owner ruling) — a KNOWN-STALE shared shell is SERVED
 					// instantly (counted in the Get funnel) and revalidated in the
@@ -269,8 +296,10 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// shared "" cell to a different ""-deriving identity (cross-identity read of
 	// a cell resolved under someone else's narrowing). Sibling of FIX-C's
 	// populate-side skip; uniform predicate (serveFromCacheEligible, helpers.go).
+	lookupMiss := cache.LookupAbsent
 	if !demand && cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
-		if entry, ok := cacheHandle.Get(cacheKey); ok {
+		var entry *cache.ResolvedEntry
+		if entry, lookupMiss = l1Get(req.Context(), cacheHandle, cacheKey); lookupMiss == cache.LookupHit {
 			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			// #444 — the requester joins the cell's representative pool (the
 			// refresher's replacement if the recorded representative drifts).
@@ -286,8 +315,11 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// never fire. entry.ExternalTTL is false for every normal entry →
 			// byte-identical header behavior when the feature is off (C4).
 			setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", entry.ExternalTTL)
-			staleHitWritePoint(cacheKey, entry) // #710 PR-2b
+			stampRefreshDigest(wri, entry.ContentDigest)                           // #1324: the cell is served verbatim
+			setWidgetStageOutcomesHeader(wri, entry.StageOutcomes)                 // #1319: the outcomes stored with the cell
+			staleHitWritePoint(req.Context(), cacheKey, entry, !entry.ExternalTTL) // #710 PR-2b; #1062 armed unless external-TTL
 			noteStaleWrite(cacheKey, entry.StaleDerived, !entry.ExternalTTL)
+			serve.servedCell(cacheKey, entry)
 			writeResolvedJSON(wri, entry.RawJSON)
 			// #547 — served (zero cold navigation); if the cell is KNOWN-STALE,
 			// revalidate it on demand under this requester, detached.
@@ -301,6 +333,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, false, false, 0)
 		pcs.l1Hit = "miss"
 	}
+	serve.servedLive(coldCauseOfLookup(req.Context(), cacheHandle, cacheInputs, lookupMiss))
 
 	// #189 — capture the widget key's generation BEFORE the resolve below, so the
 	// tail PutIfGen (main per-user-fallback branch) refuses rather than
@@ -333,9 +366,10 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if cacheKey != "" {
 		ctx = cache.WithL1KeyContextFromEpoch(ctx, cacheKey, depEpoch, cache.DepKey{
 			GVR: got.GVR, Namespace: got.Unstructured.GetNamespace(), Name: got.Unstructured.GetName()})
+		defer cache.Deps().ReleaseUnstored(ctx, cacheKey) // #890/#893 — see restactions.go
 		// #710 PR-2b — armable response: its resolve may be served a known-stale
 		// content cell at once (D2); see restactions.go.
-		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "widgets")
+		ctx, staleSink = cache.WithStaleServeSink(ctx, cacheKey, "widgets", staleSubjectOf(ctx))
 	}
 	// #83 Option A — seed THIS top-level widget as an ancestor of the
 	// nested-resolve descent BEFORE resolving (symmetric with restactions.go).
@@ -371,6 +405,11 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// widget→apiref→RA ctx inheritance (context.WithValue is preserved down
 	// the resolve chain). Additive to the stage-error sink.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
+	// The dispatched CR was fetched before this sink existed: a fetch that left
+	// snowplow under the requester's credential marks it now (objects.Result).
+	if got.RequesterDialled {
+		extTouchedSink.Bump()
+	}
 	// #398 — sensitive-resource sink: a resolve that dispatched a core
 	// v1/secrets read must not be persisted by any resolved-output Put.
 	ctx, _ = cache.WithSensitiveTouchedSink(ctx)
@@ -395,6 +434,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// changes no verdict, served byte, or cache key.
 	ctx = installShadowParityWidget(ctx, got.Unstructured.Object)
 
+	// #1319 — the widget's apiRef RESTAction reports its per-stage outcomes
+	// here (its top-level resolve claims the collector; a full-list slice or a
+	// memo entry served without a resolve replays the stored ones). The header
+	// is set before the error branch, as on a RESTAction /call, and only when a
+	// stage did not succeed; the Puts below keep the same value on the cell.
+	ctx, outcomes := api.WithStageOutcomes(ctx)
 	res, err := widgetsResolveFn(ctx, widgets.ResolveOptions{
 		In:      got.Unstructured,
 		RC:      r.saRC,
@@ -403,16 +448,28 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		Page:    page,
 		Extras:  extras,
 	})
+	stageOutcomes := storableStageOutcomes(outcomes)
+	setWidgetStageOutcomesHeader(wri, stageOutcomes)
 	if err != nil {
-		log.Error("unable to resolve widget", slog.Any("err", err))
-		var statusErr *apierrors.StatusError
-		if errors.As(err, &statusErr) {
-			code := int(statusErr.Status().Code)
-			msg := fmt.Errorf("%s", statusErr.Status().Message)
-			response.Encode(wri, response.New(code, msg))
+		// #1116 — the request's extras name a key the widget's apiRef
+		// RESTAction writes itself: the same 400 a RESTAction /call answers,
+		// naming the keys. Rendered before the ERROR line below: the refusal
+		// is a client error, already logged once at WARN where it was decided
+		// (api.RefuseReservedExtras), and nothing was read or dialled, so
+		// there is no stale-derived pass to withdraw.
+		if isReservedExtrasRefusal(err) {
+			serve.refused() // #1265 — refused before anything was read: not a cold serve
+			WriteReservedExtrasRefusal(wri, err)
 			return
 		}
-		response.InternalError(wri, err)
+		// #905 (c) — a stale-derived pass's error is withdrawn and re-run fresh
+		// (twin of restactions.go).
+		if staleWritePoint(r, wri, req, staleSink, false, nil) {
+			return
+		}
+		log.ErrorContext(ctx, "unable to resolve widget", slog.Any("err", err))
+		// #853 — the CR exists; a dependency's 404 is answered 424.
+		encodeWidgetResolveError(ctx, wri, err)
 		return
 	}
 
@@ -420,7 +477,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if traceId != "" {
 		err := maps.SetNestedField(res.Object, traceId, "status", "traceId")
 		if err != nil {
-			log.Warn("unable to set traceId in status", slog.Any("err", err))
+			log.WarnContext(ctx, "unable to set traceId in status", slog.Any("err", err))
 		}
 	}
 
@@ -441,9 +498,11 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		)
 	}
 
+	enc := slowcall.Start(ctx, slowcall.PhaseEncode) // #1054
 	encoded, err := encodeResolvedJSON(res)
+	enc.End()
 	if err != nil {
-		log.Error("unable to encode widget response", slog.Any("err", err))
+		log.ErrorContext(ctx, "unable to encode widget response", slog.Any("err", err))
 		response.InternalError(wri, err)
 		return
 	}
@@ -481,13 +540,18 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// #424 — identity-class re-check FIRST (see restactions.go): a requester
 	// whose RBAC class moved mid-resolve must not write into the pre-resolve
 	// key. Ahead of the external-TTL branch too, since that branch also writes.
+	// The widget's opt-in external-TTL cache (krateo.io/external-cache-ttl-seconds),
+	// an input of its Put-gate verdict below (WithExternalTTL).
+	extTTL := externalCacheTTLFromAnnotations(got.Unstructured)
 	if cache.Inert(ctx) {
 		// #443 (g), widget twin — a widget reached by an inert (dry-run)
 		// self-loopback hop skips the whole Put chain, decline counters
 		// included, exactly like the RESTAction handler.
 		log.Debug("Widget resolved inert (dry run); nothing persisted")
 	} else if cache.DeclineSensitivePut(ctx) {
-		// #398 — see restactions.go: a Secret-bearing envelope is never persisted.
+		// #398 — see restactions.go: a Secret-bearing envelope is never persisted,
+		// and (#1255) an older cell of this key is evicted.
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableSensitive)
 		log.Debug("Widget resolve read a sensitive resource; declining to cache",
 			slog.String("key_hash", cacheKey),
 			slog.String("effect", "envelope served (200); not persisted — Secret reads are always live (#398)"),
@@ -500,6 +564,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.String("effect", "envelope served (200) for this requester; not persisted under the pre-resolve key (#424)"),
 		)
 	} else if declineWidgetUAFPut(cacheInputs, uafTouchedSink) {
+		// #1255 — see restactions.go: an older cell of this key is evicted.
+		evictUnstorable(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), cacheKey, cache.UnstorableUAF)
 		// DEBUG, not WARN: on a portal rendering UAF-backed widgets this fires on
 		// essentially every /call, and LOG_LEVEL=warn is the production floor.
 		// snowplow_widgets_uaf_put_declined_total carries the rate.
@@ -508,17 +574,53 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.String("uaf_reason", uafDeclineObserved),
 			slog.String("effect", "envelope served (200) narrowed for THIS requester; not persisted — the widgets cell is keyed per BINDING, so a co-bound user would be served these rows verbatim (1.12.3 A-1/R-1; 1.13.0 folds the UAF scope into the key)"),
 		)
-	} else if stageErrSink.Count() > 0 && !cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, "widgets") {
-		// #681 — a denial-only envelope is cached below (twin of restactions.go).
-		// A bare decline, twin of restactions.go: the partial envelope is
-		// SERVED (written below) and not persisted. 1.12.6 C9 retired the D
-		// bounded-partial Put that used to sit here (PARTIAL_RESULT_TTL_SECONDS).
-		log.Warn("Widget served with per-item stage error(s); declining to cache the partial result",
-			slog.Int64("stage_errors", stageErrSink.Count()),
-			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
-		)
-	} else if extTTL := externalCacheTTLFromAnnotations(got.Unstructured); cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 && extTTL > 0 &&
-		cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
+	} else if verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, "widgets").WithExternalTTL(extTTL > 0); !verdict.Store() {
+		// The shared Put-gate verdict (cache.PutGateVerdict), twin of
+		// restactions.go, with the widget's opt-in external-TTL cache applied
+		// (WithExternalTTL: it turns an external-ONLY decline into a store, and
+		// never a declared write (#915), a stage error, or a touch that carried
+		// anything of the requester (#1221)). Every decline ends
+		// here; the reason only picks the log line and the counter.
+		// #1255 — a PERMANENT decline also evicts an older cell of this key (see
+		// restactions.go); a transient one keeps it.
+		evictOnPermanentDecline(ctx, dispatchEvicter(ctx, cacheHandle, cacheKey, cacheInputs), verdict, cacheKey)
+		switch verdict.Reason() {
+		case cache.PutReasonDeclaredWrite:
+			// DEBUG: designed, and it fires on every /call of such a widget.
+			log.Debug("Widget's RESTAction declares a write stage; declining to cache",
+				slog.String("effect", "envelope served (200); not persisted — every /call runs its write (#903 F1)"),
+			)
+		case cache.PutReasonExternal:
+			// #681 C2: an own-credential apiserver 403 is not an external touch.
+			// External-no-cache (proposal 2026-06-22) — the widget's resolve
+			// touched a genuine external endpoint (e.g. an external apiRef RA) and
+			// did NOT opt in (default OFF). Serve the envelope but DECLINE the Put +
+			// the dep Record (no informer edge can invalidate external data).
+			// Re-fetched live on every /call. Byte-identical to pre-Option-A.
+			cache.BumpExternalSkippedPut()
+			log.WarnContext(ctx, "Widget touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
+				slog.Int64("external_touches", extTouchedSink.Count()),
+				slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
+			)
+		case cache.PutReasonStageError:
+			// #681 — a denial-only envelope is cached below (twin of restactions.go).
+			// A bare decline, twin of restactions.go: the partial envelope is
+			// SERVED (written below) and not persisted. 1.12.6 C9 retired the D
+			// bounded-partial Put that used to sit here (PARTIAL_RESULT_TTL_SECONDS).
+			log.WarnContext(ctx, "Widget served with per-item stage error(s); declining to cache the partial result",
+				slog.Int64("stage_errors", stageErrSink.Count()),
+				slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
+			)
+		default:
+			// Any other decline: today only cache.PutReasonUnobserved, a verdict
+			// over Put-gate sinks that were not all installed on the resolve. It
+			// admits nothing (#912 delta-3 item 3); never read as another reason.
+			slog.Default().WarnContext(ctx, "resolve declined by the Put-gate verdict; declining to cache",
+				slog.String("reason", string(verdict.Reason())),
+				slog.String("effect", "body served; not persisted"),
+			)
+		}
+	} else if verdict.ExternalTTL() && cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
 		// External-widget bounded-TTL cache (Option A, 2026-07-10) — the
 		// widget's resolve touched a genuine external endpoint AND the widget
 		// CR opted in via the `krateo.io/external-cache-ttl-seconds` annotation
@@ -563,19 +665,29 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// external widget whose RA also reads K8s is dirty-marked through its
 			// inner-call edge, so a post-mark re-Put must end KNOWN-STALE — in the
 			// write's own critical section (#734).
-			cacheHandle.PutEndingKnownStale(ctx, cacheKey, &cache.ResolvedEntry{
-				RawJSON:     encoded,
-				Inputs:      cacheInputs,
-				TTLOverride: extTTL,
-				ExternalTTL: true,
+			put := cacheHandle.PutResolvedEndingKnownStale(ctx, verdict, cacheKey, &cache.ResolvedEntry{
+				RawJSON:       encoded,
+				Inputs:        cacheInputs,
+				TTLOverride:   extTTL,
+				ExternalTTL:   true,
+				StageOutcomes: stageOutcomes, // #1319
 			})
+			// #1321 B1 — this response arms nothing, but the key is the per-binding
+			// widgets key, which an earlier non-external serve of the same widget
+			// stamped. A tab still armed on it from then is told when this write
+			// changed the bytes, like after every other write of an armable cell. A
+			// no-op when nothing is armed on the key.
+			publishIfSubscribed(cacheKey, put)
 		}
 		log.Info("Widget touched an external endpoint; caching with bounded external TTL (opt-in annotation)",
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("external_ttl", extTTL.String()),
-			slog.String("effect", "body served (200) + persisted under the per-binding widgets key with TTLOverride; served from L1 for <=TTL then re-fetched live; NO dep-Record, NO publish, NO /refreshes arm"),
+			slog.String("effect", "body served (200) + persisted under the per-binding widgets key with TTLOverride; served from L1 for <=TTL then re-fetched live; NO dep-Record, NO /refreshes arm (a change is announced only to a tab already armed on the key)"),
 		)
-	} else if cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 {
+	} else if verdict.ExternalTTL() {
+		// Opted in, but this request's key may not populate the shared cell
+		// (no handle / no key / the #95 "" BindingUID collapse): decline as the
+		// external touch it is.
 		// #681 C2: an own-credential apiserver 403 is not an external touch.
 		// External-no-cache (proposal 2026-06-22) — the widget's resolve
 		// touched a genuine external endpoint (e.g. an external apiRef RA) and
@@ -583,7 +695,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// the dep Record (no informer edge can invalidate external data).
 		// Re-fetched live on every /call. Byte-identical to pre-Option-A.
 		cache.BumpExternalSkippedPut()
-		log.Warn("Widget touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
+		log.WarnContext(ctx, "Widget touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
 		)
@@ -603,7 +715,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// (their supplied extras are all declared, or they send none). Placed BEFORE
 		// the genuine-Put branch so a polluting request cannot fall into it.
 		bumpWidgetSkippedUndeclaredExtrasPut()
-		log.Warn("Widget request carried extras not declared in spec.keyExtras; declining to cache (would pollute the shared per-cohort cell post-F6)",
+		log.WarnContext(ctx, "Widget request carried extras not declared in spec.keyExtras; declining to cache (would pollute the shared per-cohort cell post-F6)",
 			slog.String("effect", "body served (200) under this request's own extras; not persisted — a co-cohort request without these extras must not be served this extras-shaped body"),
 		)
 	} else if cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
@@ -663,13 +775,14 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			cacheInputs.HasUAF = true
 		}
 		noteCustomerPut(cacheKey, "putifgen", staleSink.StaleDerived())
-		if cacheHandle.PutIfGen(ctx, cacheKey, &cache.ResolvedEntry{
-			RawJSON:      encoded,
-			Inputs:       cacheInputs,
-			TTLOverride:  uafTTLOverrideForEntry(cacheInputs),
-			StaleDerived: staleSink.StaleDerived(), // #710 PR-2b
-		}, cacheGen0) {
-			if stageErrSink.Count() > 0 {
+		if put := cacheHandle.PutResolvedIfGenOutcome(ctx, verdict, cacheKey, &cache.ResolvedEntry{
+			RawJSON:       encoded,
+			Inputs:        cacheInputs,
+			TTLOverride:   uafTTLOverrideForEntry(cacheInputs),
+			StaleDerived:  staleSink.StaleDerived(), // #710 PR-2b
+			StageOutcomes: stageOutcomes,            // #1319
+		}, cacheGen0); put.Stored() {
+			if verdict.DenialOnly() {
 				cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteCallWidget) // #681
 			}
 			// 0.30.8: record dep edges. Widget self-dep, apiRef→RestAction
@@ -684,9 +797,10 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// (it re-armed after a TTL-eviction, and this cold-fill replaces the
 			// evicted entry), announce the fill so the viewer's frame goes fresh
 			// now instead of waiting for the next churn. No-op when unarmed.
-			// SCOPE: widgets only — NOT widgetContent (shared key w/o BindingUID
-			// fold → cross-deliver risk) per refresh_publish.go.
-			publishIfSubscribed(cacheKey)
+			// (The widgetContent shell is written by the walker, which announces
+			// its own writes the same way: widget_content.go, #1321 B1.)
+			// #1321 — and only when the Put changed the stored bytes.
+			publishIfSubscribed(cacheKey, put)
 
 			// #548 — ARM the browser here, and ONLY here, on the cold path. This
 			// block is the one place a cold widget dispatch stores a cell, so its
@@ -717,10 +831,11 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// — and stays so.
 	// #710 PR-2b — a stale-derived body is written only behind an accepted Put
 	// + the armed header (+ an owed-push mark); otherwise re-run fresh.
-	if staleWritePoint(r, wri, req, staleSink, refreshArmable) {
+	if staleWritePoint(r, wri, req, staleSink, refreshArmable, encoded) {
 		return
 	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "widgets", refreshArmable)
+	stampRefreshDigest(wri, func() string { return cache.AnswerDigest(encoded, stageOutcomes) }) // #1324, #1319: the stored and written answer
 	noteStaleWrite(cacheKey, staleSink.StaleDerived(), refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }

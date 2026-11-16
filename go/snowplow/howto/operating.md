@@ -144,17 +144,49 @@ Everything is on the single `http` port (mux registrations in `debug_routes.go`)
 - **`GET /debug/apistage`** — resolved-cache entry metadata (never bodies).
 - **`GET /debug/refreshes`** — aggregate live-refresh broadcaster counters.
 
-### The debug surface is authenticated
+### The debug surface is authenticated AND authorized
 
 **Since 1.12.3 every route above returns `401` without a valid Krateo JWT.**
 Before then only `/debug/refreshes` was gated (#69) and the rest were readable
 by anyone who could reach the Service — which, with the chart's default
 `service.type: LoadBalancer`, means anyone who could reach the load balancer.
 
-The gate is `middleware.RefreshAuth`: a stateless RS256 validation of any
+The first gate is `middleware.RefreshAuth`: a stateless RS256 validation of any
 authn-issued token, read from an `Authorization: Bearer` header **or** the
-session cookie, with no apiserver read of its own. Any authenticated identity is
-accepted — the endpoints return process-wide diagnostics, not per-user data.
+session cookie, with no apiserver read of its own.
+
+**Since #1362 a valid JWT is not enough: the identity must also hold an RBAC
+grant.** Several of these routes report metadata about every identity's cache
+entries (`/debug/apistage`, `/debug/reconcile`, `/debug/deps`) or about objects
+the caller's own RBAC may forbid (`/debug/store`). `middleware.DebugAuthz`
+therefore authorizes each request as a Kubernetes non-resource request: verb =
+the lowercase HTTP method, path = the request path, for the JWT's username and
+groups. It is the same in-process evaluator as every other snowplow RBAC check,
+so with the cache on there is still no apiserver read. The grant is:
+
+```yaml
+rules:
+- nonResourceURLs: ["/debug/*"]
+  verbs: ["get", "post"]   # post only for POST /debug/shadow-parity
+```
+
+The chart ships it as the ClusterRole `<fullname>-debug-<namespace>` and binds
+it to **no one**, because the chart has no admin group to bind it to. Bind it
+to your operators:
+
+```bash
+kubectl create clusterrolebinding snowplow-debug-operators \
+  --clusterrole=snowplow-debug-krateo-system --group=<your-operator-group>
+```
+
+Any identity bound to `cluster-admin` already holds it (`nonResourceURLs:
+["*"]`). Without the grant → **`403`** (`forbidden: User "<u>" cannot get path
+"/debug/vars"`). If the authorization cannot be decided → **`503`**, with the
+reason named in the message. During the boot window before the RBAC snapshot is
+published it is `rbac_snapshot_not_built` (#1368: that includes `pprof/goroutine`). With `CACHE_ENABLED=false` it is
+**always** `review_unavailable`: the cache-off authorizer is the caller's own
+SelfSubjectAccessReview, which needs the `<user>-clientconfig` endpoint this
+route never reads. It fails closed and never answers `200`.
 
 ```bash
 TOKEN=$(curl -su "$USER:$PASS" http://authn:8082/basic/login | jq -r .accessToken)
@@ -181,7 +213,9 @@ unaffected (still anonymous), so the probes and the pod's lifecycle are fine; yo
 simply lose the diagnostics while the outage lasts.
 
 A `503` here means "snowplow could not fetch the verification key", not "your
-credentials are wrong" — do not go hunting for a token problem.
+credentials are wrong" — do not go hunting for a token problem. (A token signed
+with a key authn has stopped publishing is the opposite case: a `401` with the
+cause `KeyNotPublished`, since plumbing v1.36.0.)
 
 There is no break-glass path today, and a `kubectl exec` into the pod is **not**
 one: the gate sits on the mux, not on the network path, so a loopback `curl` from
@@ -190,14 +224,19 @@ bind the debug mux to localhost so `kubectl port-forward` always reaches it
 regardless of authn's state, or failing that a static operator token.
 
 The Phase 6 bench harness presents this token automatically: `login_all()`
-parks the first JWT it obtains and the expvar readers send it. For a
-probe-only invocation that never logs in, export `SNOWPLOW_DEBUG_TOKEN`.
+parks the first JWT it obtains, which is `admin`'s (`admin` is in group
+`admins`, bound to cluster-admin, so it holds the grant), and the expvar readers
+send it. For a probe-only invocation that never logs in, export
+`SNOWPLOW_DEBUG_TOKEN` with a token that holds the grant. The S6 acceptance
+harness (`bench/accept1126.py`) reads /debug ONLY with `SNOWPLOW_DEBUG_TOKEN`,
+an operator token, and refuses at preflight without it. Its measured requests
+stay on the unprivileged `HARNESS_USER`.
 
 What "healthy and warm" looks like:
 
 - `snowplow_prewarm_complete.done == 1`; `/readyz` is `200`.
 - `snowplow_dispatch_l1_lookups` shows a high `hit_total/(hit+miss)` ratio.
-- `snowplow_apiserver_fallthrough_total` has plateaued (not steadily climbing). **Since 1.12.4 this counts only reads that genuinely reached the apiserver** — in-process cache hits (`resolver-plurals-hit` etc.) moved to `snowplow_cache_diagnostic_total`. On the krateo-057 reference corpus the lifetime value drops **936,320 → 107,795** (customer-scope **22,015 ≈ 2.9/min**, the rest prewarm-scope); the drop is the reclassification, not a regression, and the diagnostic total should dwarf it ~8:1.
+- The customer `call-*` cells of `snowplow_apiserver_fallthrough_cells` have plateaued (not steadily climbing). Read those cells, not the bare `snowplow_apiserver_fallthrough_total`: **since 1.12.60 (#988) the refresher has a scope**, so its genuine fall-throughs are cells under `path="refresher"` and keep adding to the total for as long as the refresher re-resolves. Exclude `path="refresher"` (and the `boot-prewarm-*` paths) before judging warmth. **Since 1.12.4 this counts only reads that genuinely reached the apiserver** — in-process cache hits (`resolver-plurals-hit` etc.) moved to `snowplow_cache_diagnostic_total`. On the krateo-057 reference corpus the lifetime value drops **936,320 → 107,795** (customer-scope **22,015 ≈ 2.9/min**, the rest prewarm-scope); the drop is the reclassification, not a regression, and the diagnostic total should dwarf it ~8:1.
 - `snowplow_assertion_violations_total == 0`,
   `snowplow_phase1_seed_operational_fail_total == 0`,
   `snowplow_bindings_by_gvr_delta_skipped_non_typed == 0`.
@@ -213,7 +252,7 @@ What "healthy and warm" looks like:
 | **OOM-kill** (pod `OOMKilled`, restart) | container memory limit vs `GOMEMLIMIT` env; `curl -H "Authorization: Bearer $TOKEN" http://pod:8081/debug/pprof/heap -o heap.pprof && go tool pprof heap.pprof` | `GOMEMLIMIT ≥ container limit` so the runtime never back-pressured (set it below); or genuine working-set growth → raise the limit *and* `GOMEMLIMIT` together. |
 | **Restart loop** | which probe is failing (`kubectl describe pod`); `/health` 200? `/readyz`? | liveness killing a *warming* pod = probe too tight (widen `startupProbe`/`progressDeadlineSeconds`); `/health` not answering at all = process wedged → goroutine dump `curl -H "Authorization: Bearer $TOKEN" '/debug/pprof/goroutine?debug=2'`. |
 | **Stale content** (an object changed, UI didn't) | `snowplow_refresher_queue_depth` + `snowplow_refresher_completed_total`; `snowplow_refresher_dropped_total` / `..._failed_total` | dirty-mark only *enqueues* a re-resolve (stale-while-revalidate by design); a wedged/back-pressured refresher leaves stale content until TTL. A climbing `queue_depth` with flat `completed_total` = workers stuck. Dep-cap drop (`deps.record.cap_reached`) → entries rely on TTL. |
-| **Convergence timeout** (a `/call` hangs, client gets HTTP 0) | cache on/off?; `snowplow_apiserver_fallthrough_total` climbing? (1.12.4: genuine apiserver reads only — compare the customer-scope `path` cells, reference ≈ 2.9/min on 057; the ~8x larger `snowplow_cache_diagnostic_total` is in-process hits and is NOT a fallthrough) CPU profile `/debug/pprof/profile` (bearer required) | under cache-OFF, heavy compute can approach the 300s `WriteTimeout` at 50K (`writeTimeout`, `main.go`) — turn cache on. Under cache-ON, sustained fallthrough = prewarm not covering the live mix (check `snowplow_dispatch_l1_lookups` hit ratio + `snowplow_prewarm_engine_pending_depth`). |
+| **Convergence timeout** (a `/call` hangs, client gets HTTP 0) | cache on/off?; the customer `call-*` cells of `snowplow_apiserver_fallthrough_cells` climbing? (1.12.4: genuine apiserver reads only — compare the customer-scope `path` cells, reference ≈ 2.9/min on 057; since 1.12.60 the total also carries the refresher's `path="refresher"` cells, which climb with refresh work, so do not read the bare total; the ~8x larger `snowplow_cache_diagnostic_total` is in-process hits and is NOT a fallthrough) CPU profile `/debug/pprof/profile` (bearer required) | under cache-OFF, heavy compute can approach the 300s `WriteTimeout` at 50K (`writeTimeout`, `main.go`) — turn cache on. Under cache-ON, sustained fallthrough = prewarm not covering the live mix (check `snowplow_dispatch_l1_lookups` hit ratio + `snowplow_prewarm_engine_pending_depth`). |
 | **Everything hits the apiserver** (no cache serving) | `CACHE_ENABLED`; `snowplow_plurals_registered_gvrs.count`; `snowplow_apiserver_fallthrough_cells`; `snowplow_informer_servable` (1.12.4) | cache disabled, or an informer not yet `HasSynced` (`informer_servable.servable < registered`), or a specific GVR/reason — the per-cell breakdown attributes it. Since 1.12.4 `resolver-plurals-hit` lives in `snowplow_cache_diagnostic_cells`, not here: a hit is **not** a fallthrough. |
 | **403 for a resource the user expects** | `snowplow_rbac_publish_seq` (did a snapshot publish?); cache on/off | cache-on RBAC degrades-to-deny if the in-process snapshot isn't built yet — `seq == 0` means no snapshot (pre-readiness or cache-off). Confirm the RoleBinding exists and a snapshot has published. |
 | **Upstream looks broken, not snowplow** | `snowplow_upstream_controller_health` | an auto-discovered controller crash-looping / zero-ready endpoints, or a `Fail`-policy webhook on it (`snowplow_upstream_webhook_failurepolicy`) explaining apiserver write hangs. |

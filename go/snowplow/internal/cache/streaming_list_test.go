@@ -290,7 +290,7 @@ func TestR4_StreamingListFlagDefault(t *testing.T) {
 // returns ok=false when no *rest.Config is wired — the caller then falls
 // back to the standard NewFilteredDynamicInformer.
 func TestR4_StreamingInformerNilConfigFallback(t *testing.T) {
-	_, ok := newStreamingDynamicInformer(nil, nil, r4CompositionGVR, nil, listOptionsTweak)
+	_, ok := newStreamingDynamicInformer(context.Background(), nil, nil, r4CompositionGVR, nil, listOptionsTweak)
 	if ok {
 		t.Fatalf("newStreamingDynamicInformer with nil *rest.Config must return ok=false "+
 			"so the caller falls back to the standard informer")

@@ -160,7 +160,7 @@ func TestInProcessResolve_True_SubstitutesEnvelope(t *testing.T) {
 	stub.install(t)
 
 	r := inProcessRun(t)
-	got, did, err := r.maybeResolveInProcess(r.ctx, directRACall(), true)
+	got, did, err := r.maybeResolveInProcess(ownClusterCtx(r.ctx), directRACall(), true)
 	if err != nil {
 		t.Fatalf("I-1: unexpected error: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestInProcessResolve_False_RawCR(t *testing.T) {
 	stub.install(t)
 
 	r := inProcessRun(t)
-	_, did, err := r.maybeResolveInProcess(r.ctx, directRACall(), false)
+	_, did, err := r.maybeResolveInProcess(ownClusterCtx(r.ctx), directRACall(), false)
 	if err != nil {
 		t.Fatalf("I-3: unexpected error: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestInProcessResolve_NonRAWidget_NoOp(t *testing.T) {
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	_, did, err := r.maybeResolveInProcess(r.ctx, call, true)
+	_, did, err := r.maybeResolveInProcess(ownClusterCtx(r.ctx), call, true)
 	if err != nil {
 		t.Fatalf("I-4: unexpected error: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestInProcessResolve_List_NoOp(t *testing.T) {
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	_, did, _ := r.maybeResolveInProcess(r.ctx, call, true)
+	_, did, _ := r.maybeResolveInProcess(ownClusterCtx(r.ctx), call, true)
 	if did || stub.calls.Load() != 0 {
 		t.Fatalf("LIST path substituted (did=%v, calls=%d) — a LIST must be a no-op", did, stub.calls.Load())
 	}
@@ -259,7 +259,7 @@ func TestInProcessResolve_WidgetPath_Substitutes(t *testing.T) {
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	got, did, err := r.maybeResolveInProcess(r.ctx, call, true)
+	got, did, err := r.maybeResolveInProcess(ownClusterCtx(r.ctx), call, true)
 	if err != nil || !did {
 		t.Fatalf("widget path: did=%v err=%v — want a substitution", did, err)
 	}

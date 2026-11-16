@@ -42,8 +42,9 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // uafReadVerbs is the set of Kubernetes RBAC verbs that unambiguously express
@@ -115,7 +116,7 @@ func uafVerbIsRead(verb string) bool {
 // exactly ONCE per (RA stage) evaluation, never per item — a non-read verb is a
 // single authoring choice in one CR, so per-item logging would flood the
 // operator on a 500-item list and tell them nothing extra.
-func warnUAFVerbNonRead(log *slog.Logger, stageName string, uaf *templates.UserAccessFilterSpec) {
+func warnUAFVerbNonRead(ctx context.Context, log *slog.Logger, stageName string, uaf *templates.UserAccessFilterSpec) {
 	if log == nil || uafVerbIsRead(uaf.Verb) {
 		return
 	}
@@ -123,7 +124,7 @@ func warnUAFVerbNonRead(log *slog.Logger, stageName string, uaf *templates.UserA
 	if resource == "" {
 		resource = uaf.ResourcesFrom
 	}
-	log.Warn("userAccessFilter: verb is not a read verb",
+	log.WarnContext(ctx, "userAccessFilter: verb is not a read verb",
 		slog.String("subsystem", "uaf"),
 		slog.String("api", stageName),
 		slog.String("verb", uaf.Verb),
@@ -201,9 +202,18 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 	// describes, and the one that is not declaration-blind. The apiref
 	// chokepoint bump fires when the apiRef'd RESTAction DECLARES a UAF; it
 	// cannot see a CHAIN (a parent RA declaring nothing whose inner step consumes
-	// a UAF child). Only bumping at the refilter itself observes execution. No
-	// live RA forms such a chain today, which closes it by corpus accident rather
-	// than by code — one customer CR away from being false.
+	// a UAF child). Only bumping at the refilter itself observes execution. This
+	// bump marks the ctx the refilter runs under, so it covers the chain when
+	// the child resolves IN-PROCESS (a direct apiserver path with
+	// `resolve: true`, resolve_inprocess.go), which runs under the outer
+	// resolve's ctx. An HTTP self-loopback child (a named snowplow endpoint
+	// calling /call) is a separate request: this bump marks only that request's
+	// sink. The outer Put is declined there by the external-touched bump at the
+	// branch-E send in resolve.go, except for a widget that opts into the
+	// external-TTL cache (cache/uaf_touched_sink.go). That a refilter run marks
+	// its own ctx is pinned by TestA4_RefilterBumpsUAFTouchedSink; the
+	// declaration limb's blindness by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref).
 	//
 	// Placed BEFORE any item is evaluated so the signal does not depend on the
 	// filter keeping anything: a refilter that drops every item still narrowed
@@ -219,11 +229,11 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 	// symmetric with the live applyUserAccessFilterOnPig entry so this twin
 	// cannot silently become a bypass if it is ever re-wired. Drops nothing;
 	// 1.13.0 flips it to the same-resource rule (see uafVerbIsRead).
-	warnUAFVerbNonRead(log, apiCall.Name, uaf)
+	warnUAFVerbNonRead(ctx, log, apiCall.Name, uaf)
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		log.Error("userAccessFilter: cannot extract UserInfo; dropping all items (fail-closed)",
+		log.ErrorContext(ctx, "userAccessFilter: cannot extract UserInfo; dropping all items (fail-closed)",
 			slog.String("api", apiCall.Name),
 			slog.Any("err", err),
 		)
@@ -243,13 +253,17 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 	// item (no resource to grant against), never allow-all.
 	resources, resOK := resolveRefilterUAFResources(ctx, log, apiCall.Name, uaf, dict)
 	if !resOK {
-		log.Error("userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
+		log.ErrorContext(ctx, "userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
 			slog.String("api", apiCall.Name),
 		)
 		_ = setRefilteredEmpty(dict, apiCall.Name)
 		res.ResourcesUnresolved = true
 		return res
 	}
+	// #1124 — the items are objects of the resource the path names; an object
+	// of a checked resource is checked on its own resource alone.
+	servedGVR, _, _, servedOK := cache.ParseAPIServerPathToDep(apiCall.Path)
+	resources = uafItemResources(uaf, resources, servedGVR.GroupResource(), servedOK)
 
 	raw, ok := dict[apiCall.Name]
 	if !ok || raw == nil {
@@ -280,7 +294,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		}
 		items, ok := itemsRaw.([]any)
 		if !ok {
-			log.Warn("userAccessFilter: items is not a slice; passing through unchanged",
+			log.WarnContext(ctx, "userAccessFilter: items is not a slice; passing through unchanged",
 				slog.String("api", apiCall.Name),
 				slog.Any("items_type", fmt.Sprintf("%T", itemsRaw)),
 			)
@@ -300,7 +314,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		res.EvaluateRBACCalls = calls
 
 	default:
-		log.Warn("userAccessFilter: unrecognised result shape; passing through unchanged",
+		log.WarnContext(ctx, "userAccessFilter: unrecognised result shape; passing through unchanged",
 			slog.String("api", apiCall.Name),
 			slog.Any("result_type", fmt.Sprintf("%T", raw)),
 		)
@@ -330,6 +344,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 // error denies the item; an EvaluateRBAC error denies the item; a
 // scalar the user has no grant for is dropped by EvaluateRBAC.
 func refilterSlice(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, items []any) ([]any, int, int) {
+	defer slowcall.Start(ctx, slowcall.PhaseRefilter).End() // #1054
 	kept := make([]any, 0, len(items))
 	dropped := 0
 	calls := 0
@@ -351,6 +366,11 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 	// before; a compile error here fails closed (nsCode==nil → evalSingle
 	// treats every item as denied), exactly as the pre-1b inline EvalValue
 	// compile-error branch did per item.
+	//
+	// A plain field path (.metadata.namespace) is also recognised here, once,
+	// and then read from each item without running gojq (uafExpr.eval);
+	// anything the direct read cannot answer exactly as gojq would still runs
+	// the compiled code.
 	nsExpr, nsCode := compileNamespaceFrom(uaf)
 
 	// #123 — compile the per-item NameFrom expression ONCE for the whole
@@ -374,7 +394,17 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 	// discarded at return — no shared state, no global, no cross-call
 	// staleness (a subsequent refilter builds a fresh memo against the live
 	// RBAC store, exactly like filterListByRBAC AC-6).
-	rbacMemo := make(map[uafRBACMemoKey]bool, len(items))
+	//
+	// Size hint: the memo holds one entry per distinct tuple. For a
+	// collection verb Name is "" and the tuples are the few namespaces, so
+	// sizing it for len(items) would allocate and clear a 50K-entry table on
+	// every call; for a name-specific verb the name is in the key and the
+	// tuples run close to one per item.
+	memoHint := 0
+	if rbac.IsNameSpecificVerb(uaf.Verb) {
+		memoHint = len(items)
+	}
+	rbacMemo := make(map[uafRBACMemoKey]bool, memoHint)
 
 	for _, item := range items {
 		switch item.(type) {
@@ -435,9 +465,12 @@ type uafRBACMemoKey struct {
 // Ship 0.30.129 OR semantics: a namespace is kept iff the user can
 // perform Verb on ANY of the resolved resource plurals there.
 //
-// `resources` is the resolved plural set (resolveUAFResources): a single
-// element [uaf.Resource] when ResourcesFrom is unset (pre-0.30.129
-// behaviour, byte-identical), or the jq-derived set when it is set.
+// `resources` is the set the caller decided for these items: the resolved
+// plural set (resolveUAFResources: [uaf.Resource] when ResourcesFrom is
+// unset, the jq-derived set when it is set), narrowed by uafItemResources
+// (#1124). For objects of a checked resource it is that one resource, so the
+// OR has one term and the check is Kubernetes' own per-object decision; for
+// scope items (namespaces, names) it is the whole set.
 //
 // item is any (0.30.111 Part 1): a K8s object (map[string]any) OR a
 // bare scalar (string — the namespaces-stage name-array shape). jq
@@ -451,7 +484,7 @@ type uafRBACMemoKey struct {
 // (a lone GET-by-name has nothing to memoize) and by unit tests. It delegates
 // to evalSingleMemo with a nil memo, which is byte-identical to the pre-memo
 // behaviour (every EvaluateRBAC call is made).
-func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *gojq.Code, nameExpr string, nameCode *gojq.Code) bool {
+func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *uafExpr, nameExpr string, nameCode *uafExpr) bool {
 	return evalSingleMemo(ctx, log, username, groups, uaf, resources, item, nsExpr, nsCode, nameExpr, nameCode, nil)
 }
 
@@ -466,9 +499,12 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 // discarded at return — so there is no cross-invocation staleness. Evaluator
 // ERRORS are NOT memoized (mirroring filterListByRBAC AC-6): a transient error
 // on one (resource,namespace,name) must not poison a later same-tuple item;
-// the next item retries. The filtering RESULT is byte-identical either way —
+// the next item retries. The one exception is rbac.ErrReviewUnavailable (a
+// cache=off SelfSubjectAccessReview that could not be asked or answered). It
+// is recorded as a deny for this invocation, so an apiserver in distress
+// receives one review per tuple and not one per item, as before #1362. The filtering RESULT is byte-identical either way —
 // the memo only removes redundant EvaluateRBAC calls.
-func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *gojq.Code, nameExpr string, nameCode *gojq.Code, memo map[uafRBACMemoKey]bool) bool {
+func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *uafExpr, nameExpr string, nameCode *uafExpr, memo map[uafRBACMemoKey]bool) bool {
 	// #121 1b — nsExpr + nsCode are the ONCE-compiled NamespaceFrom
 	// expression, hoisted out of the per-item loop by the caller
 	// (compileNamespaceFrom). nsExpr is kept for error/log fidelity; nsCode
@@ -476,14 +512,14 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 	// failed to compile — fail-closed (deny the item), matching the pre-1b
 	// per-item EvalValue compile-error branch.
 	if nsCode == nil {
-		log.Warn("userAccessFilter: NamespaceFrom JQ compile failed; treating item as denied",
+		log.WarnContext(ctx, "userAccessFilter: NamespaceFrom JQ compile failed; treating item as denied",
 			slog.String("expr", nsExpr),
 		)
 		return false
 	}
-	ns, err := evalJQStringCompiled(ctx, nsCode, item)
+	ns, err := nsCode.eval(ctx, item)
 	if err != nil {
-		log.Warn("userAccessFilter: NamespaceFrom JQ eval failed; treating item as denied",
+		log.WarnContext(ctx, "userAccessFilter: NamespaceFrom JQ eval failed; treating item as denied",
 			slog.String("expr", nsExpr),
 			slog.Any("err", err),
 		)
@@ -510,14 +546,14 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 		// A nil nameCode means the expression failed to compile — fail-closed
 		// (deny the item), identical to the NamespaceFrom compile-error branch.
 		if nameCode == nil {
-			log.Warn("userAccessFilter: NameFrom JQ compile failed; treating item as denied",
+			log.WarnContext(ctx, "userAccessFilter: NameFrom JQ compile failed; treating item as denied",
 				slog.String("expr", nameExpr),
 			)
 			return false
 		}
-		n, err := evalJQStringCompiled(ctx, nameCode, item)
+		n, err := nameCode.eval(ctx, item)
 		if err != nil {
-			log.Warn("userAccessFilter: NameFrom JQ eval failed; treating item as denied",
+			log.WarnContext(ctx, "userAccessFilter: NameFrom JQ eval failed; treating item as denied",
 				slog.String("expr", nameExpr),
 				slog.Any("err", err),
 			)
@@ -548,26 +584,21 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 		}
 		// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller
 		// ignores matchedBindingUID return.
-		allowed, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-			Username:  username,
-			Groups:    groups,
-			Verb:      uaf.Verb,
-			Group:     uaf.Group,
-			Resource:  resource,
-			Namespace: namespace,
-			// #123 — thread the per-object name so a resourceNames-scoped
-			// grant (name-specific verb only) matches the named object.
-			// Empty for collection verbs is harmless: the evaluator scopes
-			// resourceNames to name-specific verbs, so a plain list grant is
-			// evaluated identically whether or not Name is set (INERTNESS).
-			Name: name,
-			// Ship L1 (0.30.252): per-item caller discards
-			// matchedBindingUID — skip the CRB/RB stable-sort.
-			SkipBindingUID: true,
+		// #123 / #1046 — the check is about this one object: rbac.ObjectCheck
+		// carries its name for a name-specific verb, so a resourceNames-scoped
+		// grant matches the named object, and drops it for a collection verb
+		// (where name is "" anyway, see above). The cache=off fallback
+		// (EvaluateRBAC → UserCan → SelfSubjectAccessReview) carries the same
+		// name, so both modes keep the same items.
+		opts := rbac.ObjectCheck(username, groups, uaf.Verb, rbac.ObjectTarget{
+			Group: uaf.Group, Resource: resource, Namespace: namespace, Name: name,
 		})
+		// Ship L1 (0.30.252): per-item caller discards matchedBindingUID —
+		// skip the CRB/RB stable-sort.
+		opts.SkipBindingUID = true
+		allowed, _, err := rbac.EvaluateRBAC(ctx, opts)
 		if err != nil {
-			log.Warn("userAccessFilter: EvaluateRBAC error; treating resource as denied",
-				slog.String("user", redact.User(username)),
+			log.WarnContext(ctx, "userAccessFilter: EvaluateRBAC error; treating resource as denied",
 				slog.String("verb", uaf.Verb),
 				slog.String("group", uaf.Group),
 				slog.String("resource", resource),
@@ -575,9 +606,22 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 				slog.String("name", name),
 				slog.Any("err", err),
 			)
+			// #1362: a cache=off SelfSubjectAccessReview that could not be
+			// asked or answered is recorded as a deny FOR THIS INVOCATION.
+			// Before #1362 the cache=off path returned that outcome as a
+			// plain (false, nil), and it was memoized like any deny. So a
+			// 50-item list cost one review per (resource, namespace, name)
+			// while the apiserver was in distress, not 50. Keeping the error
+			// un-memoized would multiply the load on an apiserver that is
+			// already failing. The verdict is unchanged (deny), and the memo
+			// dies with this call, so the next request asks again.
+			if memo != nil && errors.Is(err, rbac.ErrReviewUnavailable) {
+				memo[key] = false
+			}
 			continue // a transient evaluator error on one resource must
 			// not mask a genuine grant on another — but it also must not
-			// permit: try the rest, default-deny if none grant. The error is
+			// permit: try the rest, default-deny if none grant. Any OTHER
+			// error (the cache=on snapshot momentarily unavailable) is
 			// deliberately NOT memoized (AC-6): a later same-tuple item retries.
 		}
 		// Record the verdict for reuse by a later same-tuple item.
@@ -589,6 +633,60 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 		}
 	}
 	return false
+}
+
+// uafItemResources is the resource set the refilter checks each item of one
+// response against, decided by what the items are (#1124, SECURITY).
+//
+// served is the Kubernetes resource the stage's request names: the group and
+// plural of the dialled path (servedOK false when the path names none). Every
+// item of that response IS an object of served. A LIST answers with members of
+// the listed collection and a GET with the named object, and Kubernetes
+// authorizes reading such an object on its own resource, in its own namespace,
+// with the caller's verb. The request is the source that names that resource:
+// a typed list from the live apiserver carries no apiVersion or kind on its
+// items, and when an item does carry them they name served.
+//
+// served is parsed from the path as written, and that is the resource the
+// apiserver serves only because the plan holds no path the apiserver reads
+// differently (#1137, servedAsWritten in setup.go). A userAccessFilter stage
+// always dials this cluster's apiserver, so every one of its calls passes that
+// check. Without it, two path shapes were served as one resource and parsed as
+// another or as none: `apis/g/v/p2s` (no leading "/"; the dial adds it) and
+// `/apis/g/v/namespaces%2Fns-a%2Fp2s` (the apiserver decodes the escapes into
+// separators). servedOK was false or served was no member, so objects of a
+// checked resource were checked on the whole set. The same holds for a verb in
+// the path (`/apis/g/v/watch/namespaces/ns-a/p2s` parses as resource "watch"),
+// and for an empty or dot segment (`/apis/g/v/namespaces/ns-a/./p2s` parses as
+// resource ".")
+// on the refresher's internal-rest-config dial, which client-go cleans into a
+// LIST of p2s.
+//
+//   - served is a member of the checked set (served.Group == uaf.Group and
+//     served.Resource is in resources): the items are objects of a checked
+//     resource, and the set narrows to served.Resource alone. Keeping such an
+//     object because the caller may act on ANOTHER plural of the set reads it
+//     without its own grant: one p1s grant in a namespace plus the visibility
+//     of p2's definition read every p2 object there.
+//   - otherwise the items are not objects of a checked resource (namespaces
+//     checked with namespaceFrom .metadata.name, or another resource the
+//     author gates by the set), and the check asks about a scope: may the
+//     caller act on ANY of these plurals there. The OR across the set is that
+//     question, unchanged.
+//
+// A static resource is a set of one, so it checks exactly what it checked
+// before on both branches. Nothing here names a RESTAction, a stage or a
+// resource: the rule reads only the request and the stage's own stanza.
+func uafItemResources(uaf *templates.UserAccessFilterSpec, resources []string, served schema.GroupResource, servedOK bool) []string {
+	if !servedOK || served.Group != uaf.Group {
+		return resources
+	}
+	for _, r := range resources {
+		if r == served.Resource {
+			return []string{r}
+		}
+	}
+	return resources
 }
 
 // compileNamespaceFrom resolves the effective NamespaceFrom expression for a
@@ -610,16 +708,12 @@ func evalSingleMemo(ctx context.Context, log *slog.Logger, username string, grou
 // A compile error returns (expr, nil): evalSingle then fails closed (deny),
 // identical to the pre-1b per-item EvalValue compile-error branch. The
 // ModuleLoader matches the pre-1b evalJQString call (jqsupport.ModuleLoader()).
-func compileNamespaceFrom(uaf *templates.UserAccessFilterSpec) (string, *gojq.Code) {
+func compileNamespaceFrom(uaf *templates.UserAccessFilterSpec) (string, *uafExpr) {
 	nsExpr := uaf.NamespaceFrom
 	if nsExpr == "" {
 		nsExpr = ".metadata.namespace"
 	}
-	code, err := CompileJQ(nsExpr, jqsupport.ModuleLoader())
-	if err != nil {
-		return nsExpr, nil
-	}
-	return nsExpr, code
+	return nsExpr, compileUAFExpr(nsExpr, jqsupport.ModuleLoader())
 }
 
 // compileNameFrom resolves the effective NameFrom expression for a UAF and
@@ -644,16 +738,12 @@ func compileNamespaceFrom(uaf *templates.UserAccessFilterSpec) (string, *gojq.Co
 // A compile error returns (expr, nil): evalSingle then fails closed (deny),
 // identical to the compileNamespaceFrom compile-error branch. The
 // ModuleLoader matches the NamespaceFrom compile (jqsupport.ModuleLoader()).
-func compileNameFrom(uaf *templates.UserAccessFilterSpec) (string, *gojq.Code) {
+func compileNameFrom(uaf *templates.UserAccessFilterSpec) (string, *uafExpr) {
 	nameExpr := uaf.NameFrom
 	if nameExpr == "" {
 		nameExpr = ".metadata.name"
 	}
-	code, err := CompileJQ(nameExpr, jqsupport.ModuleLoader())
-	if err != nil {
-		return nameExpr, nil
-	}
-	return nameExpr, code
+	return nameExpr, compileUAFExpr(nameExpr, jqsupport.ModuleLoader())
 }
 
 // resolveUAFResources resolves the RBAC resource-plural set for a UAF
@@ -692,9 +782,14 @@ func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.U
 // closed as unresolved (#651: a stage error, never cached).
 //
 // The skip logs at DEBUG once per stage with the expression and the stage
-// name only, so a typo'd path that yields null stays findable.
+// name only, so a typo'd path that yields null stays findable. Every
+// evaluation is also recorded (#778: snowplow_uaf_resources_null_skip*), so the
+// stages skipping NOW are visible at the shipped LOG_LEVEL=warn.
 func resolveRefilterUAFResources(ctx context.Context, log *slog.Logger, stageName string, uaf *templates.UserAccessFilterSpec, dict map[string]any) ([]string, bool) {
 	out, ok, nulls := uafResourceSet(ctx, log, uaf, dict, true)
+	if uaf.ResourcesFrom != "" {
+		recordUAFResourcesEvaluated(ctx, stageName, ok && nulls > 0)
+	}
 	if ok && nulls > 0 {
 		log.Debug("userAccessFilter: ResourcesFrom yielded null element(s); skipped (no resource to grant against)",
 			slog.String("api", stageName),
@@ -720,7 +815,7 @@ func uafResourceSet(ctx context.Context, log *slog.Logger, uaf *templates.UserAc
 		// case surfaced as a json.Unmarshal error logged "not a JSON
 		// array". Both fail-closed identically — one warn; the distinction
 		// was never security-load-bearing.
-		log.Warn("userAccessFilter: ResourcesFrom JQ eval failed; fail-closed",
+		log.WarnContext(ctx, "userAccessFilter: ResourcesFrom JQ eval failed; fail-closed",
 			slog.String("expr", uaf.ResourcesFrom),
 			slog.Any("err", err),
 		)
@@ -731,7 +826,7 @@ func uafResourceSet(ctx context.Context, log *slog.Logger, uaf *templates.UserAc
 		// Zero-yield, or a non-array result. Pre-Ship-A json.Unmarshal of
 		// "" or of a non-array into []any errors -> "not a JSON array" ->
 		// fail-closed.
-		log.Warn("userAccessFilter: ResourcesFrom result is not a JSON array; fail-closed",
+		log.WarnContext(ctx, "userAccessFilter: ResourcesFrom result is not a JSON array; fail-closed",
 			slog.String("expr", uaf.ResourcesFrom),
 		)
 		return nil, false, 0
@@ -746,7 +841,7 @@ func uafResourceSet(ctx context.Context, log *slog.Logger, uaf *templates.UserAc
 		}
 		s, ok := e.(string)
 		if !ok {
-			log.Warn("userAccessFilter: ResourcesFrom yielded a non-string element; fail-closed",
+			log.WarnContext(ctx, "userAccessFilter: ResourcesFrom yielded a non-string element; fail-closed",
 				slog.String("expr", uaf.ResourcesFrom),
 			)
 			return nil, false, 0
@@ -865,7 +960,11 @@ func setRefilteredEmpty(dict map[string]any, apiName string) error {
 // shape for an unresolvable ResourcesFrom — identical to pre-Ship-K
 // behaviour for that case. Per-item refilter still uses `pig` items —
 // that scope is correct for items.
-func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict map[string]any, stageName string, uaf *templates.UserAccessFilterSpec) refilterResult {
+//
+// #1124 — served/servedOK is the Kubernetes resource the stage's request
+// names (jsonHandlerOptions.served): the items are objects of it, and
+// uafItemResources narrows the checked set to it when it is a member.
+func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict map[string]any, stageName string, uaf *templates.UserAccessFilterSpec, served schema.GroupResource, servedOK bool) refilterResult {
 	log := xcontext.Logger(ctx)
 	res := refilterResult{}
 
@@ -884,28 +983,37 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 	// describes, and the one that is not declaration-blind. The apiref
 	// chokepoint bump fires when the apiRef'd RESTAction DECLARES a UAF; it
 	// cannot see a CHAIN (a parent RA declaring nothing whose inner step consumes
-	// a UAF child). Only bumping at the refilter itself observes execution. No
-	// live RA forms such a chain today, which closes it by corpus accident rather
-	// than by code — one customer CR away from being false.
+	// a UAF child). Only bumping at the refilter itself observes execution. This
+	// bump marks the ctx the refilter runs under, so it covers the chain when
+	// the child resolves IN-PROCESS (a direct apiserver path with
+	// `resolve: true`, resolve_inprocess.go), which runs under the outer
+	// resolve's ctx. An HTTP self-loopback child (a named snowplow endpoint
+	// calling /call) is a separate request: this bump marks only that request's
+	// sink. The outer Put is declined there by the external-touched bump at the
+	// branch-E send in resolve.go, except for a widget that opts into the
+	// external-TTL cache (cache/uaf_touched_sink.go). That a refilter run marks
+	// its own ctx is pinned by TestA4_RefilterBumpsUAFTouchedSink; the
+	// declaration limb's blindness by
+	// TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref).
 	//
 	// Placed BEFORE any item is evaluated so the signal does not depend on the
 	// filter keeping anything: a refilter that drops every item still narrowed
 	// the body. No-op when no sink is installed on ctx (nil-receiver-safe), so
 	// every non-Put path is byte-identical.
 	//
-	// THIS IS THE LIVE SITE (jsonHandlerCore) and a hard tag condition for
-	// 1.12.3 per cache/uaf_touched_sink.go.
+	// THIS IS THE LIVE SITE (reached from jsonHandlerCore). It has been present
+	// since 1.12.3 (PR #173).
 	cache.BumpUAFTouched(ctx)
 
 	// A-4 (1.12.3) — WARN-ONLY, once per stage, before any per-item work. This
 	// is the LIVE production callsite; the applyUserAccessFilter twin above
 	// carries the identical call so neither entry point can drift. Drops
 	// nothing; 1.13.0 flips it to the same-resource rule (see uafVerbIsRead).
-	warnUAFVerbNonRead(log, stageName, uaf)
+	warnUAFVerbNonRead(ctx, log, stageName, uaf)
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		log.Error("userAccessFilter: cannot extract UserInfo; dropping all items (fail-closed)",
+		log.ErrorContext(ctx, "userAccessFilter: cannot extract UserInfo; dropping all items (fail-closed)",
 			slog.String("api", stageName),
 			slog.Any("err", err),
 		)
@@ -920,13 +1028,16 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 	// resourcesFrom expressions reference (e.g. `.crds`).
 	resources, resOK := resolveRefilterUAFResources(ctx, log, stageName, uaf, dict)
 	if !resOK {
-		log.Error("userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
+		log.ErrorContext(ctx, "userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
 			slog.String("api", stageName),
 		)
 		_ = setRefilteredEmpty(pig, stageName)
 		res.ResourcesUnresolved = true
 		return res
 	}
+	// #1124 (SECURITY) — an object of a checked resource is checked on its own
+	// resource alone; a scope item (a namespace, a name) keeps the set's OR.
+	resources = uafItemResources(uaf, resources, served, servedOK)
 
 	raw, ok := pig[stageName]
 	if !ok || raw == nil {
@@ -954,7 +1065,7 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 		}
 		items, ok := itemsRaw.([]any)
 		if !ok {
-			log.Warn("userAccessFilter: items is not a slice; passing through unchanged",
+			log.WarnContext(ctx, "userAccessFilter: items is not a slice; passing through unchanged",
 				slog.String("api", stageName),
 				slog.Any("items_type", fmt.Sprintf("%T", itemsRaw)),
 			)
@@ -974,7 +1085,7 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 		res.EvaluateRBACCalls = calls
 
 	default:
-		log.Warn("userAccessFilter: unrecognised result shape; passing through unchanged",
+		log.WarnContext(ctx, "userAccessFilter: unrecognised result shape; passing through unchanged",
 			slog.String("api", stageName),
 			slog.Any("result_type", fmt.Sprintf("%T", raw)),
 		)
@@ -990,14 +1101,9 @@ func emitRefilterFalsifierFromHandler(ctx context.Context, log *slog.Logger, api
 	if log == nil || uaf == nil {
 		return
 	}
-	username := ""
-	if u, err := xcontext.UserInfo(ctx); err == nil {
-		username = u.Username
-	}
 	log.Debug("userAccessFilter",
 		slog.String("subsystem", "uaf"),
 		slog.String("dispatch", "service_account"),
-		slog.String("user", redact.User(username)),
 		slog.String("api", apiCallName),
 		slog.String("verb", uaf.Verb),
 		slog.String("group", uaf.Group),
@@ -1011,18 +1117,17 @@ func emitRefilterFalsifierFromHandler(ctx context.Context, log *slog.Logger, api
 // emitRefilterFalsifier emits the per-call falsifier per plan
 // §"Code-path falsifier" line:
 //
-//	userAccessFilter.dispatch=service_account user=X resource_type=...
+//	userAccessFilter.dispatch=service_account resource_type=...
 //	refilter_dropped=N refilter_kept=M evaluate_rbac_calls=K
 //
 // Called by the resolver right after applyUserAccessFilter completes.
-func emitRefilterFalsifier(log *slog.Logger, apiCall *templates.API, username string, res refilterResult) {
+func emitRefilterFalsifier(log *slog.Logger, apiCall *templates.API, res refilterResult) {
 	if log == nil || apiCall == nil || apiCall.UserAccessFilter == nil {
 		return
 	}
 	log.Debug("userAccessFilter",
 		slog.String("subsystem", "uaf"),
 		slog.String("dispatch", "service_account"),
-		slog.String("user", redact.User(username)),
 		slog.String("api", apiCall.Name),
 		slog.String("verb", apiCall.UserAccessFilter.Verb),
 		slog.String("group", apiCall.UserAccessFilter.Group),

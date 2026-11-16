@@ -98,6 +98,8 @@ func newPartialMetadata(apiVersion, kind, ns, name string) *metav1.PartialObject
 // informer's processor goroutine fires DeleteFunc → metaNSName →
 // Deps().OnDelete; we assert the dep edge was evicted within 3 s.
 func TestEnsureResourceTypeMetadataOnly_DepTrackerFires(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "3600")
 
@@ -160,7 +162,7 @@ func TestEnsureResourceTypeMetadataOnly_DepTrackerFires(t *testing.T) {
 		t.Fatalf("ResolvedCache nil — CACHE_ENABLED test setup broken")
 	}
 	const l1Key = "test:composition-evict"
-	rc.Put(l1Key, &cache.ResolvedEntry{
+	rc.PutResolved(fixtureStoreVerdict, l1Key, &cache.ResolvedEntry{
 		RawJSON: []byte(`{"items":["before"]}`),
 		Inputs: &cache.ResolvedKeyInputs{
 			CacheEntryClass: "restactions",

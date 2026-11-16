@@ -112,7 +112,7 @@ func TestWaitAllInformersSynced_GoodEnoughBoundsAStuckInformer(t *testing.T) {
 	})
 
 	// Healthy seeds (sync normally) + the stuck informer.
-	rw.RegisterMetaQuerySeeds()
+	rw.RegisterMetaQuerySeeds(context.Background())
 	rw.EnsureResourceType(stuckGVR())
 
 	// OUTER budget = 60s backstop. If the barrier were still blocking on
@@ -175,7 +175,7 @@ func TestWaitAllInformersSynced_HappyPathUnchanged(t *testing.T) {
 		rw.Stop()
 		time.Sleep(50 * time.Millisecond)
 	})
-	rw.RegisterMetaQuerySeeds()
+	rw.RegisterMetaQuerySeeds(context.Background())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -222,7 +222,7 @@ func TestWaitAllInformersSynced_RaceWithStuckAndLateRegistrations(t *testing.T) 
 		time.Sleep(50 * time.Millisecond)
 	})
 
-	rw.RegisterMetaQuerySeeds()
+	rw.RegisterMetaQuerySeeds(context.Background())
 	rw.EnsureResourceType(stuckGVR())
 
 	// Concurrently register late GVRs while the barrier runs — exercises

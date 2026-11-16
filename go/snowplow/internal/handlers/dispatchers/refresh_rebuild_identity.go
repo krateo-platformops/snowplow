@@ -97,10 +97,12 @@ const (
 // classified NoPrior, because a cell with no bytes is not evidence that a
 // refresh changed nothing; it is evidence there is nothing to compare.
 func classifyRebuild(prior *cache.ResolvedEntry, hadPrior bool, encoded []byte) rebuildVerdict {
-	if !hadPrior || prior == nil || len(prior.RawJSON) == 0 || len(encoded) == 0 {
+	// #854 — Raw(): a prior incremental list cell holds no RawJSON.
+	priorRaw := prior.Raw()
+	if !hadPrior || prior == nil || len(priorRaw) == 0 || len(encoded) == 0 {
 		return rebuildVerdictNoPrior
 	}
-	if bytes.Equal(prior.RawJSON, encoded) {
+	if bytes.Equal(priorRaw, encoded) {
 		return rebuildVerdictIdentical
 	}
 	return rebuildVerdictChanged

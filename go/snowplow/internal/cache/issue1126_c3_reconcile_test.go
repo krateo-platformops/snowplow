@@ -51,7 +51,7 @@ func c3Setup(t *testing.T) {
 }
 
 func c3Put(store *ResolvedCacheStore, key string, gvr schema.GroupVersionResource, ns, name string) {
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"k":"` + key + `"}`), Inputs: widgetInputs(gvr, ns, name)})
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{"k":"` + key + `"}`), Inputs: widgetInputs(gvr, ns, name)})
 	Deps().Record(context.Background(), key, gvr, ns, name)
 }
 
@@ -176,7 +176,7 @@ func TestIssue1126_D2c_ReconcileOnceCountsExactlyAndSkipsUnknown(t *testing.T) {
 	c3Put(store, "L1_flex-x_cohortB", gvr, "demo-system", "flex-x")
 	c3Put(store, "L1_flex-y", gvr, "demo-system", "flex-y")
 	c3Put(store, "L1_button-z", unregistered, "demo-system", "button-z")                   // GVR never registered → UNKNOWN
-	store.Put("L1_list", &ResolvedEntry{RawJSON: []byte(`[]`), Inputs: &ResolvedKeyInputs{ // LIST-scope: no name
+	store.put("L1_list", &ResolvedEntry{RawJSON: []byte(`[]`), Inputs: &ResolvedKeyInputs{ // LIST-scope: no name
 		CacheEntryClass: "widgets", Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource, Namespace: "demo-system",
 	}})
 

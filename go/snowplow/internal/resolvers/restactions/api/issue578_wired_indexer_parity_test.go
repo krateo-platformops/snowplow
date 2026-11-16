@@ -108,8 +108,8 @@ func TestIssue578_WiredIndexer_RawEnvelopeMatchesDecodedEnvelope(t *testing.T) {
 			label = "cluster-wide"
 		}
 		t.Run(label, func(t *testing.T) {
-			items, servableDecoded := rw.ListObjectsServable(gvr, ns)
-			raws, servableRaw := rw.ListRawServable(gvr, ns)
+			items, servableDecoded := rw.ListObjectsServable(context.Background(), gvr, ns)
+			raws, servableRaw := rw.ListRawServable(context.Background(), gvr, ns)
 
 			// The servability VERDICT must agree. If one path can vouch for an
 			// answer and the other cannot, they are not reading the same gate.

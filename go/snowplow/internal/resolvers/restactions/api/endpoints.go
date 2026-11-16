@@ -4,75 +4,61 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/env"
-	"github.com/krateo-platformops/plumbing/kubeutil"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"k8s.io/client-go/rest"
 )
 
 type endpointReferenceMapper struct {
 	authnNS  string
 	username string
-	rc       *rest.Config
+	// groups are the requester's groups. With username they choose the
+	// caller's own credential Secret (credsecret.For, #994).
+	groups []string
+	rc     *rest.Config
 	// provenance (#443 part 2) — under ProvenanceCallerSupplied a named
 	// endpointRef Secret is read with the caller's own credentials.
 	provenance Provenance
 }
 
-// clientConfigSuffix is snowplow's OWN reserved internal-identity suffix: the
-// per-user credential Secret name resolveOne synthesizes for the nil-ref
-// internal path (`<user>-clientconfig`, endpoints.go). #113 guardrail (b) keys
-// on THIS single literal — a request-templated endpointRef may never resolve to
-// a name ending in it (that would let user query-extras select another user's
-// apiserver credentials — the credential-selection escalation). Single source so
-// the guardrail and the synthesis can never drift onto different strings
+// The per-user credential Secret names come from credsecret (#994): For picks
+// the one a validated identity reads (`<user>-clientconfig`, or
+// `<user>-clientconfig-stepup` when its groups carry krateo:loa:2), and
+// IsPerUserName is the reserved set the #1025 rule (refusePerUserRef) keys on. Single source, so
+// the rule and the synthesis can never drift onto different strings
 // (feedback_consultation_mutation_is_not_key_correctness). It is a general
-// boundary on the reserved suffix, NOT a per-resource carve-out
+// boundary on the reserved names, NOT a per-resource carve-out
 // (feedback_no_special_cases).
-const clientConfigSuffix = "-clientconfig"
 
-// resolveOne resolves a named/nil endpoint Reference to an Endpoint. templated
-// reports whether ref was produced by REQUEST-DRIVEN jq templating of
-// endpointRef.name (#113): the eval site in resolveStageEndpoint passes true so
-// this choke point can apply guardrail (b) — the defense-in-depth reserved-suffix
-// refusal — WITHOUT refusing resolveOne's OWN internal nil-ref synthesis (which
-// legitimately produces a `<user>-clientconfig` name and MUST still resolve).
-// Every non-templated caller (internal nil-ref, static author-literal refs)
-// passes false and is byte-identical to pre-#113.
+// resolveOne resolves a named/nil endpoint Reference to an Endpoint.
+//
+// #1025 — its only caller, resolveStageEndpoint, has already passed the named
+// ref through refusePerUserRef (per_user_ref.go), for every stage, UAF or
+// not, so a per-user credential name never reaches the lookup below.
+// TestRev1032_ResolveOneOnlyBehindRefusePerUserRef keeps it that way: it
+// fails on any other caller of resolveOne, and on a rule that no longer
+// precedes every resolveOne call there. The nil-ref synthesis legitimately
+// builds the caller's OWN per-user name.
+//
 // resolveOne additionally reports isSAEndpoint: true ONLY on the
 // InternalEndpointFromContext branch, which always carries snowplow's own SA
 // endpoint (every WithInternalEndpoint attach passes saEP). This is the PROVENANCE
 // signal the dial site uses to thread the SA token FILE (#267) — the SA endpoint is
 // shape-identical to a token-auth per-user clientconfig, so it can only be
 // distinguished by where it came from, never by field shape (arch-268 ruling). All
-// other returns (guardrail-b, wrong-type fall-through, clientconfig cache-hit,
-// FromSecret, errors) report false.
-func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates.Reference, templated bool) (endpoints.Endpoint, bool, error) {
-	isInternal := false
-	// #113 guardrail (b) — defense-in-depth. A REQUEST-TEMPLATED ref may never
-	// resolve to the reserved `<user>-clientconfig` internal-identity class. This
-	// is the SECOND layer (the eval site refuses first); it lives here because
-	// resolveOne is the single choke point EVERY ref lookup passes AND where the
-	// internal `-clientconfig` name is itself constructed — so a FUTURE templating
-	// call site that forgets the eval-site check still cannot dial a per-user
-	// credential Secret. Gated on templated so the internal nil-ref synthesis
-	// below (which DOES build a `-clientconfig` name) is never refused.
-	if templated && ref != nil && strings.HasSuffix(ref.Name, clientConfigSuffix) {
-		return endpoints.Endpoint{}, false, fmt.Errorf(
-			"templated endpointRef resolved to the reserved internal-identity name %q (suffix %q); refusing — a request-driven endpointRef may not select a per-user credential Secret (#113 guardrail b)",
-			ref.Name, clientConfigSuffix)
-	}
+// other returns (wrong-type fall-through, clientconfig cache-hit, FromSecret,
+// errors) report false.
+func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates.Reference) (endpoints.Endpoint, bool, error) {
 	// #443 part 2 — a caller-supplied (inline draft) named ref is read as the
 	// CALLER, never through the ServiceAccount or the SA-backed Secrets
 	// snapshot, so a draft can only use credentials its author can already
-	// read. A literal `-clientconfig` ref is refused too (the #113 guardrail
-	// applied to literal refs, defense in depth): a draft must never select
-	// another user's clientconfig even if the caller could read it.
+	// read.
 	if ref != nil && m.provenance == ProvenanceCallerSupplied {
 		return m.resolveOneAsCaller(ctx, ref)
 	}
@@ -103,71 +89,91 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 			// will silently take the per-user path, which has no
 			// `<sa>-clientconfig` Secret and so will fail. Loud so a
 			// future caller passing the wrong shape is diagnosable.
-			xcontext.Logger(ctx).Warn("resolveOne: internal endpoint present but not a usable *endpoints.Endpoint; falling through to per-user clientconfig",
+			xcontext.Logger(ctx).WarnContext(ctx, "resolveOne: internal endpoint present but not a usable *endpoints.Endpoint; falling through to per-user clientconfig",
 				slog.String("subsystem", "cache"),
 				slog.String("got_type", fmt.Sprintf("%T", v)),
 				slog.String("hint", "an internal driver (e.g. Phase 1) must pass *endpoints.Endpoint to cache.WithInternalEndpoint"),
 			)
 		}
-		ref = &templates.Reference{
-			Namespace: m.authnNS,
-			Name:      kubeutil.MakeDNS1123Compatible(m.username) + clientConfigSuffix,
+		// #1334 — an identity the apiserver does not treat as authenticated
+		// (the public identity) holds no clientconfig credential: the auth
+		// middleware never reads one for it, and the name credsecret.For
+		// would build is a REAL user's Secret (`krateo-public-clientconfig`
+		// belongs to a user named krateo-public). Its own-credential stage
+		// dials only through the impersonating context above; without it the
+		// stage fails here, before any Secret is read.
+		if !cache.Authenticated(m.username, m.groups) {
+			return endpoints.Endpoint{}, false, fmt.Errorf("an unauthenticated identity has no clientconfig credential; its stage needs the impersonating context")
 		}
-		isInternal = true
+		// #994 — the caller's OWN credential, chosen exactly as the auth
+		// middleware chose it: the step-up Secret for an identity whose
+		// groups carry krateo:loa:2, else the session Secret. No fallback: a
+		// step-up identity whose Secret is gone fails this stage rather than
+		// dialing the session credential. #1382 — read exact-then-legacy
+		// (credsecret.For), and only a Secret the caller owns
+		// (endpoints.OwnsSecret): another user's Secret under a shared name
+		// is a miss, never a dial with their credential.
+		return m.resolveOwn(ctx)
 	}
 
-	// Ship D.2 (0.30.143) — F-3 cache lookup FIRST. The Secrets
-	// snapshot covers AUTHN_NAMESPACE `<user>-clientconfig` Secrets
-	// in-process; on a hit we skip the apiserver round-trip
-	// entirely. On any soft miss (cache=off, namespace mismatch,
-	// pre-sync, Secret absent, snapshot nil pre-readiness) the
-	// function returns served=false and we fall through to the
-	// upstream plumbing call below — the pre-D.2 behavior preserved
-	// exactly (AC-D2.4). The Ship D RecordApiserverFallthrough call
-	// is BELOW the cache-hit return so the F-3 counter measures
-	// only the fallback path; the F-3 falsifier (134/60s → ≤5/60s)
-	// reads that drop.
-	if ep, served, ferr := FromInformerSecret(ctx, ref.Namespace, ref.Name); served {
-		// Hard error path: Secret present but malformed
-		// (server-url missing). Upstream FromSecret would have
-		// returned the same error verbatim — we propagate it.
-		if ferr != nil {
-			return ep, false, ferr
-		}
-		// AC-D2.7 — the isInternal+!env.TestMode ServerURL override
-		// applies UNIFORMLY on both the cache-hit and the upstream-
-		// fallback path. Kept here (not factored into
-		// FromInformerSecret) per PM-explicit `feedback_no_special_cases`:
-		// the override is the resolver's contextual decision (the
-		// stage is internal-driven), not a Secret-cache concern.
-		if isInternal && !env.TestMode() {
-			ep.ServerURL = "https://kubernetes.default.svc"
-		}
+	// A NAMED ref: the Secret it names, read through the ServiceAccount.
+	// Ship D.2 (0.30.143) — F-3 cache lookup FIRST. On any soft miss
+	// (cache=off, namespace mismatch, pre-sync, Secret absent, snapshot nil
+	// pre-readiness) the function returns served=false and we fall through
+	// to the upstream plumbing call below — the pre-D.2 behavior preserved
+	// exactly (AC-D2.4). A malformed Secret in the snapshot (served=false
+	// with an error) falls through too: the apiserver is authoritative, and
+	// answers the same verbatim error when the Secret really is malformed.
+	if ep, served, _ := FromInformerSecret(ctx, ref.Namespace, ref.Name); served {
 		return ep, false, nil
 	}
 
-	// Ship D (0.30.141) — F-3: endpoints.FromSecret issues a per-user
-	// clientconfig-Secret GET (apiserver) per non-UAF stage per /call —
-	// architect's largest snowplow-attributable apiserver traffic
-	// source on the request path. Record BEFORE the plumbing call so a
-	// panicking secret-GET still increments the counter (AC-D.3). The
-	// gvr label is left empty: the Secret being read is fixed per user,
-	// not per resolver target, and synthesizing a placeholder would
-	// inflate cardinality without diagnostic value.
-	cache.RecordApiserverFallthrough(ctx, cache.ReasonSecretGet, "")
-	ep, err := endpoints.FromSecret(ctx, m.rc, ref.Name, ref.Namespace)
+	// Ship D (0.30.141) — F-3: record BEFORE the plumbing call so a
+	// panicking secret-GET still increments the counter (AC-D.3). The gvr
+	// label is left empty: synthesizing a placeholder would inflate
+	// cardinality without diagnostic value.
+	sctx := cache.RecordApiserverFallthrough(ctx, cache.ReasonSecretGet, "")
+	ep, err := credhttp.FromSecret(sctx, m.rc, ref.Name, ref.Namespace)
 	if err != nil {
 		return ep, false, err
 	}
 	// Ship 0.30.165 — normalize CA bytes to the single-base64-encoded
 	// PEM shape that plumbing's transport expects (see endpoints_ca.go).
-	// Live `<user>-clientconfig` Secrets store double-base64 PEM; without
-	// this normalization plumbing silently fails to populate RootCAs and
-	// requests die with `x509: certificate signed by unknown authority`.
 	ep.CertificateAuthorityData = string(normalizeCAData([]byte(ep.CertificateAuthorityData)))
-	if isInternal && !env.TestMode() {
+	return ep, false, nil
+}
+
+// resolveOwn resolves the caller's OWN credential (#994, #1382): the names
+// credsecret.For gives, exact first, from the Secrets informer and then, when
+// it holds no Secret the caller owns, from the apiserver
+// (own_credential.go). A Secret the caller does not own, under any name, is a
+// miss; when no name holds one the error is a NotFound, which fails the stage
+// as a missing credential does. The endpoint is never the ServiceAccount's
+// (isSAEndpoint=false).
+//
+// AC-D2.7 — the !env.TestMode ServerURL override applies UNIFORMLY on the
+// informer and the apiserver path: the stage dials the in-cluster apiserver
+// with the caller's credential. Kept here, not in the readers, per
+// feedback_no_special_cases: it is the resolver's contextual decision, not a
+// Secret-cache concern.
+func (m *endpointReferenceMapper) resolveOwn(ctx context.Context) (endpoints.Endpoint, bool, error) {
+	names := credsecret.For(m.username, m.groups)
+	// A malformed owned Secret in the snapshot (served=false with an error)
+	// falls through to the apiserver, as on the named path: the apiserver is
+	// authoritative and answers the same verbatim error when it is malformed.
+	ep, served, _ := FromInformerOwnSecret(ctx, m.authnNS, m.username, names)
+	if !served {
+		var err error
+		// Ship D (0.30.141) — F-3: one fallthrough per miss, recorded before
+		// the reads, however many names they try.
+		sctx := cache.RecordApiserverFallthrough(ctx, cache.ReasonSecretGet, "")
+		ep, err = FromAPIServerOwnSecret(sctx, m.rc, m.authnNS, m.username, names)
+		if err != nil {
+			return ep, false, err
+		}
+	}
+	if !env.TestMode() {
 		ep.ServerURL = "https://kubernetes.default.svc"
 	}
-
 	return ep, false, nil
 }

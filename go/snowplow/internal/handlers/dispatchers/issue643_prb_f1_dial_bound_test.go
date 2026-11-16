@@ -91,6 +91,7 @@ func TestIssue643_F1b_BootCutBeforeExternalTail_FirstBackgroundPassDialsOnce(t *
 		t.Fatalf("fixture precondition: %d cohorts, want %d", got, h643K)
 	}
 	h643Budget(t, map[prewarmScopeKind]time.Duration{scopeKindBoot: 2 * time.Second})
+	h643VirtualBudget(t)
 
 	// Cut boot exactly at its external tail (#594 orders external units last):
 	// the first external unit holds until the boot budget expires.
@@ -99,8 +100,7 @@ func TestIssue643_F1b_BootCutBeforeExternalTail_FirstBackgroundPassDialsOnce(t *
 	cutBoot := true
 	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, authnNS string, mode seedScopeMode) error {
 		if cutBoot && mode == seedModeBoot && env.external[e.W.GetNamespace()+"/"+e.W.GetName()] {
-			<-ctx.Done()
-			return ctx.Err()
+			return h643HoldUntilBudget(ctx)
 		}
 		return prevW(ctx, e, authnNS, mode)
 	}

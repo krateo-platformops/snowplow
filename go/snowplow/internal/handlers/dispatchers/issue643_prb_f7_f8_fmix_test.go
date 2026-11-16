@@ -64,7 +64,7 @@ func TestIssue643_F8_CallPathDialsEveryTime_MarkOrNot(t *testing.T) {
 		t.Fatal("precondition: ext-w0 must be marked")
 	}
 
-	w, ok := env.rw.GetObject(h643WidgetGVR, h643NS, "ext-w0")
+	w, ok := env.rw.GetObject(context.Background(), h643WidgetGVR, h643NS, "ext-w0")
 	if !ok {
 		t.Fatal("precondition: ext-w0 not in the informer")
 	}

@@ -34,7 +34,7 @@ joins a shared context that later calls and JQ expressions can reference.
 | `filter` | JQ expression applied to the response ([custom modules](./configuration.md) available). |
 | `continueOnError`, `errorKey` | Keep going on failure; where the error lands in `status`. |
 | `exportJwt` | Export a JWT obtained by this stage for later stages. |
-| `resolve` | When `path` points at a `RESTAction`/`Widget` CR, resolve it in-process (default `true`). |
+| `resolve` | When `path` points at a `RESTAction`/`Widget` CR, resolve it in-process. Opt-in: omitted means `false`, and the raw stored CR is returned. |
 | `userAccessFilter` | Dispatch the read via snowplow's ServiceAccount, then RBAC-refilter the result per item against the requesting user. CEL rules on the CRD enforce read-verb-only, no `exportJwt`, and the `resource`/`resourcesFrom` XOR. |
 
 A top-level `spec.filter` shapes the overall output.
@@ -66,7 +66,8 @@ authoritative machine-readable spec is
 |---|---|
 | `GET /call` | **The content endpoint.** Resolves the referenced `RESTAction` or `Widget` (`apiVersion`, `resource`, `name`, `namespace` query params; optional [`extras`](../go/snowplow/howto/extras.md)) — dispatched, RBAC-gated, cached. |
 | `POST/PUT/PATCH/DELETE /call` | Write passthrough to the apiserver under the caller's identity — never resolved, never cached. |
-| `GET /export` | Any `/call`-resolvable list as a CSV/JSON attachment; re-dispatches in-process with identical auth/RBAC ([export.md](../go/snowplow/howto/export.md)). |
+| `GET /export` | Any `/call`-resolvable list as a CSV, JSON or PDF attachment, with optional column labels; re-dispatches in-process with identical auth/RBAC ([export.md](../go/snowplow/howto/export.md)). |
+| `POST /export` | The same export with the extras in the request body (`{"extras":{...}}`, as `POST /call/read`), for filters too large for a URL; pages go through the `/call/read` read lane ([export.md](../go/snowplow/howto/export.md)). |
 | `GET /list` | List resources by category in a namespace. |
 | `GET /api-info/names` | API names/plurals discovery helper. |
 | `GET /rbac` | Enumerates the (group, version, resource, verb) read-set a RESTAction *would* perform, without dispatching — for RBAC pre-generation. |
@@ -74,7 +75,7 @@ authoritative machine-readable spec is
 | `POST /jq` | Evaluate a JQ expression against a JSON input. |
 | `GET /health`, `GET /readyz` | Liveness (always 200 once serving) / readiness (200 on prewarm-complete). |
 | `GET /swagger/` | The OpenAPI UI + spec. |
-| `GET /debug/vars`, `/debug/pprof/*`, `/debug/servable`, `/debug/apistage`, `/debug/refreshes`, `/debug/reconcile` | Operator diagnostics ([observability](../go/snowplow/docs/architecture/observability.md)); `/debug/refreshes` is JWT-gated. |
+| `GET /debug/vars`, `/debug/pprof/*`, `/debug/servable`, `/debug/apistage`, `/debug/refreshes`, `/debug/reconcile`, `/debug/harvest`, `/debug/store`, `/debug/deps`, `GET`/`POST /debug/shadow-parity` | Operator diagnostics ([observability](../go/snowplow/docs/architecture/observability.md)). Every route needs a JWT **and** the RBAC grant `nonResourceURLs: ["/debug/*"]` (verb `get`; `post` for the POST). Without the grant the answer is `403` (#1362). |
 
 Note: the spec also describes `POST /convert` (YAML↔JSON), but that route is currently
 not wired in `main.go` — the spec is a superset on this one endpoint.

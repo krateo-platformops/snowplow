@@ -1,0 +1,33 @@
+# Published versions of this repo's charts that must not be pinned.
+#
+# A tag cannot be withdrawn: it stays in the registry and looks like any other release. This list is
+# how a release is marked bad where a pinning session will see it. installer's CI reads it on every
+# PR, over every pin (not only the pins a PR changes), and refuses a pin on a listed version, so a bad
+# pin resting on installer's main fails CI until it is moved, whether or not anyone was told.
+#
+# Same schema as krateo-platformops/frontend's and portal's retracted-versions.yaml. `charts` names
+# the chart, as in the `chart:` field of installer's component-pins.yaml (a helm/<dir>/Chart.yaml
+# `name:` here: snowplow and snowplow-crds), not the component (snowplow-crd). `use` is the version to
+# pin instead, and it must already be published when the entry lands.
+# go/snowplow/scripts/check_retracted_versions.sh guards both.
+retracted:
+  - version: 1.12.71
+    charts: [snowplow, snowplow-crds]
+    use: 1.12.70
+    reason: >-
+      Pre-release built only for a paired bench run (do-not-install): not yet measured against
+      1.12.70. Expected to become a real release after its paired run against 1.12.70 (launch B,
+      verdict expected Tuesday 17 November 2026, evening, Rome time); this entry is then removed in
+      its own PR.
+  - version: 1.12.72
+    charts: [snowplow, snowplow-crds]
+    use: 1.12.70
+    reason: >-
+      Pre-release built only for a paired bench run (do-not-install): not yet measured against
+      1.12.70. Stays listed until its own paired run gives a verdict.
+  - version: 1.12.73
+    charts: [snowplow, snowplow-crds]
+    use: 1.12.70
+    reason: >-
+      Pre-release built only for a paired bench run (do-not-install): not yet measured against
+      1.12.70. Stays listed until its own paired run gives a verdict.

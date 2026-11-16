@@ -259,7 +259,7 @@ func StartConfigVarsWatch(ctx context.Context, rc *rest.Config, authnNS string) 
 
 	client, err := buildConfigVarsWatchClient(rc)
 	if err != nil {
-		log.Warn("prewarm.configvars.watch_client_failed",
+		log.WarnContext(ctx, "prewarm.configvars.watch_client_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
 			slog.String("effect", "config-vars watch not wired; eager one-shot read remains the only trigger (degraded, not fatal)"),
@@ -325,7 +325,7 @@ func StartConfigVarsWatch(ctx context.Context, rc *rest.Config, authnNS string) 
 		// re-walk — nothing to enqueue. delete→recreate is covered by the
 		// unconditional AddFunc (recreate == ADD).
 	}); err != nil {
-		log.Warn("prewarm.configvars.add_event_handler_failed",
+		log.WarnContext(ctx, "prewarm.configvars.add_event_handler_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
 		)

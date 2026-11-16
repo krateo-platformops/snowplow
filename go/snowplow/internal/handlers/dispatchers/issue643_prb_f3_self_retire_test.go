@@ -77,13 +77,14 @@ func TestIssue643_F3a_RAEditedToInternal_NextBackgroundPassPuts(t *testing.T) {
 	env := h643Setup(t, h643Opts{cohorts: h643K, external: h643M, internal: h643N, things: 2})
 	h643BootAndMark(t, env, "ext-w0")
 
-	// Edit ext-ra0 so its stages hit an apiserver path (internal dispatch).
+	// Edit ext-ra0 so its stage reads this cluster: an apiserver path with no
+	// endpointRef (#1017: a named endpointRef is always sent to its endpoint).
 	u, err := env.dyn.Resource(h643RAGVR).Namespace(h643NS).Get(context.Background(), "ext-ra0", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get ext-ra0: %v", err)
 	}
 	internalPath := "/apis/" + h643ThingsGVR.Group + "/" + h643ThingsGVR.Version + "/namespaces/" + h643NS + "/" + h643ThingsGVR.Resource
-	_ = unstructured.SetNestedSlice(u.Object, []any{h643ExtStage("s0", internalPath)}, "spec", "api")
+	_ = unstructured.SetNestedSlice(u.Object, []any{h643OwnStage("s0", internalPath)}, "spec", "api")
 	u.SetResourceVersion("2")
 	if _, err := env.dyn.Resource(h643RAGVR).Namespace(h643NS).Update(context.Background(), u, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("update ext-ra0: %v", err)
@@ -116,7 +117,7 @@ func TestIssue643_F3b_PutRetiresTheMark_ExternalTTLPutDoesNot(t *testing.T) {
 	// An ExternalTTL Put — the /call path's opt-in cache of an EXTERNAL result
 	// (widgets.go, krateo.io/external-cache-ttl-seconds) — proves nothing about
 	// cacheability: the mark stays and the next background pass dials 0.
-	store.Put(keys[0], &cache.ResolvedEntry{RawJSON: []byte(`{"ext":true}`), Inputs: inputs, ExternalTTL: true})
+	store.PutResolved(fixtureStoreVerdict, keys[0], &cache.ResolvedEntry{RawJSON: []byte(`{"ext":true}`), Inputs: inputs, ExternalTTL: true})
 	if !set.Marked(keys[0]) {
 		t.Fatal("F3b: an ExternalTTL Put retired the mark — that cell still touches external")
 	}
@@ -126,7 +127,7 @@ func TestIssue643_F3b_PutRetiresTheMark_ExternalTTLPutDoesNot(t *testing.T) {
 	}
 
 	// A plain Put proves the key cacheable: the mark retires (store-side hook).
-	store.Put(keys[1], &cache.ResolvedEntry{RawJSON: []byte(`{"cacheable":true}`), Inputs: inputs})
+	store.PutResolved(fixtureStoreVerdict, keys[1], &cache.ResolvedEntry{RawJSON: []byte(`{"cacheable":true}`), Inputs: inputs})
 	if set.Marked(keys[1]) {
 		t.Fatal("F3b: a plain L1 Put of the key did not retire its declined-external mark (retire rule a)")
 	}
@@ -192,6 +193,19 @@ const (
 // Returns pass B's and pass C's dials and how many iter-w cells pass C Put.
 func h643F3d(t *testing.T, how h643F3dHow, mutate func()) (dialsB, dialsC, putC int) {
 	t.Helper()
+	// #854 — these arms pin the PLAIN list cell, whose refresh re-Puts it (a new
+	// putSeq retires the mark). The incremental cell's twin, where the refresh
+	// drains a new generation (a new body identity) and Puts nothing, is
+	// list_cell_854_f3d_test.go.
+	t.Cleanup(cache.SetListCellAnchoringForTest(false))
+	return h643F3dRun(t, how, mutate, nil)
+}
+
+// h643F3dRun is h643F3d's scenario; onRefresh, when non-nil, replaces the
+// plain-cell refresh precondition (a new putSeq) with the caller's own checks
+// around the real apistage refresh (the #854 incremental twin).
+func h643F3dRun(t *testing.T, how h643F3dHow, mutate func(), onRefresh func(cellKey string, refresh func())) (dialsB, dialsC, putC int) {
+	t.Helper()
 	env := h643Setup(t, h643Opts{cohorts: h643K, internal: 1, things: 2, extra: []h643Extra{h643IterExtra}})
 	h643Budget(t, nil)
 	RegisterRefreshHandlers(nil)
@@ -243,6 +257,14 @@ func h643F3d(t *testing.T, how h643F3dHow, mutate func()) (dialsB, dialsC, putC 
 		fn := cache.RefreshFuncForTest(cache.CacheEntryClassApistage)
 		if fn == nil {
 			t.Fatal("no apistage RefreshFunc registered")
+		}
+		if onRefresh != nil {
+			onRefresh(cellKey, func() {
+				if err := fn(context.Background(), cellKey, cellInputs); err != nil {
+					t.Fatalf("the real apistage refresh of the list cell failed: %v", err)
+				}
+			})
+			break
 		}
 		seq0, _ := cache.ResolvedCache().CellPutSeq(cellKey)
 		if err := fn(context.Background(), cellKey, cellInputs); err != nil {

@@ -26,8 +26,12 @@
 //	    an attempt that succeeds → rerun unchanged, the slot released, no second
 //	    attempt (architect-ch's gate: the still-known-stale check had no arm).
 //
-// K5 (the rerun bypasses the admission cap) lands with PR-2b's customer-
-// triggered marker, which is not on main yet (ruling: "whichever lands second").
+// K5 (the rerun bypasses the admission cap) is not in this file. The
+// customer-triggered marker it needed is on main: the refresher marks a
+// dequeue whose known-stale background slot is held — an absorbed read's rerun
+// included — as customer-triggered (refresher.go, "#740 K5"). Its arm is
+// TestIssue740_K5_TheBackgroundSlotDequeueIsCustomerTriggeredAtBothGates in
+// issue740_viewer_retry_test.go.
 package dispatchers
 
 import (
@@ -56,7 +60,7 @@ func k740Shell(t *testing.T, h *k547Harness) (string, cacheHandle) {
 	shell.Object["status"] = map[string]any{"widgetData": map[string]any{"conditions": []any{
 		map[string]any{"type": "Ready", "status": "True", "reason": "v0"}}}}
 	raw, _ := json.Marshal(shell.Object)
-	handle.Put(contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
+	putFixture(handle, contentKey, &cache.ResolvedEntry{RawJSON: raw, Inputs: inputs})
 	cache.Deps().Record(ctx, contentKey, k547CompGVR, k547CompNS, fmt.Sprintf("comp-%d", k547Changed))
 	if r, code := h.get(0, k547Changed); code != 200 || r != "v0" {
 		t.Fatalf("PRECONDITION: the shared shell must serve before the UPDATE (code=%d reason=%q)", code, r)
@@ -167,6 +171,8 @@ func TestIssue740_K1_AnAbsorbedReadEarnsTheShellOneRerunThatHeals(t *testing.T) 
 }
 
 func TestIssue740_K2_TheRerunNeverLoopsWithoutAnotherRead(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	h := newK547Harness(t, k547DenyBackground)
 	contentKey, _ := k740Shell(t, h)
 	park := k740ParkDoomed(h, true, 1)

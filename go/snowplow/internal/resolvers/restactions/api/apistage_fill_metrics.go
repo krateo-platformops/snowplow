@@ -33,6 +33,12 @@
 //     epoch-at-entry rule): they lead the next flight, so they are also fills
 //     and duplicates;
 //   - _join_waiting            gauge: joiners waiting on a flight right now;
+//   - _refresh_reused_total    (#765) refresher reads whose trigger set held
+//     the cell's GVR but whose stored cell's content stamp covered every
+//     trigger: served from the cell, NO fill (each one a re-fill avoided);
+//   - _refresh_coalesced_total (#765) background refresher readers that joined
+//     their key's PENDING flight instead of starting a concurrent fill of the
+//     same list (each one a concurrent re-fill avoided);
 //   - _not_servable_total      fills whose dispatch was not pivot-servable
 //     (no bytes; the caller falls through);
 //   - _inflight, _inflight_bytes            gauges, right now;
@@ -89,6 +95,7 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 )
 
 // contentFillReason is why a reader entered the content fill.
@@ -98,11 +105,15 @@ const (
 	contentFillAbsent contentFillReason = iota
 	contentFillKnownStale
 	contentFillRefreshForced
+	// contentFillReanchor — #854: the stored cell is an incremental list cell
+	// that stopped trusting itself (servability epoch, lost event, type event,
+	// divergence): the full fill re-anchors it.
+	contentFillReanchor
 	contentFillReasons
 )
 
 // contentFillReasonNames is the closed `reason` key set, in enum order.
-var contentFillReasonNames = [contentFillReasons]string{"absent", "known_stale", "refresh_forced"}
+var contentFillReasonNames = [contentFillReasons]string{"absent", "known_stale", "refresh_forced", "reanchor"}
 
 func (r contentFillReason) String() string {
 	if r >= contentFillReasons {
@@ -136,6 +147,9 @@ var (
 	contentFillJoined      [contentFillReasons]atomic.Uint64
 	contentFillJoinRefused [contentFillReasons]atomic.Uint64
 	contentFillJoinWaiting atomic.Int64
+	// #765 — re-fills the content stamp avoided.
+	contentFillRefreshReused    atomic.Uint64
+	contentFillRefreshCoalesced atomic.Uint64
 
 	contentFillInflight          atomic.Int64
 	contentFillInflightBytes     atomic.Int64
@@ -183,10 +197,14 @@ type ContentFillGVRStats struct {
 	Fills      uint64 `json:"fills"`
 	Duplicates uint64 `json:"duplicates"`
 	Joined     uint64 `json:"joined"`
-	Bytes      uint64 `json:"bytes"`
-	Items      uint64 `json:"items_total"`
-	MaxBytes   uint64 `json:"max_bytes"`
-	MaxItems   uint64 `json:"max_items"`
+	// #765 — refresher reads served from the stamped cell / joined to the
+	// pending flight instead of filling.
+	RefreshReused    uint64 `json:"refresh_reused"`
+	RefreshCoalesced uint64 `json:"refresh_coalesced"`
+	Bytes            uint64 `json:"bytes"`
+	Items            uint64 `json:"items_total"`
+	MaxBytes         uint64 `json:"max_bytes"`
+	MaxItems         uint64 `json:"max_items"`
 	// One fill's duration (dispatch start to the end of its parse and Put):
 	// EWMA and max.
 	DurationMSEWMA float64 `json:"duration_ms_ewma"`
@@ -401,11 +419,17 @@ func beginContentFill(ctx context.Context, key, gvr, namespace string, isList bo
 // closed-enum reason and a RESTAction namespace/name — no identity.
 func (f *contentFill) pprofLabels() pprof.LabelSet {
 	return pprof.Labels(
-		"apistage_fill_gvr", f.gvr,
-		"apistage_fill_reason", f.reason.String(),
+		fillLabelGVR, f.gvr,
+		fillLabelReason, f.reason.String(),
 		"apistage_fill_ra", f.owner.ra,
 	)
 }
+
+// The fill label keys a slow-call goroutine snapshot keeps (#1054).
+const (
+	fillLabelGVR    = "apistage_fill_gvr"
+	fillLabelReason = "apistage_fill_reason"
+)
 
 // dispatched records the raw envelope the fill's dispatch produced.
 func (f *contentFill) dispatched(raw []byte) {
@@ -482,6 +506,24 @@ func noteContentFillJoined(reason contentFillReason, gvr string) {
 	contentFillJoined[reason].Add(1)
 	contentFillMu.Lock()
 	contentFillGVRRow(gvr).Joined++
+	contentFillMu.Unlock()
+}
+
+// noteContentRefreshReused counts one stamp-gated refresher read served from
+// the stored cell because its stamp covered every trigger (#765).
+func noteContentRefreshReused(gvr string) {
+	contentFillRefreshReused.Add(1)
+	contentFillMu.Lock()
+	contentFillGVRRow(gvr).RefreshReused++
+	contentFillMu.Unlock()
+}
+
+// noteContentRefreshCoalesced counts one background stamp-gated refresher
+// reader that joined its key's pending flight (#765).
+func noteContentRefreshCoalesced(gvr string) {
+	contentFillRefreshCoalesced.Add(1)
+	contentFillMu.Lock()
+	contentFillGVRRow(gvr).RefreshCoalesced++
 	contentFillMu.Unlock()
 }
 
@@ -566,6 +608,8 @@ type ContentFillStats struct {
 	Joined            map[string]uint64
 	JoinRefused       map[string]uint64
 	JoinWaiting       int64
+	RefreshReused     uint64 // #765
+	RefreshCoalesced  uint64 // #765
 	NotServable       uint64
 	Inflight          int64
 	InflightBytes     int64
@@ -586,6 +630,8 @@ func ContentFillStatsSnapshot() ContentFillStats {
 		Joined:            make(map[string]uint64, contentFillReasons),
 		JoinRefused:       make(map[string]uint64, contentFillReasons),
 		JoinWaiting:       contentFillJoinWaiting.Load(),
+		RefreshReused:     contentFillRefreshReused.Load(),
+		RefreshCoalesced:  contentFillRefreshCoalesced.Load(),
 		NotServable:       contentFillNotServable.Load(),
 		Inflight:          contentFillInflight.Load(),
 		InflightBytes:     contentFillInflightBytes.Load(),
@@ -658,6 +704,9 @@ func ContentFillAdmissionStatsSnapshot() ContentFillAdmissionStats {
 // ResetContentFillStatsForTest zeroes every counter, gauge, peak and table. It
 // must not run while a fill is in flight. Production MUST NOT use it.
 func ResetContentFillStatsForTest() {
+	for o := range contentFillCalibrationSamples { // #787
+		contentFillCalibrationSamples[o].Store(0)
+	}
 	for r := range contentFillTotal {
 		contentFillTotal[r].Store(0)
 		contentFillDuplicate[r].Store(0)
@@ -666,6 +715,8 @@ func ResetContentFillStatsForTest() {
 		contentFillJoinRefused[r].Store(0)
 	}
 	contentFillJoinWaiting.Store(0)
+	contentFillRefreshReused.Store(0)
+	contentFillRefreshCoalesced.Store(0)
 	contentFillNotServable.Store(0)
 	contentFillInflight.Store(0)
 	contentFillInflightBytes.Store(0)
@@ -763,6 +814,10 @@ func RecordContentFillDurationForTest(ms int64) { recordContentFillDuration(ms) 
 var contentFillExpvarOnce sync.Once
 
 func init() {
+	// #1054 — a slow call's goroutine snapshot keeps a fill's GVR and reason
+	// labels (identity-free, see pprofLabels) so a stack names the fill it
+	// serves; the RESTAction label stays out.
+	slowcall.AllowStackLabels(fillLabelGVR, fillLabelReason)
 	if cache.Disabled() {
 		return
 	}
@@ -788,6 +843,12 @@ func registerContentFillExpvar() {
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_join_waiting", expvar.Func(func() any {
 			return contentFillJoinWaiting.Load()
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_refresh_reused_total", expvar.Func(func() any {
+			return contentFillRefreshReused.Load()
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_refresh_coalesced_total", expvar.Func(func() any {
+			return contentFillRefreshCoalesced.Load()
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_not_servable_total", expvar.Func(func() any {
 			return contentFillNotServable.Load()
@@ -834,6 +895,15 @@ func registerContentFillExpvar() {
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_by_gvr", expvar.Func(func() any {
 			return ContentFillStatsSnapshot().ByGVR
+		}))
+		// #787 — the learned decode expansion's summary and the calibration
+		// samples by outcome (the per-GVR value is already in by_gvr).
+		expvar.Publish("snowplow_apistage_content_fill_decode_expansion_summary", expvar.Func(func() any {
+			s, _ := ContentFillExpansionSummarySnapshot()
+			return s
+		}))
+		expvar.Publish("snowplow_apistage_content_fill_calibration_samples_total", expvar.Func(func() any {
+			return contentFillCalibrationSamplesMap()
 		}))
 		expvar.Publish("snowplow_apistage_content_fill_by_ra", expvar.Func(func() any {
 			return ContentFillStatsSnapshot().ByRA

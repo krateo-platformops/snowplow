@@ -33,6 +33,8 @@ import (
 )
 
 func TestIssue552_StaleServeIsCountedOnlyThroughTheCustomerGet(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := p3CacheEnv(t)
 	gvr := schema.GroupVersionResource{Group: "p552.example", Version: "v1", Resource: "things"}
 	RegisterRefreshFunc("restactions", func(context.Context, string, ResolvedKeyInputs) error { return nil })
@@ -51,7 +53,7 @@ func TestIssue552_StaleServeIsCountedOnlyThroughTheCustomerGet(t *testing.T) {
 	in := ResolvedKeyInputs{CacheEntryClass: "restactions", Group: gvr.Group, Version: gvr.Version,
 		Resource: gvr.Resource, Namespace: "p552", Name: "cell", BindingUID: "uid"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in})
 	Deps().Record(context.Background(), key, gvr, "p552", in.Name)
 	Deps().OnUpdate(gvr, "p552", in.Name)
 

@@ -20,9 +20,10 @@
 //	                  always passes.
 //
 // RED-first (feedback_falsifier_first_before_ship): written before the
-// deps_reconcile.go change; ReconcileFullDryRun does not exist yet, so the file
-// does not compile — the RED-for-the-right-reason signal that the mode is
-// absent (same posture as #272's new-API RED).
+// deps_reconcile.go change, when ReconcileFullDryRun did not exist, so the file
+// did not compile — the RED-for-the-right-reason signal that the mode was
+// absent (same posture as #272's new-API RED). ReconcileFullDryRun now exists
+// (deps_reconcile.go).
 
 package cache
 

@@ -53,6 +53,8 @@ func oldFrontendRequest() map[string]any {
 // field-equality + a real Put-under-seed / Get-under-serve HIT with zero resolver
 // invocations. This is the warmth vehicle that fixes #107: seed cell == browser key.
 func TestFARCH1_SeedParity_NonDeclaredWidget_PortalShapedHIT(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	ctx := ctxWithIdentity() // cyberjoker / [devs] — the requesting principal
 	const (
@@ -71,7 +73,7 @@ func TestFARCH1_SeedParity_NonDeclaredWidget_PortalShapedHIT(t *testing.T) {
 		t.Fatal("F-ARCH-1: expected a live per-cohort cache handle + key under the seed ctx")
 	}
 	body := []byte(`{"status":{"widgetData":{"label":"warm"}}}`)
-	seedHandle.Put(seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
+	putFixture(seedHandle, seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
 
 	// SERVE key: the REAL dispatcher fold under a POST-CONTRACT portal request
 	// (empty extras) — effectiveKeyExtras(ctx, cr, portalDashboardRequest()).
@@ -122,6 +124,8 @@ func TestFARCH1_SeedParity_NonDeclaredWidget_PortalShapedHIT(t *testing.T) {
 // extras.) The arm stays permanent, flipped GREEN-on-HIT, as the pin that F6
 // keeps the #107 class closed.
 func TestFARCH1_F6_OldFrontendRequest_NowHits(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	ctx := ctxWithIdentity()
 	const (
@@ -137,7 +141,7 @@ func TestFARCH1_F6_OldFrontendRequest_NowHits(t *testing.T) {
 		t.Fatal("F-ARCH-1 F6: expected a live seed handle + key")
 	}
 	body := []byte(`{"x":1}`)
-	seedHandle.Put(seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
+	putFixture(seedHandle, seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
 
 	// OLD-FRONTEND serve request: unconditional identity extras on the wire. Under
 	// F6 the undeclared widget DROPS them from the key.

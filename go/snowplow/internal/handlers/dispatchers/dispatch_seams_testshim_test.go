@@ -13,6 +13,7 @@ import (
 
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -28,10 +29,13 @@ func setFetchObjectForTest(fn func(req *http.Request) objects.Result) func() {
 
 // setCheckDispatchRBACForTest swaps the cache=on dispatch RBAC gate verdict and
 // returns a restore. Records every (gvr, namespace) it is asked so a test can
-// assert the gate ran (or did NOT run) and in what order.
+// assert the gate ran (or did NOT run) and in what order. The gate takes the
+// dispatched object (#1046); these stubs only ever read its namespace.
 func setCheckDispatchRBACForTest(fn func(ctx context.Context, gvr schema.GroupVersionResource, namespace string) bool) func() {
 	prev := checkDispatchRBACFn
-	checkDispatchRBACFn = fn
+	checkDispatchRBACFn = func(ctx context.Context, gvr schema.GroupVersionResource, obj rbac.ObjectNamer) bool {
+		return fn(ctx, gvr, obj.GetNamespace())
+	}
 	return func() { checkDispatchRBACFn = prev }
 }
 

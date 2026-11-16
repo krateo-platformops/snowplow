@@ -128,7 +128,7 @@ func TestF3_NeverWalkedGVR_RegisterOnNavigation(t *testing.T) {
 		t.Fatalf("F3: triggering request must fall through — a just-registered, " +
 			"not-yet-confirmed GVR must NOT be servable")
 	}
-	if _, servable := rw.ListObjectsServable(neverWalkedGVR, ""); servable {
+	if _, servable := rw.ListObjectsServable(context.Background(), neverWalkedGVR, ""); servable {
 		t.Fatalf("F3: triggering LIST must fall through — not-yet-confirmed GVR " +
 			"must NOT be servable")
 	}
@@ -147,7 +147,7 @@ func TestF3_NeverWalkedGVR_RegisterOnNavigation(t *testing.T) {
 		t.Fatalf("F3: after sync + discovery confirm, a subsequent request " +
 			"must find the GVR servable")
 	}
-	items, servable := rw.ListObjectsServable(neverWalkedGVR, "")
+	items, servable := rw.ListObjectsServable(context.Background(), neverWalkedGVR, "")
 	if !servable {
 		t.Fatalf("F3: after sync + discovery confirm, ListObjectsServable " +
 			"must report servable=true")
@@ -217,7 +217,7 @@ func TestF3_F1Guard_PostStartupCRD_StaysUnconfirmed(t *testing.T) {
 		t.Fatalf("F1-guard regressed: register-on-navigation must not let an " +
 			"unconfirmed post-startup CRD become servable")
 	}
-	if _, servable := rw.ListObjectsServable(neverWalkedGVR, ""); servable {
+	if _, servable := rw.ListObjectsServable(context.Background(), neverWalkedGVR, ""); servable {
 		t.Fatalf("F1-guard regressed: unconfirmed post-startup CRD must not be " +
 			"servable via ListObjectsServable")
 	}

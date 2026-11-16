@@ -53,9 +53,10 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/pathtemplate"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -145,9 +146,12 @@ var clusterListCollapseEnabled = true
 // VERBATIM for S.2, just unreachable until S.2 flips the var true
 // after landing refresher-decoupling.
 //
-// When enabled, the helper performs FOUR structural gates in order,
+// When enabled, the helper performs FIVE structural gates in order,
 // short-circuiting on the first failure (no wasted work):
 //
+//  9. Verb (#1011): the stage's verb is a plain GET (isPlainGet). The
+//     collapse replaces the stage's calls with one GET LIST, so a write
+//     (or a HEAD) must never enter it. Checked first.
 //  2. Cache-off + snapshot gate (AC-D5.13): !cache.Disabled() AND the
 //     Ship B typed-RBAC snapshot is published.
 //  3. Iterator present: apiCall.DependsOn.Iterator is non-empty (a
@@ -178,6 +182,25 @@ func attemptClusterListCollapse(
 	// disabled, S.2-pending".
 	if !clusterListCollapseEnabled {
 		return nil, false, 1
+	}
+
+	// #1017 — the cell holds THIS cluster's objects: a stage whose endpoint
+	// names another one (targetsOwnCluster) never collapses into it. Its own
+	// deny gate, 10. The one order every serve site uses: own cluster first
+	// (where the stage's calls go), then the verb (whether a cache may answer
+	// them).
+	if !targetsOwnCluster(ctx) {
+		return nil, false, 10
+	}
+
+	// #1011 — the verb. The collapse stands in for the stage's per-item calls
+	// with ONE cluster-scope GET LIST, so only a stage whose calls ARE a plain
+	// GET may enter it (isPlainGet, write_verb.go). Without this gate a write
+	// iterator was rewritten into that GET once the cell was warm: its writes
+	// were never sent and the stage reported success. Its own deny gate, 9,
+	// before any other work on an own-cluster stage.
+	if !isPlainGet(apiCall.Verb) {
+		return nil, false, 9
 	}
 
 	// Gate 2: cache-off + Servable. AC-D5.13.
@@ -235,17 +258,14 @@ func attemptClusterListCollapse(
 		// per-user token / SA-dispatch downstream narrows correctly.
 		return nil, false, 5
 	}
-	permitOpts := rbac.EvaluateOptions{
-		Username:  user.Username,
-		Groups:    user.Groups,
-		Verb:      "list",
-		Group:     gvr.Group,
-		Resource:  gvr.Resource,
-		Namespace: "", // cluster-scope check — evaluate.go:213-235
-		// Ship L1 (0.30.252): per-item caller discards
-		// matchedBindingUID — skip the CRB/RB stable-sort.
-		SkipBindingUID: true,
-	}
+	// #1049 — the check of the collapsed call itself: the cluster scope
+	// (Namespace "", evaluate.go:213-235) and the canonical query the call
+	// carries (buildClusterListCallQ), so a metadata.name selector carries its
+	// Name here exactly as at the serve gate (filterListByRBAC).
+	permitOpts := rbac.CollectionCheck(user.Username, user.Groups, gvr, "", query)
+	// Ship L1 (0.30.252): per-item caller discards matchedBindingUID — skip
+	// the CRB/RB stable-sort.
+	permitOpts.SkipBindingUID = true
 	// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller
 	// ignores matchedBindingUID.
 	permit, _, evalErr := rbac.EvaluateRBAC(ctx, permitOpts)
@@ -253,7 +273,6 @@ func attemptClusterListCollapse(
 		log.Debug("cluster_list.gate_deny.rbac_deny",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
-			slog.String("user", redact.User(user.Username)),
 			slog.String("gvr", gvr.String()),
 			slog.Bool("permit", permit),
 			slog.Any("eval_err", evalErr),
@@ -309,7 +328,6 @@ func attemptClusterListCollapse(
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
-			slog.String("user", redact.User(user.Username)),
 		)
 		return []httpcall.RequestOptions{clusterCall}, true, 0
 	}
@@ -330,7 +348,6 @@ func attemptClusterListCollapse(
 		slog.String("subsystem", "cache"),
 		slog.String("ra_stage", apiCall.Name),
 		slog.String("gvr", gvr.String()),
-		slog.String("user", redact.User(user.Username)),
 		slog.String("effect", "per-NS fallback for this request; async populate scheduled — next request warm"),
 	)
 	return nil, false, 8
@@ -393,7 +410,9 @@ func populateClusterListCellSync(
 
 	pipSink := cache.PIPStageTimingSinkFrom(ctx)
 	dispatchStart := time.Now()
-	rawEnvelope, dispatchedOK := dispatchViaInformerFn(
+	// informer-only: an unservable collapse falls back to the per-NS path and
+	// sends nothing to the apiserver from here.
+	rawEnvelope, dispatchedOK, _ := dispatchViaInformerFn(
 		cache.WithApistageContentResolve(ctx), clusterCall)
 	defensiveDispatchMs := time.Since(dispatchStart).Milliseconds()
 	if !dispatchedOK {
@@ -409,7 +428,7 @@ func populateClusterListCellSync(
 	shape, shapeOK, shapeReason := validateClusterListShape(gvr, rawEnvelope)
 	envelopeOKElapsed := time.Since(shapeStart)
 	if envelopeOKElapsed > shapeCheckSlowThreshold {
-		log.Warn("cluster_list.shape_check.slow",
+		log.WarnContext(ctx, "cluster_list.shape_check.slow",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.Duration("elapsed", envelopeOKElapsed),
@@ -420,7 +439,7 @@ func populateClusterListCellSync(
 	if !shapeOK {
 		cache.RecordApiserverFallthrough(ctx,
 			cache.ReasonClusterListShapeFallback, gvr.String())
-		log.Warn("cluster_list.shape_fallback",
+		log.WarnContext(ctx, "cluster_list.shape_fallback",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
@@ -436,7 +455,7 @@ func populateClusterListCellSync(
 	if decodeErr != "" {
 		cache.RecordApiserverFallthrough(ctx,
 			cache.ReasonClusterListShapeFallback, gvr.String())
-		log.Warn("cluster_list.shape_fallback",
+		log.WarnContext(ctx, "cluster_list.shape_fallback",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
@@ -477,7 +496,7 @@ func populateClusterListCellSync(
 	// during the defensive resolve. On refusal the populate DECLINES — the caller
 	// degrades (per-NS fallback / log-only), same as any other populate failure —
 	// and the dep-Record + tier-key registration are skipped (no cell to track).
-	if !apistageStore.PutIfGen(ctx, contentKey, newEntry, contentGen0) {
+	if !apistageStore.PutContentIfGen(ctx, contentKey, newEntry, contentGen0) {
 		log.Debug("cluster_list.populate_refused_gen_moved",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
@@ -597,7 +616,7 @@ func populateClusterListCellAsync(
 			<-clusterListAsyncSemaphore
 			clusterListInflightCells.Delete(contentKey)
 			if r := recover(); r != nil {
-				log.Error("cluster_list.cell.async_populate_panic",
+				log.ErrorContext(customerCtx, "cluster_list.cell.async_populate_panic",
 					slog.String("subsystem", "cache"),
 					slog.String("gvr", gvr.String()),
 					slog.Any("panic", r),
@@ -611,7 +630,16 @@ func populateClusterListCellAsync(
 		// internal endpoint + REST config + apistage-content-resolve
 		// markers so dispatchViaInformer can serve the cluster-scope
 		// call. Use a fresh timeout context anchored to Background.
-		populateCtx, cancel := context.WithTimeout(context.Background(),
+		//
+		// #871 — measurement only: started from the caller's goroutine, so it
+		// inherited the caller's label, but the ctx below starts from nothing
+		// and the content fill's pprof.Do would reset the goroutine to it.
+		// workclass.Detach replaces context.Background(): a background
+		// caller's populate continues that unit's class; a customer's is a
+		// new fill_bg unit (no user waits on it). The pre-build check's E1.
+		detachedCtx, endWork := workclass.Detach(customerCtx)
+		defer endWork()
+		populateCtx, cancel := context.WithTimeout(detachedCtx,
 			clusterListAsyncPopulateTimeout)
 		defer cancel()
 		// Carry endpoint identity from the customer ctx so the
@@ -625,7 +653,15 @@ func populateClusterListCellAsync(
 		if irc, ok := cache.InternalRESTConfigFromContext(customerCtx); ok && irc != nil {
 			populateCtx = cache.WithInternalRESTConfig(populateCtx, irc)
 		}
-		// Carry logger.
+		// Carry the logger, and the traceId it carries (#916). WithLogger
+		// stamps the traceId of the context it builds, so without the id the
+		// populate's lines would carry this one's empty traceId as well as the
+		// request's: the log decorator keeps the later copy, and the line would
+		// lose the request it belongs to. An empty id is not set, so an
+		// outbound call still mints one (xcontext.TraceId(ctx, true)).
+		if id := xcontext.TraceId(customerCtx, false); id != "" {
+			populateCtx = xcontext.BuildContext(populateCtx, xcontext.WithTraceId(id))
+		}
 		populateCtx = xcontext.BuildContext(populateCtx, xcontext.WithLogger(log))
 		_ = ep // ep retained in closure for future SA-context wiring if needed
 
@@ -655,6 +691,26 @@ var clusterListInflightCells sync.Map
 // and the cell stays cold; next customer retries via the same cold-miss
 // path.
 const clusterListAsyncPopulateTimeout = 30 * time.Second
+
+// WaitClusterListAsyncIdleForTest blocks until no populateClusterListCellAsync
+// goroutine is running. A populate takes its semaphore slot before its
+// goroutine starts and gives it back when the populate is done, so holding
+// every slot at once means none is running. Test-only — production code MUST
+// NOT call this. A harness registers it as the cleanup that runs BEFORE it
+// resets the globals a populate reads (the dependency tracker, the resolved
+// cache): the populate detaches from the request and outlives it. Do not mix
+// it with ResetClusterListAsyncStateForTest while a populate runs: that drain
+// takes back a running populate's slot, and the populate's own release would
+// then consume one of these.
+func WaitClusterListAsyncIdleForTest() {
+	n := cap(clusterListAsyncSemaphore)
+	for range n {
+		clusterListAsyncSemaphore <- struct{}{}
+	}
+	for range n {
+		<-clusterListAsyncSemaphore
+	}
+}
 
 // ResetClusterListAsyncStateForTest clears the inflight-cells dedup map
 // + drains the bounded-concurrency semaphore. Test-only — production
@@ -748,11 +804,12 @@ func deriveClusterListTarget(
 	// runtime errors. A probe that read the iterator differently from the
 	// dispatch would decide the collapse for a different element set.
 	elems, probeErr := jqsupport.IterateValues(ctx, iter, dict, nil)
+	pt := pathtemplate.Compile(apiCall.Path) // #1123: once per stage, as the dial
 	for _, sa := range elems {
 		if diverged {
 			break
 		}
-		gvr, query, ok := clusterListElementTarget(apiCall.Path, sa)
+		gvr, query, ok := clusterListElementTargetWith(pt, sa)
 		if !ok {
 			// cluster-scope / by-name / empty / jq|parse error / a query the
 			// cluster call cannot carry → collapse-unsafe.
@@ -800,12 +857,31 @@ func gvrForClusterListElement(pathTmpl string, element any) (schema.GroupVersion
 // canonical query as the CLUSTER-scope call would carry it (#602). ok=false
 // when that query cannot be applied in process on a cluster path.
 func clusterListElementTarget(pathTmpl string, element any) (schema.GroupVersionResource, string, bool) {
-	resolvedPath, jqErr := evalJQE(pathTmpl, element)
+	return clusterListElementTargetWith(pathtemplate.Compile(pathTmpl), element)
+}
+
+// clusterListElementTargetWith is clusterListElementTarget with the stage path
+// already compiled.
+func clusterListElementTargetWith(pt *pathtemplate.Template, element any) (schema.GroupVersionResource, string, bool) {
+	// #1123 — the same render as the dial (createRequestOption), so the probe
+	// reads the path that would be sent. A refused path is not a jq error: it
+	// is simply not a collapsible LIST.
+	// Not cancellable, as on context.TODO() before; Background is the context
+	// the gojq fork does not poll per opcode (execute.go:24) — run 23.
+	resolvedPath, jqErr := pt.Render(context.Background(), element)
 	if jqErr != nil {
-		bumpNondialJQError(nondialClusterListGVRProbe)
+		if !pathtemplate.IsRefused(jqErr) {
+			bumpNondialJQError(nondialClusterListGVRProbe)
+		}
 		return schema.GroupVersionResource{}, "", false
 	}
 	if resolvedPath == "" || strings.Contains(resolvedPath, "${") {
+		return schema.GroupVersionResource{}, "", false
+	}
+	// #1123 — only a path the dial would plan: an element whose path the guard
+	// refuses (an escaped value in an apiserver path, a DNS-invalid namespace)
+	// is not a list this element would read.
+	if ok, _ := validInterpolatedPath(resolvedPath, http.MethodGet); !ok {
 		return schema.GroupVersionResource{}, "", false
 	}
 	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(resolvedPath)
@@ -828,9 +904,13 @@ func clusterListElementTarget(pathTmpl string, element any) (schema.GroupVersion
 //
 // The Path is /apis/<group>/<version>/<resource> for a named group OR
 // /api/<version>/<resource> for the core group (group==""). Verb is
-// forced GET (the cluster-list collapse is a read-only mechanism;
-// non-GET iterator stages never reach this site — the worker would
-// reject them anyway).
+// GET, and it may be: the cluster-list collapse is a read optimisation, and
+// only a stage whose own calls are a plain GET reaches this site (#1011).
+// Its two production callers each admit only such a stage, by the one
+// predicate isPlainGet: attemptClusterListCollapse (deny gate 9, before any
+// other work) and the boot prewarm roster (extractClusterListGVRFromStagePath).
+// TestIssue1011_B_OnlyThePlainGetGatedCallersBuildTheCollapsedCall pins
+// that these are its only callers and that both are gated.
 func buildClusterListCall(
 	apiCall *templates.API,
 	ep endpoints.Endpoint,

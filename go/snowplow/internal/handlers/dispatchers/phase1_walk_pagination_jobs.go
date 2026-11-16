@@ -67,6 +67,7 @@ import (
 	"github.com/krateo-platformops/plumbing/endpoints"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -115,28 +116,11 @@ type apiRefPaginationJob struct {
 	// as the page-1 children loop.
 	Depth int
 
-	// PerPage is the RESOLUTION perPage — passed unchanged to
-	// widgets.Resolve for pages 2..N.
-	PerPage int
-
-	// KeyPerPage is the dispatcher-lookup KEY perPage tuple (Ship
-	// 0.30.187 D2). Decoupled from PerPage; passed to
-	// populateWidgetContentL1 so each page's seed cell matches the
-	// dispatcher's serve-time lookup.
-	KeyPerPage int
-
-	// KeyPage is page-1's dispatcher-lookup KEY page tuple (Ship
-	// 0.30.187 D2; Task #318 Step 1). Decoupled from the RESOLUTION
-	// page the drain advances. Captured at collect time from the SAME
-	// deriveSeedKeyTuple the page-1 walk used (phase1_walk.go's
-	// keyPage), so the drain can reconstruct page-1's KEY tuple instead
-	// of substituting the raw loop counter. The per-page KEY page for a
-	// drain page is derived from this base via drainKeyPageFor — see
-	// phase1_walk_pagination.go. Pre-#318 the job carried only
-	// KeyPerPage, so the drain's :403 install and :446 Put disagreed on
-	// the key tuple (the AC-G.5 detached-entry defect re-introduced for
-	// the page cell).
-	KeyPage int
+	// Pagination is the pagination the first page was resolved AND keyed
+	// with (the walk's pg, #966). The drain resolves and keys each next page
+	// with Pagination.pageAfter(n); the re-collection re-resolves the first
+	// page with Pagination itself.
+	Pagination prewarmPagination
 
 	// AuthnNS is the authn namespace — threaded to widgets.Resolve.
 	AuthnNS string
@@ -203,6 +187,12 @@ func newApiRefPaginationCollector() *apiRefPaginationCollector {
 // fast no-op; matches the byte-identical-when-flag-off posture.
 func (c *apiRefPaginationCollector) collect(j apiRefPaginationJob) {
 	if c == nil || j.In == nil || j.Page1Res == nil {
+		return
+	}
+	// #966 — a first page resolved (and keyed) unpaginated has no next page:
+	// its body is the whole list, exactly as an unpaginated /call's. Nothing
+	// to drain, nothing to re-collect.
+	if !j.Pagination.paginated() {
 		return
 	}
 	if !isApiRefTemplateDriven(j.Page1Res.Object) {
@@ -392,7 +382,7 @@ func drainApiRefPaginationJobs(
 	completed := 0
 	for _, j := range jobs {
 		if err := ctx.Err(); err != nil {
-			log.Warn("phase1.pagination_drain.ctx_cancel",
+			log.WarnContext(ctx, "phase1.pagination_drain.ctx_cancel",
 				slog.String("subsystem", "cache"),
 				slog.Int("completed", completed),
 				slog.Int("remaining", len(jobs)-completed),
@@ -409,37 +399,12 @@ func drainApiRefPaginationJobs(
 		// drainCtx (SA-credentialed) so the yield observes the drain's own
 		// cancellation, symmetric with the loop's ctx.Err() guard.
 		engineYieldCheckpoint(drainCtx)
-		// Run the original 3.2.2 mechanism, unchanged. Returns no error
-		// (logs internally); a failure leaves the page-1 cell correct
-		// and proceeds to the next job.
-		iterateApiRefPages(
-			drainCtx,
-			// The walker is gone by the time the drain runs. Construct a
-			// minimal walker shell for the SAME helpers iterateApiRefPages
-			// uses (visited set + harvesters). The visited set is
-			// per-drain so children discovered by THIS drain are
-			// internally deduped; we do NOT share with the original
-			// walker's visited (the walker's visited is no longer
-			// referenced post-MarkPhase1Done). Harvesters are nil — the
-			// drain runs AFTER MarkPhase1Done so the content-pass / PIP-
-			// seed harvesters have already been drained; populating them
-			// now would have no consumer.
-			// Ship 0.30.232: type-safe construction via newPhase1Walker.
-			// Ship 0.30.230 fix-at-root preserved — the drain shell walker
-			// MUST carry the SA *rest.Config so the page-N
-			// widgets.Resolve at phase1_walk_pagination.go's literal
-			// receives non-nil rc downstream of opts.RC. No harvesters
-			// (drain post-MarkPhase1Done; consumers already drained).
-			newPhase1Walker(saRC, j.AuthnNS),
-			j.In,
-			j.GVR,
-			j.Page1Res,
-			j.Depth,
-			j.PerPage,
-			j.KeyPerPage,
-			j.KeyPage,
-			j.AuthnNS,
-		)
+		// #871 — measurement only: one job is one drain unit (pprof label +
+		// counter); its pages, their child walks and their stage goroutines
+		// carry snowplow_work=drain.
+		workclass.Do(drainCtx, workclass.Drain, func(jobCtx context.Context) {
+			drainOneApiRefPaginationJob(jobCtx, j, saRC)
+		})
 		completed++
 	}
 
@@ -448,6 +413,41 @@ func drainApiRefPaginationJobs(
 		slog.String("phase", "post_phase1_done"),
 		slog.Int("jobs_completed", completed),
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+	)
+}
+
+// drainOneApiRefPaginationJob runs one collected job through the unchanged
+// iterateApiRefPages mechanism (split out of drainApiRefPaginationJobs for the
+// #871 drain work-class bracket only).
+func drainOneApiRefPaginationJob(ctx context.Context, j apiRefPaginationJob, saRC *rest.Config) {
+	// Run the original 3.2.2 mechanism, unchanged. Returns no error
+	// (logs internally); a failure leaves the page-1 cell correct
+	// and proceeds to the next job.
+	iterateApiRefPages(
+		ctx,
+		// The walker is gone by the time the drain runs. Construct a
+		// minimal walker shell for the SAME helpers iterateApiRefPages
+		// uses (visited set + harvesters). The visited set is
+		// per-drain so children discovered by THIS drain are
+		// internally deduped; we do NOT share with the original
+		// walker's visited (the walker's visited is no longer
+		// referenced post-MarkPhase1Done). Harvesters are nil — the
+		// drain runs AFTER MarkPhase1Done so the content-pass / PIP-
+		// seed harvesters have already been drained; populating them
+		// now would have no consumer.
+		// Ship 0.30.232: type-safe construction via newPhase1Walker.
+		// Ship 0.30.230 fix-at-root preserved — the drain shell walker
+		// MUST carry the SA *rest.Config so the page-N
+		// widgets.Resolve at phase1_walk_pagination.go's literal
+		// receives non-nil rc downstream of opts.RC. No harvesters
+		// (drain post-MarkPhase1Done; consumers already drained).
+		newPhase1Walker(saRC, j.AuthnNS),
+		j.In,
+		j.GVR,
+		j.Page1Res,
+		j.Depth,
+		j.Pagination,
+		j.AuthnNS,
 	)
 }
 
@@ -515,6 +515,9 @@ func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginati
 	if len(candidates) == 0 {
 		return
 	}
+	// #871 — measurement only: the re-collection pass is one drain unit.
+	ctx, endWork := workclass.Begin(ctx, workclass.Drain)
+	defer endWork()
 
 	log.Info("phase1.pagination_recollect.start",
 		slog.String("subsystem", "cache"),
@@ -531,7 +534,7 @@ func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginati
 		defer t.Stop()
 		select {
 		case <-ctx.Done():
-			log.Warn("phase1.pagination_recollect.ctx_cancel_during_settle",
+			log.WarnContext(ctx, "phase1.pagination_recollect.ctx_cancel_during_settle",
 				slog.String("subsystem", "cache"),
 				slog.Int("candidates", len(candidates)),
 				slog.Any("err", ctx.Err()),
@@ -544,7 +547,7 @@ func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginati
 	recollected := 0
 	for _, cand := range candidates {
 		if err := ctx.Err(); err != nil {
-			log.Warn("phase1.pagination_recollect.ctx_cancel",
+			log.WarnContext(ctx, "phase1.pagination_recollect.ctx_cancel",
 				slog.String("subsystem", "cache"),
 				slog.Int("recollected", recollected),
 				slog.Any("err", err),
@@ -563,7 +566,7 @@ func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginati
 		}
 		got := paginationFetchPageFn(ctx, ref)
 		if got.Err != nil || got.Unstructured == nil {
-			log.Warn("phase1.pagination_recollect.fetch_failed",
+			log.WarnContext(ctx, "phase1.pagination_recollect.fetch_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", cand.GVR.String()),
 				slog.String("ns", ns),
@@ -572,17 +575,18 @@ func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginati
 			)
 			continue
 		}
-		// Re-resolve PAGE 1 (we are re-trying the page-1 continuation decision,
-		// not advancing to page 2). Use the candidate's RESOLUTION perPage.
+		// Re-resolve the FIRST page (we are re-trying the first page's
+		// continuation decision, not advancing). #966: with the candidate's own
+		// pagination — the one its first page was resolved and keyed with.
 		res, err := paginationResolvePageFn(ctx, widgets.ResolveOptions{
 			In:      got.Unstructured,
 			RC:      saRC, // SA rest.Config — see the function doc (nil-rc 500 class).
 			AuthnNS: cand.AuthnNS,
-			PerPage: cand.PerPage,
-			Page:    1,
+			PerPage: cand.Pagination.PerPage,
+			Page:    cand.Pagination.Page,
 		})
 		if err != nil || res == nil {
-			log.Warn("phase1.pagination_recollect.resolve_failed",
+			log.WarnContext(ctx, "phase1.pagination_recollect.resolve_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", cand.GVR.String()),
 				slog.String("ns", ns),

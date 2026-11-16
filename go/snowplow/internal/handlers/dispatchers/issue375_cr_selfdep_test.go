@@ -142,7 +142,7 @@ func runSelfDepArm(t *testing.T, edit, warm bool) (remarks int, key string) {
 		t.Fatalf("PRECONDITION: a live cacheable key is required; key=%q", key)
 	}
 	if warm {
-		handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"old":true}`), Inputs: inputs})
+		putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"old":true}`), Inputs: inputs})
 		cache.Deps().Record(context.Background(), key, h1RAGVR, h1NS, h1RAName) // its self edge
 	}
 	resolved := &templatesv1.RESTAction{}
@@ -196,7 +196,7 @@ func TestIssue375_CRSelfDep_WarmKey_EditCaughtByMark(t *testing.T) {
 	if handle == nil || key == "" || inputs == nil {
 		t.Fatalf("PRECONDITION: a live cacheable key is required")
 	}
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"old":true}`), Inputs: inputs})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"old":true}`), Inputs: inputs})
 	cache.Deps().Record(context.Background(), key, h1RAGVR, h1NS, h1RAName) // its self edge
 	var mu sync.Mutex
 	residentMarks := 0

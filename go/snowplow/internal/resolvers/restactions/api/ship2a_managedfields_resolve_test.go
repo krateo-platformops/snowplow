@@ -98,9 +98,7 @@ func newF1WatcherWithManagedFields(t *testing.T) *cache.ResourceWatcher {
 		seed = append(seed, f1WidgetObjectWithManagedFields(ns, "widget-"+ns))
 	}
 	seed = append(seed, f1WidgetListerClusterRole())
-	for _, ns := range f1AllNamespaces {
-		seed = append(seed, f1RoleBinding(ns, f1BroadUser))
-	}
+	seed = append(seed, f1ClusterRoleBinding(f1BroadUser)) // #961: a cluster-wide LIST needs a cluster grant
 	for _, ns := range f1NarrowNamespaces {
 		seed = append(seed, f1RoleBinding(ns, f1NarrowUser))
 	}

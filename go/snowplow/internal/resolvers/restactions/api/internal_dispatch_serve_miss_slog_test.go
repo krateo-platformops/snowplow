@@ -87,7 +87,7 @@ func TestServe1a_ServeMiss_EmitsConjunctSnapshotOnFallThrough(t *testing.T) {
 	ctx = cache.WithServeWatcher(ctx, rw)
 	ctx = withSlogLogger(ctx, logger)
 
-	_, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+	_, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: serve1aListPath},
 	})
 	if err != nil {
@@ -146,7 +146,7 @@ func TestServe1a_ServeHit_DoesNotEmitServeMiss(t *testing.T) {
 	ctx = cache.WithServeWatcher(ctx, rw)
 	ctx = withSlogLogger(ctx, logger)
 
-	_, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+	_, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: serve1aListPath},
 	})
 	if err != nil {

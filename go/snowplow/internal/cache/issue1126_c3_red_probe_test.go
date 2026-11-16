@@ -43,7 +43,7 @@ func TestIssue1126_D2_RedProbe_LostDeleteLeavesEntryResidentWithNoRecoveryPath(t
 	SetGlobal(rw)
 	t.Cleanup(func() { SetGlobal(nil) })
 	createObj(t, rw, dyn, gvr, "demo-system", "flex-x", "x")
-	store.Put("L1_flex-x", &ResolvedEntry{RawJSON: []byte(`{"k":"x"}`), Inputs: widgetInputs(gvr, "demo-system", "flex-x")})
+	store.put("L1_flex-x", &ResolvedEntry{RawJSON: []byte(`{"k":"x"}`), Inputs: widgetInputs(gvr, "demo-system", "flex-x")})
 	Deps().Record(context.Background(), "L1_flex-x", gvr, "demo-system", "flex-x")
 
 	depWatchSingleton().stopWorker()                    // the pipeline drops the next event

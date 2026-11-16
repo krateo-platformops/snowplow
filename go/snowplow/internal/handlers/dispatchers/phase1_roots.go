@@ -141,7 +141,7 @@ func listNavigationRootsFromConfigMap(ctx context.Context, dynCli k8sdynamic.Int
 	cmName := frontendConfigConfigMapName()
 	cfg, err := readFrontendConfig(ctx, dynCli, cfgNamespace, cmName)
 	if err != nil {
-		log.Warn("phase1.roots.configmap_read_failed",
+		log.WarnContext(ctx, "phase1.roots.configmap_read_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("configmap", cfgNamespace+"/"+cmName),
 			slog.Any("err", err),
@@ -190,7 +190,7 @@ func listNavigationRootsFromConfigMap(ctx context.Context, dynCli k8sdynamic.Int
 				)
 				continue
 			}
-			log.Warn("phase1.roots.entry_point_empty",
+			log.WarnContext(ctx, "phase1.roots.entry_point_empty",
 				slog.String("subsystem", "cache"),
 				slog.String("field", rr.field),
 				slog.String("effect", "navigation entry point not declared in config.json — skipped. "+
@@ -201,7 +201,7 @@ func listNavigationRootsFromConfigMap(ctx context.Context, dynCli k8sdynamic.Int
 		}
 		ref, ok := objects.ParseCallPathToObjectRef(rr.url)
 		if !ok {
-			log.Warn("phase1.roots.entry_point_unparseable",
+			log.WarnContext(ctx, "phase1.roots.entry_point_unparseable",
 				slog.String("subsystem", "cache"),
 				slog.String("field", rr.field),
 				slog.String("url", rr.url),
@@ -245,7 +245,7 @@ func listNavigationRootsFromConfigMap(ctx context.Context, dynCli k8sdynamic.Int
 	for _, ref := range refs {
 		got := objects.Get(ctx, ref)
 		if got.Err != nil {
-			log.Warn("phase1.roots.root_fetch_failed",
+			log.WarnContext(ctx, "phase1.roots.root_fetch_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("root", ref.Resource+"/"+ref.Name),
 				slog.String("namespace", ref.Namespace),

@@ -83,11 +83,19 @@ type getRecordingHandle struct {
 	noTouchKeys []string // #376 — internal no-stamp GetNoTouch() calls
 }
 
+func (h *getRecordingHandle) Now() time.Time { return time.Now() }
+
 func (h *getRecordingHandle) Get(key string) (*cache.ResolvedEntry, bool) {
 	h.mu.Lock()
 	h.getKeys = append(h.getKeys, key)
 	h.mu.Unlock()
 	return nil, false // MISS — the declined external cell is never Put/warmed
+}
+
+// GetReportingMiss is Get with the miss reason (#1265 P0): always absent.
+func (h *getRecordingHandle) GetReportingMiss(key string) (*cache.ResolvedEntry, cache.LookupMiss) {
+	h.Get(key)
+	return nil, cache.LookupAbsent
 }
 
 // GetNoTouch is the #376 internal no-stamp read the seed-skip decision now uses
@@ -118,6 +126,45 @@ func (h *getRecordingHandle) PutThenRemark(ctx context.Context, key string, entr
 func (h *getRecordingHandle) PutEndingKnownStale(ctx context.Context, key string, entry *cache.ResolvedEntry) {
 	h.Put(key, entry)
 }
+
+// #912 re-review — the verdict-gated writes the cacheHandle interface carries;
+// like the store, they refuse a declining verdict.
+func (h *getRecordingHandle) PutResolved(v cache.PutVerdict, key string, entry *cache.ResolvedEntry) bool {
+	if !v.Store() {
+		return false
+	}
+	h.Put(key, entry)
+	return true
+}
+func (h *getRecordingHandle) PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool {
+	return v.Store() && h.PutIfGen(ctx, key, entry, capturedGen)
+}
+func (h *getRecordingHandle) PutResolvedIfGenOutcome(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) cache.PutOutcome {
+	if h.PutResolvedIfGen(ctx, v, key, entry, capturedGen) {
+		return cache.PutChanged
+	}
+	return cache.PutRefused
+}
+func (h *getRecordingHandle) PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome {
+	if !v.Store() {
+		return cache.PutRefused
+	}
+	h.PutThenRemark(ctx, key, entry)
+	return cache.PutChanged
+}
+func (h *getRecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome {
+	if !v.Store() {
+		return cache.PutRefused
+	}
+	h.PutEndingKnownStale(ctx, key, entry)
+	return cache.PutChanged
+}
+
+// #1255 — the unstorable-eviction surface; this handle holds no cell to evict.
+func (h *getRecordingHandle) EvictOnPermanentDecline(context.Context, cache.PutVerdict, string) bool {
+	return false
+}
+func (h *getRecordingHandle) EvictUnstorable(context.Context, string, string) bool { return false }
 
 // getCount is method-AGNOSTIC: the number of liveness reads (Get + #376 GetNoTouch),
 // so "a liveness read occurred / did not occur" assertions survive the #376 switch
@@ -177,7 +224,7 @@ func declineExternalOnce(ctx context.Context, class, target, key string) bool {
 	_, stageSink := cache.WithStageErrorSink(ctx)
 	_, extSink := cache.WithExternalTouchedSink(ctx)
 	extSink.Bump() // the resolve touched a genuine external endpoint
-	return declineSeedPutOnError(ctx, class, target, key, stageSink, extSink, nil)
+	return declineSeedPutOnError(ctx, class, target, key, cache.PutGateVerdict(cache.PutGateSinks{Stage: stageSink, Forbidden: &cache.PerIdentityForbiddenSink{}, External: extSink}, class), stageSink, extSink)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -217,7 +264,7 @@ func makeBootSeedHandler(t *testing.T, reResolvedThisPass *int, sawGetOnMarked *
 			h := &getRecordingHandle{}
 			// The REAL boot skip predicate — consults the declined-external set
 			// (engine-lived on scopeCtx) BEFORE handle.Get.
-			if seedSkipDecision(ctx, seedModeBoot, h, k, "widgets", multiCohortWidget, "") {
+			if seedSkipDecision(ctx, seedModeBoot, h, k, "widgets", multiCohortWidget) {
 				// Skipped: the whale was already resolved-and-declined this boot
 				// scope. No re-resolve, no external round-trip. This is the fix.
 				if h.getCount() != 0 {
@@ -379,7 +426,7 @@ func TestF4bLeverA_EngineWide_ReusedAcrossRequeues_RetainedOnCompletion(t *testi
 			return nil
 		}
 		h := &getRecordingHandle{}
-		if seedSkipDecision(scopeCtx, seedModeBoot, h, whaleKey, "widgets", widget, "") {
+		if seedSkipDecision(scopeCtx, seedModeBoot, h, whaleKey, "widgets", widget) {
 			if h.getCount() != 0 {
 				sawGet = true
 			}
@@ -408,7 +455,7 @@ func TestF4bLeverA_EngineWide_ReusedAcrossRequeues_RetainedOnCompletion(t *testi
 	}
 	h := &getRecordingHandle{}
 	kwCtx := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(prewarmScope{kind: scopeKindKeepwarm}.key()))
-	if !seedSkipDecision(kwCtx, seedModeKeepwarm, h, whaleKey, "widgets", widget, "") {
+	if !seedSkipDecision(kwCtx, seedModeKeepwarm, h, whaleKey, "widgets", widget) {
 		t.Fatal("#643: a keepwarm pass after boot completion must skip the whale boot declined")
 	}
 }
@@ -443,7 +490,7 @@ func TestF4bLeverA_ConfigVarsRedrive_ClearsSet_WhaleReResolvesUnderNewTopology(t
 	// A resume pass BEFORE any redrive skips the whale (reused set).
 	hBefore := &getRecordingHandle{}
 	ctxBefore := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(bootKey))
-	if !seedSkipDecision(ctxBefore, seedModeBoot, hBefore, whaleKey, "widgets", widget, "") {
+	if !seedSkipDecision(ctxBefore, seedModeBoot, hBefore, whaleKey, "widgets", widget) {
 		t.Fatal("pre-redrive: reused set must skip the already-declined whale")
 	}
 
@@ -455,7 +502,7 @@ func TestF4bLeverA_ConfigVarsRedrive_ClearsSet_WhaleReResolvesUnderNewTopology(t
 	// the fresh set has no mark → seedSkipDecision falls through to handle.Get.
 	hAfter := &getRecordingHandle{}
 	ctxAfter := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(bootKey))
-	if seedSkipDecision(ctxAfter, seedModeBoot, hAfter, whaleKey, "widgets", widget, "") {
+	if seedSkipDecision(ctxAfter, seedModeBoot, hAfter, whaleKey, "widgets", widget) {
 		t.Fatal("post-redrive VIOLATED: a whale stayed suppressed ACROSS a topology change — the redrive must clear the set so the whale re-resolves once under the new nav set")
 	}
 	if !hAfter.sawGet(whaleKey) {
@@ -500,7 +547,7 @@ func TestF4bLeverA_R2_RedriveClearsStaleSkip_OmitClearIsRED(t *testing.T) {
 		// Next invocation over the same key: does it skip?
 		h := &getRecordingHandle{}
 		nextCtx := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(bootKey))
-		return seedSkipDecision(nextCtx, seedModeBoot, h, whaleKey, "widgets", widget, "")
+		return seedSkipDecision(nextCtx, seedModeBoot, h, whaleKey, "widgets", widget)
 	}
 
 	// GREEN: redrive fired → next invocation does NOT skip (Marked()==false).
@@ -711,7 +758,7 @@ func TestF4bLeverA_MarkerIsPerKey_NoCrossCohortSkip(t *testing.T) {
 	// be skipped — B has never resolved W, so the marker must miss on B's key. A
 	// per-(class,target) marker would WRONGLY skip B here (B would serve nothing).
 	h := &getRecordingHandle{}
-	if seedSkipDecision(bootCtx, seedModeBoot, h, keyB, "widgets", widget, "") {
+	if seedSkipDecision(bootCtx, seedModeBoot, h, keyB, "widgets", widget) {
 		t.Fatal("C-F4B-2 VIOLATED: cohort B's FIRST resolve of the same widget was skipped — the marker is per-(class,target), not per-key. A cohort would lose its cell. Marker MUST key on the full dispatchCacheLookupKey.")
 	}
 	if !h.sawGet(keyB) {
@@ -720,7 +767,7 @@ func TestF4bLeverA_MarkerIsPerKey_NoCrossCohortSkip(t *testing.T) {
 
 	// And A's own key IS still marked (didn't get clobbered by B's derivation).
 	hA := &getRecordingHandle{}
-	if !seedSkipDecision(bootCtx, seedModeBoot, hA, keyA, "widgets", widget, "") {
+	if !seedSkipDecision(bootCtx, seedModeBoot, hA, keyA, "widgets", widget) {
 		t.Fatal("C-F4B-2: cohort A's own declined key must still skip on the resume pass")
 	}
 }
@@ -748,7 +795,7 @@ func TestF4bLeverA_MarkerNilOnUserPath_ReResolves(t *testing.T) {
 	// re-resolves: Marked(nil) == false → falls through to handle.Get. The user
 	// path re-resolves the external widget fresh, unaffected.
 	h := &getRecordingHandle{}
-	if seedSkipDecision(userCtx, seedModeBoot, h, key, "widgets", widget, "") {
+	if seedSkipDecision(userCtx, seedModeBoot, h, key, "widgets", widget) {
 		t.Fatal("C-F4B-3 VIOLATED: a set-less (user/keepwarm) ctx must never skip via the marker — it would fake a warm serve of an intentionally-cold external cell")
 	}
 	if !h.sawGet(key) {
@@ -780,7 +827,7 @@ func TestF4bLeverA_StageErrorDoesNotMark_OnlyExternal(t *testing.T) {
 	_, stageSink := cache.WithStageErrorSink(bootCtx)
 	_, extSink := cache.WithExternalTouchedSink(bootCtx)
 	stageSink.Bump("exportJwt-loopback", "401 transient no per-user JWT")
-	if !declineSeedPutOnError(bootCtx, "widgets", widget, key, stageSink, extSink, nil) {
+	if !declineSeedPutOnError(bootCtx, "widgets", widget, key, cache.PutGateVerdict(cache.PutGateSinks{Stage: stageSink, Forbidden: &cache.PerIdentityForbiddenSink{}, External: extSink}, "widgets"), stageSink, extSink) {
 		t.Fatal("setup: a stage-error resolve must still decline the Put (GTTL-1)")
 	}
 	if got := cache.SeedDeclinedExternalSetFromContext(bootCtx).Marks(); got != 0 {
@@ -789,7 +836,7 @@ func TestF4bLeverA_StageErrorDoesNotMark_OnlyExternal(t *testing.T) {
 
 	// So the resume pass does NOT skip on the marker account — it re-resolves.
 	h := &getRecordingHandle{}
-	if seedSkipDecision(bootCtx, seedModeBoot, h, key, "widgets", widget, "") {
+	if seedSkipDecision(bootCtx, seedModeBoot, h, key, "widgets", widget) {
 		t.Fatal("a stage-errored (non-external) target must be re-resolved on the resume pass, NOT marker-skipped")
 	}
 	if !h.sawGet(key) {
@@ -805,7 +852,7 @@ func TestF4bLeverA_StageErrorDoesNotMark_OnlyExternal(t *testing.T) {
 	_, extSink2 := cache.WithExternalTouchedSink(bootCtx)
 	stageSink2.Bump("obs-query", "context deadline exceeded")
 	extSink2.Bump()
-	if !declineSeedPutOnError(bootCtx, "widgets", widget, mixKey, stageSink2, extSink2, nil) {
+	if !declineSeedPutOnError(bootCtx, "widgets", widget, mixKey, cache.PutGateVerdict(cache.PutGateSinks{Stage: stageSink2, Forbidden: &cache.PerIdentityForbiddenSink{}, External: extSink2}, "widgets"), stageSink2, extSink2) {
 		t.Fatal("setup: a stage-error + external resolve must decline the Put")
 	}
 	if !cache.SeedDeclinedExternalSetFromContext(bootCtx).Marked(mixKey) {

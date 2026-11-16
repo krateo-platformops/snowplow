@@ -336,7 +336,7 @@ func s425UserServer(t *testing.T, dials *atomic.Int64) *httptest.Server {
 	cache.ResetSecretsSnapshotForTest()
 	cache.PublishSecretsSnapshotForTest(&cache.SecretsSnapshot{ByName: map[string]*corev1.Secret{
 		s425Carol + "-clientconfig": {
-			ObjectMeta: metav1.ObjectMeta{Namespace: s425AuthnNS, Name: s425Carol + "-clientconfig"},
+			ObjectMeta: authnMeta(s425AuthnNS, s425Carol+"-clientconfig", s425Carol),
 			Data:       map[string][]byte{"server-url": []byte(srv.URL), "token": []byte("tok-" + s425Carol)},
 		},
 	}})
@@ -392,7 +392,7 @@ func s425Seed(t *testing.T, cohort seedTarget, cr *unstructured.Unstructured, sa
 	seedCtx := withCohortSeedContext(context.Background(), cohort, saEP, saRC)
 	ref := templatesv1.ObjectReference{Reference: templatesv1.Reference{Name: s425RAName, Namespace: h1NS},
 		APIVersion: h1RAGVR.Group + "/" + h1RAGVR.Version, Resource: h1RAGVR.Resource}
-	if err := seedOneRestaction(seedCtx, "s425", ref, s425AuthnNS, seedModeBoot); err != nil {
+	if err := seedOneRestaction(seedCtx, ref, s425AuthnNS, seedModeBoot); err != nil {
 		t.Fatalf("seedOneRestaction: %v", err)
 	}
 	if e, ok := cache.ResolvedCache().Get(s425Key(t, seedCtx)); ok {
@@ -632,7 +632,7 @@ func TestRefresher427_TenantSARepresentative_Narrowed(t *testing.T) {
 	}
 	// A narrowed body already sits in the cell (what the #425-fixed seed or a
 	// narrowed resolve produces). The arm drives the REAL refresher over it.
-	cache.ResolvedCache().Put(key, &cache.ResolvedEntry{
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{
 		RawJSON: []byte(`{"kind":"RESTAction","status":{"sa":"narrowed"}}`), Inputs: inputs})
 
 	cr := s425RA(s425PathGetY())

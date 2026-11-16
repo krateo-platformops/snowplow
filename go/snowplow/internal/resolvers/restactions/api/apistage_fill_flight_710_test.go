@@ -34,8 +34,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// fill710NobodyUser holds no grant on the fixture: its serve is narrowed to
-// zero items by its own gate.
+// fill710NobodyUser holds no grant on the fixture: its own gate refuses the
+// LIST with the per-identity Forbidden (#961).
 const fill710NobodyUser = "fill710-nobody"
 
 func fill710CtxAs(user string) context.Context {
@@ -111,13 +111,15 @@ func TestContentFill710_SF1_KnownStaleHerd_64Readers_OneFlight(t *testing.T) {
 		}
 	}
 	out := make([]fill710Served, readers)
+	errs := make([]error, readers)
 	var wg sync.WaitGroup
 	for i := 0; i < readers; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			v, served, ok, _ := apistageContentServe(fill710CtxAs(users[i]), store, fill710ListCall(), false)
+			v, served, ok, _, err := apistageContentServe(fill710CtxAs(users[i]), store, fill710ListCall(), false)
 			out[i] = fill710Served{v, served, ok}
+			errs[i] = err
 		}(i)
 	}
 	// The precondition: 64 blocked readers — one in the dispatch, 63 on its flight.
@@ -139,16 +141,18 @@ func TestContentFill710_SF1_KnownStaleHerd_64Readers_OneFlight(t *testing.T) {
 	}
 	var shared uintptr
 	for i, r := range out {
+		if users[i] == fill710NobodyUser {
+			// #961 — a reader with no grant is refused the LIST by its own
+			// identity (the per-identity Forbidden), from the shared flight.
+			if !r.ok || r.served || !isRegateDenied(errs[i]) {
+				t.Fatalf("reader %d holds no grant: ok=%v served=%v err=%v — the joiner was not gated by its own identity", i, r.ok, r.served, errs[i])
+			}
+			continue
+		}
 		if !r.ok || !r.served {
 			t.Fatalf("reader %d (%s) not served: ok=%v served=%v", i, users[i], r.ok, r.served)
 		}
 		got := fill710Items(t, r.v)
-		if users[i] == fill710NobodyUser {
-			if len(got) != 0 {
-				t.Fatalf("reader %d holds no grant but was served %d items — the joiner was not narrowed by its own identity", i, len(got))
-			}
-			continue
-		}
 		if len(got) != items {
 			t.Fatalf("reader %d served %d items, want %d", i, len(got), items)
 		}
@@ -191,19 +195,19 @@ func TestContentFill710_SF2_ReaderWithNewerEpochDoesNotJoinOlderFlight(t *testin
 	var calls atomic.Int64
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
-		raw, ok := orig(ctx, call)
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
+		raw, ok, fctx := orig(ctx, call)
 		if calls.Add(1) == 1 {
 			close(leaderRead)
 			<-gate
 		}
-		return raw, ok
+		return raw, ok, fctx
 	}
 
 	serve := func() chan fill710Served {
 		ch := make(chan fill710Served, 1)
 		go func() {
-			v, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
+			v, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
 			ch <- fill710Served{v, served, ok}
 		}()
 		return ch
@@ -286,11 +290,11 @@ func TestContentFill710_SF3_CancelledLeaderDoesNotFailJoiners(t *testing.T) {
 	var arrived atomic.Int64
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		arrived.Add(1)
 		<-gate
 		if ctx.Err() != nil {
-			return nil, false
+			return nil, false, ctx
 		}
 		return orig(ctx, call)
 	}
@@ -312,7 +316,7 @@ func TestContentFill710_SF3_CancelledLeaderDoesNotFailJoiners(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			v, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
+			v, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false)
 			out[i] = fill710Served{v, served, ok}
 		}(i)
 	}
@@ -320,7 +324,7 @@ func TestContentFill710_SF3_CancelledLeaderDoesNotFailJoiners(t *testing.T) {
 	quitterCtx, quit := context.WithCancel(r1Ctx())
 	quitter := make(chan fill710Served, 1)
 	go func() {
-		v, served, ok, _ := apistageContentServe(quitterCtx, store, fill710ListCall(), false)
+		v, served, ok, _, _ := apistageContentServe(quitterCtx, store, fill710ListCall(), false)
 		quitter <- fill710Served{v, served, ok}
 	}()
 	if !fill710WaitFor(10*time.Second, func() bool { return ContentFillStatsSnapshot().JoinWaiting == joiners+1 }) {

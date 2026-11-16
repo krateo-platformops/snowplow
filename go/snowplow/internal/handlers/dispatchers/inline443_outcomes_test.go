@@ -4,10 +4,13 @@
 //
 //	a FilterDropsErrorKeys — a draft whose filter drops every error key still
 //	  surfaces each failed stage (and why) in the header.
-//	b AbsentOnStored — the header is never set on a stored resolve.
+//	b PresentOnStored — #904: a stored resolve carries the header too.
 //	c TruncationBound — above 4 KiB the header is {"truncated":true,"failed":N}.
 //	d NoMessageOrIdentity — the header carries names, ok and reason codes from
 //	  the closed set only: no error text, path, data or identity.
+//
+// #904: the header lists only the stages that did NOT succeed; a succeeded
+// stage is absent from it.
 //	k ReasonField — the refused stage's error object carries
 //	  reason "StageNotExecuted" next to the stable message.
 package dispatchers
@@ -71,8 +74,10 @@ func TestS443_StageOutcomes(t *testing.T) {
 			t.Fatalf("PRE: the filter must keep only the target and drop the error keys from .status: %s", st)
 		}
 		got := parseOutcomes443(t, rec.Header().Get(util.HeaderStageOutcomes))
+		if row, listed := got["target"]; listed {
+			t.Errorf("stage \"target\" succeeded and must not be listed (#904); got %+v", row)
+		}
 		want := map[string]outcomeRow443{
-			"target":  {Name: "target", OK: true},
 			"missing": {Name: "missing", OK: false, Reason: api.StageReasonNotFound},
 			"create":  {Name: "create", OK: false, Reason: api.StageReasonNotExecuted},
 		}
@@ -83,14 +88,18 @@ func TestS443_StageOutcomes(t *testing.T) {
 		}
 	})
 
-	t.Run("b_AbsentOnStored", func(t *testing.T) {
+	t.Run("b_PresentOnStored", func(t *testing.T) {
 		f := in443Setup(t)
 		rec := serveStored(t, f, in443Ctx(f, psAlice), in443RA(psRAName, "", outcomeStages443()...))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("code=%d", rec.Code)
 		}
-		if v := rec.Header().Get(util.HeaderStageOutcomes); v != "" {
-			t.Fatalf("%s set on a STORED resolve: %s", util.HeaderStageOutcomes, v)
+		got := parseOutcomes443(t, rec.Header().Get(util.HeaderStageOutcomes))
+		if w := (outcomeRow443{Name: "missing", OK: false, Reason: api.StageReasonNotFound}); got["missing"] != w {
+			t.Fatalf("stored resolve: stage \"missing\" outcome=%+v, want %+v (header=%s)", got["missing"], w, rec.Header().Get(util.HeaderStageOutcomes))
+		}
+		if row, listed := got["target"]; listed {
+			t.Fatalf("stored resolve: succeeded stage \"target\" is listed: %+v", row)
 		}
 	})
 

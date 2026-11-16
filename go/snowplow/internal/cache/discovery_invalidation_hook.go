@@ -84,6 +84,7 @@ func invalidateSADiscovery() {
 	saDiscoveryInvalidatorMu.RUnlock()
 	if f == nil {
 		saDiscoveryNilHookWarnOnce.Do(func() {
+			// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 			slog.Warn("cache.crd_discovery.sa_discovery_invalidator_unwired",
 				slog.String("subsystem", "cache"),
 				slog.String("hint", "SetSADiscoveryInvalidator was not called at "+
@@ -160,6 +161,7 @@ func invalidateCRDSchemaMemo() {
 	saCRDSchemaInvalidatorMu.RUnlock()
 	if f == nil {
 		saCRDSchemaNilHookWarnOnce.Do(func() {
+			// log-ctx-waiver: worker: the CRD discovery worker: a dequeued CRD event
 			slog.Warn("cache.crd_discovery.crd_schema_invalidator_unwired",
 				slog.String("subsystem", "cache"),
 				slog.String("hint", "SetCRDSchemaInvalidator was not called at "+

@@ -4,10 +4,18 @@
 // /readyz, /debug/vars, pprof and swagger), the per-GVR dispatchers, the
 // informer/L1 caches and prewarm engine, RBAC, and the in-cluster
 // Kubernetes clients, then runs the server until signalled to shut down.
+//
+// The same program also builds for js/wasm, to run in a browser worker for
+// the Agentiko sandbox. That build adds only files constrained to js && wasm:
+// bridge_js.go serves the page's requests from this server
+// (internal/browserbridge, whose package doc says what does not apply in a
+// browser), egress leaves through the browser's fetch (internal/credhttp's
+// package doc), and no shutdown signal ever arrives.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,9 +26,9 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
+	krateoaudit "github.com/krateo-platformops/audit"
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/jwtutil"
@@ -36,17 +44,18 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/logging"
+	"github.com/krateo-platformops/snowplow/internal/memlimit"
 	"github.com/krateo-platformops/snowplow/internal/metrics"
 	"github.com/krateo-platformops/snowplow/internal/otelresource"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	crdschema "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
+	"github.com/krateo-platformops/snowplow/internal/telemetry/rum"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 	httpSwagger "github.com/swaggo/http-swagger"
-
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/transport"
@@ -101,6 +110,9 @@ func snowplowCORSOptions() cors.Options {
 			"traceparent",
 			"tracestate",
 			"baggage",
+			// #1333 — the portal's write provenance on /call writes and
+			// dry runs (docs/howto-frontend-call-provenance.md).
+			audit.ProvenanceHeader,
 		},
 		ExposedHeaders: []string{
 			"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class",
@@ -113,10 +125,125 @@ func snowplowCORSOptions() cors.Options {
 			handlers.HeaderResolveSource,
 			handlers.HeaderStageOutcomes,
 			"Warning",
+			// #1265 P0 — the serve outcome (fresh | stale | cold) of a customer
+			// /call. The SPA ignores it; a browser-side reader (the bench's
+			// Chrome driver) needs it exposed like the refresh key.
+			dispatchers.ServeOutcomeHeader,
+			// #1324 — the digest of the bytes an armed /call wrote: the SPA
+			// echoes it as `held` when it arms, so a tab that missed a frame
+			// gets one catch-up frame (docs/howto-frontend-refresh-digest-catch-up.md).
+			dispatchers.RefreshDigestHeader,
 		},
 		AllowCredentials: true,
 		MaxAge:           300, // Maximum value not ignored by any of major browsers
 	}
+}
+
+// newServerHandler is the http.Server's handler around the route table, from
+// the outside in:
+//
+//   - use.CORS is OUTERMOST, so it answers the OPTIONS preflight before the
+//     tracing layer runs (a preflight is CORS's, not a served API request).
+//   - tracing.NewServerHandler gives every served request exactly one Server
+//     span named "<METHOD> <route>" with the templated http.route, and
+//     extracts the inbound W3C traceparent/baggage (#1013). With tracing off
+//     the global TracerProvider is the no-op default and it records nothing;
+//     otelhttp's HTTP server metrics still flow when metrics are on.
+//   - krateoaudit.RecordedMiddleware (#1291) is the first layer inside the
+//     span: it installs the holder every audit record emitted on the request
+//     sets (a RESTAction stage's, on a client span's context, included), and
+//     when the handler exits, a panic included, it marks the Server span
+//     krateo.audit.recorded=true when one was. The tail sampler keeps such a
+//     trace whole. The attribute is a boolean, never identity (#848).
+//   - slowcall.Middleware (#1054) runs inside the span, where r.Pattern
+//     already names the route: it gives each API request its phase record
+//     and logs one WARN line for a request slower than the page goal's bound
+//     (slowcall.Bound), with the log line correlated to the span. Its writer,
+//     outside the compressor, times the bytes that reach the connection.
+//   - middleware.Gzip (Track 2): it compresses the handler's actual response
+//     bytes while the span still measures the whole request.
+//     text/event-stream (GET /refreshes) is excluded so the SSE stream keeps
+//     its per-event flush (T2-2); non-gzip clients are byte-identical.
+//   - slowcall.Body times the handler's writes into the compressor, so a
+//     slow record splits compression from the network write. A pass-through
+//     on a request without a record.
+//   - dispatchers.StageOutcomesSpan is INNERMOST, around the route table
+//     (#1264): when the handler returns it copies the response's
+//     X-Snowplow-Stage-Outcomes (count and reason codes, no names) onto the
+//     Server span, so a 200 whose stages failed is visible to the tail
+//     sampler. A response without the header gets nothing.
+//
+// It is a function so the composition the pod serves is the one the tests
+// drive (main_server_spans_test.go).
+func newServerHandler(mux *http.ServeMux) http.Handler {
+	return use.CORS(snowplowCORSOptions())(tracing.NewServerHandler(krateoaudit.RecordedMiddleware(slowcall.Middleware(middleware.Gzip(slowcall.Body(dispatchers.StageOutcomesSpan(mux))))), mux))
+}
+
+// newRUMIngest returns #1015's ingest, with its forwarder's worker running
+// until ctx is done, when rum.CollectorURL enables it: tracing on
+// (OTEL_TRACING_ENABLED, defaulting to OTEL_ENABLED) AND a collector endpoint
+// set (Diego, 2026-10-30: on whenever tracing is on, no switch of its own).
+// Otherwise it returns a nil http.Handler, which mountTelemetryRoute mounts as
+// a 404. It is a function so the default-off contract is tested through the
+// code main runs (TestS1015_DefaultOffContract).
+//
+// mux is snowplow's own routing table: a krateo.widget.fetch http.route must
+// be one of its routes (rum.RegisteredRoutes, #1020 F3). The set is looked up
+// on the live mux at request time, so routes registered after this call count.
+func newRUMIngest(ctx context.Context, mux *http.ServeMux) http.Handler {
+	url, ok := rum.CollectorURL()
+	if !ok {
+		return nil // an untyped nil: a typed (*rum.Ingest)(nil) would mount as "enabled"
+	}
+	fwd := rum.NewForwarder(url)
+	fwd.Start(ctx)
+	return rum.NewIngest(fwd, rum.RegisteredRoutes(mux))
+}
+
+// newRequestChain is the middleware every route starts from. It is a function
+// so the logger chain the pod runs is the one the tests drive
+// (main_identity_logs_1192_test.go).
+func newRequestChain(log *slog.Logger) use.Chain {
+	return use.NewChain(
+		use.TraceId(),
+		// #1192: the request logger carries the traceId and no identity.
+		middleware.RequestLogger(log),
+		// Audit correlation (D19a): mint/accept the business session id and
+		// write it into W3C baggage (session.id), carried on the request
+		// context and serialized downstream by the Baggage propagator. The
+		// AuditEvent itself is emitted as a trace-correlated OTLP LogRecord.
+		// ADDITIVE — coexists with the shortid X-Krateo-TraceId and the OTel
+		// traceparent; no bespoke correlation header any more.
+		audit.Middleware(),
+	)
+}
+
+// mountTelemetryRoute mounts #1015's browser RUM ingest, POST
+// /telemetry/v1/traces, and registers it as a scoped route (scope telemetry,
+// listed in requiredScopedRoutes).
+//
+// Enabled (ingest non-nil), the chain is: the auth-failure counter, then
+// middleware.RefreshAuth, then the telemetry fall-through scope, then the
+// ingest. The contract with frontend is the same `Authorization: Bearer` JWT
+// as /call. RefreshAuth validates it exactly as UserConfig does (the same
+// jwtutil.ValidateWithKeySource), without UserConfig's per-request
+// clientconfig Secret lookup, which this route has no use for: it issues no
+// apiserver read. RefreshAuth also accepts the session cookie, a superset the
+// contract does not rely on. Disabled, the route answers 404 to everyone, so it exposes
+// nothing, not even a 401 that would reveal it.
+//
+// It is a function so the route the pod serves is the one the tests drive
+// (main_telemetry_1015_test.go).
+func mountTelemetryRoute(mux routeRegistrar, chain use.Chain, keys jwtutil.KeySource, ingest http.Handler) {
+	var h http.Handler = http.NotFoundHandler()
+	if ingest != nil {
+		h = rum.CountAuthFailures(chain.Append(
+			middleware.RefreshAuth(keys),
+			cache.FallthroughScopeMiddleware(cache.ScopeTelemetry)).
+			Then(ingest))
+	}
+	mux.HandleUnaudited(rum.Pattern, "browser spans forwarded to the trace plane: no platform state changes (#1015)", h)
+	cache.RegisterScopedRoute(rum.Pattern, cache.ScopeTelemetry)
 }
 
 // mountCallWriteRoutes mounts the write-verb /call routes and their #443
@@ -138,7 +265,7 @@ func snowplowCORSOptions() cors.Options {
 //
 // It is a function (not inline in main) so the route table is testable with a
 // test identity middleware in place of the JWT + clientconfig lookup.
-func mountCallWriteRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(http.Handler) http.Handler) {
+func mountCallWriteRoutes(mux routeRegistrar, chain use.Chain, userConfig func(http.Handler) http.Handler) {
 	writes := []struct {
 		method string
 		scope  string
@@ -150,7 +277,7 @@ func mountCallWriteRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(h
 	}
 	for _, w := range writes {
 		pattern := w.method + " /call"
-		mux.Handle(pattern, chain.Append(
+		mux.HandleAudited(pattern, handlers.CallRoute(), chain.Append(
 			userConfig,
 			cache.FallthroughScopeMiddleware(w.scope)).
 			Then(handlers.Call()))
@@ -162,11 +289,40 @@ func mountCallWriteRoutes(mux *http.ServeMux, chain use.Chain, userConfig func(h
 			continue
 		}
 		dryPattern := w.method + " /call/dry-run"
-		mux.Handle(dryPattern, chain.Append(
+		mux.HandleAudited(dryPattern, handlers.CallDryRunRoute(), chain.Append(
 			userConfig,
 			cache.FallthroughScopeMiddleware(w.scope)).
 			Then(handlers.CallDryRun()))
 		cache.RegisterScopedRoute(dryPattern, w.scope)
+	}
+}
+
+// mountExportRoutes mounts GET and POST /export (#970) on mux behind the
+// /call middleware prefix — the caller's identity (userConfig), then the
+// call-generic fallthrough scope — and registers each as a scoped route, so
+// the boot-assert (requiredScopedRoutes) catches a lost registration.
+//
+//   - GET /export: handlers.ExportGET, the export over the GET /call lane.
+//   - POST /export: handlers.ExportPOST, the export with its extras in the
+//     body, over exactly the POST /call/read lane (its body decode, the read
+//     dispatcher, the read-only CallRead). The export's own parameters stay
+//     in the query, as /call/read keeps every non-extras parameter there.
+//
+// It is a function (not inline in main) so the route table is testable with a
+// test identity middleware, as mountCallWriteRoutes is.
+func mountExportRoutes(mux routeRegistrar, chain use.Chain, userConfig func(http.Handler) http.Handler) {
+	for _, r := range []struct {
+		pattern string
+		handler http.Handler
+	}{
+		{"GET /export", handlers.ExportGET()},
+		{"POST /export", handlers.ExportPOST()},
+	} {
+		mux.HandleAudited(r.pattern, handlers.ExportRoute(), chain.Append(
+			userConfig,
+			cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
+			Then(r.handler))
+		cache.RegisterScopedRoute(r.pattern, cache.ScopeCallGeneric)
 	}
 }
 
@@ -226,6 +382,10 @@ func main() {
 	// and needs the seed bearer. PORT-anchored to the listen port.
 	urlSelf := flag.String("url-self", env.String("URL_SELF", "http://snowplow.krateo-system.svc.cluster.local:8081"),
 		"snowplow's own service URL — the self-loopback host for the #57 bearer-append arm (exact scheme+host+port match)")
+	// #1334 — opt-in per install, off by default. The chart sets it from the
+	// same value (publicIdentity.enabled) that ships the impersonate grant.
+	publicIdentityOn := flag.Bool("public-identity", env.Bool(envPublicIdentityEnabled, false),
+		"serve requests that carry no Authorization header as the public identity (user krateo:public, group system:unauthenticated), by impersonation")
 
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
@@ -261,10 +421,16 @@ func main() {
 	// dump. Re-export it as the DEBUG env so those downstream readers observe it,
 	// so LOG_LEVEL=debug now enables the tracing exactly as DEBUG=true always did.
 	debugMode := logLevel == slog.LevelDebug
-	os.Setenv("DEBUG", strconv.FormatBool(debugMode))
-	os.Setenv("TRACE", strconv.FormatBool(*blizzardOn))
-	os.Setenv("AUTHN_NAMESPACE", *authnNS)
-	os.Setenv(jqsupport.EnvModulesPath, *jqModPath)
+	if err := exportEnv([][2]string{
+		{"DEBUG", strconv.FormatBool(debugMode)},
+		{"TRACE", strconv.FormatBool(*blizzardOn)},
+		{"AUTHN_NAMESPACE", *authnNS},
+		{jqsupport.EnvModulesPath, *jqModPath},
+	}); err != nil {
+		// The logger is built from these settings below, so the reason goes to stderr directly.
+		fmt.Fprintf(os.Stderr, "snowplow: %v\n", err)
+		os.Exit(1)
+	}
 
 	// 1.12.4: the handler chain lives in buildLogHandler (log_handler.go)
 	// — base text/JSON handler + the OTel trace-correlation decorator that
@@ -291,6 +457,12 @@ func main() {
 		log.Debug("environment variables", slog.Any("env", os.Environ()))
 	}
 
+	// Soft memory limit from the container's cgroup memory limit (7/8 of it),
+	// unless the operator set GOMEMLIMIT. Done before any informer or cache
+	// allocates, so the whole heap's life runs under it. GOGC is the runtime
+	// default (the chart no longer overrides it). See internal/memlimit.
+	memlimit.Apply(log)
+
 	// #367 — boot-time env backing for the dark shadow-parity toggle. Read ONCE
 	// here, BEFORE the Phase 1 boot seed walk below, so a cold boot can run the
 	// boot-walk populate arm (populate_seed_installs_total + the four classify
@@ -301,6 +473,7 @@ func main() {
 	// changes no verdict, served byte or cache key (rbac/shadow_hook.go).
 	rbac.InitShadowParityFromEnv()
 	if rbac.ShadowParityEnabled() {
+		// log-ctx-waiver: boot: process start, before a context exists
 		log.Warn("shadow-parity ENABLED via SHADOW_PARITY_ENABLED — dark R/projection overhead active; do not run latency-acceptance on this pod",
 			slog.String("subsystem", "cache"),
 			slog.String("source", rbac.ShadowParitySource()),
@@ -321,18 +494,28 @@ func main() {
 	//   - authn stays off the hot path of every token validation.
 	// Absent an explicit --jwks-url, derive it from the authn base URL already
 	// configured for the #57 token exchange — one URL to get wrong, not two.
+	if err := checkJWKSRequestTimeout(*jwksTimeout); err != nil {
+		// log-ctx-waiver: boot: process start, before a context exists
+		log.Error(err.Error())
+		os.Exit(1)
+	}
 	resolvedJWKSURL := strings.TrimSpace(*jwksURL)
 	if resolvedJWKSURL == "" {
 		resolvedJWKSURL = jwtutil.JWKSURL(*urlAuthn)
 	}
 	if resolvedJWKSURL == "" {
+		// log-ctx-waiver: boot: process start, before a context exists
 		log.Error("no JWKS URL: set --jwks-url/JWT_JWKS_URL or --url-authn/URL_AUTHN")
 		os.Exit(1)
 	}
-	jwtKeys := jwtutil.NewJWKSKeySource(resolvedJWKSURL,
+	// credhttp builds the key source's client: the one plumbing builds by
+	// default (dialguard.Client) at the request timeout, positive by
+	// checkJWKSRequestTimeout above. On js/wasm plumbing sets fetch's
+	// credentials mode on it, so the browser attaches none of the frame's
+	// cookies to the JWKS fetch (credhttp/plumbing_clients.go).
+	jwtKeys := credhttp.JWKSKeySource(resolvedJWKSURL, *jwksTimeout,
 		jwtutil.WithJWKSCacheTTL(*jwksCacheTTL),
-		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh),
-		jwtutil.WithJWKSRequestTimeout(*jwksTimeout))
+		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh))
 	log.Info("JWT verification keys sourced from authn JWKS",
 		slog.String("jwks_url", resolvedJWKSURL),
 		slog.Duration("cache_ttl", *jwksCacheTTL),
@@ -373,7 +556,7 @@ func main() {
 	// no propagator, no exporter), so the global providers stay no-op and
 	// every instrumentation site degrades to zero cost. This does NOT touch
 	// the shortid X-Krateo-TraceId correlation id, the stdout->otel_logs log
-	// pipeline, or the use.TraceId()/use.Logger() chain below — OTel
+	// pipeline, or the newRequestChain() chain below — OTel
 	// coexists with all three. The deferred shutdowns flush the batch
 	// span/metric pipelines on graceful exit; they are no-ops when disabled.
 	otelCtx := context.Background()
@@ -383,13 +566,13 @@ func main() {
 	otelresource.InstallErrorHandler(log)
 	traceShutdown, err := tracing.Setup(otelCtx, build)
 	if err != nil {
-		log.Error("otel tracing setup failed", slog.Any("err", err))
+		log.ErrorContext(otelCtx, "otel tracing setup failed", slog.Any("err", err))
 	}
 	defer func() { _ = traceShutdown(context.Background()) }()
 
 	metricShutdown, err := metrics.Setup(otelCtx, build)
 	if err != nil {
-		log.Error("otel metrics setup failed", slog.Any("err", err))
+		log.ErrorContext(otelCtx, "otel metrics setup failed", slog.Any("err", err))
 	}
 	defer func() { _ = metricShutdown(context.Background()) }()
 
@@ -404,26 +587,19 @@ func main() {
 	// untouched.
 	logProvider, logShutdown, err := logging.Setup(otelCtx, build)
 	if err != nil {
-		log.Error("otel logs setup failed", slog.Any("err", err))
+		log.ErrorContext(otelCtx, "otel logs setup failed", slog.Any("err", err))
 	}
 	defer func() { _ = logShutdown(context.Background()) }()
 	if logProvider != nil {
-		audit.SetDefault(audit.New(
-			logProvider.Logger("github.com/krateo-platformops/snowplow/audit"),
-		))
+		// #1291 — the shared writer (github.com/krateo-platformops/audit),
+		// declared as the request writer. Built after metrics.Setup, so its
+		// krateo.audit.records.incomplete counter is on the real global
+		// MeterProvider (OTLP) when metrics are on; /debug/vars mirrors it.
+		audit.SetDefault(audit.New(logProvider.Logger(audit.Scope)))
+		startAuditNamespaceReader(otelCtx, log)
 	}
 
-	chain := use.NewChain(
-		use.TraceId(),
-		use.Logger(log),
-		// Audit correlation (D19a): mint/accept the business session id and
-		// write it into W3C baggage (session.id), carried on the request
-		// context and serialized downstream by the Baggage propagator. The
-		// AuditEvent itself is emitted as a trace-correlated OTLP LogRecord.
-		// ADDITIVE — coexists with the shortid X-Krateo-TraceId and the OTel
-		// traceparent; no bespoke correlation header any more.
-		audit.Middleware(),
-	)
+	chain := newRequestChain(log)
 
 	// Wire the in-process RA/widget resolver seam (introduced Ship 0.30.123
 	// #155 for the /call loopback; the loopback DISPATCH BRANCH was retired
@@ -481,7 +657,7 @@ func main() {
 	defer cacheCancel()
 	// 0.30.207 — honor DEBUG on the background path. cacheCtx is a bare
 	// context.Background() derivative; unlike the HTTP request path (which
-	// runs use.Logger(log) → xcontext.WithLogger), it carries NO logger.
+	// runs middleware.RequestLogger → xcontext.WithLogger), it carries NO logger.
 	// Every background-resolve site (refresher → resolveAndPopulateL1 →
 	// resolver, prewarm walk, discovery refresher) calls
 	// xcontext.Logger(ctx), which on a logger-less context falls back to a
@@ -498,7 +674,7 @@ func main() {
 	if !cache.Disabled() {
 		rc, rcErr := credhttp.InClusterConfig()
 		if rcErr != nil {
-			log.Warn("cache: rest.InClusterConfig failed; staying on apiserver branch",
+			log.WarnContext(cacheCtx, "cache: rest.InClusterConfig failed; staying on apiserver branch",
 				slog.Any("err", rcErr))
 		} else {
 			// #237 A3 — install the reflector-path classifier BEFORE the
@@ -540,18 +716,18 @@ func main() {
 			cache.SetImpersonationAvailable(func() bool {
 				reviewer, revErr := cache.NewSSARImpersonationReviewer(rc)
 				if revErr != nil {
-					log.Warn("cache: #574 impersonation probe could not build a clientset; refresher keeps the SA transport",
+					log.WarnContext(cacheCtx, "cache: #574 impersonation probe could not build a clientset; refresher keeps the SA transport",
 						slog.Any("err", revErr))
 					return false
 				}
 				usersOK, ssarErr := reviewer(cacheCtx, cache.ImpersonateResourceUsers, "", "")
 				if ssarErr != nil {
-					log.Warn("cache: #574 impersonation probe failed; refresher keeps the SA transport",
+					log.WarnContext(cacheCtx, "cache: #574 impersonation probe failed; refresher keeps the SA transport",
 						slog.Any("err", ssarErr))
 					return false
 				}
 				if !usersOK {
-					log.Warn("cache: #574 impersonation NOT granted — the refresher keeps dialling as snowplow's ServiceAccount, "+
+					log.WarnContext(cacheCtx, "cache: #574 impersonation NOT granted — the refresher keeps dialling as snowplow's ServiceAccount, "+
 						"so background refreshes for a per-user cohort stay re-gated and continue to fail closed",
 						slog.String("needed", "impersonate on users (and allowlisted groups) in snowplow's ClusterRole"),
 						slog.String("effect", "pre-#574 behaviour; this is a MISSING RBAC GRANT, not a code fault"))
@@ -565,11 +741,11 @@ func main() {
 				cache.SetImpersonationProbeResult(true, gErr == nil && groupsAll, sErr == nil && sasAll)
 				switch {
 				case gErr != nil || sErr != nil:
-					log.Warn("cache: #574 impersonation granted for users; the groups/serviceaccounts probe FAILED — "+
+					log.WarnContext(cacheCtx, "cache: #574 impersonation granted for users; the groups/serviceaccounts probe FAILED — "+
 						"each cohort is checked on its first refresh and falls back to the re-gated SA transport if refused",
 						slog.Any("groups_err", gErr), slog.Any("serviceaccounts_err", sErr))
 				case !groupsAll:
-					log.Warn("cache: #574 impersonation granted for users only — groups are NOT granted for every name. "+
+					log.WarnContext(cacheCtx, "cache: #574 impersonation granted for users only — groups are NOT granted for every name. "+
 						"A cohort whose groups are not all in rbac.impersonateGroups is refreshed over snowplow's ServiceAccount "+
 						"with the re-gate instead of as the cohort (#608); read snowplow_impersonation{stat=impersonation_fallback_sa}",
 						slog.String("placeholder", cache.CohortPlaceholderUsername),
@@ -585,12 +761,12 @@ func main() {
 
 			dynCli, dynErr := credhttp.Dynamic(rc)
 			if dynErr != nil {
-				log.Warn("cache: dynamic.NewForConfig failed; staying on apiserver branch",
+				log.WarnContext(cacheCtx, "cache: dynamic.NewForConfig failed; staying on apiserver branch",
 					slog.Any("err", dynErr))
 			} else {
 				w, wErr := cache.NewResourceWatcher(cacheCtx, dynCli)
 				if wErr != nil {
-					log.Warn("cache: NewResourceWatcher failed; staying on apiserver branch",
+					log.WarnContext(cacheCtx, "cache: NewResourceWatcher failed; staying on apiserver branch",
 						slog.Any("err", wErr))
 				} else {
 					cacheWatcher = w
@@ -654,7 +830,7 @@ func main() {
 					// without crash-looping the pod).
 					metaCli, metaErr := credhttp.Metadata(rc)
 					if metaErr != nil {
-						log.Warn("cache: metadata.NewForConfig failed; metadata-only routing offline (full-informer fallback)",
+						log.WarnContext(cacheCtx, "cache: metadata.NewForConfig failed; metadata-only routing offline (full-informer fallback)",
 							slog.Any("err", metaErr))
 					} else {
 						w.SetMetadataClient(metaCli)
@@ -680,7 +856,7 @@ func main() {
 					// but not crash-looping — a loud WARN flags it.
 					discoCli, discoErr := credhttp.Discovery(rc)
 					if discoErr != nil {
-						log.Warn("cache: discovery.NewDiscoveryClientForConfig failed; resource-type confirmation offline (S4 gate degrades to HasSynced-only)",
+						log.WarnContext(cacheCtx, "cache: discovery.NewDiscoveryClientForConfig failed; resource-type confirmation offline (S4 gate degrades to HasSynced-only)",
 							slog.Any("err", discoErr))
 					} else {
 						w.SetDiscoveryClient(discoCli)
@@ -802,14 +978,18 @@ func main() {
 					// is a no-op inside the Start fn.
 					cache.StartSliceabilityReverifier(cacheCtx)
 
-					// Block until RBAC informer LISTs complete so the
-					// first dispatch is not racing the initial sync.
-					// Bounded at 60s — soft failure (log + continue),
-					// not fatal.
+					// Wait for the informers' initial LISTs before Phase 1, so
+					// its walk is not racing the initial sync. Bounded at 60 s:
+					// on timeout boot continues. This bounds boot, never
+					// readiness (#1231): /readyz stays 503 until the RBAC
+					// snapshot is complete (cache.RBACReadiness), however long
+					// that takes. The WARN names the RBAC informers still
+					// listing, so a stalled sync says where it is stuck.
 					syncCtx, syncCancel := context.WithTimeout(cacheCtx, 60*time.Second)
 					if err := w.WaitForCacheSync(syncCtx, 60*time.Second); err != nil {
-						log.Warn("cache: initial WaitForCacheSync incomplete; first dispatches may evaluate against partial RBAC index",
-							slog.Any("err", err))
+						log.WarnContext(syncCtx, "cache: initial WaitForCacheSync incomplete after 60s; boot continues, and /readyz stays NotReady until every RBAC informer has synced",
+							slog.Any("err", err),
+							slog.Any("unsynced_rbac_informers", cache.UnsyncedRBACInformers()))
 					} else {
 						log.Info("cache: RBAC informers fully synced")
 					}
@@ -833,7 +1013,7 @@ func main() {
 					if snap := cache.LiveRBACSnapshot(); snap != nil {
 						const sentinel = "system:cohort:group-only:v1"
 						if n := len(snap.CRBsByUser[sentinel]); n > 0 {
-							log.Error("cache: sentinel collision — a ClusterRoleBinding has subject Name="+sentinel,
+							log.ErrorContext(syncCtx, "cache: sentinel collision — a ClusterRoleBinding has subject Name="+sentinel,
 								slog.Int("crb_count", n),
 								slog.String("hint", "rename the offending subject or change groupOnlyCohortSentinel; sentinel must be unique"),
 							)
@@ -841,7 +1021,7 @@ func main() {
 						}
 						for ns, byUser := range snap.RBsByUserByNS {
 							if n := len(byUser[sentinel]); n > 0 {
-								log.Error("cache: sentinel collision — a RoleBinding has subject Name="+sentinel,
+								log.ErrorContext(syncCtx, "cache: sentinel collision — a RoleBinding has subject Name="+sentinel,
 									slog.String("namespace", ns),
 									slog.Int("rb_count", n),
 									slog.String("hint", "rename the offending subject or change groupOnlyCohortSentinel; sentinel must be unique"),
@@ -867,7 +1047,7 @@ func main() {
 					// to surface the misconfiguration.
 					if *authnNS != "" {
 						if err := cache.StartSecretsInformer(cacheCtx, rc, *authnNS); err != nil {
-							log.Warn("cache: StartSecretsInformer failed; F-3 cache offline (upstream fallback)",
+							log.WarnContext(syncCtx, "cache: StartSecretsInformer failed; F-3 cache offline (upstream fallback)",
 								slog.String("authn_ns", *authnNS),
 								slog.Any("err", err))
 						}
@@ -886,7 +1066,7 @@ func main() {
 					// only runs when cache is on.
 					controllerHealthNamespaces := splitCommaList(*controllerHealthNS)
 					if err := cache.StartControllerHealthInformer(cacheCtx, rc, controllerHealthNamespaces); err != nil {
-						log.Warn("cache: StartControllerHealthInformer failed; Resilience-1 gauges offline",
+						log.WarnContext(syncCtx, "cache: StartControllerHealthInformer failed; Resilience-1 gauges offline",
 							slog.Any("err", err))
 					}
 
@@ -921,7 +1101,7 @@ func main() {
 						invCtx, invCancel := context.WithTimeout(cacheCtx, startupTimeout)
 						inv, invErr := cache.CollectResourceTypesFromRestActions(invCtx, dynCli)
 						if invErr != nil {
-							log.Warn("cache: RestAction inventory walk failed; falling through to lazy registration",
+							log.WarnContext(invCtx, "cache: RestAction inventory walk failed; falling through to lazy registration",
 								slog.Any("err", invErr))
 							// Mark eager-done with an empty set so any
 							// post-startup AddResourceType is treated as
@@ -930,7 +1110,7 @@ func main() {
 						} else {
 							n, regErr := cache.EagerRegisterAll(invCtx, w, inv, fanin, startupTimeout)
 							if regErr != nil {
-								log.Warn("cache: eager registration WaitForCacheSync incomplete",
+								log.WarnContext(invCtx, "cache: eager registration WaitForCacheSync incomplete",
 									slog.Int("resource_types", n),
 									slog.Any("err", regErr))
 							}
@@ -1014,7 +1194,7 @@ func main() {
 							reg, present, pwErr := w.PrewarmRegisterFromNavigation(pwCtx, dynCli)
 							pwCancel()
 							if pwErr != nil {
-								log.Warn("cache: startup navigation GVR-walk incomplete; lazy register-on-navigation covers the gap",
+								log.WarnContext(pwCtx, "cache: startup navigation GVR-walk incomplete; lazy register-on-navigation covers the gap",
 									slog.Any("err", pwErr))
 							} else {
 								log.Info("cache: startup navigation GVR-walk done",
@@ -1078,7 +1258,7 @@ func main() {
 								p1Ctx, p1Cancel := context.WithTimeout(cacheCtx, phase1Timeout)
 								defer p1Cancel()
 								if err := dispatchers.Phase1Warmup(p1Ctx, rc, *authnNS); err != nil {
-									log.Warn("cache: Phase 1 startup warmup incomplete",
+									log.WarnContext(p1Ctx, "cache: Phase 1 startup warmup incomplete",
 										slog.String("subsystem", "cache"),
 										slog.Any("err", err))
 								}
@@ -1133,13 +1313,13 @@ func main() {
 		} else {
 			dynCli, dynErr := credhttp.Dynamic(rc)
 			if dynErr != nil {
-				log.Warn("cache: dynamic.NewForConfig failed in disabled mode; watcher will be nil",
+				log.WarnContext(cacheCtx, "cache: dynamic.NewForConfig failed in disabled mode; watcher will be nil",
 					slog.Any("err", dynErr))
 				_, _ = cache.NewResourceWatcher(cacheCtx, nil)
 			} else {
 				w, wErr := cache.NewResourceWatcher(cacheCtx, dynCli)
 				if wErr != nil {
-					log.Warn("cache: NewResourceWatcher failed in disabled mode; watcher will be nil",
+					log.WarnContext(cacheCtx, "cache: NewResourceWatcher failed in disabled mode; watcher will be nil",
 						slog.Any("err", wErr))
 				} else if w != nil {
 					cacheWatcher = w
@@ -1186,78 +1366,29 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	// #1362: every route goes through routeTable, which refuses a /debug
+	// pattern outside registerDebugRoutes (see debug_routes.go).
+	routes := newRouteTable(mux)
 
-	mux.Handle("GET /swagger/", httpSwagger.WrapHandler)
+	// #1334 — every route whose work is authorized by the caller's identity:
+	// mountCallerIdentityRoutes (public_identity.go), so the route table that
+	// decides which routes accept the public identity is testable.
+	mountCallerIdentityRoutes(routes, chain, jwtKeys, *authnNS, newPublicIdentity(*publicIdentityOn))
+
+	routes.Handle("GET /swagger/", httpSwagger.WrapHandler)
 	//mux.Handle("POST /convert", chain.Then(handlers.Converter()))
 
-	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
-	mux.Handle("GET /readyz", handlers.ReadyCheck())
+	routes.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
+	routes.Handle("GET /readyz", handlers.ReadyCheck())
 	// Ship D (0.30.141, architectural-consistency invariant) —
 	// /api-info/names is `/call`-class read; scope as `plurals` so the
 	// invariant counter classifies any apiserver fall-through from this
 	// route. cache.FallthroughScopeMiddleware is a no-op when
 	// CACHE_ENABLED=false (project_caching_is_provisional).
-	mux.Handle("GET /api-info/names", chain.Append(
+	routes.Handle("GET /api-info/names", chain.Append(
 		cache.FallthroughScopeMiddleware(cache.ScopePlurals)).
 		Then(handlers.Plurals()))
 	cache.RegisterScopedRoute("GET /api-info/names", cache.ScopePlurals)
-
-	mux.Handle("GET /list", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeList)).
-		Then(handlers.List()))
-	cache.RegisterScopedRoute("GET /list", cache.ScopeList)
-
-	// Ship D — GET /call is the canonical `/call` read path. Dispatcher
-	// routes into the per-group restactions / widgets handlers; for the
-	// scope label we use call-generic (the dispatcher's fallthrough lane
-	// is the F-1 site). The restactions / widgets dispatcher entries
-	// inherit the scope via the same ctx.
-	mux.Handle("GET /call", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
-		handlers.Dispatcher(dispatchers.All())).
-		Then(handlers.Call()))
-	cache.RegisterScopedRoute("GET /call", cache.ScopeCallGeneric)
-
-	// #186 — POST /call/read is the body-carrying READ path. It exists so a
-	// large `extras` input rides the request BODY instead of the URL query,
-	// where over HTTP/2 it is charged against the gateway's ~16 KiB header
-	// budget and 431s before Snowplow is invoked. It shares the GET /call
-	// chain EXACTLY — UserConfig, the call-generic read scope, and crucially
-	// the dispatcher into the restactions / widgets resolve handlers — with
-	// two additions: BodyExtrasDecode (decodes {"extras":{...}} → context, so
-	// the context-first util.ParseExtras returns it) runs BEFORE the
-	// dispatcher, and the dispatcher is the POST variant (ReadDispatcher —
-	// the plain Dispatcher is GET-only by design). The terminal fallthrough
-	// is handlers.CallRead(), the READ-ONLY /call (verb forced GET, no
-	// Payload): a POST /call/read to an unhandled GVR is a read passthrough,
-	// never a create. Same read-path invariant as GET /call, so it is
-	// RegisterScopedRoute'd + listed in requiredScopedRoutes (a boot-assert
-	// fails if either half is missing).
-	mux.Handle("POST /call/read", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
-		middleware.BodyExtrasDecode,
-		handlers.ReadDispatcher(dispatchers.All())).
-		Then(handlers.CallRead()))
-	cache.RegisterScopedRoute("POST /call/read", cache.ScopeCallGeneric)
-
-	// GET /export — GENERIC export: any /call-resolvable list
-	// (RESTAction or list/table Widget) serialized as a CSV/JSON
-	// attachment. The handler re-dispatches IN-PROCESS through the same
-	// dispatcher lane the GET /call route uses (identical auth, RBAC gate
-	// and serve-time user-aware filtering — export can never see more
-	// than the caller's own /call), then serializes the extracted rows.
-	// The route shares the /call middleware chain, so the scope
-	// classification and the read-path invariant hold; a scheduled
-	// export is just a CronJob curling this route (see howto/export.md).
-	mux.Handle("GET /export", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS),
-		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
-		Then(handlers.Export(
-			handlers.Dispatcher(dispatchers.All())(handlers.Call()))))
-	cache.RegisterScopedRoute("GET /export", cache.ScopeCallGeneric)
 
 	// Ship 1 (live-refresh-coherence, option A) — GET /refreshes is the
 	// per-subject live-refresh SSE stream. It uses middleware.RefreshAuth
@@ -1273,7 +1404,7 @@ func main() {
 	refreshesHandler := chain.Append(
 		middleware.RefreshAuth(jwtKeys)).
 		Then(handlers.Refreshes())
-	mux.Handle("GET /refreshes", refreshesHandler)
+	routes.Handle("GET /refreshes", refreshesHandler)
 	// #560 — the SAME handler on POST. The GET form carries the subscription set
 	// in `?sub=`, which grows ~361 bytes per widget: a 50-widget page sends an
 	// 18 KB URL and the ingress returns 431 before snowplow sees it, so live
@@ -1281,30 +1412,21 @@ func main() {
 	// coordinate array in the body, which has no request-line limit. Same path,
 	// same auth, same semantics, still zero apiserver reads — and GET stays
 	// byte-identical so the server can land ahead of the client.
-	mux.Handle("POST /refreshes", refreshesHandler)
-
-	// GET /rbac — RESTAction read-set enumeration for core-provider RBAC
-	// pre-generation (design docs/restaction-rbac-endpoint-design.md). It
-	// resolves a referenced RESTAction's api[] stages to the (group, version,
-	// resource, verb) tuples a /call WOULD read, WITHOUT dispatching.
-	// Authenticated with the SAME JWT+clientconfig as /call (middleware.UserConfig):
-	// the JWT authenticates the caller, but the enumeration uses NONE of the
-	// caller's RBAC perms (it runs under the SA), so the read-set is computable
-	// before any binding exists. DELIBERATELY NOT cache.RegisterScopedRoute'd:
-	// like /refreshes above, it issues ZERO per-user apiserver reads, so it sits
-	// outside the read-path-scoped invariant (fallthrough_assert.go).
-	mux.Handle("GET /rbac", chain.Append(
-		middleware.UserConfig(jwtKeys, *authnNS)).
-		Then(handlers.RBAC()))
-
-	mountCallWriteRoutes(mux, chain, middleware.UserConfig(jwtKeys, *authnNS))
+	routes.HandleUnaudited("POST /refreshes", "the live-refresh subscription: its coordinates ride the body; no state changes (#560)", refreshesHandler)
 
 	// #443 — GET /capabilities: a static, unauthenticated token list a client
 	// gates on by presence (a 404 means none). No identity, no apiserver call,
 	// so it is outside the read-path-scoped invariant (like /refreshes).
-	mux.Handle("GET /capabilities", chain.Then(handlers.CapabilitiesHandler()))
+	routes.Handle("GET /capabilities", chain.Then(handlers.CapabilitiesHandler()))
 
-	mux.Handle("POST /jq", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
+	// #1015 — authenticated browser RUM ingest (POST /telemetry/v1/traces).
+	// On only under the OTel trace contract with a collector endpoint
+	// (rum.CollectorURL); off, the route answers 404. The forwarder's worker
+	// runs until main returns.
+	rumCtx, rumStop := context.WithCancel(context.Background())
+	defer rumStop()
+	mountTelemetryRoute(routes, chain, jwtKeys, newRUMIngest(rumCtx, mux))
+	rum.RegisterExpvar()
 
 	// Ship 0.30.249 / Task #250 Block 2a — register
 	// snowplow_rbac_publish_seq (RBAC snapshot publish-sequence counter)
@@ -1360,6 +1482,9 @@ func main() {
 	// deliberate 17-byte static write with zero allocation, hit by the
 	// kubelet every 10s.
 	registerBuildInfoExpvar(build)
+	// The effective GOGC and soft memory limit (and where the limit came
+	// from), unconditionally, for the same reason as the build stamp.
+	memlimit.PublishExpvar()
 
 	// O-D3 (1.12.3) — the WHOLE /debug/* surface (pprof, vars, servable,
 	// apistage, refreshes) is mounted here, every route behind
@@ -1369,58 +1494,21 @@ func main() {
 	// Extracted into a named registrar (debug_routes.go) so the gating is
 	// testable against production wiring — the same shape snowplowCORSOptions
 	// uses for the CORS contract. /health + /readyz above stay ANONYMOUS (the
-	// kubelet presents no JWT); /swagger/ is unchanged.
+	// kubelet presents no JWT); /swagger/ is unchanged. #1362: every route is
+	// also authorized (middleware.DebugAuthz): RBAC `nonResourceURLs` for the
+	// JWT's identity, so an authenticated caller without the grant gets 403.
 	//
 	// MUST come after the expvar publishers registered just above.
-	registerDebugRoutes(mux, chain, jwtKeys)
+	registerDebugRoutes(routes, chain, jwtKeys)
 
-	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
-		os.Interrupt,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGKILL,
-		syscall.SIGHUP,
-		syscall.SIGQUIT,
-	}...)
+	// The signals that start a graceful shutdown: shutdown_signals.go on a
+	// server build, shutdown_signals_js.go on js/wasm, which has no SIGHUP.
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals...)
 	defer stop()
-
-	// Track 2 (transport gzip) — wrap the mux with Accept-Encoding-gated gzip
-	// compression BEFORE otelhttp so gzip is the INNERMOST wrapper (closest to
-	// the mux): it compresses the handler's actual response bytes, and the
-	// otelhttp span still measures the full request incl. the compressed
-	// write. text/event-stream (GET /refreshes) is excluded so the SSE stream
-	// keeps its per-event incremental flush (middleware.Gzip / T2-2). Non-gzip
-	// clients + curl diagnostics are byte-identical (gzhttp only compresses on
-	// Accept-Encoding: gzip). See middleware/compression.go.
-	var muxHandler http.Handler = middleware.Gzip(mux)
-
-	// OTel HTTP server instrumentation (default-OFF gated). otelhttp wraps
-	// the mux to create a server span per request and EXTRACT inbound W3C
-	// traceparent/baggage (the global propagator installed by
-	// tracing.Setup). When tracing is disabled the global TracerProvider is
-	// the no-op default, so otelhttp.NewHandler produces no spans and adds
-	// negligible overhead — the off-path stays effectively byte-identical.
-	//
-	// The wrap sits INSIDE use.CORS so CORS remains OUTERMOST and answers
-	// the OPTIONS preflight before otelhttp ever runs (otelhttp would
-	// otherwise span the preflight; CORS must own it). WithFilter skips
-	// span creation for the high-frequency health/readiness/debug probes.
-	var rootHandler http.Handler = otelhttp.NewHandler(muxHandler, serviceName,
-		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
-			return r.Method + " " + r.URL.Path
-		}),
-		otelhttp.WithFilter(func(r *http.Request) bool {
-			switch r.URL.Path {
-			case "/health", "/readyz":
-				return false
-			}
-			return !strings.HasPrefix(r.URL.Path, "/debug/")
-		}),
-	)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),
-		Handler:      use.CORS(snowplowCORSOptions())(rootHandler),
+		Handler:      newServerHandler(mux),
 		ReadTimeout:  10 * time.Second, // read is fast; unchanged (#351/C2)
 		WriteTimeout: writeTimeout,     // 300s — clears cache-OFF heavy path (#351/C2)
 		IdleTimeout:  30 * time.Second, // keep-alive; unchanged (#351/C2)
@@ -1443,7 +1531,7 @@ func main() {
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error("server cannot run",
+			log.ErrorContext(cacheCtx, "server cannot run",
 				slog.String("addr", server.Addr),
 				slog.Any("err", err))
 		}
@@ -1462,7 +1550,7 @@ func main() {
 
 	server.SetKeepAlivesEnabled(false)
 	if err := server.Shutdown(ctx); err != nil {
-		log.Error("server forced to shutdown", slog.Any("err", err))
+		log.ErrorContext(ctx, "server forced to shutdown", slog.Any("err", err))
 	}
 
 	log.Info("server gracefully stopped")
@@ -1508,6 +1596,22 @@ func resolvePrewarmRegisterDefault(raw string) bool {
 	return raw != "false"
 }
 
+// errJWKSRequestTimeoutNotPositive refuses a non-positive
+// --jwks-request-timeout / JWT_JWKS_REQUEST_TIMEOUT at startup. The timeout
+// bounds every JWKS fetch, and a token validation waits on one, so without a
+// bound an authn that accepts the connection and never answers hangs every
+// authentication. The default is 5 s.
+var errJWKSRequestTimeoutNotPositive = errors.New("--jwks-request-timeout/JWT_JWKS_REQUEST_TIMEOUT must be positive: it bounds every JWKS fetch, and an unbounded one can hang every authentication")
+
+// checkJWKSRequestTimeout is errJWKSRequestTimeoutNotPositive, with the value
+// given, when d is not positive.
+func checkJWKSRequestTimeout(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("%w (got %s)", errJWKSRequestTimeoutNotPositive, d)
+	}
+	return nil
+}
+
 // parseLogLevel maps a --log-level / LOG_LEVEL string to a slog.Level for the
 // handler's minimum floor (issue #163). Case- and whitespace-insensitive. Any
 // unrecognised value — including the empty string and the default "info" —
@@ -1540,4 +1644,36 @@ func splitCommaList(s string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// startAuditNamespaceReader installs the reader the audit records' preview
+// flag is read through (#1291, internal/support/audit/preview.go): a
+// metadata-only informer on namespaces over snowplow's own ServiceAccount,
+// with a GET for a Namespace it does not hold. Without in-cluster config it
+// installs none, and a record of a namespaced target is marked preview: the
+// gap is recorded, never guessed.
+func startAuditNamespaceReader(ctx context.Context, log *slog.Logger) {
+	rc, err := credhttp.InClusterConfig()
+	if err != nil {
+		log.WarnContext(ctx, "audit: no in-cluster config; records of a namespaced target are marked preview", slog.Any("err", err))
+		return
+	}
+	mc, err := credhttp.Metadata(rc)
+	if err != nil {
+		log.WarnContext(ctx, "audit: metadata client failed; records of a namespaced target are marked preview", slog.Any("err", err))
+		return
+	}
+	audit.SetNamespaceReader(audit.StartNamespaceReader(ctx, mc))
+}
+
+// exportEnv sets each variable for the process, in order, and names the first one it could not
+// set: the downstream readers (plumbing's DEBUG tracing, the authn namespace, the jq module path)
+// would otherwise run with a stale value and nothing would say so.
+func exportEnv(vars [][2]string) error {
+	for _, kv := range vars {
+		if err := os.Setenv(kv[0], kv[1]); err != nil {
+			return fmt.Errorf("cannot set %s for the process: %w", kv[0], err)
+		}
+	}
+	return nil
 }

@@ -48,10 +48,7 @@ func s394WidgetEntry() navWidgetEntry {
 	return navWidgetEntry{
 		W:          h1WidgetUnstructured(map[string]any{}),
 		GVR:        h1WidgetGVR,
-		PerPage:    -1,
-		Page:       -1,
-		KeyPerPage: -1,
-		KeyPage:    -1,
+		Pagination: unpaginatedPrewarm,
 	}
 }
 
@@ -163,7 +160,7 @@ func (h *s394Harness) install(t *testing.T) {
 // re-resolve. age backdates CreatedAt (keepwarm only re-resolves cells at or
 // beyond the age-skip threshold).
 func s394PreSeed(handle cacheHandle, key string, inputs *cache.ResolvedKeyInputs, age time.Duration) {
-	handle.Put(key, &cache.ResolvedEntry{
+	putFixture(handle, key, &cache.ResolvedEntry{
 		RawJSON:   []byte(`{"body":"pre-removal"}`),
 		Inputs:    inputs,
 		CreatedAt: time.Now().Add(-age),
@@ -263,7 +260,7 @@ func TestS394_PostReadyzSeed_RemovalDuringResolve_NotResurrected_ReseededOnce(t 
 								if key == raKey {
 									inputs = raIn
 								}
-								handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
+								putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
 							}
 							cache.ResolvedCache().DeleteForTest(key)
 						}
@@ -355,8 +352,8 @@ func TestS394_BootSeed_LRUEvictionDuringResolve_StillPlainPuts(t *testing.T) {
 	widgetKey, raKey, handle, wIn, raIn := s394Keys(t)
 
 	lruEvict := func(key string, inputs *cache.ResolvedKeyInputs) {
-		handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
-		handle.Put("s394-filler", &cache.ResolvedEntry{RawJSON: []byte(`{}`)}) // cap 1 → evicts key
+		putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"body":"concurrent"}`), Inputs: inputs})
+		putFixture(handle, "s394-filler", &cache.ResolvedEntry{RawJSON: []byte(`{}`)}) // cap 1 → evicts key
 		if _, ok := handle.Get(key); ok {
 			t.Fatalf("PRECONDITION: the filler Put did not LRU-evict %q (RESOLVED_CACHE_MAX_ENTRIES not honoured?)", key)
 		}
@@ -379,7 +376,7 @@ func TestS394_BootSeed_LRUEvictionDuringResolve_StillPlainPuts(t *testing.T) {
 		t.Fatalf("#394 arm 3 RED (boot over-refused): the boot widget seed did not plain-Put into the LRU-evicted "+
 			"cell (present=%v body=%q). Boot is pre-readyz and exempt (#323) — guarding it leaves boot cells cold.", ok, body)
 	}
-	if err := seedOneRestaction(cctx, "cohort-s394", s394RARef(), h1NS, seedModeBoot); err != nil {
+	if err := seedOneRestaction(cctx, s394RARef(), h1NS, seedModeBoot); err != nil {
 		t.Fatalf("boot seedOneRestaction returned %v; want nil (boot never refuses)", err)
 	}
 	if body, ok := s394Body(handle, raKey); !ok || !strings.Contains(body, "ra-resolve-1") {

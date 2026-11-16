@@ -124,7 +124,7 @@ func ResolveNestedCall(
 		// #630 — keep the apiserver status typed (403 stays IsForbidden), the
 		// same repair as the refresher's re-fetch; the text is unchanged.
 		return nil, fmt.Errorf("nested resolve: fetch %s/%s: %w",
-			ref.Resource, ref.Name, statusErrFromResponse(got.Err))
+			ref.Resource, ref.Name, statusErrFromResult(got))
 	}
 	if got.Unstructured == nil {
 		return nil, fmt.Errorf("nested resolve: fetch %s/%s: nil object",
@@ -138,8 +138,8 @@ func ResolveNestedCall(
 	// the RESTAction and widget arms are gated identically. A denied identity
 	// gets a 403-class error — never empty content.
 	if !cache.Disabled() {
-		if !checkDispatchRBAC(ctx, got.GVR, got.Unstructured.GetNamespace()) {
-			log.Warn("nested resolve dispatch denied by EvaluateRBAC",
+		if !checkDispatchRBAC(ctx, got.GVR, got.Unstructured) {
+			log.WarnContext(ctx, "nested resolve dispatch denied by EvaluateRBAC",
 				slog.String("name", got.Unstructured.GetName()),
 				slog.String("namespace", got.Unstructured.GetNamespace()),
 				slog.String("gvr", got.GVR.String()),

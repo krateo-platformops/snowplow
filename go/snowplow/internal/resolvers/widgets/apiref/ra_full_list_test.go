@@ -411,6 +411,8 @@ func TestRAServe_EmptyFullDoesNotFreeze(t *testing.T) {
 // hit — proving the ""-guard fires BEFORE the known-sliceable hit path. RED arm
 // = remove the `if bindingUID == "" { return }` guard → it serves the ""-cell.
 func TestRAServe_EmptyBindingDeclines(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()
@@ -425,7 +427,7 @@ func TestRAServe_EmptyBindingDeclines(t *testing.T) {
 	keyInputs := f6KeyInputs(gvr().Group, gvr().Version, gvr().Resource,
 		"krateo-system", raName, "" /* the empty-identity key */, nil)
 	raKey := cache.ComputeKey(keyInputs)
-	cache.ResolvedCache().PutRAFullList(raKey, keyInputs, panelDict(40))
+	cache.ResolvedCache().PutRAFullList(fixtureStoreVerdict, raKey, keyInputs, panelDict(40))
 	cache.RecordSliceability(raKey, shape, true) // known-sliceable → would HIT
 	if _, ok := cache.ResolvedCache().Get(raKey); !ok {
 		t.Fatalf("setup: the representative empty-identity cell must be present")

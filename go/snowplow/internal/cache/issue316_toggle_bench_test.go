@@ -26,6 +26,8 @@ func SetProactiveRefreshEnabledForTest(enabled bool) {
 }
 
 func TestIssue316_ProactiveRefreshToggle_ForBench(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "20") // TTL/4 = 5s

@@ -379,7 +379,7 @@ func TestFalsifierFR6ReAdd_DeleteRecreateSelfHeals(t *testing.T) {
 	// The decisive assertion: the row created AFTER recreate is served
 	// by the fresh informer. A frozen (stale) informer would never have
 	// it.
-	got, ok := rw.GetObject(gvr, ns, objName)
+	got, ok := rw.GetObject(context.Background(), gvr, ns, objName)
 	if !ok || got == nil {
 		t.Fatalf("FR6-readd: post-recreate object %s/%s not served by the re-added "+
 			"informer — the re-add resurrected a frozen store instead of "+

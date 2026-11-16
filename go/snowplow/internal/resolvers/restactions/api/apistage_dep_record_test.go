@@ -106,7 +106,7 @@ func TestApistageContentServe_MissRecordsDepEdges(t *testing.T) {
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	_, served, ok, _ := apistageContentServe(ctx, store, call, false)
+	_, served, ok, _, _ := apistageContentServe(ctx, store, call, false)
 	if !ok {
 		t.Fatalf("apistageContentServe ok=false on the F1 watcher's broad-user widget LIST; "+
 			"setup is broken (pivot-servable cluster-wide LIST should succeed): served=%v", served)
@@ -230,7 +230,7 @@ func TestApistageContentServe_HitReRecordsDepEdges(t *testing.T) {
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	_, served, ok, _ := apistageContentServe(ctxBroad, store, call, false)
+	_, served, ok, _, _ := apistageContentServe(ctxBroad, store, call, false)
 	if !ok || !served {
 		t.Fatalf("seed: apistageContentServe ok=%v served=%v — setup MISS failed", ok, served)
 	}
@@ -273,7 +273,7 @@ func TestApistageContentServe_HitReRecordsDepEdges(t *testing.T) {
 	// Hot-path HIT — apistageContentServe finds the entry, runs the
 	// per-user RBAC gate, and (Ship 0.30.212 Site 2) re-records the
 	// dep edge so any LATER informer event dirty-marks the entry.
-	_, served2, ok2, _ := apistageContentServe(ctxBroad, store, call, false)
+	_, served2, ok2, _, _ := apistageContentServe(ctxBroad, store, call, false)
 	if !ok2 || !served2 {
 		t.Fatalf("HIT: apistageContentServe ok=%v served=%v on populated entry", ok2, served2)
 	}
@@ -299,7 +299,7 @@ func TestApistageContentServe_HitReRecordsDepEdges(t *testing.T) {
 	// Deps.recordTotal counter would blow up under refresher load.
 	statsBeforeLoop := cache.Deps().Stats()
 	for i := 0; i < 100; i++ {
-		_, _, _, _ = apistageContentServe(ctxBroad, store, call, false)
+		_, _, _, _, _ = apistageContentServe(ctxBroad, store, call, false)
 	}
 	statsAfterLoop := cache.Deps().Stats()
 	delta := statsAfterLoop.RecordTotal - statsBeforeLoop.RecordTotal

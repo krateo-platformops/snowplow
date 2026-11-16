@@ -89,6 +89,7 @@ func InitShadowParityFromEnv() {
 	// TL). Empty/unset is the silent default. raw is a boolean flag (no per-identity
 	// data), so logging the raw value is safe. Init runs once at boot ⇒ one WARN.
 	if _, err := strconv.ParseBool(raw); raw != "" && err != nil {
+		// log-ctx-waiver: boot: main reads the environment once at start
 		slog.Default().Warn("SHADOW_PARITY_ENABLED unparseable; shadow-parity stays OFF",
 			slog.String("value", raw))
 	}

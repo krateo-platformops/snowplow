@@ -89,6 +89,8 @@ func TestProactiveRASeed_F2_DispatchKeyParity(t *testing.T) {
 // dispatcher computes for the SAME RA → HIT, byte-identical RawJSON. Proves
 // the proactively-seeded cell is the cell the customer /call reads.
 func TestProactiveRASeed_F1_SeedServeHit(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	ctx := ctxWithIdentity()
 	const ns, name = "comp-b", "composition-resources"
@@ -101,7 +103,7 @@ func TestProactiveRASeed_F1_SeedServeHit(t *testing.T) {
 		t.Fatal("expected a live seed handle + key")
 	}
 	body := []byte(`{"status":{"items":[{"name":"comp-b-resource"}]}}`)
-	seedHandle.Put(seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
+	putFixture(seedHandle, seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
 
 	// SERVE side — the dispatcher's key for the same RA tuple (same identity).
 	serveKey, serveHandle, _ := dispatchCacheLookupKey(ctx, "restactions",

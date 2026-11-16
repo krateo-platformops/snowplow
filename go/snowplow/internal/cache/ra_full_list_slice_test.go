@@ -331,6 +331,8 @@ func TestRAFullList_SliceabilityMemoPerShape(t *testing.T) {
 // HG-4a.4a — Pinned entries are SKIPPED by evictUntilUnderCapsLocked under
 // transient cap pressure while transient entries evict.
 func TestRAFullList_PinnedSkipsLRUEviction(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	// Transient entry cap = 2; generous transient bytes; generous resident.
 	c := newResolvedCache(2, 1<<30, time.Hour)
 	c.maxResidentBytes = 1 << 30
@@ -350,11 +352,11 @@ func TestRAFullList_PinnedSkipsLRUEviction(t *testing.T) {
 	}
 
 	// One PINNED cell.
-	c.Put("pin1", pinnedEntry("PINNED-FULL-LIST"))
+	c.put("pin1", pinnedEntry("PINNED-FULL-LIST"))
 	// Fill transient region past its entry cap to force LRU eviction.
-	c.Put("t1", transientEntry("a"))
-	c.Put("t2", transientEntry("b"))
-	c.Put("t3", transientEntry("c")) // evicts a transient (t1), NOT the pin
+	c.put("t1", transientEntry("a"))
+	c.put("t2", transientEntry("b"))
+	c.put("t3", transientEntry("c")) // evicts a transient (t1), NOT the pin
 
 	if _, ok := c.Get("pin1"); !ok {
 		t.Fatalf("PINNED entry was evicted under transient LRU pressure — pin protection broken")
@@ -381,10 +383,12 @@ func TestRAFullList_PinnedSkipsLRUEviction(t *testing.T) {
 // HG-4a.4b — maxResidentBytes==0 DISABLES pinning (kill-switch): a pin
 // request is demoted to transient.
 func TestRAFullList_ResidentKillSwitch(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.maxResidentBytes = 0 // kill-switch
 
-	c.Put("k", &ResolvedEntry{
+	c.put("k", &ResolvedEntry{
 		RawJSON: []byte("x"),
 		Pinned:  true,
 		Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList},
@@ -408,11 +412,13 @@ func TestRAFullList_ResidentKillSwitch(t *testing.T) {
 // HG-4a.4c — resident budget OVERFLOW demotes to transient rather than
 // evicting another pinned cell.
 func TestRAFullList_ResidentBudgetOverflowDemotes(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(100, 1<<20, time.Hour)
 	c.maxResidentBytes = 10 // only ~10 bytes resident
 
 	pin := func(name, payload string) {
-		c.Put(name, &ResolvedEntry{
+		c.put(name, &ResolvedEntry{
 			RawJSON: []byte(payload),
 			Pinned:  true,
 			Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Name: name},
@@ -440,6 +446,8 @@ func TestRAFullList_ResidentBudgetOverflowDemotes(t *testing.T) {
 // HG-4a.4d — re-pin in place (refresher re-resolve) keeps the cell resident
 // and updates resident bytes; demote-then-repin moves bytes between budgets.
 func TestRAFullList_RePinInPlace(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	c.maxResidentBytes = 1 << 20
 
@@ -450,12 +458,12 @@ func TestRAFullList_RePinInPlace(t *testing.T) {
 			Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Name: "x"},
 		}
 	}
-	c.Put("k", mk("aaa", true)) // resident, 3 bytes
+	c.put("k", mk("aaa", true)) // resident, 3 bytes
 	if s := c.Stats(); s.ResidentEntries != 1 || s.ResidentBytes != 3 {
 		t.Fatalf("after first pin: entries=%d bytes=%d", s.ResidentEntries, s.ResidentBytes)
 	}
 	// Refresher re-resolve: same key, still pinned, larger payload.
-	c.Put("k", mk("bbbbb", true))
+	c.put("k", mk("bbbbb", true))
 	if s := c.Stats(); s.ResidentEntries != 1 || s.ResidentBytes != 5 {
 		t.Fatalf("after re-pin: entries=%d bytes=%d (want 1/5)", s.ResidentEntries, s.ResidentBytes)
 	}
@@ -464,7 +472,7 @@ func TestRAFullList_RePinInPlace(t *testing.T) {
 	}
 	// Now write the SAME key transient (e.g. a per-user fallback path) —
 	// bytes move from resident to transient.
-	c.Put("k", mk("cc", false))
+	c.put("k", mk("cc", false))
 	if s := c.Stats(); s.ResidentEntries != 0 || s.ResidentBytes != 0 {
 		t.Fatalf("after demote-in-place: resident entries=%d bytes=%d (want 0/0)", s.ResidentEntries, s.ResidentBytes)
 	}
@@ -489,7 +497,7 @@ func TestRAFullList_ResidentAndMemoRace(t *testing.T) {
 			for i := 0; i < 300; i++ {
 				key := fmt.Sprintf("k%d-%d", w, i%11)
 				pinned := (i % 3) == 0
-				c.Put(key, &ResolvedEntry{
+				c.put(key, &ResolvedEntry{
 					RawJSON: []byte(fmt.Sprintf("payload-%d-%d", w, i)),
 					Pinned:  pinned,
 					Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList, Name: key},

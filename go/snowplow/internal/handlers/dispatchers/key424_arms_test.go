@@ -294,7 +294,7 @@ func TestKey424_SeedTerminalPut_DeclinesOnClassDrift(t *testing.T) {
 		endpoints.Endpoint{}, nil)
 	key, handle, inputs := k424SeedKey(t, cohort)
 	k424Grant(t, dyn, a, psCarol) // the class moves after the mint, before the terminal write
-	ok := seedTerminalPut(cohort, handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs},
+	ok := seedTerminalPut(cohort, handle, fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs},
 		seedTerminalGuardFor(seedModeBoot, handle, key))
 	if ok {
 		t.Fatalf("SEED TOCTOU: seedTerminalPut wrote a body under a key minted for the cohort's PRE-grant class")
@@ -304,7 +304,7 @@ func TestKey424_SeedTerminalPut_DeclinesOnClassDrift(t *testing.T) {
 	}
 	// Control: with no class change the same write lands.
 	key2, handle2, inputs2 := k424SeedKey(t, cohort)
-	if !seedTerminalPut(cohort, handle2, key2, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs2},
+	if !seedTerminalPut(cohort, handle2, fixtureStoreVerdict, key2, &cache.ResolvedEntry{RawJSON: []byte(`{"seeded":true}`), Inputs: inputs2},
 		seedTerminalGuardFor(seedModeBoot, handle2, key2)) {
 		t.Fatalf("CONTROL: an unchanged class must still be written (the guard is over-broad)")
 	}
@@ -378,7 +378,7 @@ func k424SeedParity(t *testing.T, step string) {
 		Reference:  templatesv1.Reference{Name: psRAName, Namespace: h1NS},
 		APIVersion: h1RAGVR.Group + "/" + h1RAGVR.Version, Resource: h1RAGVR.Resource,
 	}
-	if err := seedOneRestaction(cohort, "cohort-k424", ref, psAuthnNS, seedModeBoot); err != nil {
+	if err := seedOneRestaction(cohort, ref, psAuthnNS, seedModeBoot); err != nil {
 		t.Fatalf("seedOneRestaction: %v", err)
 	}
 	key, _ := k423RAKey(t, carolCtx)
@@ -426,7 +426,7 @@ func k424SubGenSettled(t *testing.T, user string, groups []string, from uint64) 
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if cache.RBACSubGenForSubject(user, rbac.WithAuthenticatedGroup(groups)) != from {
+		if cache.RBACSubGenForSubject(user, rbac.WithAuthenticatedGroup(user, groups)) != from {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -449,7 +449,7 @@ func TestKey424_RestactionsPut_SubGenOnlyDrift_GrantThenRevokeMidResolve(t *test
 	dyn := psBuildWatcher(t, a)
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target}) // activates the sub-gen deltas
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target}) // activates the sub-gen deltas
 	carolCtx, daveCtx := psUserCtx(a, psCarol), psUserCtx(a, psDave)
 	cKey, cIn := k423RAKey(t, carolCtx)
 	if dKey, _ := k423RAKey(t, daveCtx); cKey != dKey {
@@ -459,7 +459,7 @@ func TestKey424_RestactionsPut_SubGenOnlyDrift_GrantThenRevokeMidResolve(t *test
 	seam := func(ctx context.Context, opts restactions.ResolveOptions) (*templatesv1.RESTAction, error) {
 		body := k424Body(t, ctx, a)
 		if ui, _ := xcontext.UserInfo(ctx); ui.Username == psCarol && armed.CompareAndSwap(false, true) {
-			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psGroups(a)))
+			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psCarol, psGroups(a)))
 			k424Grant(t, dyn, a, psCarol)
 			body = k424Body(t, ctx, a) // read under the transient grant
 			k424Revoke(t, dyn, a, psCarol)
@@ -513,17 +513,17 @@ func TestKey424_RefresherSubGenOnlyDrift_RoleEditMidResolve(t *testing.T) {
 	dyn := psBuildWatcher(t, a, k423PortalReaders(a)...) // Group:portal → target-reader in ns x
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target})
 	carolCtx := psUserCtx(a, psCarol)
 	key, in := k423RAKey(t, carolCtx)
 	in.RepresentativeUsername, in.RepresentativeGroups = psCarol, psGroups(a)
-	cache.ResolvedCache().Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"password":"pre-edit"}`), Inputs: in})
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"password":"pre-edit"}`), Inputs: in})
 
 	rGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}
 	var armed atomic.Bool
 	restore := setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
 		if armed.CompareAndSwap(false, true) {
-			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psGroups(a)))
+			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psCarol, psGroups(a)))
 			u, err := dyn.Resource(rGVR).Namespace(psTargetNS).Get(context.Background(), "target-reader", metav1.GetOptions{})
 			if err != nil {
 				t.Fatalf("get role: %v", err)

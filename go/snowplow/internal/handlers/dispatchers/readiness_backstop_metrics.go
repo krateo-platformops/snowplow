@@ -73,6 +73,7 @@ func registerReadinessBackstopMetrics() {
 //     (outcome boot_aborted). Recorded once by releasePhase1BootAborted.
 func recordReadinessBackstop(reason string, elapsed time.Duration, unseededRemaining int) {
 	readinessBackstopFired.Add(1)
+	// log-ctx-waiver: boot: the readiness backstop, which precedes readiness
 	slog.Error("readyz.backstop.fired",
 		slog.String("subsystem", "cache"),
 		slog.String("reason", reason),

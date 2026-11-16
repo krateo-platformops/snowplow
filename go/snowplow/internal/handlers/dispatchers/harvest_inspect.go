@@ -135,7 +135,7 @@ func PublishHarvestersForInspectionForTest(navWidgets []HarvestCoordinateForTest
 		u.SetNamespace(c.Namespace)
 		u.SetName(c.Name)
 		u.SetGroupVersionKind(schema.GroupVersionKind{Group: c.GVR.Group, Version: c.GVR.Version, Kind: "Flex"})
-		nav.harvestNavWidget(u, c.GVR, -1, -1, -1, -1)
+		nav.harvestNavWidget(u, c.GVR, unpaginatedPrewarm)
 	}
 	content := newContentPrewarmHarvester()
 	for _, c := range apiRefs {

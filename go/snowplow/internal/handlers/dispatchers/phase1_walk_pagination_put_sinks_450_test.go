@@ -90,6 +90,8 @@ func heuristicDeclassifiedPageEnvelope(ns, name string, page int) *unstructured.
 }
 
 func TestIssue450_DrainWidgetContentPut_DeclinesOnUAFAndExternal(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	const ns, name = "krateo-system", "compositions-page-datagrid"
 
 	// Precondition for the whole arm: the envelope really does slip past the
@@ -180,18 +182,16 @@ func TestIssue450_DrainWidgetContentPut_DeclinesOnUAFAndExternal(t *testing.T) {
 				newPhase1Walker(nil, "krateo-system"),
 				newUnstructuredWidget(ns, name),
 				gvr,
-				fakePage1Driven(), // apiRef+template, wants continue → loop entry
-				1,                 // depth
-				5,                 // perPage (resolution)
-				-1,                // keyPerPage (root tuple)
-				-1,                // keyPage (root tuple)
+				fakePage1Driven(),          // apiRef+template, wants continue → loop entry
+				1,                          // depth
+				newPrewarmPagination(5, 1), // #966: the first page's one pagination
 				"krateo-system",
 			)
 
 			if !resolved {
 				t.Fatal("PRECONDITION: the drain never reached the page resolve — nothing was exercised")
 			}
-			key, _ := widgetContentL1Key(gvr, ns, name, -1, drainKeyPageFor(-1, 2))
+			key, _ := widgetContentL1Key(gvr, ns, name, 5, 2)
 			if key == "" {
 				t.Fatal("PRECONDITION: widgetContent layer must be live (empty key)")
 			}
@@ -282,6 +282,8 @@ var widgetContentPutGates = []widgetContentPutGate{
 }
 
 func TestIssue450_WithWidgetContentPutSinks_InstallsEveryGateSink(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Run("installs", func(t *testing.T) {
 		ctx := withWidgetContentPutSinks(context.Background())
 		if cache.StageErrorSinkFromContext(ctx) == nil {
@@ -558,12 +560,12 @@ func TestIssue450_DrainWidgetContentPut_DeclinesOnSecretRead(t *testing.T) {
 
 			sensBefore, extBefore, uafBefore := sensitiveSkipped398(), cache.ExternalSkippedPut(), cache.WidgetsUAFPutDeclined()
 			iterateApiRefPages(drainCtx, newPhase1Walker(saRC, psAuthnNS), wcr.DeepCopy(), h1WidgetGVR,
-				fakePage1Driven(), 1, 5, -1, -1, psAuthnNS)
+				fakePage1Driven(), 1, newPrewarmPagination(5, 1), psAuthnNS)
 			if !resolved {
 				t.Fatal("PRECONDITION: the drain never reached the page resolve")
 			}
 
-			key, _ := widgetContentL1Key(h1WidgetGVR, h1NS, h1WName, -1, drainKeyPageFor(-1, 2))
+			key, _ := widgetContentL1Key(h1WidgetGVR, h1NS, h1WName, 5, 2)
 			if key == "" {
 				t.Fatal("PRECONDITION: widgetContent layer must be live (empty key)")
 			}

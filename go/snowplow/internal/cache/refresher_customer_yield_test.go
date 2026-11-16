@@ -44,6 +44,8 @@ func customerHookInstall(t *testing.T, fn func() bool) {
 // AC-98.3 / mechanism gate — yield engages when predicate=true, releases
 // when predicate=false. Counters reflect both transitions.
 func TestRefresher_YieldEngagesAndReleases(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 
@@ -54,7 +56,7 @@ func TestRefresher_YieldEngagesAndReleases(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-feed"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"y":1}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"y":1}`), Inputs: &inputs})
 
 	handlerRan := make(chan struct{}, 1)
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, _ ResolvedKeyInputs) error {
@@ -100,6 +102,8 @@ func TestRefresher_YieldEngagesAndReleases(t *testing.T) {
 
 // Nil-hook default — no yield, byte-identical pre-Ship-#98 behaviour.
 func TestRefresher_NilHookNoYield(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 
@@ -107,7 +111,7 @@ func TestRefresher_NilHookNoYield(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-0042"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	handlerRan := make(chan struct{}, 1)
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, _ ResolvedKeyInputs) error {
@@ -144,6 +148,8 @@ func TestRefresher_NilHookNoYield(t *testing.T) {
 // must release after ≤ refresherYieldMaxParked + a small slack, AND
 // cappedTotal must tick.
 func TestRefresher_YieldCapBound(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	if testing.Short() {
 		t.Skip("skipping 5s-cap test under -short")
 	}
@@ -157,7 +163,7 @@ func TestRefresher_YieldCapBound(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-dead"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	handlerRan := make(chan time.Time, 1)
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, _ ResolvedKeyInputs) error {
@@ -204,6 +210,8 @@ func TestRefresher_YieldCapBound(t *testing.T) {
 // predicate flipping at a frequency faster than the production
 // 10s-convergence SLA, the refresher MUST still process its queue.
 func TestRefresher_ConvergesUnderIntermittentBurst(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 
@@ -233,7 +241,7 @@ func TestRefresher_ConvergesUnderIntermittentBurst(t *testing.T) {
 	for i := 0; i < N; i++ {
 		in := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: fmt.Sprintf("uid-0100-%d", i)}
 		k := ComputeKey(in)
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 		keys[i] = k
 	}
 
@@ -266,6 +274,8 @@ func TestRefresher_ConvergesUnderIntermittentBurst(t *testing.T) {
 // flip inflight up/down while 4 refresher workers read the hook each
 // yield-poll tick + dispatch handlers. Must pass `-race`.
 func TestRefresher_RaceYieldUnderConcurrentInflightFlips(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	// 4 workers (the production default), 4 concurrent inflight writers,
 	// short test horizon. Run under `go test -race`.
 	cleanup := withCleanRefresher(t, 4, 0)
@@ -284,7 +294,7 @@ func TestRefresher_RaceYieldUnderConcurrentInflightFlips(t *testing.T) {
 	for i := 0; i < N; i++ {
 		in := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: fmt.Sprintf("uid-c000-%d", i)}
 		k := ComputeKey(in)
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 		keys[i] = k
 	}
 
@@ -426,6 +436,8 @@ func TestRefresher_HookSetterReaderRace(t *testing.T) {
 // influence yield behaviour. Verify by enqueuing both kinds under an
 // in-flight predicate and confirming neither runs early.
 func TestRefresher_YieldUniformAcrossKinds(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 
@@ -438,8 +450,8 @@ func TestRefresher_YieldUniformAcrossKinds(t *testing.T) {
 	rsInputs := ResolvedKeyInputs{CacheEntryClass: "restactions", BindingUID: "uid-0002"}
 	wk := ComputeKey(widgetInputs)
 	rk := ComputeKey(rsInputs)
-	c.Put(wk, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &widgetInputs})
-	c.Put(rk, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &rsInputs})
+	c.put(wk, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &widgetInputs})
+	c.put(rk, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &rsInputs})
 
 	wRan := make(chan struct{}, 1)
 	rRan := make(chan struct{}, 1)

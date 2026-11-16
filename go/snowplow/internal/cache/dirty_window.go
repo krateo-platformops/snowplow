@@ -26,9 +26,11 @@
 //
 // #547 — KNOWN-STALE. A declined or dropped window (and the suppressed skip,
 // which is a decline) is counted as before, but its stamp is NOT deleted: it is
-// converted to {t0, stale: <reason>} and stays until an accepted re-Put closes
-// it (windowFresh, or an accepted demand revalidation) or the cell leaves the
-// store (evictDirtyWindow). Before #547 the stamp was erased there
+// converted to {t0, stale: <reason>} and stays until an accepted re-Put ends
+// it (windowFresh, a remarked accepted re-Put, an accepted demand revalidation
+// or any other carrier's accepted Put — #884: known-stale means the last
+// refresh FAILED; a mark newer than that Put's resolve leaves an ordinary open
+// window) or the cell leaves the store (evictDirtyWindow). Before #547 the stamp was erased there
 // (CompareAndDelete), so the cell looked exactly like a fresh one: every reload
 // was a hit on a body the system knew was stale, nothing re-validated it short
 // of a later informer event or the TTL, and stale_served_total went blind at the
@@ -93,13 +95,20 @@ type dirtyStamp struct {
 	next     time.Time // a mark that landed during the in-flight re-resolve (zero = none)
 	// stale (#547) is non-zero once a refresh of this window ENDED without an
 	// accepted re-Put: the body is KNOWN-STALE since t0. It survives later marks
-	// and later in-flight dequeues; only a fresh Put or an eviction clears it.
+	// and later in-flight dequeues; an accepted Put (any carrier, #884) or an
+	// eviction clears it.
 	stale knownStaleReason
 	// seq (#547) is the dep-event sequence at the LATEST mark of this window. An
 	// accepted Put whose resolve began at or after it (its #375 sink startSeq)
-	// read the post-mark state, so it closes a known-stale window whatever
-	// carrier wrote it (endKnownStaleOnPut).
+	// read the post-mark state, so it closes the window whatever carrier wrote
+	// it; one that began before it ends only the known-stale flag and leaves an
+	// ordinary open window (#884, endKnownStaleOnPut).
 	seq uint64
+	// began (#870) is when the in-flight dequeue began (set by beginWindow).
+	// The store-swap push ledger applies a refresher close only to a dequeue
+	// that began after the ledger opened (store_swap_ledger.go, Q3): one that
+	// began earlier may have read the pre-swap copy.
+	began time.Time
 }
 
 // unfreshReason indexes the closed set of unfresh outcomes.
@@ -118,10 +127,43 @@ type dirtyWindowStats struct {
 	samples atomic.Uint64
 	unfresh [unfreshReasons]atomic.Uint64
 	d2f     *windowedQuantile
+	// dequeueAge is the age of the change a dequeue is about to refresh (its
+	// window's t0 to the dequeue that runs it, after the rate floor and the
+	// customer yield), split by side: [ageViewed] the viewed tier,
+	// [ageUnviewed] the normal and cluster_list tiers. Unlike d2f it is read at
+	// EVERY dequeue that runs inside a window, whatever the outcome, so a window
+	// that a remark or a failure keeps open is still measured at each attempt
+	// (d2f only sees the ones that close fresh).
+	dequeueAge [2]*windowedQuantile
 }
 
+const (
+	ageViewed = iota
+	ageUnviewed
+)
+
 func newDirtyWindowStats() *dirtyWindowStats {
-	return &dirtyWindowStats{d2f: newWindowedQuantile(metricExportInterval(), true)}
+	w := metricExportInterval()
+	return &dirtyWindowStats{
+		d2f:        newWindowedQuantile(w, true),
+		dequeueAge: [2]*windowedQuantile{newWindowedQuantile(w, true), newWindowedQuantile(w, true)},
+	}
+}
+
+// observeDequeueAge records the age of the change a dequeue runs.
+func (s *dirtyWindowStats) observeDequeueAge(viewed bool, age time.Duration) {
+	if s == nil {
+		return
+	}
+	ms := age.Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	side := ageUnviewed
+	if viewed {
+		side = ageViewed
+	}
+	s.dequeueAge[side].observe(float64(ms))
 }
 
 // dirtyToFreshRecorder is the OTLP histogram hook (internal/metrics installs it
@@ -137,6 +179,41 @@ func SetDirtyToFreshRecorder(fn func(ms int64)) {
 		return
 	}
 	dirtyToFreshRecorder.Store(&fn)
+}
+
+// dirtyWindowClock (#930) is the clock of the invalidation→fresh window: a
+// mark's t0 and every age measured from it (the dirty→fresh sample, the stale-
+// served age) are read from it, so a window's length is the difference of two
+// readings of ONE clock. nil reads time.Now, which is all production ever uses.
+// A test installs a virtual clock (SetDirtyWindowClockForTest) to place the
+// mark, a remark and the clean Put at exact instants, so an arm about WHICH mark
+// starts the window asserts the exact length instead of a wall-clock bound.
+var dirtyWindowClock atomic.Pointer[func() time.Time]
+
+// windowNow reads dirtyWindowClock.
+func windowNow() time.Time {
+	if f := dirtyWindowClock.Load(); f != nil {
+		return (*f)()
+	}
+	return time.Now()
+}
+
+// DirtyWindowNow reads the dirty-window clock. Every age measured from a
+// window's t0 (KnownStale / KnownStaleMark) outside this package — the D2
+// stale-serve age — is DirtyWindowNow() minus that t0, never another clock.
+func DirtyWindowNow() time.Time { return windowNow() }
+
+// SetDirtyWindowClockForTest installs now as the dirty-window clock and returns
+// the restore. TEST-ONLY: production never calls it, so the window reads
+// time.Now.
+func SetDirtyWindowClockForTest(now func() time.Time) (restore func()) {
+	prev := dirtyWindowClock.Load()
+	if now == nil {
+		dirtyWindowClock.Store(nil)
+	} else {
+		dirtyWindowClock.Store(&now)
+	}
+	return func() { dirtyWindowClock.Store(prev) }
 }
 
 // DirtyToFreshBoundsMS are the explicit histogram bounds: they bracket the 1 s
@@ -159,7 +236,7 @@ func (r *refresher) markDirty(key string, now time.Time) {
 		s := cur.(*dirtyStamp)
 		// First mark wins t0; #547 — the LATEST mark's seq is kept, so a Put whose
 		// resolve predates a later mark never closes the window.
-		next := &dirtyStamp{t0: s.t0, inflight: s.inflight, next: s.next, stale: s.stale, seq: seq}
+		next := &dirtyStamp{t0: s.t0, inflight: s.inflight, next: s.next, stale: s.stale, seq: seq, began: s.began}
 		if s.inflight && s.next.IsZero() {
 			next.next = now
 		}
@@ -181,18 +258,35 @@ func (r *refresher) beginWindow(key string) (t0 time.Time, open bool) {
 			return time.Time{}, false
 		}
 		s := cur.(*dirtyStamp)
-		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, stale: s.stale, seq: s.seq}) {
+		if r.dirty.CompareAndSwap(key, cur, &dirtyStamp{t0: s.t0, inflight: true, next: s.next, stale: s.stale, seq: s.seq, began: windowNow()}) {
 			return s.t0, true
 		}
 	}
 }
 
-// settleWindow closes (keepOpen=false, stale=none) or re-opens (keepOpen=true,
-// the earliest mark kept) key's in-flight window, or — #547 — marks it
-// KNOWN-STALE (stale != none: the refresh ended without an accepted re-Put, the
-// earliest mark kept). gone reports that the stamp was removed by an eviction
-// during the dequeue.
-func (r *refresher) settleWindow(key string, t0 time.Time, keepOpen bool, stale knownStaleReason) (gone bool) {
+// windowKeep says whether a dequeue's settle keeps its window open, and what
+// happens to a KNOWN-STALE flag when it does.
+type windowKeep uint8
+
+const (
+	// windowEnd closes the window (or, with a reason, marks it known-stale).
+	windowEnd windowKeep = iota
+	// windowKeepAccepted re-opens the window after an ACCEPTED re-Put that was
+	// remarked (a dep moved during the resolve). #884 (owner ruling F5): the
+	// refresh succeeded, so a known-stale flag ENDS; the window stays an
+	// ordinary open one from the earliest mark, replaced by the remark's refresh.
+	windowKeepAccepted
+	// windowKeepFailed re-opens the window after a retried error: the refresh
+	// FAILED, so a known-stale flag is KEPT (#547).
+	windowKeepFailed
+)
+
+// settleWindow closes (windowEnd, stale=none) or re-opens (windowKeepAccepted /
+// windowKeepFailed, the earliest mark kept) key's in-flight window, or — #547 —
+// marks it KNOWN-STALE (windowEnd, stale != none: the refresh ended without an
+// accepted re-Put, the earliest mark kept). gone reports that the stamp was
+// removed by an eviction during the dequeue.
+func (r *refresher) settleWindow(key string, t0 time.Time, keep windowKeep, stale knownStaleReason) (gone bool) {
 	for {
 		cur, ok := r.dirty.Load(key)
 		if !ok {
@@ -206,7 +300,12 @@ func (r *refresher) settleWindow(key string, t0 time.Time, keepOpen bool, stale 
 		}
 		var next any
 		switch {
-		case keepOpen:
+		case keep == windowKeepAccepted:
+			// #884 — known-stale means the last refresh FAILED; this one was
+			// accepted. Before #884 the flag was carried over (stale: s.stale), so
+			// under steady churn a remarked re-Put never ended it.
+			next = &dirtyStamp{t0: t0, seq: s.seq}
+		case keep == windowKeepFailed:
 			next = &dirtyStamp{t0: t0, stale: s.stale, seq: s.seq}
 		case stale != knownStaleNone:
 			// #547 — the mark outlives the failed refresh. A mark that landed
@@ -229,13 +328,26 @@ func (r *refresher) settleWindow(key string, t0 time.Time, keepOpen bool, stale 
 
 // windowFresh closes the window with a sample of now − t0.
 func (r *refresher) windowFresh(key string, t0 time.Time) {
-	r.settleWindow(key, t0, false, knownStaleNone)
+	began := r.inflightBegan(key, t0)
+	r.settleWindow(key, t0, windowEnd, knownStaleNone)
 	r.sampleFresh(t0)
+	ledgerRefreshed(key, began) // #870 — the push ledger's refreshed state
+}
+
+// inflightBegan is when key's in-flight dequeue for the window t0 began (the
+// zero time when it is not this dequeue's stamp).
+func (r *refresher) inflightBegan(key string, t0 time.Time) time.Time {
+	if cur, ok := r.dirty.Load(key); ok {
+		if s := cur.(*dirtyStamp); s.inflight && s.t0.Equal(t0) {
+			return s.began
+		}
+	}
+	return time.Time{}
 }
 
 // sampleFresh records one dirty→fresh sample of now − t0.
 func (r *refresher) sampleFresh(t0 time.Time) {
-	ms := time.Since(t0).Milliseconds()
+	ms := windowNow().Sub(t0).Milliseconds()
 	if ms < 0 {
 		ms = 0
 	}
@@ -262,15 +374,26 @@ func (r *refresher) windowUnfresh(key string, t0 time.Time, reason unfreshReason
 	if reason == unfreshRemarked || reason == unfreshEvicted {
 		ks = knownStaleNone
 	}
-	if r.settleWindow(key, t0, reason == unfreshRemarked, ks) {
+	keep := windowEnd
+	if reason == unfreshRemarked {
+		keep = windowKeepAccepted // a remark follows an ACCEPTED re-Put (settleDequeue)
+	}
+	began := r.inflightBegan(key, t0)
+	if r.settleWindow(key, t0, keep, ks) {
 		reason = unfreshEvicted
 	}
 	r.dirtyStats.unfresh[reason].Add(1)
+	// #870 — the push ledger: a dequeue that ended known-stale closes its
+	// entries known_stale (an eviction closes them through evictDirtyWindow).
+	if reason != unfreshEvicted && reason != unfreshRemarked && ks != knownStaleNone {
+		ledgerKnownStale(key, began)
+	}
 }
 
-// windowContinue keeps the window open from t0 (a retried error).
+// windowContinue keeps the window open from t0 (a retried error: a FAILED
+// refresh, so a known-stale flag is kept).
 func (r *refresher) windowContinue(key string, t0 time.Time) {
-	if r.settleWindow(key, t0, true, knownStaleNone) {
+	if r.settleWindow(key, t0, windowKeepFailed, knownStaleNone) {
 		r.dirtyStats.unfresh[unfreshEvicted].Add(1)
 	}
 }
@@ -279,6 +402,8 @@ func (r *refresher) windowContinue(key string, t0 time.Time) {
 // only, no store re-entry). A window that is not in flight ends here as evicted;
 // an in-flight one is ended by its dequeue's outcome (the stamp is gone).
 func evictDirtyWindow(key string) {
+	ledgerEvicted(key)        // #870 — the key left the store: its push-ledger entries close evicted
+	noteStalePushEvicted(key) // #1062 — its stale serves are replaced: a refetch is a fresh fill
 	r := refresherPeek()
 	if r == nil {
 		return
@@ -394,9 +519,33 @@ func NoteRefreshWrite(ctx context.Context, key string, stored bool) {
 	}
 	if stored {
 		o.accepted.Store(true)
+		// #870 (design v5.3) — the store-swap push ledger's "refreshed" is the
+		// accepted re-Put, taken HERE, at the write: the publish that follows
+		// (PublishRefresh, after this call) can reach a subscriber and be
+		// WRITTEN before this dequeue returns to settle its window, and a
+		// frame written for an entry still marked stale would close nothing.
+		// A remark does not matter: a dequeue that began after the ledger
+		// opened read the installed copy, so its body already carries the
+		// corrected content (only that dequeue counts — ledgerRefreshed checks
+		// when it began).
+		ledgerRefreshed(key, refreshDequeueBegan(key))
 	} else {
 		o.refused.Store(true)
 	}
+}
+
+// refreshDequeueBegan is when key's in-flight dequeue began (zero when none).
+func refreshDequeueBegan(key string) time.Time {
+	r := refresherPeek()
+	if r == nil {
+		return time.Time{}
+	}
+	if cur, ok := r.dirty.Load(key); ok {
+		if s := cur.(*dirtyStamp); s.inflight {
+			return s.began
+		}
+	}
+	return time.Time{}
 }
 
 // noteRefreshRemark reports a #375 remark of key on the dequeue's ctx.

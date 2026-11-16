@@ -25,6 +25,8 @@ func obsGVR() schema.GroupVersionResource {
 // evicts nothing, and must not move for the verdicts that do evict or that had
 // nothing at stake.
 func TestIssue1127Obs_DegradedNoEvict_CountsTheConsequence(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	ResetDepsForTest()
 	t.Cleanup(ResetDepsForTest)
@@ -33,7 +35,7 @@ func TestIssue1127Obs_DegradedNoEvict_CountsTheConsequence(t *testing.T) {
 	Deps().SetStore(store)
 	gvr := obsGVR()
 	const ns, name, key = "demo-system", "obs-flex", "L1_obs-flex"
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &ResolvedKeyInputs{
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &ResolvedKeyInputs{
 		CacheEntryClass: "widgets", Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource,
 		Namespace: ns, Name: name,
 	}})

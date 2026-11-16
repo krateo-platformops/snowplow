@@ -132,7 +132,7 @@ func w484Names(prefix string, n int) []string {
 func w484Body(k string, gen int) string { return fmt.Sprintf(`{"key":%q,"v":%d}`, k, gen) }
 
 func w484Commit(store *cache.ResolvedCacheStore, k, name, body string) {
-	store.Put(k, &cache.ResolvedEntry{RawJSON: []byte(body), Inputs: &cache.ResolvedKeyInputs{
+	store.PutResolved(fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(body), Inputs: &cache.ResolvedKeyInputs{
 		CacheEntryClass: cache.CacheEntryClassWidgetContent,
 		Group:           panelGVR.Group, Version: panelGVR.Version, Resource: panelGVR.Resource,
 		Namespace: evictTestNS, Name: name,
@@ -395,7 +395,7 @@ func TestRefreshes484_FDrop_Wire(t *testing.T) {
 
 	// v1 is what each tab loaded on mount.
 	for i, k := range tkeys {
-		store.Put(k, &cache.ResolvedEntry{RawJSON: []byte(w484Body(k, 1))})
+		store.PutResolved(fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(w484Body(k, 1))})
 		_ = i
 	}
 	gate := make(chan struct{})
@@ -511,7 +511,7 @@ func TestRefreshes484_StallForcesResyncAndReconnectRepairs(t *testing.T) {
 	base := refreshServer(t)
 
 	for _, k := range tkeys {
-		store.Put(k, &cache.ResolvedEntry{RawJSON: []byte(w484Body(k, 1))})
+		store.PutResolved(fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: []byte(w484Body(k, 1))})
 	}
 	gate := make(chan struct{})
 	var gateOnce sync.Once

@@ -139,6 +139,8 @@ func body375(s string) *ResolvedEntry { return &ResolvedEntry{RawJSON: []byte(s)
 // restactions/api/issue375_dep_gen_guard_test.go.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm1_ChurnInReadToRecordWindow_Remarks(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	const K = "arm1-K"
 	// WARM bucket: another dependent already depends on the coordinate.
@@ -149,7 +151,7 @@ func TestIssue375_Arm1_ChurnInReadToRecordWindow_Remarks(t *testing.T) {
 	// ... the resolve READS obj (data@N) here ...
 	Deps().OnUpdate(g375A, "ns1", "obj") // churn → N+1 lands INSIDE [read, Record]
 	Deps().Record(ctx, K, g375A, "ns1", "obj")
-	if !c.PutIfGen(ctx, K, body375(`{"obj":"N"}`), gen0) {
+	if !c.putIfGen(ctx, K, body375(`{"obj":"N"}`), gen0) {
 		t.Fatalf("setup: PutIfGen refused")
 	}
 	if got := rl.count(K); got != 1 {
@@ -166,6 +168,8 @@ func TestIssue375_Arm1_ChurnInReadToRecordWindow_Remarks(t *testing.T) {
 // remark and NO dirty-mark. RED @38f18496 (no GVR floor); NEUTER: drop the floor
 // inheritance in recordInternal + the depMovedSince fallback.
 func TestIssue375_Arm1b_ColdCoordinateChurn_RemarksViaGVRFloor(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, hl := setup375(t)
 	const K = "arm1b-K"
 	if _, ok := DepBucketLastBumpSeqForTest(g375A, "ns1", "cold"); ok {
@@ -175,7 +179,7 @@ func TestIssue375_Arm1b_ColdCoordinateChurn_RemarksViaGVRFloor(t *testing.T) {
 	gen0 := c.CaptureGen(K)
 	Deps().OnUpdate(g375A, "ns1", "cold") // churn on a coordinate nobody depends on yet
 	Deps().Record(ctx, K, g375A, "ns1", "cold")
-	if !c.PutIfGen(ctx, K, body375(`{}`), gen0) {
+	if !c.putIfGen(ctx, K, body375(`{}`), gen0) {
 		t.Fatalf("setup: PutIfGen refused")
 	}
 	if got := rl.count(K); got != 1 {
@@ -192,6 +196,8 @@ func TestIssue375_Arm1b_ColdCoordinateChurn_RemarksViaGVRFloor(t *testing.T) {
 // remark, even while a DIFFERENT GVR churns (the floor is per-GVR, not global).
 // NEUTER: a GLOBAL floor (gvrLastBumpSeq returns depEventSeq) → RED.
 func TestIssue375_Arm1b_ColdCoordinate_OtherGVRChurn_NoRemark(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	const K = "arm1b-anti-K"
 	Deps().OnUpdate(g375A, "ns1", "cold") // A's floor moves BEFORE the resolve starts
@@ -201,7 +207,7 @@ func TestIssue375_Arm1b_ColdCoordinate_OtherGVRChurn_NoRemark(t *testing.T) {
 		Deps().OnUpdate(g375B, "ns1", "other") // churn on a DIFFERENT GVR inside the window
 	}
 	Deps().Record(ctx, K, g375A, "ns1", "cold")
-	if !c.PutIfGen(ctx, K, body375(`{}`), gen0) {
+	if !c.putIfGen(ctx, K, body375(`{}`), gen0) {
 		t.Fatalf("setup: PutIfGen refused")
 	}
 	if got := rl.count(K); got != 0 {
@@ -216,6 +222,8 @@ func TestIssue375_Arm1b_ColdCoordinate_OtherGVRChurn_NoRemark(t *testing.T) {
 // NEUTER: compare `>=` instead of `>` (or treat any recorded dep as moved) → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm2_IdleNoChurnAfterStart_ZeroRemarks(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	for i := 0; i < 50; i++ {
 		k := "arm2-K"
@@ -226,7 +234,7 @@ func TestIssue375_Arm2_IdleNoChurnAfterStart_ZeroRemarks(t *testing.T) {
 		gen0 := c.CaptureGen(k)
 		Deps().Record(ctx, k, g375A, "ns1", "obj")
 		Deps().RecordList(ctx, k, g375A, "ns1")
-		if !c.PutIfGen(ctx, k, body375(`{}`), gen0) {
+		if !c.putIfGen(ctx, k, body375(`{}`), gen0) {
 			t.Fatalf("setup: PutIfGen refused")
 		}
 	}
@@ -243,13 +251,13 @@ func TestIssue375_Arm2_IdleNoChurnAfterStart_ZeroRemarks(t *testing.T) {
 func TestIssue375_Arm3_S189RefusedPut_NoRemark(t *testing.T) {
 	c, rl, _ := setup375(t)
 	const K = "arm3-K"
-	c.Put(K, body375(`{"v":"pre"}`))
+	c.put(K, body375(`{"v":"pre"}`))
 	gen0 := c.CaptureGen(K)
 	ctx := WithL1KeyContext(context.Background(), K)
 	Deps().Record(ctx, K, g375A, "ns1", "obj")
 	Deps().OnUpdate(g375A, "ns1", "obj") // dep moved
 	c.DeleteForTest(K)                   // and K was DELETE-evicted during the resolve
-	if c.PutIfGen(ctx, K, body375(`{"v":"stale"}`), gen0) {
+	if c.putIfGen(ctx, K, body375(`{"v":"stale"}`), gen0) {
 		t.Fatalf("setup: #189 must refuse the Put")
 	}
 	if got := rl.count(K); got != 0 {
@@ -257,7 +265,7 @@ func TestIssue375_Arm3_S189RefusedPut_NoRemark(t *testing.T) {
 			"nothing; remarking it resurrects nothing but churns the refresher", got)
 	}
 	// ReplaceIfGen (refresher carrier): absent key → refused → no remark.
-	if c.ReplaceIfGen(ctx, K, body375(`{}`), gen0) {
+	if c.replaceIfGen(ctx, K, body375(`{}`), gen0) {
 		t.Fatalf("setup: ReplaceIfGen of an absent key must refuse")
 	}
 	if got := rl.count(K); got != 0 {
@@ -272,6 +280,8 @@ func TestIssue375_Arm3_S189RefusedPut_NoRemark(t *testing.T) {
 // the cluster-wide list. NEUTER: drop the listWildcard stamps in bumpCoordinateGen.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm4_ListMemberAdd_RemarksViaListBucket(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, tc := range []struct{ name, listNS string }{{"ns-list", "ns1"}, {"cluster-list", ""}} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, rl, _ := setup375(t)
@@ -280,7 +290,7 @@ func TestIssue375_Arm4_ListMemberAdd_RemarksViaListBucket(t *testing.T) {
 			gen0 := c.CaptureGen(K)
 			Deps().RecordList(ctx, K, g375A, tc.listNS)
 			Deps().OnAdd(g375A, "ns1", "new-member") // an UNREAD member appears
-			if !c.PutIfGen(ctx, K, body375(`{"items":[]}`), gen0) {
+			if !c.putIfGen(ctx, K, body375(`{"items":[]}`), gen0) {
 				t.Fatalf("setup: PutIfGen refused")
 			}
 			if got := rl.count(K); got != 1 {
@@ -292,6 +302,8 @@ func TestIssue375_Arm4_ListMemberAdd_RemarksViaListBucket(t *testing.T) {
 }
 
 func TestIssue375_Arm5_ListMemberRemove_RemarksViaListBucket(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, tc := range []struct{ name, listNS string }{{"ns-list", "ns1"}, {"cluster-list", ""}} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, rl, _ := setup375(t)
@@ -300,7 +312,7 @@ func TestIssue375_Arm5_ListMemberRemove_RemarksViaListBucket(t *testing.T) {
 			gen0 := c.CaptureGen(K)
 			Deps().RecordList(ctx, K, g375A, tc.listNS)
 			Deps().OnDelete(g375A, "ns1", "member-x") // a member leaves
-			if !c.PutIfGen(ctx, K, body375(`{"items":[{"x":1}]}`), gen0) {
+			if !c.putIfGen(ctx, K, body375(`{"items":[{"x":1}]}`), gen0) {
 				t.Fatalf("setup: PutIfGen refused")
 			}
 			if got := rl.count(K); got != 1 {
@@ -320,6 +332,8 @@ func TestIssue375_Arm5_ListMemberRemove_RemarksViaListBucket(t *testing.T) {
 // → r0/r1 miss → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm6_KResolvesTimesMMutations_ExactOracle(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	type res struct {
 		key  string
@@ -331,7 +345,7 @@ func TestIssue375_Arm6_KResolvesTimesMMutations_ExactOracle(t *testing.T) {
 	}
 	rec := func(r *res, name string) { Deps().Record(r.ctx, r.key, g375A, "ns", name) }
 	put := func(r *res) {
-		if !c.PutIfGen(r.ctx, r.key, body375(`{}`), r.gen0) {
+		if !c.putIfGen(r.ctx, r.key, body375(`{}`), r.gen0) {
 			t.Fatalf("setup: PutIfGen(%s) refused", r.key)
 		}
 	}
@@ -371,6 +385,8 @@ func TestIssue375_Arm6_KResolvesTimesMMutations_ExactOracle(t *testing.T) {
 // re-resolves K forever → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm8_RefresherReResolveSelfRemark_Bounded(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	c := ResolvedCache()
@@ -383,7 +399,7 @@ func TestIssue375_Arm8_RefresherReResolveSelfRemark_Bounded(t *testing.T) {
 	})()
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "arm8"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
 
 	var calls atomic.Int32
 	RegisterRefreshFunc("widgets", func(ctx context.Context, k string, used ResolvedKeyInputs) error {
@@ -394,7 +410,7 @@ func TestIssue375_Arm8_RefresherReResolveSelfRemark_Bounded(t *testing.T) {
 		if n == 1 {
 			Deps().OnUpdate(g375A, "ns", "dep") // churn INSIDE the first re-resolve
 		}
-		c.ReplaceIfGen(rctx, k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used}, gen0)
+		c.replaceIfGen(rctx, k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used}, gen0)
 		return nil
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -415,15 +431,22 @@ func TestIssue375_Arm8_RefresherReResolveSelfRemark_Bounded(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // arm-9 — COVERAGE-ENUM, STRUCTURAL. Reflect over *ResolvedCacheStore at test time:
-// EVERY generation-guarded Put method (name contains "IfGen" — PutIfGen,
-// ReplaceIfGen, PutRAFullListIfGen, ReplaceIfGenRefresh (#378), and any future
-// one) must (1) take a context.Context first (it cannot reach the
+// EVERY exported generation-guarded Put method (name contains "IfGen" —
+// PutResolvedIfGen, ReplaceResolvedIfGen, ReplaceResolvedIfGenRefresh (#378),
+// PutRAFullListIfGen, PutContentIfGen, and any future one) must (1) take a context.Context first (it cannot reach the
 // resolve's sink otherwise) and (2) invoke the dep-gen check on ACCEPT — proven
 // behaviourally by an accepted call on a NIL-sink ctx bumping unguarded_put_total
 // and remarking exactly once. A new gen-guarded Put added unwired goes RED here with
 // no edit to this test. NEUTER: remove the remark from any one method → RED.
+// #912 delta-3 item 3 — the ungated primitives (putIfGen, replaceIfGen,
+// replaceIfGenRefresh) are unexported, so reflection sees the exported writes
+// only; each wraps one of them, and they are the only way any other package can
+// reach one, so driving every exported one drives every reachable gen-guarded
+// write.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
 	st := reflect.TypeOf(c)
@@ -441,7 +464,15 @@ func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
 			continue
 		}
 		key := "arm9-" + m.Name
-		c.Put(key, body375(`{"seed":1}`)) // live, so a Replace* variant can accept
+		entry := func() *ResolvedEntry { return body375(`{"v":2}`) }
+		if m.Name == "PutContentIfGen" {
+			// It writes only an apistage entry under the key its inputs compute
+			// (TestIssue912_V3): synthesize exactly that.
+			in := ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage, Version: "v1", Resource: "arm9"}
+			key = ComputeKey(in)
+			entry = func() *ResolvedEntry { e := body375(`{"v":2}`); e.Inputs = &in; return e }
+		}
+		c.put(key, body375(`{"seed":1}`)) // live, so a Replace* variant can accept
 		args := []reflect.Value{reflect.ValueOf(c), reflect.ValueOf(context.Background())}
 		ok := true
 		for j := 2; j < mt.NumIn(); j++ {
@@ -450,7 +481,7 @@ func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
 			case pt.Kind() == reflect.String:
 				args = append(args, reflect.ValueOf(key))
 			case pt == reflect.TypeOf(&ResolvedEntry{}):
-				args = append(args, reflect.ValueOf(body375(`{"v":2}`)))
+				args = append(args, reflect.ValueOf(entry()))
 			case pt.Kind() == reflect.Uint64:
 				args = append(args, reflect.ValueOf(c.CaptureGen(key)))
 			case pt == reflect.TypeOf(ResolvedKeyInputs{}):
@@ -459,6 +490,10 @@ func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
 				args = append(args, reflect.ValueOf(map[string]any{"v": 2}))
 			case pt.Kind() == reflect.Bool:
 				args = append(args, reflect.ValueOf(false))
+			case pt == reflect.TypeOf(PutVerdict{}):
+				// #912 re-review — a verdict-gated write: drive it with a STORING
+				// verdict so the dep-gen check is what decides.
+				args = append(args, reflect.ValueOf(fixtureStoreVerdict))
 			default:
 				t.Errorf("#375 arm-9: gen-guarded Put %s has a parameter of type %s this enumeration cannot "+
 					"synthesize — extend arm-9 so the new method is DRIVEN, never silently skipped", m.Name, pt)
@@ -471,7 +506,10 @@ func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
 		before := Deps().Stats().UnguardedPutTotal
 		remarksBefore := rl.count(key)
 		out := m.Func.Call(args)
-		if len(out) == 0 || out[0].Kind() != reflect.Bool || !out[0].Bool() {
+		// #1321 — a write that reports its PutOutcome accepts when Stored().
+		accepted := len(out) > 0 && ((out[0].Kind() == reflect.Bool && out[0].Bool()) ||
+			(out[0].Type() == reflect.TypeOf(PutRefused) && out[0].Interface().(PutOutcome).Stored()))
+		if !accepted {
 			t.Errorf("#375 arm-9: %s did not ACCEPT the synthesized live-key Put (out=%v) — cannot prove the "+
 				"accept branch invokes the check; extend the synthesis", m.Name, out)
 			continue
@@ -484,7 +522,7 @@ func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
 			t.Errorf("#375 arm-9 RED: accepted %s on a NIL-sink ctx remarked %d times, want 1", m.Name, got)
 		}
 	}
-	for _, must := range []string{"PutIfGen", "ReplaceIfGen", "PutRAFullListIfGen", "ReplaceIfGenRefresh"} {
+	for _, must := range []string{"PutResolvedIfGen", "ReplaceResolvedIfGen", "PutRAFullListIfGen", "ReplaceResolvedIfGenRefresh", "PutContentIfGen"} {
 		found := false
 		for _, n := range covered {
 			found = found || n == must
@@ -505,6 +543,8 @@ func TestIssue375_Arm9_EveryGenGuardedPutInvokesTheCheck(t *testing.T) {
 // window, independent of the event count. NEUTER: per-dep remark → remarks = 5×.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm10_HighChurnStorm_RemarkOncePerResolve_RateFloorBounded(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "1")
@@ -529,7 +569,7 @@ func TestIssue375_Arm10_HighChurnStorm_RemarkOncePerResolve_RateFloorBounded(t *
 		for _, d := range deps {
 			Deps().Record(rctx, k, g375A, "ns", d)
 		}
-		c.ReplaceIfGen(rctx, k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used}, gen0)
+		c.replaceIfGen(rctx, k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used}, gen0)
 		return nil
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -568,7 +608,7 @@ func TestIssue375_Arm10_HighChurnStorm_RemarkOncePerResolve_RateFloorBounded(t *
 		for DepEventSeqForTest() < seq0+len64(deps)+1 {
 			time.Sleep(100 * time.Microsecond)
 		}
-		if !c.PutIfGen(rctx, key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in}, gen0) {
+		if !c.putIfGen(rctx, key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in}, gen0) {
 			t.Fatalf("setup: customer PutIfGen refused")
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -609,6 +649,8 @@ func len64(s []string) uint64 { return uint64(len(s)) }
 // atomic. NEUTER: a non-atomic lastBumpSeq write in bumpCoordinateGen → -race RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm11_ConcurrentBumpAndPutCheck_NoTornSeq(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	var started, completed atomic.Int64
 	stop := make(chan struct{})
@@ -651,7 +693,7 @@ func TestIssue375_Arm11_ConcurrentBumpAndPutCheck_NoTornSeq(t *testing.T) {
 					runtime.Gosched()
 				}
 				c1 := completed.Load() // c1 > s0 ⇒ ≥1 bump started after startSeq and completed
-				if !c.PutIfGen(ctx, k, body375(`{}`), gen0) {
+				if !c.putIfGen(ctx, k, body375(`{}`), gen0) {
 					t.Errorf("setup: PutIfGen(%s) refused", k)
 					return
 				}
@@ -690,13 +732,15 @@ func TestIssue375_Arm11_ConcurrentBumpAndPutCheck_NoTornSeq(t *testing.T) {
 // unchanged, hook silent. NEUTERS: nil-sink no-remark → RED; empty treated as nil → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_Arm12_NilSinkRemarksOnceAndDetects_EmptySinkSilent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	var hookKeys []string
 	restore := SetUnguardedPutHookForTest(func(k string) { hookKeys = append(hookKeys, k) })
 	defer restore()
 
 	base := Deps().Stats().UnguardedPutTotal
-	if !c.PutIfGen(context.Background(), "arm12-nil", body375(`{}`), 0) {
+	if !c.putIfGen(context.Background(), "arm12-nil", body375(`{}`), 0) {
 		t.Fatalf("setup: nil-sink PutIfGen refused")
 	}
 	if got := rl.count("arm12-nil"); got != 1 {
@@ -714,7 +758,7 @@ func TestIssue375_Arm12_NilSinkRemarksOnceAndDetects_EmptySinkSilent(t *testing.
 
 	empty := WithDepGenSink(context.Background()) // installed, zero deps recorded
 	Deps().OnUpdate(g375A, "ns", "unrelated")     // churn somewhere — irrelevant to an empty sink
-	if !c.PutIfGen(empty, "arm12-empty", body375(`{}`), 0) {
+	if !c.putIfGen(empty, "arm12-empty", body375(`{}`), 0) {
 		t.Fatalf("setup: empty-sink PutIfGen refused")
 	}
 	if got := rl.count("arm12-empty"); got != 0 {
@@ -733,7 +777,7 @@ func TestIssue375_Arm12_NilSinkRemarksOnceAndDetects_EmptySinkSilent(t *testing.
 				t.Fatalf("#375 arm-12: the test-build panic hook did not fire on a nil-sink Put")
 			}
 		}()
-		c.PutIfGen(context.Background(), "arm12-panic", body375(`{}`), 0)
+		c.putIfGen(context.Background(), "arm12-panic", body375(`{}`), 0)
 	}()
 }
 
@@ -785,6 +829,8 @@ func TestIssue375_R1_ReadOnlyMatchQueriesNeverBump(t *testing.T) {
 // check sees no stamp → NEITHER → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_R2_PutInsideBumpWindow_IsCaught(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, stage := range []string{"after_store", "after_add"} {
 		t.Run(stage, func(t *testing.T) {
 			c, rl, hl := setup375(t)
@@ -795,7 +841,7 @@ func TestIssue375_R2_PutInsideBumpWindow_IsCaught(t *testing.T) {
 			var fired atomic.Bool
 			defer SetDepBumpHookForTest(func(s string) {
 				if s == stage && fired.CompareAndSwap(false, true) {
-					if !c.PutIfGen(ctx, K, body375(`{"stale":true}`), gen0) {
+					if !c.putIfGen(ctx, K, body375(`{"stale":true}`), gen0) {
 						t.Errorf("setup: PutIfGen refused inside the window")
 					}
 				}
@@ -825,6 +871,8 @@ func TestIssue375_R2_PutInsideBumpWindow_IsCaught(t *testing.T) {
 // parent link in WithDepGenSink → the outer Put misses the nested dep → RED.
 // ---------------------------------------------------------------------------
 func TestIssue375_NestedResolveDep_ReachesOuterPutCheck(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	const outer, nested = "nest-outer", "nest-inner"
 	octx := WithL1KeyContext(context.Background(), outer)
@@ -833,7 +881,7 @@ func TestIssue375_NestedResolveDep_ReachesOuterPutCheck(t *testing.T) {
 	ngen := c.CaptureGen(nested)
 	Deps().Record(nctx, nested, g375A, "ns", "deep") // only the NESTED resolve reads "deep"
 	Deps().OnUpdate(g375A, "ns", "deep")
-	if !c.PutIfGen(nctx, nested, body375(`{}`), ngen) || !c.PutIfGen(octx, outer, body375(`{}`), ogen) {
+	if !c.putIfGen(nctx, nested, body375(`{}`), ngen) || !c.putIfGen(octx, outer, body375(`{}`), ogen) {
 		t.Fatalf("setup: Put refused")
 	}
 	if rl.count(nested) != 1 {
@@ -851,6 +899,8 @@ func TestIssue375_NestedResolveDep_ReachesOuterPutCheck(t *testing.T) {
 // content Put (no outer-dep FP); and a Record under the child still reaches the parent.
 // NEUTER: WithContentDepGenSink returns ctx unchanged → own-dep RED + FP RED.
 func TestIssue375_ContentChildSink_OwnDepRemarks_OuterDepSilent_ParentSees(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	const outer, content = "cs-outer", "cs-content"
 	octx := WithL1KeyContext(context.Background(), outer)
@@ -860,7 +910,7 @@ func TestIssue375_ContentChildSink_OwnDepRemarks_OuterDepSilent_ParentSees(t *te
 	cctx := WithContentDepGenSink(octx, g375A, "ns", "") // content LIST cell entry
 	cgen := c.CaptureGen(content)
 	Deps().OnAdd(g375A, "ns", "member") // churn on the cell's own list
-	if !c.PutIfGen(cctx, content, body375(`{}`), cgen) {
+	if !c.putIfGen(cctx, content, body375(`{}`), cgen) {
 		t.Fatalf("setup: content Put refused")
 	}
 	Deps().RecordList(cctx, content, g375A, "ns") // the cell records AFTER the accepted Put
@@ -877,7 +927,7 @@ func TestIssue375_ContentChildSink_OwnDepRemarks_OuterDepSilent_ParentSees(t *te
 	cctx2 := WithContentDepGenSink(octx, g375A, "ns", "other")
 	cgen2 := c.CaptureGen(content2)
 	Deps().OnUpdate(g375B, "ns", "outer-only")
-	if !c.PutIfGen(cctx2, content2, body375(`{}`), cgen2) {
+	if !c.putIfGen(cctx2, content2, body375(`{}`), cgen2) {
 		t.Fatalf("setup: content Put refused")
 	}
 	if rl.count(content2) != 0 {
@@ -899,6 +949,8 @@ func containsDK(ds []DepKey, dk DepKey) bool {
 // dirty-mark hook (tier routing + trigger set), ONE enqueue per Put. NEUTER: enqueue
 // the remark with no trigger → RED.
 func TestIssue375_RemarkCarriesMovedGVRsAsTriggers(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c, rl, _ := setup375(t)
 	merged := map[schema.GroupVersionResource]int{}
 	var enq []schema.GroupVersionResource
@@ -913,7 +965,7 @@ func TestIssue375_RemarkCarriesMovedGVRsAsTriggers(t *testing.T) {
 	Deps().OnUpdate(g375A, "ns", "a")
 	Deps().OnUpdate(g375B, "ns", "b")
 	enq = nil // the two dirty-marks (K not resident) — the remark is what we assert on
-	if !c.PutIfGen(ctx, K, body375(`{}`), gen0) {
+	if !c.putIfGen(ctx, K, body375(`{}`), gen0) {
 		t.Fatalf("setup: Put refused")
 	}
 	if rl.count(K) != 1 || len(enq) != 1 {
@@ -933,12 +985,14 @@ func TestIssue375_RemarkCarriesMovedGVRsAsTriggers(t *testing.T) {
 // overwrote the first). Real OnObjectEvents, real refresher dequeue. NEUTER: Store
 // (overwrite) instead of merge → RED.
 func TestIssue375_TwoMarksDifferentGVRsBeforeDequeue_BothForceMiss(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	c := ResolvedCache()
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "twomarks"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in, CreatedAt: time.Now().Add(-agedBackoff)})
 	Deps().Record(context.Background(), key, g375A, "ns", "a")
 	Deps().Record(context.Background(), key, g375B, "ns", "b")
 

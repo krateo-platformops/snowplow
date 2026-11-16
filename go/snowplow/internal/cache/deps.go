@@ -84,7 +84,7 @@ var ctxKeyL1Record = ctxKeyL1RecordType{}
 // chain (api.Resolve → restactions.Resolve → httpcall.Do).
 func WithL1KeyContext(ctx context.Context, l1Key string) context.Context {
 	if l1Key == "" {
-		loudFailEmptyL1Key("WithL1KeyContext")
+		loudFailEmptyL1Key(ctx, "WithL1KeyContext")
 		return ctx
 	}
 	if ctx == nil {
@@ -97,7 +97,9 @@ func WithL1KeyContext(ctx context.Context, l1Key string) context.Context {
 	// inner-call dispatch PRESERVES the parent ctx (one sink per resolve). A gen-guarded Put
 	// whose ctx has no sink (a resolve that Put without setting an L1 key — e.g. a content-
 	// populate path keyed directly) is caught by remarkIfDepsMoved's nil-sink detector.
-	return WithDepGenSink(context.WithValue(ctx, ctxKeyL1Record, l1Key))
+	ctx = WithDepGenSink(context.WithValue(ctx, ctxKeyL1Record, l1Key))
+	depGenSinkFromContext(ctx).key = l1Key // #890: this resolve's own key
+	return ctx
 }
 
 // DepGenEpochNow returns the current dep-event sequence (#375). A customer handler
@@ -126,7 +128,7 @@ func DepGenStartSeqFromContext(ctx context.Context) (uint64, bool) {
 // accepted Put. An edit of the CR anywhere in [fetch, Put] then remarks the Put.
 func WithL1KeyContextFromEpoch(ctx context.Context, l1Key string, epoch uint64, pre ...DepKey) context.Context {
 	if l1Key == "" {
-		loudFailEmptyL1Key("WithL1KeyContextFromEpoch")
+		loudFailEmptyL1Key(ctx, "WithL1KeyContextFromEpoch")
 		return ctx
 	}
 	if ctx == nil {
@@ -139,6 +141,7 @@ func WithL1KeyContextFromEpoch(ctx context.Context, l1Key string, epoch uint64, 
 		startSeq: epoch,
 		deps:     append([]DepKey(nil), pre...),
 		parent:   depGenSinkFromContext(ctx),
+		key:      l1Key, // #890
 	})
 }
 
@@ -146,13 +149,13 @@ func WithL1KeyContextFromEpoch(ctx context.Context, l1Key string, epoch uint64, 
 // test mode (so a missing-key regression cannot ship), WARN + counter in
 // production (the TTL outer net keeps the cache correct). The counter
 // lives on the Deps() singleton; Deps() is always non-nil.
-func loudFailEmptyL1Key(callsite string) {
+func loudFailEmptyL1Key(ctx context.Context, callsite string) {
 	Deps().recordDroppedNoKey.Add(1)
 	if depsTestMode.Load() {
 		panic("cache.deps: " + callsite + " called with empty l1Key — " +
 			"the L1 key was not threaded through (O15 loud-fail, test mode)")
 	}
-	slog.Warn("deps.empty_l1_key",
+	slog.WarnContext(ctx, "deps.empty_l1_key",
 		slog.String("subsystem", "cache"),
 		slog.String("callsite", callsite),
 		slog.String("hint", "dep edge dropped — L1 key was not threaded through; "+
@@ -556,7 +559,7 @@ type depGenSink struct {
 	parent *depGenSink
 	// seen dedups deps (a resolve re-Records the same coordinate many times, and every
 	// Record is appended to each ancestor sink). Lazily initialised under mu.
-	seen map[DepKey]struct{}
+	seen map[DepKey]bool // value: recorded under the sink's own key (#890)
 	// #375 C3 — the post-Put window. Set by remarkIfDepsMoved on an ACCEPTED gen-guarded
 	// Put checked against this sink: putKey is the key that was Put, checkedSeq the
 	// dep-event seq at the check, putRemarked whether that check (or a later re-check)
@@ -589,20 +592,73 @@ type depGenSink struct {
 	// each with its Put identity and the deps it covers. A declined-external
 	// mark folds them in: the mark retires when a served cell is re-Put or gone.
 	served []ServedCell
+	// key / ownN — #890: the L1 key this resolve populates (set by WithL1KeyContext*;
+	// "" for a content child sink), and how many of the deps this resolve recorded
+	// UNDER that key — the edges an accepted write of key re-asserts if a
+	// concurrent strip took them (reassertOwnEdges). Which deps are own is the
+	// value of seen (true = recorded under key): no second map, no second slice.
+	key  string
+	ownN int
+	// ownDS / ownStripped — #890: the key's edge set (the reverse-index *depSet)
+	// this resolve's first own record found, and whether a later own record found
+	// a different one. RemoveL1Key — the only writer that deletes a key's edge set
+	// — removes that *depSet, and the next record creates a new one; so "the key's
+	// edge set is still ownDS and never changed" means no strip touched the key
+	// since this resolve recorded under it, and the accepted write has nothing to
+	// re-assert. Lock-free (one CAS per own record at most).
+	ownDS       atomic.Pointer[depSet]
+	ownStripped atomic.Bool
+}
+
+// noteOwnDepSet records the key's edge-set identity seen by an own record.
+func (s *depGenSink) noteOwnDepSet(ds *depSet) {
+	if cur := s.ownDS.Load(); cur == nil {
+		if s.ownDS.CompareAndSwap(nil, ds) {
+			return
+		}
+		cur = s.ownDS.Load()
+		if cur != ds {
+			s.ownStripped.Store(true)
+		}
+	} else if cur != ds {
+		s.ownStripped.Store(true)
+	}
+}
+
+// addOwnLocked marks dk (already added by addDepLocked) as recorded under the
+// sink's own key. Caller holds s.mu.
+func (s *depGenSink) addOwnLocked(dk DepKey) {
+	if own := s.seen[dk]; !own {
+		s.seen[dk] = true
+		s.ownN++
+	}
+}
+
+// ownDepsLocked returns the deps recorded under the sink's own key. Caller holds s.mu.
+func (s *depGenSink) ownDepsLocked() []DepKey {
+	// No capacity hint: this runs only on the full check (after a strip), never
+	// on the skip path, so growing by append costs nothing that matters.
+	var out []DepKey
+	for _, dk := range s.deps {
+		if s.seen[dk] {
+			out = append(out, dk)
+		}
+	}
+	return out
 }
 
 // addDepLocked appends dk unless already present. Caller holds s.mu.
 func (s *depGenSink) addDepLocked(dk DepKey) {
 	if s.seen == nil {
-		s.seen = make(map[DepKey]struct{}, len(s.deps)+4)
+		s.seen = make(map[DepKey]bool, len(s.deps)+4)
 		for _, d := range s.deps {
-			s.seen[d] = struct{}{}
+			s.seen[d] = false
 		}
 	}
 	if _, dup := s.seen[dk]; dup {
 		return
 	}
-	s.seen[dk] = struct{}{}
+	s.seen[dk] = false
 	s.deps = append(s.deps, dk)
 }
 
@@ -788,6 +844,14 @@ type DepTracker struct {
 	// that ever produced a dep event (not a per-coordinate map).
 	gvrLastBump sync.Map
 
+	// gvrLastTypeBump — #765: the depEventSeq of the LAST type-level event on the GVR
+	// (bumpResourceTypeGen: available / removed),
+	// gvr -> *atomic.Uint64. A listOnly type event stamps only the GVR's LIST buckets,
+	// so a GET content cell's own bucket cannot show it; ContentStampCovers checks this
+	// too, so a type event since a content cell's read always re-fills it. Bounded by the
+	// GVRs that ever produced a type event.
+	gvrLastTypeBump sync.Map
+
 	// totalRecords is the global record count — bounded by maxRecords.
 	totalRecords atomic.Int64
 	maxRecords   int64
@@ -844,6 +908,17 @@ type DepTracker struct {
 	dirtyMarkTotal     atomic.Uint64 // dirty-marks (OnAdd/OnUpdate + OnDelete non-self)
 	enqueueUpdateTotal atomic.Uint64 // refresh enqueues triggered by OnUpdate
 	removeL1Total      atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
+	// reassertedEdgesTotal — #890: edges an accepted write re-recorded because a
+	// concurrent strip of its then non-resident key had taken them (test seam).
+	reassertedEdgesTotal atomic.Uint64
+	// reassertCheckedTotal — #890: accepted writes that had to check their own
+	// edges because a strip touched the key since the resolve recorded (test seam).
+	reassertCheckedTotal atomic.Uint64
+
+	// #603 PR-2 / #765 option B — the list-interest SHADOW (deps_list_interest.go):
+	// per-edge interest, the handler-side masks' registry, the would-avoid
+	// decisions and the would-change audit. Observes only; never changes a mark.
+	narrow *listNarrow
 
 	// #239 dirty-mark attribution: the {path,cause,class} distribution, per-
 	// submit-source counts, fan-out denominator and /debug/vars-only GVR
@@ -927,6 +1002,7 @@ func newDepTracker(maxRecords int64) *DepTracker {
 	return &DepTracker{
 		maxRecords: maxRecords,
 		dmAttr:     newDMAttribution(),
+		narrow:     newListNarrow(),
 	}
 }
 
@@ -1007,7 +1083,7 @@ func (d *DepTracker) Record(ctx context.Context, l1Key string, gvr schema.GroupV
 	if l1Key == "" {
 		// O15: a Record call with no L1 key is an unambiguous bug — a
 		// DepKey with nowhere to attach it. Loud-fail.
-		loudFailEmptyL1Key("Record")
+		loudFailEmptyL1Key(ctx, "Record")
 		return
 	}
 	if name == "" {
@@ -1033,7 +1109,7 @@ func (d *DepTracker) RecordList(ctx context.Context, l1Key string, gvr schema.Gr
 	if l1Key == "" {
 		// O15: same loud-fail as Record — a list-scope edge with no L1
 		// key cannot be attached anywhere.
-		loudFailEmptyL1Key("RecordList")
+		loudFailEmptyL1Key(ctx, "RecordList")
 		return
 	}
 	d.recordInternal(ctx, l1Key, DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
@@ -1042,14 +1118,27 @@ func (d *DepTracker) RecordList(ctx context.Context, l1Key string, gvr schema.Gr
 // recordInternal is the shared body of Record + RecordList. Idempotent;
 // honours the global cap.
 func (d *DepTracker) recordInternal(ctx context.Context, l1Key string, dk DepKey) {
+	d.recordInternalMode(ctx, l1Key, dk, recordPlain)
+}
+
+// recordInternalMode is recordInternal with the #603 PR-2 interest mode. The
+// mode decides ONLY the reverse-index value of a list edge (deps_list_interest.go):
+// the forward index, the dedup, the cap and every counter are the same for both.
+func (d *DepTracker) recordInternalMode(ctx context.Context, l1Key string, dk DepKey, mode recordMode) {
 	// #375 (option c) — append the recorded dep to the per-resolve sink (installed at
 	// resolve ENTRY via WithDepGenSink), gated like the capture tap below. The accepted-
 	// Put check (remarkIfDepsMoved) compares each recorded dep's bucket lastBumpSeq to
 	// startSeq. Appended BEFORE the dedup early-return so the resolve's dep set is complete.
-	var recheck *depGenSink
+	var recheck, ownSink *depGenSink
 	for s := depGenSinkFromContext(ctx); s != nil; s = s.parent {
 		s.mu.Lock()
 		s.addDepLocked(dk)
+		if s.key != "" && s.key == l1Key {
+			s.addOwnLocked(dk) // #890
+			if ownSink == nil {
+				ownSink = s
+			}
+		}
 		if recheck == nil && s.putKey != "" && s.putKey == l1Key && !s.putRemarked {
 			recheck = s // #375 C3: a Record for a key this sink's resolve already Put
 		}
@@ -1082,6 +1171,34 @@ func (d *DepTracker) recordInternal(ctx context.Context, l1Key string, dk DepKey
 		storeMaxSeq(&ks.lastBumpSeq, d.gvrLastBumpSeq(dk.GVR))
 	}
 	if _, loaded := ks.keys.LoadOrStore(l1Key, struct{}{}); loaded {
+		// #603 PR-2 — a plain re-record widens a narrowable list edge for good.
+		// The reverse value may not be in place yet (the committing Record is
+		// between its forward and reverse inserts): place it ourselves, so a
+		// plain record is never lost to that window.
+		if dk.Name == listWildcard && mode == recordPlain {
+			dsI, _ := d.reverse.LoadOrStore(l1Key, &depSet{})
+			ds := dsI.(*depSet)
+			if v, loadedV := ds.deps.LoadOrStore(dk, struct{}{}); loadedV {
+				noteReRecord(v, dk, mode)
+			} else {
+				ds.count.Add(1)
+			}
+		}
+		// #890 FU-1 — the edge already existed (a refresher re-resolve of a resident
+		// key, a seed re-Put, two fills at once): this resolve's records are all
+		// dedups, so note the key's CURRENT edge set here too, or the accepted
+		// write would find no identity to compare and take the full check.
+		if ownSink != nil {
+			if dsI, ok := d.reverse.Load(l1Key); ok {
+				ownSink.noteOwnDepSet(dsI.(*depSet))
+			} else {
+				// No edge set to name (another record is between its forward and
+				// reverse inserts, or a strip just removed it): this resolve cannot
+				// tell later that nothing stripped its dedup'd edge, so its write
+				// takes the full check.
+				ownSink.ownStripped.Store(true)
+			}
+		}
 		return // already recorded — idempotent no-op
 	}
 	// At this point we are committing a NEW edge. Bound-check first.
@@ -1101,9 +1218,10 @@ func (d *DepTracker) recordInternal(ctx context.Context, l1Key string, dk DepKey
 		// check-then-delete race is the identical benign one accepted there.
 		if !loadedBucket && ks.count.Load() == 0 && d.forward.CompareAndDelete(dk, ks) {
 			d.coordinates.Add(-1)
+			notifyResolveMemosBucketGone(dk) // #883 F4 — the GVR floor judges dk now
 		}
 		if d.capWarned.CompareAndSwap(false, true) {
-			slog.Warn("deps.record.cap_reached",
+			slog.WarnContext(ctx, "deps.record.cap_reached",
 				slog.String("subsystem", "cache"),
 				slog.Int64("max_records", d.maxRecords),
 				slog.String("hint", "subsequent records will be dropped silently — TTL purge keeps cache correct"),
@@ -1118,8 +1236,13 @@ func (d *DepTracker) recordInternal(ctx context.Context, l1Key string, dk DepKey
 	// Reverse: l1Key -> *depSet[DepKey]
 	dsI, loadedDS := d.reverse.LoadOrStore(l1Key, &depSet{})
 	ds := dsI.(*depSet)
-	if _, loaded := ds.deps.LoadOrStore(dk, struct{}{}); !loaded {
+	if ownSink != nil {
+		ownSink.noteOwnDepSet(ds) // #890: the key's edge-set identity this resolve recorded into
+	}
+	if v, loaded := ds.deps.LoadOrStore(dk, initialEdgeValue(dk, mode)); !loaded {
 		ds.count.Add(1)
+	} else {
+		noteReRecord(v, dk, mode)
 	}
 	// #479 1b / #603 PR-0 — carry the key's depSet on the forward edge, so the
 	// mark loop reads the entry class off the edge it already ranges. A CAS from
@@ -1158,20 +1281,199 @@ func (d *DepTracker) bumpCoordinateGen(gvr schema.GroupVersionResource, namespac
 	// bucket created after this point by a racing recordInternal inherits s (see there).
 	fI, _ := d.gvrLastBump.LoadOrStore(gvr, new(atomic.Uint64))
 	storeMaxSeq(fI.(*atomic.Uint64), s)
-	stamp := func(dk DepKey) {
+	buckets, n := coordinateBuckets(gvr, namespace, name)
+	for _, dk := range buckets[:n] {
 		if ksI, ok := d.forward.Load(dk); ok {
 			storeMaxSeq(&ksI.(*keySet).lastBumpSeq, s)
 		}
 	}
-	stamp(DepKey{GVR: gvr, Namespace: namespace, Name: name})
-	if namespace != "" {
-		stamp(DepKey{GVR: gvr, Namespace: "", Name: name})
-	}
-	stamp(DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
-	if namespace != "" {
-		stamp(DepKey{GVR: gvr, Namespace: "", Name: listWildcard})
-	}
 	fireDepBumpHook("after_store") // test seam (nil in prod): the R2 [Store→mark] window
+	// #883 F4 — the resolve memos drop every entry this move made unservable,
+	// judged by the same depMovedSince Load uses, now that the stamps are in.
+	notifyResolveMemosCoordinateMoved(gvr, namespace, name)
+}
+
+// coordinateBuckets is the bucket set one object event on (gvr, namespace, name)
+// stamps — exact + ns-wildcard + list-wildcard, mirroring collectMatchesWithDep's
+// addAll set. Shared by bumpCoordinateGen and the #883 memo drop so the two can
+// never disagree about which deps an event moved.
+func coordinateBuckets(gvr schema.GroupVersionResource, namespace, name string) ([4]DepKey, int) {
+	var out [4]DepKey
+	n := 0
+	out[n] = DepKey{GVR: gvr, Namespace: namespace, Name: name}
+	n++
+	if namespace != "" {
+		out[n] = DepKey{GVR: gvr, Namespace: "", Name: name}
+		n++
+	}
+	out[n] = DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard}
+	n++
+	if namespace != "" {
+		out[n] = DepKey{GVR: gvr, Namespace: "", Name: listWildcard}
+		n++
+	}
+	return out, n
+}
+
+// reassertOwnEdges — #890: re-record, under key, every dep ctx's resolve recorded
+// under key that the tracker no longer holds (a concurrent strip of the then
+// non-resident key took it). Called by the store's accepted writes while they hold
+// the store lock, so the published cell and its edges appear together. Only
+// MISSING edges are recorded, and in plain mode: a plain record of a list edge is
+// "unknown interest: every event marks" — conservative, never a missed
+// invalidation — and an edge that is present keeps its own mode and narrowing
+// state untouched. No sink, no key match, or nothing missing: no work beyond one
+// lookup per own dep.
+func (d *DepTracker) reassertOwnEdges(ctx context.Context, key string) {
+	if d == nil || key == "" {
+		return
+	}
+	for s := depGenSinkFromContext(ctx); s != nil; s = s.parent {
+		if s.key != key {
+			continue
+		}
+		ownDS := s.ownDS.Load()
+		if ownDS != nil && !s.ownStripped.Load() && !reassertAlwaysCheckForBench.Load() {
+			// The common case: no strip touched key since this resolve recorded
+			// under it iff its edge set is still the one the resolve recorded into.
+			if cur, ok := d.reverse.Load(key); ok && cur.(*depSet) == ownDS {
+				return
+			}
+		}
+		s.mu.Lock()
+		if s.ownN == 0 {
+			s.mu.Unlock()
+			return
+		}
+		own := s.ownDepsLocked()
+		s.mu.Unlock()
+		d.reassertCheckedTotal.Add(1)
+		for _, dk := range own {
+			if !d.hasExactEdge(key, dk) {
+				// No ctx: the resolve's sink already holds dk, and the remark /
+				// capture bookkeeping a ctx would drive belongs to the original record.
+				// log-ctx-waiver: detached: the resolve's sink already holds dk, so this reassert stays off the context
+				d.recordInternalMode(context.Background(), key, dk, recordPlain)
+				d.reassertedEdgesTotal.Add(1)
+			}
+		}
+		return
+	}
+}
+
+// ReleaseUnstored — #890 / #893: called when a resolve of l1Key ends (deferred at
+// every production site that installs an L1 resolve scope, WithL1KeyContext*). If
+// the resolve's write did not leave l1Key resident — refused, declined by a Put
+// gate, or never reached because the resolve failed — the edges it recorded belong
+// to no cell, and they are stripped through the store's eviction path
+// (stripDepEdges → RemoveL1Key, which also tells the resolve memos). A resident key
+// is untouched. One lock-free lookup when the key holds no edges.
+//
+// Two things keep a non-resident key's edges, and both are checked here:
+//   - an inert (#443 dry-run) resolve leaves no trace, so its end changes nothing;
+//   - a registered edge holder holds the key (RegisterEdgeHolder) — today the
+//     #643 declined-external mark, which judges its facts by the buckets these
+//     edges anchor. The holder releases the key when it lets go.
+func (d *DepTracker) ReleaseUnstored(ctx context.Context, l1Key string) {
+	if d == nil || l1Key == "" || Inert(ctx) || !d.hasEdges(l1Key) {
+		return
+	}
+	if edgeHeld(l1Key) {
+		return
+	}
+	d.storeMu.RLock()
+	store := d.store
+	d.storeMu.RUnlock()
+	store.releaseUnstored(l1Key)
+}
+
+// EDGE HOLDERS — #890/#893. A non-resident key's edges are normally orphans and
+// are stripped (ReleaseUnstored, the store's refusal strip). Something that
+// judges its own facts by a key's edges HOLDS the key: while it does, the edges
+// stay. A holder registers a predicate once; every strip of a non-resident key
+// asks all of them. When a holder lets go of a key it releases the key itself
+// (ReleaseUnstored), or the cell is re-resolved and that resolve's end does.
+var edgeHolders atomic.Pointer[[]func(l1Key string) bool]
+
+// RegisterEdgeHolder adds a holder predicate: held(key) true keeps key's edges
+// while key is not resident. It must be cheap and lock-free (it runs under the
+// store lock) and must not call into the store or the tracker.
+func RegisterEdgeHolder(held func(l1Key string) bool) {
+	if held == nil {
+		return
+	}
+	for {
+		cur := edgeHolders.Load()
+		var next []func(string) bool
+		if cur != nil {
+			next = append(next, (*cur)...)
+		}
+		next = append(next, held)
+		if edgeHolders.CompareAndSwap(cur, &next) {
+			return
+		}
+	}
+}
+
+// edgeHeld reports whether any registered holder holds l1Key.
+func edgeHeld(l1Key string) bool {
+	hs := edgeHolders.Load()
+	if hs == nil {
+		return false
+	}
+	for _, h := range *hs {
+		if h(l1Key) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasExactEdge — #890: whether the exact edge (l1Key, dk) is in BOTH indexes:
+// the key's edge set (reverse) and the coordinate's bucket (forward). Two map
+// lookups, independent of how many other keys share the bucket. Unlike hasEdge
+// (collectMatchesWithDep: the fan-out view, which walks whole buckets and counts
+// a recorded LIST edge as matching an exact coordinate), it answers "was THIS
+// edge recorded", which is what a re-assert must ask — a LIST edge must not mask
+// a missing exact one.
+func (d *DepTracker) hasExactEdge(l1Key string, dk DepKey) bool {
+	if d == nil {
+		return false
+	}
+	dsI, ok := d.reverse.Load(l1Key)
+	if !ok {
+		return false
+	}
+	if _, ok := dsI.(*depSet).deps.Load(dk); !ok {
+		return false
+	}
+	ksI, ok := d.forward.Load(dk)
+	if !ok {
+		return false
+	}
+	_, ok = ksI.(*keySet).keys.Load(l1Key)
+	return ok
+}
+
+// reassertAlwaysCheckForBench — #890 benchmark seam (false in production): makes
+// reassertOwnEdges check every own edge even when no strip touched the key, so
+// the exact-lookup cost can be measured on its own.
+var reassertAlwaysCheckForBench atomic.Bool
+
+// hasEdges reports whether the tracker still holds edges recorded under l1Key —
+// true from the key's first Record until RemoveL1Key, which the resolved cache
+// calls when it evicts or deletes the key (#883: the memo's liveness test for
+// the L1 keys an entry serves).
+func (d *DepTracker) hasEdges(l1Key string) bool {
+	_, ok := d.reverse.Load(l1Key)
+	return ok
+}
+
+// hasBucket reports whether dk has a forward bucket — i.e. whether
+// depMovedSince judges it by its own lastBumpSeq rather than the GVR floor.
+func (d *DepTracker) hasBucket(dk DepKey) bool {
+	_, ok := d.forward.Load(dk)
+	return ok
 }
 
 // depBumpHook is a test-build seam (nil in production) fired inside bumpCoordinateGen at
@@ -1186,11 +1488,11 @@ func fireDepBumpHook(stage string) {
 	}
 }
 
-// bumpResourceTypeGen is bumpCoordinateGen's TYPE-LEVEL twin (#375, TL ruling): the four
-// GVR-lifecycle dirty-mark sources (OnResourceTypeAvailable / Removed / SchemaRelisted /
-// StoreRepaired) mark every dependent of a whole GVR without an OnObjectEvent, so they
-// must advance the generation too, or a resolve in flight across a CRD add / delete /
-// schema relist / store repair could have its type-level mark consumed while it is
+// bumpResourceTypeGen is bumpCoordinateGen's TYPE-LEVEL twin (#375, TL ruling): the two
+// GVR-lifecycle dirty-mark sources (OnResourceTypeAvailable / Removed; #870 deleted the
+// schema-relist and store-repair ones) mark every dependent of a whole GVR without an OnObjectEvent, so they
+// must advance the generation too, or a resolve in flight across a CRD add / delete
+// could have its type-level mark consumed while it is
 // non-resident and its Put-check see no move. It advances depEventSeq ONCE, raises the
 // GVR floor (cold buckets), and stamps every bucket of the GVR the matching
 // collectTypeMatches scan would fan out to (LIST buckets only when listOnly). Called by
@@ -1200,10 +1502,15 @@ func (d *DepTracker) bumpResourceTypeGen(gvr schema.GroupVersionResource, listOn
 	if d == nil {
 		return
 	}
+	// #854 — a type-level event (CRD available / removed) is not a per-object delta: the incremental list cells of
+	// the GVR drop back to a full fill.
+	unanchorListCellsForGVR(gvr, "type_event")
 	s := depEventSeq.Add(1)
 	fireDepBumpHook("after_add")
 	fI, _ := d.gvrLastBump.LoadOrStore(gvr, new(atomic.Uint64))
 	storeMaxSeq(fI.(*atomic.Uint64), s)
+	tI, _ := d.gvrLastTypeBump.LoadOrStore(gvr, new(atomic.Uint64)) // #765
+	storeMaxSeq(tI.(*atomic.Uint64), s)
 	d.forward.Range(func(k, v any) bool {
 		dk := k.(DepKey)
 		if dk.GVR == gvr && (!listOnly || dk.Name == listWildcard) {
@@ -1212,6 +1519,7 @@ func (d *DepTracker) bumpResourceTypeGen(gvr schema.GroupVersionResource, listOn
 		return true
 	})
 	fireDepBumpHook("after_store")
+	notifyResolveMemosTypeMoved(gvr) // #883 F4 — see bumpCoordinateGen
 }
 
 // gvrLastBumpSeq returns the per-GVR floor (#375 fix ii): the seq of the last dep event
@@ -1525,18 +1833,35 @@ func (d *DepTracker) EndCapture(l1Key string, h *[]DepKey) []DepKey {
 // replayed coordinate actually fires. nil-safe on dst=="" (never routes an
 // empty key through the loudFail).
 func (d *DepTracker) ReplayEdges(ctx context.Context, dst string, edges []DepKey) {
+	d.ReplayEdgesWithStates(ctx, dst, edges, nil, "")
+}
+
+// ReplayEdgesWithStates is ReplayEdges carrying the PRODUCER's per-edge
+// interest states (#765 B, EdgeNarrowStates; deps_list_interest.go): a LIST
+// edge whose producer state is narrowed is recorded narrowable and committed to
+// that read set; anything else replays plain, as ReplayEdges always did. states
+// must be index-aligned with edges, else every edge replays plain. site is the
+// replay site for the replay counter (ReplaySiteMemo / ReplaySiteFullList).
+func (d *DepTracker) ReplayEdgesWithStates(ctx context.Context, dst string, edges []DepKey, states []EdgeNarrowState, site string) {
 	if d == nil || dst == "" {
 		return
+	}
+	if len(states) != len(edges) {
+		states = nil
 	}
 	// #443 — an inert (dry-run) resolve replays no edge and registers no
 	// informer (Record/RecordList refuse too; this also skips ensureInformer).
 	if Inert(ctx) {
 		return
 	}
-	for _, e := range edges {
+	for i, e := range edges {
 		d.ensureInformer(ctx, e.GVR)
 		if e.Name == listWildcard {
-			d.RecordList(ctx, dst, e.GVR, e.Namespace)
+			var st *EdgeNarrowState
+			if states != nil {
+				st = &states[i]
+			}
+			d.replayListEdge(ctx, dst, e, st, site)
 		} else {
 			d.Record(ctx, dst, e.GVR, e.Namespace, e.Name)
 		}
@@ -1553,6 +1878,12 @@ func (d *DepTracker) ReplayEdges(ctx context.Context, dst string, edges []DepKey
 // set BEFORE the Records, so any check that observes the Record also observes
 // the floor. No sink on ctx ⇒ plain ReplayEdges.
 func (d *DepTracker) ReplayEdgesAsOf(ctx context.Context, dst string, edges []DepKey, asOf uint64) {
+	d.ReplayEdgesAsOfWithStates(ctx, dst, edges, nil, asOf, "")
+}
+
+// ReplayEdgesAsOfWithStates is ReplayEdgesAsOf carrying the producer's interest
+// states (see ReplayEdgesWithStates).
+func (d *DepTracker) ReplayEdgesAsOfWithStates(ctx context.Context, dst string, edges []DepKey, states []EdgeNarrowState, asOf uint64, site string) {
 	if d == nil || dst == "" {
 		return
 	}
@@ -1568,7 +1899,7 @@ func (d *DepTracker) ReplayEdgesAsOf(ctx context.Context, dst string, edges []De
 		}
 		s.mu.Unlock()
 	}
-	d.ReplayEdges(ctx, dst, edges)
+	d.ReplayEdgesWithStates(ctx, dst, edges, states, site)
 }
 
 // ensureInformer registers (idempotently, singleflighted) the informer for gvr
@@ -1727,9 +2058,23 @@ func (s objectState) String() string {
 // into L1 forever. See the fire site for why it precedes the no-matches
 // return.
 func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, name string, state objectState) (int, int) {
+	return d.onObjectEventMasked(gvr, namespace, name, state, nil)
+}
+
+// onObjectEventMasked is OnObjectEvent with the transition mask the informer
+// handler computed for this coordinate (#603 PR-2 SHADOW, deps_list_interest.go).
+// The mask is read ONLY by the shadow classification of list_dep marks: the
+// evict/mark partition, every enqueue and every counter are those of
+// OnObjectEvent whatever the mask says. A nil mask (a caller with no
+// transition) classifies every narrowed mark as kept{no_mask}.
+func (d *DepTracker) onObjectEventMasked(gvr schema.GroupVersionResource, namespace, name string, state objectState, mask *eventMask) (int, int) {
 	if d == nil {
 		return 0, 0
 	}
+	// #854 (MC1) — record the coordinate in every incremental list cell of the
+	// GVR BEFORE bumpCoordinateGen takes this event's seq: a cell generation
+	// stamped at seq s then provably contains every event <= s (list_cell.go).
+	noteListCellsPending(gvr, namespace, name)
 	// 1.12.7 F6b — carry the GONE verdict to whoever holds a harvested
 	// in-memory copy of this object, BEFORE the no-matches return below.
 	// The placement is load-bearing: the population this exists for is
@@ -1760,6 +2105,10 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 	self := DepKey{GVR: gvr, Namespace: namespace, Name: name}
 
 	var toEvict, toMark []string
+	// #603 PR-2 SHADOW — the would-avoid list_dep marks (their enqueue carries
+	// the audit token). Classification only: toMark is built exactly as before.
+	shadow := listNarrowShadowOn()
+	var wouldAvoid map[string]struct{}
 	classCounts := map[string]int{} // #239: self / list_dep / exact_dep of the marked keys
 	// #479 1b / #603 PR-0: entry class of the marked keys, read off the edge.
 	var entryClasses dmEntryClassCounts
@@ -1808,6 +2157,16 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 		toMark = append(toMark, l1Key) // buckets 2 + 3, and self-when-present
 		classCounts[dirtyMarkClassFor(m.listOnly, isSelf)]++
 		entryClasses[m.ds.entryClassIdx()]++
+		if shadow && m.listOnly {
+			r := narrowDecide(m.ds, gvr, namespace, state, mask)
+			d.narrow.decisions[r].Add(1)
+			if r.avoided() {
+				if wouldAvoid == nil {
+					wouldAvoid = map[string]struct{}{}
+				}
+				wouldAvoid[l1Key] = struct{}{}
+			}
+		}
 	}
 
 	// 1.12.7 observability — an UNKNOWN_DEGRADED verdict structurally cannot
@@ -1823,6 +2182,14 @@ func (d *DepTracker) OnObjectEvent(gvr schema.GroupVersionResource, namespace, n
 	}
 	for _, l1Key := range toMark {
 		if enqueue != nil {
+			if _, avoid := wouldAvoid[l1Key]; avoid {
+				// #603 PR-2 — the would-avoid mark's enqueue consumes a one-shot
+				// audit token; it is still enqueued exactly like any other.
+				narrowAuditTokenBegin(l1Key)
+				enqueue(l1Key, gvr)
+				narrowAuditTokenEnd(l1Key)
+				continue
+			}
 			enqueue(l1Key, gvr)
 		}
 	}
@@ -1921,10 +2288,22 @@ func (d *DepTracker) isSelfRepresentation(store *ResolvedCacheStore, l1Key strin
 // "" namespace) and dirty-marks the dependent L1 keys via the same
 // refreshHook onChange uses.
 //
-// It deliberately ignores EXACT-object GET-dep buckets: an exact GET-dep
-// for a named object that did not resolve before the CRD existed is not
-// a stale-negative LIST and is left to OnAdd when the object itself
-// arrives. Dirty-mark only — NEVER evicts.
+// It deliberately ignores EXACT-object GET-dep buckets. Since #1080 an
+// exact edge CAN hold a cached NotFound (a watched named object's 404
+// under continueOnError), but never one taken while the type was absent:
+// the definite-NotFound rule needs the GVR's informer servable
+// (cache.WatchedAbsent), and a GVR without its CRD has no servable
+// informer. A NotFound cached BEFORE the type went away is invalidated by
+// OnResourceTypeRemoved, which marks exact buckets too: its re-resolve
+// cannot re-establish the 404 while the type is gone, so the cell ends
+// KNOWN-STALE (#547) and the next read revalidates it under the requester.
+// That is what heals a CRD restored together with its objects, whose
+// objects reach the new informer only in its initial list (the pre-sync
+// gate drops those ADDs, so no exact-edge mark follows them). An object
+// created after the type is back arrives as an ordinary post-sync ADD
+// (OnObjectEvent). Pinned end to end by #1080 C8
+// (dispatchers/issue1080_review_arms_test.go). Dirty-mark only — NEVER
+// evicts.
 //
 // Returns the number of dependent L1 keys dirty-marked. AC-D4: a no-op
 // (and idempotent) when no LIST-dep matches gvr.
@@ -1964,52 +2343,12 @@ func (d *DepTracker) OnResourceTypeRemoved(gvr schema.GroupVersionResource) int 
 	return d.dirtyMarkResourceType("CRD_DELETE", gvr, matched)
 }
 
-// OnResourceTypeSchemaRelisted is invoked by the CRD schema-widen relist
-// (triggerCRDSchemaRelist, crd_discovery_side_effect.go) when a CRD's
-// structural schema CHANGED at runtime and its data informer was relisted.
-// The GVR is NOT being removed — its informer is re-LISTing under the now-
-// wider schema — but every L1 entry that LIST- or GET-depends on the GVR was
-// resolved against the PRE-widen (pruned) objects and is now stale, so it
-// must dirty-mark the same dependent-bucket set OnResourceTypeRemoved does.
-//
-// Mechanically identical to OnResourceTypeRemoved (same collectTypeMatches
-// scan, same dirty-mark-only, NEVER-evict contract) — it differs ONLY in the
-// telemetry label: it logs cache_event.consumed type=SCHEMA_RELIST, not
-// type=CRD_DELETE, so the relist's dirty-mark does not masquerade as a CRD
-// deletion in logs/metrics. dirtyMarkResourceType already parameterises the
-// event type, so this is a label-only divergence.
-//
-// Returns the number of dependent L1 keys dirty-marked. A no-op (and
-// idempotent) when no dep matches gvr.
-func (d *DepTracker) OnResourceTypeSchemaRelisted(gvr schema.GroupVersionResource) int {
-	if d == nil {
-		return 0
-	}
-	d.bumpResourceTypeGen(gvr, false) // #375 R1/R2: handler-only, BEFORE the fan-out
-	matched := d.collectTypeMatches(gvr, false /* listOnly */)
-	return d.dirtyMarkResourceType("SCHEMA_RELIST", gvr, matched)
-}
-
-// OnResourceTypeStoreRepaired is the #237 deliverable B sibling of
-// OnResourceTypeSchemaRelisted: the same dirty-mark-only, never-evict body,
-// reached when a relist was fired because the informer STORE was found to
-// disagree with the apiserver — not because a CRD's schema changed.
-//
-// It exists for one reason: the event label. The relist machinery is shared
-// (relistGVRForRepair, crd_discovery_side_effect.go), so a store repair that
-// reused OnResourceTypeSchemaRelisted would log cache_event.consumed
-// type=SCHEMA_RELIST and the event log would attribute a store divergence to a
-// CRD schema widen. That is the same misattribution this whole issue is about:
-// #237 spent two sessions on a defect whose instruments named the wrong cause.
-// One label, one caller each, so a non-zero bucket names the code path.
-func (d *DepTracker) OnResourceTypeStoreRepaired(gvr schema.GroupVersionResource) int {
-	if d == nil {
-		return 0
-	}
-	d.bumpResourceTypeGen(gvr, false) // #375 R1/R2: handler-only, BEFORE the fan-out
-	matched := d.collectTypeMatches(gvr, false /* listOnly */)
-	return d.dirtyMarkResourceType("STORE_REPAIR", gvr, matched)
-}
+// #870 — OnResourceTypeSchemaRelisted and OnResourceTypeStoreRepaired are
+// deleted. A schema widen and a store repair no longer tear the informer down:
+// the replacement is built beside the live copy and swapped in, and only the
+// keys whose bytes changed (M) reach the consumers, as ordinary per-object
+// events (store_swap.go). A whole-type mark of either kind is the mutation X2
+// that K2 turns RED.
 
 // dirtyMarkResourceType dirty-marks every L1 key in matched via the
 // refreshHook — the shared body of OnResourceTypeAvailable +
@@ -2346,10 +2685,14 @@ func (d *DepTracker) RemoveL1Key(l1Key string) {
 	if d == nil || l1Key == "" {
 		return
 	}
+	narrowAuditForget(l1Key) // #603 PR-2 — the key's audit pair leaves with it
 	dsI, ok := d.reverse.LoadAndDelete(l1Key)
 	if !ok {
 		return
 	}
+	// #883 — the resolved cache evicted or deleted l1Key (this is its only strip
+	// funnel): the resolve memo entries that served only this key go with it.
+	notifyResolveMemosL1Gone(l1Key)
 	ds := dsI.(*depSet)
 	ds.deps.Range(func(k, _ any) bool {
 		dk := k.(DepKey)
@@ -2369,6 +2712,8 @@ func (d *DepTracker) RemoveL1Key(l1Key string) {
 					// the coordinate's disappearance.
 					if d.forward.CompareAndDelete(dk, ks) {
 						d.coordinates.Add(-1)
+						// #883 F4 — the GVR floor judges dk from now on.
+						notifyResolveMemosBucketGone(dk)
 					}
 				}
 			}
@@ -2461,6 +2806,9 @@ func MovedRemarkTotals() (total, boot uint64) {
 // NOT call this. Also clears the O15 test-mode toggle so a test that
 // forgot to reset it cannot leak panic-on-empty-key into the next test.
 func resetDepsForTest() {
+	// A tracked resolve memo's entries are judged against this tracker's
+	// buckets: they cannot outlive it (dropTrackedResolveMemoEntriesForTest).
+	dropTrackedResolveMemoEntriesForTest()
 	depsInstance = nil
 	depsOnce = sync.Once{}
 	depsTestMode.Store(false)

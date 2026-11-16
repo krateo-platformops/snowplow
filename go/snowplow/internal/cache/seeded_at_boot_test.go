@@ -21,10 +21,12 @@ import (
 // TestSeededAtBoot_RoundTripsThroughGet is M11: a boot-seeded entry reports
 // SeededAtBoot==true on Get; a same-key traffic re-Put flips it to false.
 func TestSeededAtBoot_RoundTripsThroughGet(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	// Boot seed Put: SeededAtBoot=true.
-	c.Put("k", &ResolvedEntry{
+	c.put("k", &ResolvedEntry{
 		RawJSON:      []byte(`{"seed":true}`),
 		SeededAtBoot: true,
 		Inputs:       &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassWidgets},
@@ -38,7 +40,7 @@ func TestSeededAtBoot_RoundTripsThroughGet(t *testing.T) {
 	}
 
 	// Traffic re-Put of the SAME key: SeededAtBoot=false (the natural zero).
-	c.Put("k", &ResolvedEntry{
+	c.put("k", &ResolvedEntry{
 		RawJSON:      []byte(`{"traffic":true}`),
 		SeededAtBoot: false,
 		Inputs:       &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassWidgets},
@@ -69,18 +71,20 @@ func putPreservingSeededAtBoot(c *ResolvedCacheStore, key string, entry *Resolve
 		// Field copy, not `*entry` (ResolvedEntry holds an atomic since #444).
 		merged := &ResolvedEntry{RawJSON: entry.RawJSON, Inputs: entry.Inputs, Pinned: entry.Pinned}
 		merged.SeededAtBoot = prior.SeededAtBoot // the defect: carry over old provenance
-		c.Put(key, merged)
+		c.put(key, merged)
 		return
 	}
-	c.Put(key, entry)
+	c.put(key, entry)
 }
 
 // TestSeededAtBoot_PreserveOnReplace_RedArm proves the M11 GREEN arm
 // discriminates: the preserve-provenance wrong impl keeps reporting true after a
 // traffic re-Put — the exact behavior the GREEN arm forbids.
 func TestSeededAtBoot_PreserveOnReplace_RedArm(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
-	c.Put("k", &ResolvedEntry{
+	c.put("k", &ResolvedEntry{
 		RawJSON:      []byte(`{"seed":true}`),
 		SeededAtBoot: true,
 		Inputs:       &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassWidgets},

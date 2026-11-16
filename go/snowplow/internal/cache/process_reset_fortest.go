@@ -90,6 +90,7 @@ func ResetCacheProcessStateForTest() error {
 
 	// 5 — RBAC sub-generation state.
 	ResetRBACSubGenForTest()
+	ResetRBACCompleteForTest() // #1231
 	ResetPendingSubGenBumpsForTest()
 
 	// 5b — #578 lazy LIST-item materialisation counters. Process-global
@@ -99,10 +100,19 @@ func ResetCacheProcessStateForTest() error {
 	// exists precisely so those assertions are deterministic — #471.
 	ResetLazyItemsStatsForTest()
 
+	// 5b1 — #854 incremental list cells: a process-global registry (GVR → cells)
+	// fed by the dep hook, so a fresh store must not inherit a sibling's cells
+	// or counters. Composed — #471.
+	ResetListCellsForTest()
+
 	// 5b2 — #710 PR-2b owed-push marks: process-global (keyed by L1 keys a
 	// stale-derived body was written under), so a fresh store must not inherit
 	// a sibling's marks or counters. Composed — #471.
 	ResetStaleOwedForTest()
+
+	// 5b3 — #1062 the stale-push ledger: process-global, keyed by L1 keys served
+	// stale, with its counters and histograms. Composed — #471.
+	ResetStalePushForTest()
 
 	// 5c — #560 live-refresh arming counters. Process-global (the stamp site is
 	// in dispatchers and the arrival site in handlers, so neither owns them), so
@@ -116,6 +126,17 @@ func ResetCacheProcessStateForTest() error {
 	// rather than exempted — #471.
 	ResetRefreshFailedByClassForTest()
 
+	// 5d‴ — #1070 the refresh-cycle family (put_total, wait / duration /
+	// put_to_frame histograms). Process-global (the store, the refresher and the
+	// broadcaster all record into it), so a test asserting on a sample count
+	// would read a sibling's refreshes. Composed — #471.
+	ResetRefreshCycleForTest()
+
+	// 5d″ — #841 the seed-origin counters (cells seeded / hit per seed class)
+	// and the kept / unmatched representative counts. Process-global, so a test
+	// asserting on a class's hits would read a sibling's. Composed — #471.
+	ResetSeedOriginStatsForTest()
+
 	// 5d′ — #643 the engine-wide declined-external set (marks keyed by L1 keys)
 	// and its retire-reason breakdown. Process-global, so a test's marks would
 	// otherwise skip a sibling test's units. Composed rather than exempted — #471.
@@ -126,6 +147,11 @@ func ResetCacheProcessStateForTest() error {
 	// stamps, the panic counter). Process-global. Composed rather than
 	// exempted — #471.
 	ResetRBACPublishHealthForTest()
+
+	// 5d⁗ — #947 the dangling-roleRef set of the last synced publish and its
+	// gauge. Process-global, so a test would otherwise see a sibling's
+	// bindings resolve, or its own reported as already known. Composed — #471.
+	ResetDanglingRoleRefsForTest()
 
 	// 5d″ — #681 the denial-only Put counter (process-global). Composed rather
 	// than exempted — #471.
@@ -144,6 +170,10 @@ func ResetCacheProcessStateForTest() error {
 	// previous -count iteration's cell (#636). Composed rather than exempted —
 	// #471.
 	ResetUnrenderableStoreItemsForTest()
+
+	// 5g — #870 the build-and-swap instruments and the push ledger
+	// (process-global: keyed by reason and by L1 key). Composed — #471.
+	resetStoreSwapStatsForTest()
 
 	// 6 — the publish container, after the incremental rebuild has quiesced.
 	err := WaitRBACRebuildQuiesceForTest(5 * time.Second)

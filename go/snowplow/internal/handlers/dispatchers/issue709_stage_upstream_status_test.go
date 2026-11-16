@@ -17,8 +17,9 @@ package dispatchers
 //
 //	A1  stored RESTAction /call: 404 NotFound naming the CRD (was 500).
 //	A2  the widget apiRef frame (apiref.Resolve) returns a typed 404, and the
-//	    widget /call handler answers 404 with it (was 500 "resolve apiRef …:
-//	    unexpected end of JSON input").
+//	    widget /call handler answers with it (was 500 "resolve apiRef …:
+//	    unexpected end of JSON input") — since #853 as 424 Failed Dependency,
+//	    because the widget CR exists and only a dependency is missing.
 //	A3  continueOnError: the stage's 404 is recorded under errorKey and the
 //	    later stage still ran — 200, unchanged.
 //	A4  an empty 2xx body is "no content": the stage's value is null, no stage
@@ -36,6 +37,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
@@ -115,11 +117,21 @@ func TestIssue709_A1_StoredRESTAction_StageGet404_NoContinueOnError_Is404(t *tes
 	i709AssertNotFound(t, rec)
 }
 
-func TestIssue709_A2_WidgetApiRef_StageGet404_Is404(t *testing.T) {
+func TestIssue709_A2_WidgetApiRef_StageGet404_Is424(t *testing.T) {
 	ra := &unstructured.Unstructured{Object: in443RA("agent-formdef", i709Filter, i709CRDStage(false), targetStage())}
 	f := in443Setup(t, ra)
 	i709Serve404(f)
 	alice := in443Ctx(f, psAlice)
+	// #1034 — apiref.Resolve reads the RESTAction through objects.Get, which
+	// serves it from the restactions informer only once that informer is
+	// registered AND synced. Until then it falls through to the apiserver, and
+	// the fake apiserver does not hold the RESTAction: that read is answered with
+	// the apiserver's own generic 404 ("the server could not find the requested
+	// resource"), which is a NotFound about the RESTAction, not the stage's 404
+	// this arm is about. The first resolve is what lazily registers the
+	// informer, so whether the second one is informer-served was a race with the
+	// informer's initial sync. Register it and wait for that sync, as #729 does.
+	i709SyncRESTActionInformer(t)
 
 	// The apiRef frame itself (the "resolve apiRef …" error in the issue).
 	_, err := apiref.Resolve(alice, apiref.ResolveOptions{
@@ -134,6 +146,11 @@ func TestIssue709_A2_WidgetApiRef_StageGet404_Is404(t *testing.T) {
 	var se *apierrors.StatusError
 	if !errors.As(err, &se) || !apierrors.IsNotFound(err) {
 		t.Fatalf("#709 RED: want a typed 404 NotFound, got %T: %v", err, err)
+	}
+	// The 404 must be the STAGE's: a NotFound for the RESTAction itself is
+	// also a typed 404, so the code alone cannot tell the two apart.
+	if msg := se.ErrStatus.Message; !strings.Contains(msg, `"agents.kagent.dev" not found`) || !strings.Contains(msg, `stage "crd"`) {
+		t.Fatalf("#709: the apiRef 404 must name the stage and the missing resource, got %q", msg)
 	}
 
 	// The widget /call handler answers with it. widgets.Resolve wraps an apiRef
@@ -157,7 +174,45 @@ func TestIssue709_A2_WidgetApiRef_StageGet404_Is404(t *testing.T) {
 	rec := httptest.NewRecorder()
 	(&widgetsHandler{authnNS: psAuthnNS, saRC: &rest.Config{Host: f.srv.URL}}).ServeHTTP(rec,
 		httptest.NewRequest(http.MethodGet, "/call", nil).WithContext(alice))
-	i709AssertNotFound(t, rec)
+	// #853 — the widget exists, so its missing dependency is answered 424 Failed
+	// Dependency (404 is the CR read's answer only); the message still names the
+	// stage and the missing resource, and the JSON decoder's error never leaks.
+	body := rec.Body.String()
+	if strings.Contains(body, "unexpected end of JSON input") {
+		t.Fatalf("#709 RED: the JSON decoder's error reached the response: %d %s", rec.Code, body)
+	}
+	if rec.Code != http.StatusFailedDependency {
+		t.Fatalf("#853 RED: code=%d, want 424: %s", rec.Code, body)
+	}
+	st := i709Status(t, rec)
+	if st["reason"] != "FailedDependency" || st["status"] != "Failure" || st["kind"] != "Status" {
+		t.Fatalf("want a FailedDependency Failure Status, got %s", body)
+	}
+	msg, _ := st["message"].(string)
+	if !strings.Contains(msg, `"agents.kagent.dev" not found`) || !strings.Contains(msg, `stage "crd"`) {
+		t.Fatalf("the message must name the stage and the missing resource, got %q", msg)
+	}
+}
+
+// i709SyncRESTActionInformer registers the restactions informer on the
+// harness watcher and waits for its initial sync, so every objects.Get of the
+// RESTAction is informer-served (see A2).
+func i709SyncRESTActionInformer(t *testing.T) {
+	t.Helper()
+	rw := cache.Global()
+	if rw == nil {
+		t.Fatal("PRE: the harness watcher must be installed")
+	}
+	if _, ch := rw.EnsureResourceType(h1RAGVR); ch != nil {
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("restactions informer did not sync")
+		}
+	}
+	if !rw.IsServable(h1RAGVR) {
+		t.Fatal("PRE: the restactions informer must be servable")
+	}
 }
 
 func TestIssue709_A3_ContinueOnError_RecordsTheStageErrorAndContinues(t *testing.T) {
@@ -185,7 +240,10 @@ func TestIssue709_A3_ContinueOnError_RecordsTheStageErrorAndContinues(t *testing
 	}
 
 	// A filter that yields no value under continueOnError is not a failure:
-	// status null, 200.
+	// status null, 200. (#1080: the CRD is watched and absent, so the result
+	// above is a definite NotFound and was cached under this RESTAction's key;
+	// the arm wants a fresh resolve of the edited filter.)
+	cache.ResetResolvedCacheForTest()
 	rec = serveStored(t, f, in443Ctx(f, psAlice), in443RA("agent-formdef", i709Filter, i709CRDStage(true), targetStage()))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":null`) {
 		t.Fatalf("zero-yield filter after a continueOnError failure: want 200 status null, got %d %s", rec.Code, rec.Body.String())
@@ -216,9 +274,12 @@ func TestIssue709_A5_NonOKWithoutAStatusBody_KeepsTheCode(t *testing.T) {
 		}
 		rec := serveStored(t, f, in443Ctx(f, psAlice), in443RA("agent-formdef", i709Filter, i709CRDStage(false)))
 		i709AssertNotFound(t, rec)
-		// What the stage recorded under errorKey says what the upstream did.
+		// What the stage recorded under errorKey keeps the code. (#1080: the CRD
+		// is watched and absent, and the 404 came from the requester's own
+		// apiserver dial, so under continueOnError it is a definite NotFound,
+		// recorded with the canonical identity-free NotFound text.)
 		rec = serveStored(t, f, in443Ctx(f, psAlice), in443RA("agent-formdef", `{e: .crdError}`, i709CRDStage(true)))
-		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "upstream answered 404 Not Found with an empty body") ||
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `\"agents.kagent.dev\" not found`) ||
 			!strings.Contains(rec.Body.String(), `"code":404`) {
 			t.Fatalf("empty-body 404 errorKey: got %d %s", rec.Code, rec.Body.String())
 		}

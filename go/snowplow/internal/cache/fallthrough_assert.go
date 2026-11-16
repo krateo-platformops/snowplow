@@ -58,6 +58,15 @@ var requiredScopedRoutes = []string{
 	"POST /call/dry-run",
 	"PUT /call/dry-run",
 	"PATCH /call/dry-run",
+	// #970 — the export routes. Each page of an export is a per-user read
+	// re-dispatched through the /call lane (GET) or the /call/read lane
+	// (POST), so both are in the read-path invariant, like those routes.
+	"GET /export",
+	"POST /export",
+	// #1015 — the browser RUM ingest. Zero apiserver reads, unlike the routes
+	// above; it is registered (scope telemetry) by the issue's requirement so
+	// that any read it ever issues is attributed instead of unscoped.
+	"POST /telemetry/v1/traces",
 }
 
 // assertionViolationsTotal is the production-mode counter bumped by
@@ -130,6 +139,7 @@ func AssertReadPathsScoped() int {
 	// counter once per missing route. The pod stays up.
 	for _, m := range missing {
 		assertionViolationsTotal.Add(1)
+		// log-ctx-waiver: boot: main checks the route table once before serving
 		slog.Error("cache.read_paths_scoped.violation",
 			slog.String("subsystem", "cache"),
 			slog.String("check", "read_paths_scoped"),

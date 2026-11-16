@@ -8,12 +8,12 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,10 +24,12 @@ import (
 	"github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
+	"github.com/krateo-platformops/snowplow/internal/apipath"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -148,10 +150,26 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	uri, err := buildURIPath(opts)
+	uri, dialled, asked, err := dialledTarget(opts)
 	if err != nil {
-		response.InternalError(wri, err)
+		// #1257 — a value that is not one path segment is the caller's
+		// error: refused before anything is dialled, as validateRequest's
+		// refusals are.
+		response.BadRequest(wri, err)
 		return
+	}
+	if callAudited(opts.verb) && !asked {
+		// F3 (#1379 review) — the apiserver would act on another object than
+		// the one the request names, so its record could not describe both:
+		// refused before the dial.
+		response.BadRequest(wri, errDialNotAsked)
+		return
+	}
+	if callAudited(opts.verb) {
+		// The handler's one descriptor of what this request asks for: the
+		// route's record of any later exit is built from it (#1379 review
+		// LOW a), never by parsing the request again.
+		audit.SetAsked(req.Context(), callAuditEvent(req, opts, uri, dialled, "", nil))
 	}
 
 	log := xcontext.Logger(req.Context())
@@ -160,7 +178,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	ep, err := xcontext.UserConfig(req.Context())
 	if err != nil {
-		log.Error("unable to get user endpoint", slog.Any("err", err))
+		log.ErrorContext(req.Context(), "unable to get user endpoint", slog.Any("err", err))
 		response.Unauthorized(wri, err)
 		return
 	}
@@ -176,6 +194,10 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	setCallEchoHeaders(wri.Header(), uri, opts)
 
 	dict := map[string]any{}
+	// answer is the apiserver's 2xx response body, kept for the audit record
+	// (#957): a write records the identity of the object the apiserver
+	// returned, never of the object the caller sent.
+	var answer []byte
 	callOpts := request.RequestOptions{
 		RequestInfo: request.RequestInfo{
 			Path: uri,
@@ -185,7 +207,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			},
 		},
 		Endpoint:        &ep,
-		ResponseHandler: callResponseHandler(dict),
+		ResponseHandler: callResponseHandler(dict, &answer),
 	}
 	if opts.dat != nil && has([]string{http.MethodPost, http.MethodPut, http.MethodPatch}, opts.verb) {
 		callOpts.Headers = append(callOpts.Headers,
@@ -207,44 +229,69 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if opts.raw {
 		reason = cache.ReasonRawRead
 	}
-	cache.RecordApiserverFallthrough(req.Context(), reason, "")
+	// #988 — the dial is sent with the returned ctx, so a passthrough LIST is
+	// labelled with this reason on snowplow_resolve_collection_lists.
+	dctx := cache.RecordApiserverFallthrough(req.Context(), reason, "")
 	// #726 — the dial presents the CALLER's clientconfig credential, which
 	// snowplow holds on their behalf: credhttp.Do is request.Do with a client
 	// that never follows a redirect (a token-auth clientconfig's bearer is
 	// re-added on every hop), and a refused 3xx is surfaced with its own code.
-	rt := credhttp.Do(req.Context(), callOpts)
+	// #1054 — the passthrough fetch is one dial: its attempts (the retry
+	// client's network-error, 5xx and 429 retries) are recorded on it.
+	dctx, dial := slowcall.StartDial(dctx, slowcall.BranchPassthrough, strings.ToUpper(opts.verb), opts.gvr.String())
+	// #1298 — what the apiserver answered, observed at the dial for the audit
+	// record below (credhttp/answer.go): rt's code is often snowplow's own.
+	dctx, answered := credhttp.WithAnswer(dctx)
+	// #1334 — a caller with no clientconfig of its own (the public identity)
+	// is dialled with the impersonating config its context carries, so the
+	// apiserver decides this read or write for that identity, exactly. Its
+	// UserConfig endpoint is empty, so it can never be dialled as anyone.
+	var rt *response.Status
+	if rc, ok := cache.ImpersonatingConfigFor(dctx); ok {
+		rt = credhttp.DoAs(dctx, callOpts, rc)
+	} else {
+		rt = credhttp.Do(dctx, callOpts)
+	}
+	if rt != nil && rt.Status == response.StatusFailure {
+		dial.EndRelease(slowcall.ReleaseFailed)
+	} else {
+		dial.End()
+	}
 
 	// Audit correlation: every WRITE through /call emits a
 	// normalized AuditEvent carrying the request correlation id (see
 	// internal/support/audit) so a portal action is linkable to the
-	// object it mutated. Reads are deliberately not audited here (volume;
-	// they are already covered by the request log + trace id).
-	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) {
-		outcome, code, msg := "success", http.StatusOK, ""
+	// object it mutated. Reads are not audited: AUDIT-4 (installer#410) covers
+	// mutations. The request log and trace id once named as their cover do not
+	// cover them (measured on 057: no outcome/resource/session in the gateway
+	// log; the trace is sampled) — docs/architecture/audit-coverage.md.
+	if callAudited(opts.verb) {
+		// #1298 — a failed /call is recorded from what was observed at the
+		// dial (credhttp.Answer.Outcome, the stage records' closed set), never
+		// from rt: rt.Message is the apiserver's Status.message, which names
+		// the user, or the raw upstream body when it is not a Status, and
+		// rt.Code is often snowplow's own (500 for a connection refused, 502
+		// for a refused destination or redirect, 504 for the page budget, 406
+		// for a non-JSON 2xx). So a dial nothing answered carries no status
+		// code and says what happened instead, and a 2xx whose body snowplow
+		// would not use is the accepted write it was. A success keeps its
+		// record unchanged. The caller's response below still carries rt.
+		// A dial the destination policy refused is denied, with reason
+		// destination_refused (audit v0.12.0).
+		outcome, code, msg, reason := audit.OutcomeSuccess, http.StatusOK, "", ""
 		if rt.Status == response.StatusFailure {
-			outcome, code, msg = "failure", rt.Code, rt.Message
+			outcome, code, msg, reason = answered.OutcomeWithReason()
 		}
-		action := "call"
-		if opts.dryRun {
-			action = "call.dryRun"
-		}
-		audit.Emit(req.Context(), audit.Event{
-			Action:      action,
-			Verb:        strings.ToUpper(opts.verb),
-			Group:       opts.gvr.Group,
-			Version:     opts.gvr.Version,
-			Resource:    opts.gvr.Resource,
-			Subresource: opts.subresource,
-			Name:        opts.nsn.Name,
-			Namespace:   opts.nsn.Namespace,
-			Outcome:     outcome,
-			Code:        code,
-			Message:     msg,
-		})
+		ev := callAuditEvent(req, opts, uri, dialled, outcome, answer)
+		ev.StatusCode, ev.Message, ev.DenialReason = code, msg, reason
+		// #957 — the written object's uid/generation/resourceVersion, from the
+		// apiserver's answer (none on a failure or a dry run).
+		audit.RecordWrittenObject(&ev, answer)
+		audit.EmitRoute(req.Context(), ev)
 	}
 
 	if rt.Status == response.StatusFailure {
-		log.Error("unable to call endpoint",
+		log.ErrorContext(dctx, "unable to call endpoint",
 			slog.String("verb", strings.ToUpper(opts.verb)),
 			slog.String("uri", uri),
 			slog.String("err", rt.Message))
@@ -264,11 +311,28 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	enc := json.NewEncoder(wri)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(dict); err != nil {
-		log.Error("unable to serve api call response", slog.Any("err", err))
+		log.ErrorContext(dctx, "unable to serve api call response", slog.Any("err", err))
 	}
 }
 
 func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err error) {
+	if opts, err = r.parseRequest(req); err != nil {
+		return
+	}
+	// #186 — a read-only handler NEVER reads the body into opts.dat, so
+	// callOpts.Payload can never be set (ServeHTTP gates Payload on
+	// opts.dat != nil AND a write verb). On POST /call/read the body has
+	// already been consumed by the BodyExtrasDecode middleware anyway.
+	if req.Body != nil && !r.readOnly {
+		opts.dat, err = io.ReadAll(io.LimitReader(req.Body, 1048576))
+	}
+	return
+}
+
+// parseRequest is validateRequest without the body: the request's method,
+// path and query, checked. The route's audit descriptor (asked) reads it for
+// an exit before the handler ran, so no body is ever read twice.
+func (r *callHandler) parseRequest(req *http.Request) (opts callOptions, err error) {
 	// #443 part 2 — an inline object is resolved only by the RESTAction
 	// handler. BodyExtrasDecode already refuses one for any other GVR; this is
 	// the backstop for one that still reaches the passthrough (e.g. with
@@ -399,27 +463,22 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 		}
 	}
 
-	// #186 — a read-only handler NEVER reads the body into opts.dat, so
-	// callOpts.Payload can never be set (ServeHTTP gates Payload on
-	// opts.dat != nil AND a write verb). On POST /call/read the body has
-	// already been consumed by the BodyExtrasDecode middleware anyway.
-	if req.Body != nil && !r.readOnly {
-		opts.dat, err = io.ReadAll(io.LimitReader(req.Body, 1048576))
-		if err != nil {
-			return
-		}
-	}
-
 	return
 }
 
 // strictParams are the #443 query keys whose exact spelling is load-bearing.
 var strictParams = []string{"dryRun", "fieldValidation"}
 
+// paramKeySeparators drops '_' and '-'. One Replacer for the process: it is
+// safe for concurrent use, and building one per call was 1.65% of all CPU and
+// 4.2% of allocated bytes on run 23's customer path (every dispatched request
+// normalizes every query key).
+var paramKeySeparators = strings.NewReplacer("_", "", "-", "")
+
 // normalizeParamKey folds case and drops '_' and '-', so "dry_run", "DryRun"
 // and "dry-run" all compare equal to "dryRun".
 func normalizeParamKey(k string) string {
-	return strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(k))
+	return strings.ToLower(paramKeySeparators.Replace(k))
 }
 
 // nearMissParam returns the exact spelling a query key nearly matches ("" when
@@ -607,37 +666,67 @@ type callOptions struct {
 	raw bool
 }
 
+// buildURIPath is the apiserver path and query /call dials for opts. It is the
+// one place that path is built: /call, /call/dry-run and /call/read dial it,
+// and an export's record reads its verb from it (auditTarget.dialledVerb).
+//
+// #1257 — every value that becomes a path segment (the API group and version,
+// the resource, the namespace, the name and the subresource) is exactly one
+// segment of the path, or the request is refused (apipath.BadSegmentError, a 400)
+// before anything is dialled. A value is a segment only when the apiserver
+// accepts it as one (apipath.Segment: never "." or "..", never a "/"
+// or a "%", which the apiserver decodes back into a "/"), and it is sent
+// escaped (url.PathEscape), so a "?" or a "#" in a name stays in the name
+// instead of starting a query or a fragment. So the object the apiserver
+// resolves from the dialled path is, by construction, the object opts names,
+// which is the object the audit record names. Before, path.Join turned
+// name=cm-x/status into the status subresource of cm-x, and name=../secrets/s1
+// into another resource, while the record named the query's values.
+//
+// An empty group is the core group (/api), and an empty name a collection, as
+// before; an empty version, resource, or namespace on a namespaced path is
+// refused (path.Join used to drop it, which dials a different path).
 func buildURIPath(opts callOptions) (string, error) {
-	base := path.Join("/apis", opts.gvr.Group, opts.gvr.Version)
+	var parts []string
+	add := func(param, v string) error {
+		if err := apipath.Segment(apipath.Query(param), v); err != nil {
+			return err
+		}
+		parts = append(parts, url.PathEscape(v))
+		return nil
+	}
+
 	if len(opts.gvr.Group) == 0 {
-		base = path.Join("/api", opts.gvr.Version)
+		parts = append(parts, "api")
+	} else {
+		parts = append(parts, "apis")
+		if err := add("apiVersion", opts.gvr.Group); err != nil {
+			return "", err
+		}
+	}
+	if err := add("apiVersion", opts.gvr.Version); err != nil {
+		return "", err
 	}
 
 	// Issue #156 — the ONLY scope-dependent difference is the
-	// namespaces/<ns> segment. namespaced==true reproduces today's path
-	// byte-for-byte; namespaced==false (a POSITIVE cluster scope resolved
-	// upstream) omits the segment → base/resource. The name-append block
-	// below is scope-independent and unchanged.
-	var uriPath string
-	if opts.namespaced {
-		uriPath = path.Join(base, "namespaces", opts.nsn.Namespace, opts.gvr.Resource)
-	} else {
-		uriPath = path.Join(base, opts.gvr.Resource)
+	// namespaces/<ns> segment: namespaced==true emits it, namespaced==false (a
+	// POSITIVE cluster scope resolved upstream) omits it → base/resource.
+	// namespaces is itself cluster-scoped, so it never takes the segment
+	// (kept explicit for backward compatibility).
+	if opts.namespaced && !strings.EqualFold("namespaces", opts.gvr.Resource) {
+		parts = append(parts, "namespaces")
+		if err := add("namespace", opts.nsn.Namespace); err != nil {
+			return "", err
+		}
 	}
-	if strings.EqualFold("namespaces", opts.gvr.Resource) {
-		// namespaces is itself cluster-scoped; either branch above yields
-		// base/resource for it, but keep this explicit special case for
-		// zero churn / backward-compat (harmless with the new branch).
-		uriPath = path.Join(base, opts.gvr.Resource)
+	if err := add("resource", opts.gvr.Resource); err != nil {
+		return "", err
 	}
 
-	if has([]string{
-		http.MethodDelete,
-		http.MethodGet,
-		http.MethodPut,
-		http.MethodPatch,
-	}, opts.verb) {
-		uriPath = path.Join(uriPath, opts.nsn.Name)
+	if opts.nsn.Name != "" && nameInPath(opts.verb) {
+		if err := add("name", opts.nsn.Name); err != nil {
+			return "", err
+		}
 	}
 
 	// #282 — append the subresource segment (.../{name}/<subresource>, e.g.
@@ -645,8 +734,11 @@ func buildURIPath(opts callOptions) (string, error) {
 	// verb, so the name was just appended above; hang the subresource off it.
 	// Empty subresource → byte-identical to the pre-#282 whole-object path.
 	if opts.subresource != "" {
-		uriPath = path.Join(uriPath, opts.subresource)
+		if err := add("subresource", opts.subresource); err != nil {
+			return "", err
+		}
 	}
+	uriPath := "/" + strings.Join(parts, "/")
 
 	// Aggiunta dei query parametri, se necessario
 	query := url.Values{}
@@ -672,6 +764,78 @@ func buildURIPath(opts callOptions) (string, error) {
 	return uriPath, nil
 }
 
+// errDialNotAsked is the refusal of a /call write whose dial the apiserver
+// would resolve to another object than the one the request names.
+var errDialNotAsked = errors.New("the request names an object the apiserver would not act on: the path it builds resolves to another one")
+
+// callAudited reports whether a /call request with verb is audited: every
+// write. Reads are not (AUDIT-4 covers mutations).
+func callAudited(verb string) bool {
+	return has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, verb)
+}
+
+// callAuditEvent is a /call write's record before what the authority answered
+// is added: the one builder of it, for the handler and for the route's audit
+// descriptor (CallRoute).
+//
+//   - A dry run (#443, /call/dry-run: the apiserver is always sent
+//     dryRun=All, and a plain /call refuses an inbound dryRun) is recorded as
+//     krateo.action=call.dryRun, krateo.audit.dry_run=true and with no written
+//     object (#957). The verb is the apiserver's for the URI that is dialled
+//     (#1291), and the method the one sent, which is that verb's.
+//   - F3 (#1379 review) — the target is the apiserver's classification of the
+//     dial (dialledTarget), so it describes the dial by construction; #1378 —
+//     a create's name is the object the apiserver wrote (dialledObjectName).
+//   - #1333 — the client's provenance (X-Krateo-Provenance), validated
+//     against its closed schema: the asserted krateo.audit.client.* keys, or
+//     krateo.audit.client.rejected alone. It is the client's word and sets
+//     nothing else on the record.
+func callAuditEvent(req *http.Request, opts callOptions, uri string, dialled auditTarget, outcome string, answer []byte) audit.Event {
+	target := dialled
+	target.nsn.Name = dialledObjectName(opts, dialled, outcome, answer)
+	ev := requestAuditEvent("call", opts.verb, audit.KubernetesVerb(opts.verb, uri), target, outcome, 0)
+	ev.DryRun = opts.dryRun
+	ev.Client = audit.ProvenanceOf(req.Header)
+	return ev
+}
+
+// CallRoute is the audit descriptor of the write /call routes (POST, PUT,
+// PATCH, DELETE /call); CallDryRunRoute of /call/dry-run. Each asks the
+// route's own handler what a request asked for.
+func CallRoute() audit.Route { return audit.Route{Asked: Call().(*callHandler).asked} }
+
+// CallDryRunRoute is the audit descriptor of /call/dry-run (see CallRoute).
+func CallDryRunRoute() audit.Route { return audit.Route{Asked: CallDryRun().(*callHandler).asked} }
+
+// asked is the record of what req asks the handler to write, from its
+// method, path and query alone (parseRequest: the body is never read here),
+// by the rules its dial is built with: the object the apiserver would act on,
+// when the query names one the handler would dial; otherwise the action and
+// the method alone (the method is the one /call sends, the verb that
+// method's lowercase, the apiserver's non-resource rule), and the shared
+// writer marks the target. It describes an exit before the handler parsed
+// the request; after that the handler's own descriptor (audit.SetAsked) is
+// used.
+func (r *callHandler) asked(req *http.Request) audit.Event {
+	unresolved := audit.Event{Action: "call", HTTPMethod: req.Method, Verb: audit.MethodVerb(req.Method), DryRun: r.dryRun}
+	opts, err := r.parseRequest(req)
+	if err != nil {
+		return unresolved
+	}
+	uri, dialled, asked, err := dialledTarget(opts)
+	if err != nil || !asked {
+		return unresolved
+	}
+	return callAuditEvent(req, opts, uri, dialled, "", nil)
+}
+
+// nameInPath reports whether buildURIPath puts the object's name in the path
+// for verb: a by-name verb does; a POST is a create, sent to the collection,
+// and the apiserver takes the new object's name from the body (#1378).
+func nameInPath(verb string) bool {
+	return has([]string{http.MethodDelete, http.MethodGet, http.MethodPut, http.MethodPatch}, verb)
+}
+
 func has(s []string, e string) bool {
 	for _, a := range s {
 		if strings.EqualFold(a, e) {
@@ -682,12 +846,15 @@ func has(s []string, e string) bool {
 	return false
 }
 
-func callResponseHandler(out map[string]any) func(io.ReadCloser) error {
+// callResponseHandler decodes the apiserver's 2xx answer into out and keeps
+// its bytes in body, for the audit record of a write (#957).
+func callResponseHandler(out map[string]any, body *[]byte) func(io.ReadCloser) error {
 	return func(in io.ReadCloser) error {
 		dat, err := io.ReadAll(in)
 		if err != nil {
 			return err
 		}
+		*body = dat
 
 		x := bytes.TrimSpace(dat)
 		isArray := len(x) > 0 && x[0] == '['

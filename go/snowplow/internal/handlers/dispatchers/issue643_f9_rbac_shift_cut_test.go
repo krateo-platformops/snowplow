@@ -31,6 +31,7 @@ func TestIssue643_F9_RBACShiftSelfRequeuedCutIsCounted(t *testing.T) {
 	}
 	budgets := map[prewarmScopeKind]time.Duration{}
 	h643Budget(t, budgets)
+	h643VirtualBudget(t)
 
 	// The rbac-shift handler drains (and on a cut re-merges into) the PROCESS
 	// engine's accumulator, and re-enqueues on the process queue: leave both clean.
@@ -70,8 +71,7 @@ func TestIssue643_F9_RBACShiftSelfRequeuedCutIsCounted(t *testing.T) {
 	t.Cleanup(func() { seedOneWidgetFn = prevW })
 	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, authnNS string, mode seedScopeMode) error {
 		if calls.Add(1) == 3 {
-			<-ctx.Done()
-			return ctx.Err()
+			return h643HoldUntilBudget(ctx)
 		}
 		return prevW(ctx, e, authnNS, mode)
 	}

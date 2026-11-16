@@ -176,7 +176,7 @@ func TestRefresherReMint_TerminalResets_NestedApistageUntouched(t *testing.T) {
 
 	// (1) POPULATE via a real resolve: terminal restactions cell + nested apistage
 	// content cell.
-	if err := seedOneRestaction(ctx, "cohort", ref, nestedNS, seedModeGVRDiscovered); err != nil {
+	if err := seedOneRestaction(ctx, ref, nestedNS, seedModeGVRDiscovered); err != nil {
 		t.Fatalf("populate seedOneRestaction: %v", err)
 	}
 	keys := keysByClass(t, store)
@@ -223,7 +223,7 @@ func TestSeedOneRestaction_GVRDiscovered_TerminalInheritsBornAt(t *testing.T) {
 	ref := nestedRARef()
 	store := cache.ResolvedCache()
 
-	if err := seedOneRestaction(ctx, "cohort", ref, nestedNS, seedModeGVRDiscovered); err != nil {
+	if err := seedOneRestaction(ctx, ref, nestedNS, seedModeGVRDiscovered); err != nil {
 		t.Fatalf("populate: %v", err)
 	}
 	termKey := keysByClass(t, store)["restactions"]
@@ -234,7 +234,7 @@ func TestSeedOneRestaction_GVRDiscovered_TerminalInheritsBornAt(t *testing.T) {
 	if !store.SetBornAtForTest(termKey, past) {
 		t.Fatal("SetBornAtForTest failed")
 	}
-	if err := seedOneRestaction(ctx, "cohort", ref, nestedNS, seedModeGVRDiscovered); err != nil {
+	if err := seedOneRestaction(ctx, ref, nestedNS, seedModeGVRDiscovered); err != nil {
 		t.Fatalf("re-put: %v", err)
 	}
 	term, _ := store.Get(termKey)

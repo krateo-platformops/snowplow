@@ -86,11 +86,13 @@ func withEmitSeamHarness(t *testing.T) (cache.ResolvedKeyInputs, string) {
 // FRESH bytes (coherent-by-construction: emit is strictly post-Put). It then
 // asserts the refetch is an L1 HIT for the fresh bytes (9.1, cache-respecting).
 func TestEmitSeam_PutFiresExactlyOneCoherentSignal(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	inputs, key := withEmitSeamHarness(t)
 
 	c := cache.ResolvedCache()
 	// Seed the prior (stale) entry — the realistic live-refresh case.
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(emitStaleBytes), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(emitStaleBytes), Inputs: &inputs})
 
 	// Arm a /refreshes subscriber for this key BEFORE the re-resolve.
 	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{key: {}})
@@ -153,7 +155,7 @@ func runNoPutCase(t *testing.T, stub func(ctx context.Context, in cache.Resolved
 	inputs, key := withEmitSeamHarness(t)
 	c := cache.ResolvedCache()
 	if preSeed && c != nil {
-		c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(emitStaleBytes), Inputs: &inputs})
+		c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(emitStaleBytes), Inputs: &inputs})
 	}
 	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{key: {}})
 	defer unsub()
@@ -229,6 +231,8 @@ func TestEmitSeam_EvictedDuringRefresh_NoSignal(t *testing.T) {
 // re-inserted body survives and no signal fires. RED on the pre-#189 tree
 // (clobbered → stale), GREEN after.
 func TestEmitSeam_S189_RefreshRePutRacingReinsert_RefusedNoClobberNoSignal(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	inputs, key := withEmitSeamHarness(t)
 	c := cache.ResolvedCache()
 	if c == nil {
@@ -236,7 +240,7 @@ func TestEmitSeam_S189_RefreshRePutRacingReinsert_RefusedNoClobberNoSignal(t *te
 	}
 	// Seed the entry so the refresher captures a LIVE generation (gen0) at the
 	// head of resolveAndPopulateL1, before the resolve below.
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(emitStaleBytes), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(emitStaleBytes), Inputs: &inputs})
 
 	ch, unsub := cache.SubscribeRefresh(map[string]struct{}{key: {}})
 	defer unsub()
@@ -249,7 +253,7 @@ func TestEmitSeam_S189_RefreshRePutRacingReinsert_RefusedNoClobberNoSignal(t *te
 	restore := setResolveOnceForTest(func(_ context.Context, in cache.ResolvedKeyInputs) ([]byte, error) {
 		c.DeleteForTest(key)             // real deleteForDep — bumps the generation
 		reinsertGen := c.CaptureGen(key) // the fresh generation post-delete
-		c.PutIfGen(context.Background(), key, &cache.ResolvedEntry{RawJSON: []byte(freshBody), Inputs: &in}, reinsertGen)
+		c.PutResolvedIfGen(context.Background(), fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(freshBody), Inputs: &in}, reinsertGen)
 		return []byte(emitStaleBytes), nil // the refresher's STALE body
 	})
 	t.Cleanup(restore)

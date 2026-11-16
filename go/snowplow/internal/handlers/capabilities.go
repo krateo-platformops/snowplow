@@ -26,6 +26,12 @@ const (
 	// the stored CR, as the caller, persisting nothing, and echoes
 	// X-Snowplow-Dry-Run: All and X-Snowplow-Resolve-Source: request-body.
 	CapCallReadInline = "call.read.inline"
+	// CapCallProvenance: a /call write or /call/dry-run reads the
+	// X-Krateo-Provenance header (#1333) into its audit record's
+	// krateo.audit.client.* keys (docs/howto-frontend-call-provenance.md). An
+	// older snowplow ignores the header, so a client that has no other record
+	// of its provenance sends it only where this token is advertised.
+	CapCallProvenance = "call.provenance"
 )
 
 // capabilities is the static advertised set. A token is added here only in the
@@ -36,6 +42,7 @@ var capabilities = []string{
 	CapCallFieldValidation,
 	CapCallRaw,
 	CapCallReadInline,
+	CapCallProvenance,
 }
 
 // Capabilities returns a sorted copy of the advertised capability tokens.

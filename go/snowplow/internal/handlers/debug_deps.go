@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
-	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
@@ -152,7 +151,7 @@ func depsKeyViewFor(keyHash string) depsKeyView {
 	if !ok || entry == nil {
 		return view
 	}
-	now := time.Now()
+	now := cache.ResolvedCache().Now() // #930: ages on the store clock that stamped them
 	view.Resident = true
 	if !entry.CreatedAt.IsZero() {
 		view.AgeSeconds = int64(now.Sub(entry.CreatedAt).Seconds())
@@ -176,8 +175,10 @@ func depsKeyViewFor(keyHash string) depsKeyView {
 	if entry.Inputs != nil {
 		view.CacheEntryClass = entry.Inputs.CacheEntryClass
 	}
-	if len(entry.RawJSON) > 0 {
-		sum := sha256.Sum256(entry.RawJSON)
+	// #854 — Raw(): an incremental list cell builds its envelope on demand
+	// (counted in snowplow_list_incremental.rawjson_built).
+	if raw := entry.Raw(); len(raw) > 0 {
+		sum := sha256.Sum256(raw)
 		view.BodySha256 = hex.EncodeToString(sum[:])
 	}
 	return view
@@ -227,7 +228,7 @@ func depsFilterMissingBacking() depsFilterView {
 // lifetime; bounded only by the 86400 hard cap).
 func depsFilterStaleRisk() depsFilterView {
 	out := depsFilterView{Filter: "stale-risk"}
-	now := time.Now()
+	now := cache.ResolvedCache().Now() // #930: ages on the store clock that stamped them
 	inspected := 0
 	// RangeKeys (not RangeEdges): stale-risk needs only the key, so skip
 	// materializing each key's edge slice.

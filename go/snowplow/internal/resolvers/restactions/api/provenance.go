@@ -3,40 +3,39 @@ package api
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
 // fromSecretAsCallerFn reads a named endpointRef Secret with the caller's
-// credentials. A package var so a hermetic test can observe the identity used.
-var fromSecretAsCallerFn = endpoints.FromSecret
+// credentials, through credhttp.FromSecret (a hardened copy: no client-side
+// limiter, no redirect followed). A package var so a hermetic test can observe
+// the identity used.
+var fromSecretAsCallerFn = credhttp.FromSecret
 
 // resolveOneAsCaller resolves a NAMED endpointRef for a caller-supplied
 // (inline draft) spec. The Secret is read with the CALLER's own rest config,
 // built from the caller's clientconfig endpoint on the request ctx, so the
 // apiserver decides whether the caller may read it (a 403 or 404 becomes the
 // stage's error). It never consults the SA-backed Secrets snapshot or the
-// ServiceAccount rest config, and refuses a `-clientconfig` name outright.
+// ServiceAccount rest config. A per-user credential name never reaches it:
+// resolveStageEndpoint applies the #1025 rule (refusePerUserRef) to every
+// stage's ref, for every provenance, before it calls resolveOne.
 func (m *endpointReferenceMapper) resolveOneAsCaller(ctx context.Context, ref *templates.Reference) (endpoints.Endpoint, bool, error) {
-	if strings.HasSuffix(ref.Name, clientConfigSuffix) {
-		return endpoints.Endpoint{}, false, fmt.Errorf(
-			"endpointRef %q names a reserved per-user credential Secret (suffix %q); a caller-supplied RESTAction may not select one",
-			ref.Name, clientConfigSuffix)
-	}
 	// An inline request never carries an internal (ServiceAccount) rest
 	// config: only seeds and the refresher set one. Refuse rather than let
 	// ClientConfigFor hand back the SA's config.
 	if _, ok := cache.InternalRESTConfigFromContext(ctx); ok {
 		return endpoints.Endpoint{}, false, fmt.Errorf(
-			"caller-supplied RESTAction resolved on a context carrying an internal rest config; refusing to read endpointRef %q", ref.Name)
+			"%w: a caller-supplied RESTAction resolved on a context carrying an internal rest config; refusing to read endpointRef %q", errInternalIdentityContext, ref.Name)
 	}
 	callerEP, err := xcontext.UserConfig(ctx)
 	if err != nil {
-		return endpoints.Endpoint{}, false, fmt.Errorf("caller-supplied endpointRef %q: no caller endpoint: %w", ref.Name, err)
+		return endpoints.Endpoint{}, false, fmt.Errorf("%w: endpointRef %q: no caller endpoint: %w", errInternalIdentityContext, ref.Name, err)
 	}
 	rc, err := cache.ClientConfigFor(ctx, callerEP)
 	if err != nil {
@@ -69,8 +68,8 @@ const (
 	//   - a userAccessFilter stage dials the caller's clientconfig instead of
 	//     the ServiceAccount (the refilter still runs);
 	//   - a named endpointRef Secret is read with the caller's credentials,
-	//     never through the ServiceAccount or the informer snapshot, and a
-	//     literal "-clientconfig" ref is refused, so a draft can never dial
-	//     as another user.
+	//     never through the ServiceAccount or the informer snapshot.
+	// A named per-user credential ref (session or step-up) is refused for
+	// EVERY provenance, this one included (#1025, per_user_ref.go).
 	ProvenanceCallerSupplied
 )

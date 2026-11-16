@@ -24,8 +24,7 @@
 // D-derivation — are recover-isolated: a dark panic bumps dark_panic_total and
 // is swallowed, never propagated. Identity never leaves this package raw: the
 // counters are process-wide scalars (no labels, no identity), and the anomaly
-// log carries only the non-identity coordinate {verb,group,resource,scope-kind}
-// plus the identity's redact labels (internal/redact, keyed sha256, #453).
+// log carries only the non-identity coordinate {verb,group,resource,scope-kind}.
 
 package dispatchers
 
@@ -40,7 +39,6 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 func init() {
@@ -507,11 +505,8 @@ func checkScopeKind(opts rbac.EvaluateOptions) string {
 }
 
 // logShadowAnomaly emits a Debug line for one anomaly. It carries ONLY the
-// non-identity coordinate {verb,group,resource,scope-kind} and the identity's
-// redact labels (#453: keyed, so neither the username nor a small group set can
-// be recovered by dictionary; pre-#453 an unkeyed sha256 prefix and the FNV
-// canonical groups hash) — never raw username/groups/name, never a body (the
-// debug-surface rule).
+// non-identity coordinate {verb,group,resource,scope-kind}: no identity, in
+// clear or as a label (#1192), no name, no body (the debug-surface rule).
 func logShadowAnomaly(ctx context.Context, reason string, opts rbac.EvaluateOptions) {
 	log := xcontext.Logger(ctx)
 	log.Debug("v7.shadow_parity anomaly (dark)",
@@ -520,7 +515,5 @@ func logShadowAnomaly(ctx context.Context, reason string, opts rbac.EvaluateOpti
 		slog.String("group", opts.Group),
 		slog.String("resource", opts.Resource),
 		slog.String("scope_kind", checkScopeKind(opts)),
-		slog.String("user_hash", redact.User(opts.Username)),
-		slog.String("identity", redact.Identity(opts.Username, opts.Groups)),
 	)
 }

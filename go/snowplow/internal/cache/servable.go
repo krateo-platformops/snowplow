@@ -108,19 +108,37 @@ func (rw *ResourceWatcher) installWatchErrorHandler(gvr schema.GroupVersionResou
 	if gi == nil {
 		return
 	}
-	handler := rw.watchErrorHandlerFor(gvr)
+	rw.setWatchErrorHandlerLocked(context.Background(), gvr, gi, rw.watchErrorHandlerFor(gvr), true)
+}
+
+// installWatchErrorHandlerFor is installWatchErrorHandler for one informer
+// INSTANCE (#870): the handler acts on the GVR's servability only while that
+// instance is the live one. A build's candidate records its own watch state
+// (copied in at the install) and aborts on a terminal LIST refusal; a retiring
+// copy's errors change nothing. Callers MUST hold rw.mu.Lock().
+func (rw *ResourceWatcher) installWatchErrorHandlerFor(ctx context.Context, gvr schema.GroupVersionResource, in *storeInstance) {
+	if in == nil || in.gi == nil {
+		return
+	}
+	rw.setWatchErrorHandlerLocked(ctx, gvr, in.gi, rw.watchErrorHandlerForInstance(gvr, in), rw.instances[gvr] == in)
+}
+
+func (rw *ResourceWatcher) setWatchErrorHandlerLocked(ctx context.Context, gvr schema.GroupVersionResource, gi informers.GenericInformer,
+	handler func(*clientcache.Reflector, error), live bool) {
 	if err := gi.Informer().SetWatchErrorHandler(handler); err != nil {
 		// Reachable only if the informer already started — which the
 		// callers guarantee against (handler installed pre-Run). Log a
 		// WARN so the regression is visible without failing the boot.
-		slog.Warn("cache.watch.set_error_handler_failed",
+		slog.WarnContext(ctx, "cache.watch.set_error_handler_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("error", err.Error()),
 		)
 		return
 	}
-	rw.markWatchHandlerInstalledLocked(gvr)
+	if live {
+		rw.markWatchHandlerInstalledLocked(gvr)
+	}
 }
 
 // watchErrorHandlerFor builds the per-GVR reflector error handler.
@@ -131,13 +149,72 @@ func (rw *ResourceWatcher) installWatchErrorHandler(gvr schema.GroupVersionResou
 // Hoisting it here is what lets the falsifier hold the installed closure rather
 // than re-implement its arithmetic.
 func (rw *ResourceWatcher) watchErrorHandlerFor(gvr schema.GroupVersionResource) func(*clientcache.Reflector, error) {
+	return rw.watchErrorHandlerForInstance(gvr, nil)
+}
+
+// watchErrorHandlerForInstance is watchErrorHandlerFor bound to one informer
+// instance (nil = whatever instance is live: the test hooks). The live check
+// and the servability write happen under ONE rw.mu section, so a swap can never
+// land between them.
+func (rw *ResourceWatcher) watchErrorHandlerForInstance(gvr schema.GroupVersionResource, in *storeInstance) func(*clientcache.Reflector, error) {
 	return func(_ *clientcache.Reflector, err error) {
+		// #928 F1 — the instance's position at this error, read before rw.mu
+		// (the reflector calls this handler with no lock of its own held).
+		var pos string
+		if in != nil {
+			pos = in.gi.Informer().LastSyncResourceVersion()
+		}
 		rw.mu.Lock()
+		if in != nil && rw.instances[gvr] != in {
+			// #870 — not the live copy. A candidate keeps its own watch state
+			// and its build aborts on a terminal LIST refusal (#796's
+			// classification: only a CRD version or an RBAC grant heals it). A
+			// retiring copy's error changes nothing. The state is the LATEST
+			// error and the position at it; the install judges it by the live
+			// copy's recovery rule (storeInstance.watchStateNow).
+			refusedNow := apierrors.IsNotFound(err) || apierrors.IsForbidden(err)
+			var aborted *buildAccount
+			if b := rw.builds[gvr]; b != nil && b.inst == in {
+				in.broken = true
+				in.brokenAt = pos
+				in.refused = refusedNow
+				in.watchErrs.Add(1) // #1146 — the install's off-lock position read is judged against it
+				if refusedNow {
+					aborted = rw.abortBuildLocked(gvr)
+				}
+			}
+			rw.unlockAndDetach() // #1146 — an abort retires the copy's delivery log
+			recordWatchError()
+			if aborted != nil {
+				aborted.endAll(outcomeAbortRefused, windowNow())
+				noteSwapOutcome(gvr, outcomeAbortRefused)
+				// log-ctx-waiver: informer-event: a watch error on the reflector goroutine
+				slog.Warn("cache.store.swap.aborted_refused",
+					slog.String("subsystem", "cache"),
+					slog.String("gvr", gvr.String()),
+					slog.String("hint", "the replacement store's LIST was refused (not found / forbidden), so the "+
+						"build was aborted; the live copy keeps serving and its known-stale keys stay counted"))
+			}
+			return
+		}
 		if rw.watchBroken == nil {
 			rw.watchBroken = map[schema.GroupVersionResource]struct{}{}
 		}
 		_, already := rw.watchBroken[gvr]
 		rw.watchBroken[gvr] = struct{}{}
+		bumpServabilityEpoch(gvr) // #854 — an exit from servable
+		// #796 — the LATEST error decides whether the LIST is refused: a
+		// terminal NotFound / Forbidden (client-go wraps the LIST error with
+		// %w, so apierrors classifies through it) sets the mark, any other
+		// error removes it.
+		if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) {
+			if rw.listRefused == nil {
+				rw.listRefused = map[schema.GroupVersionResource]struct{}{}
+			}
+			rw.listRefused[gvr] = struct{}{}
+		} else {
+			delete(rw.listRefused, gvr)
+		}
 		rw.mu.Unlock()
 		// 1.12.7 — count EVERY reflector error. The WARN below is one-shot per
 		// GVR (map membership), which keeps a broken watch from flooding the
@@ -149,12 +226,19 @@ func (rw *ResourceWatcher) watchErrorHandlerFor(gvr schema.GroupVersionResource)
 		// this handler: this counter is #263-safe by code path.
 		recordRBACWatchError(gvr)
 		if !already {
+			// log-ctx-waiver: informer-event: a watch error on the reflector goroutine
 			slog.Warn("cache.watch.broken",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
 				slog.Any("err", err),
 				slog.String("effect", "servable=false until reflector relists; pivot falls through to apiserver"),
 			)
+		}
+		// #807 — a 404 may mean the CRD retired this version. The check and the
+		// teardown run on the CRD-lifecycle worker, never here: this is the
+		// reflector goroutine of the very informer that would be stopped.
+		if apierrors.IsNotFound(err) {
+			crdDiscoverySingleton().submitListRefused(rw, gvr)
 		}
 	}
 }
@@ -206,6 +290,7 @@ func (rw *ResourceWatcher) assertWatchHandlerCoverageLocked() {
 		}
 	}
 	if len(missing) > 0 {
+		// log-ctx-waiver: boot: the watcher constructor, once
 		slog.Warn("cache.watch.handler_coverage_gap",
 			slog.String("subsystem", "cache"),
 			slog.Int("missing_count", len(missing)),
@@ -282,6 +367,14 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 		}
 	}
 
+	// #1146 — each informer's position is read here, with no lock held:
+	// LastSyncResourceVersion takes the informer's startedLock, which is never
+	// waited on under rw.mu.
+	rvs := make([]string, len(gis))
+	for i, gi := range gis {
+		rvs[i] = gi.Informer().LastSyncResourceVersion()
+	}
+
 	// Write confirmed + clear watchBroken on advanced RV, under the lock.
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
@@ -291,7 +384,16 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 		// result ({false,false,""}), exactly as the pre-#483 zero-value map read
 		// did; applyConfirmLocked ignores it under haveDisco==false either way.
 		r := lookups[groupVersionString(gvr)].resultFor(gvr.Resource)
-		rw.applyConfirmLocked(gvr, gis[i], disco != nil, r.served, r.known, r.reason, confirmRetractDiscoveryRefresh)
+		// N2 (#1146 review) — re-read the informer under the write lock, as
+		// the scoped passes do: a GVR torn down since the snapshot is skipped
+		// (its confirmation and baseline must not be written back), and a
+		// position read from an informer since replaced does not count for
+		// its successor.
+		cur, stillRegistered := rw.informers[gvr]
+		if !stillRegistered {
+			continue
+		}
+		rw.applyConfirmLocked(ctx, gvr, cur, positionIfCurrent(cur, gis[i], rvs[i]), disco != nil, r.served, r.known, r.reason, confirmRetractDiscoveryRefresh)
 	}
 }
 
@@ -315,12 +417,12 @@ func (rw *ResourceWatcher) ensureConfirmMapsLocked() {
 // rw.mu.Lock() and MUST have called ensureConfirmMapsLocked. The counter
 // (recordConfirmRetainedUnknown) carries the per-decision RATE; this log carries
 // the human-readable episode edge without flooding on a sustained outage.
-func (rw *ResourceWatcher) warnRetainUnknownLocked(gvr schema.GroupVersionResource, reason string) {
+func (rw *ResourceWatcher) warnRetainUnknownLocked(ctx context.Context, gvr schema.GroupVersionResource, reason string) {
 	if _, warned := rw.retainUnknownWarned[gvr]; warned {
 		return
 	}
 	rw.retainUnknownWarned[gvr] = struct{}{}
-	slog.Warn("cache.servable.confirm_retained_unknown",
+	slog.WarnContext(ctx, "cache.servable.confirm_retained_unknown",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),
 		slog.String("reason", reason),
@@ -345,6 +447,12 @@ func (rw *ResourceWatcher) clearRetainUnknownWarnLocked(gvr schema.GroupVersionR
 // confirm logic" constraint). Callers MUST hold rw.mu.Lock() and MUST have
 // called ensureConfirmMapsLocked.
 //
+//   - rv: gi's LastSyncResourceVersion, read by the caller with NO lock held
+//     (#1146: it takes the informer's startedLock, which a RemoveEventHandler
+//     can hold while it waits on a listener that waits on rw.mu). "" when the
+//     caller has no reading of THIS informer (it was replaced between the read
+//     and the lock): the recovery is then left to the next pass.
+//
 //   - haveDisco: a discovery client is wired (disco != nil). With no
 //     discovery client, conjunct 4 is degraded-true (resourceTypeConfirmedLocked
 //     returns true) so rw.confirmed is left untouched — identical to the
@@ -360,8 +468,10 @@ func (rw *ResourceWatcher) clearRetainUnknownWarnLocked(gvr schema.GroupVersionR
 //     hand one sibling's verdict to the others; doing so retracted healthy
 //     resources whose group/version mates were absent.
 func (rw *ResourceWatcher) applyConfirmLocked(
+	ctx context.Context,
 	gvr schema.GroupVersionResource,
 	gi informers.GenericInformer,
+	rv string,
 	haveDisco bool,
 	served bool,
 	known bool,
@@ -385,7 +495,7 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 			// the retain-on-unknown DETECTOR — per decision, so it carries the
 			// flap RATE — and WARN once per GVR per episode.
 			recordConfirmRetainedUnknown(unknownReason)
-			rw.warnRetainUnknownLocked(gvr, unknownReason)
+			rw.warnRetainUnknownLocked(ctx, gvr, unknownReason)
 		case served:
 			rw.confirmed[gvr] = struct{}{}
 			// A definite answer arrived — this GVR's retain episode (if any) is
@@ -411,6 +521,7 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 				// in the deadline's queue rather than letting it inherit a
 				// verification from before the gap.
 				invalidateStoreVerification(gvr)
+				bumpServabilityEpoch(gvr) // #854 — confirmation retracted: an exit from servable
 			}
 			delete(rw.confirmed, gvr)
 			rw.clearRetainUnknownWarnLocked(gvr)
@@ -421,9 +532,9 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 	// LastSyncResourceVersion. If it advanced since the last refresh AND
 	// the informer is currently synced, the WATCH is healthy again — clear
 	// watchBroken.
-	rv := gi.Informer().LastSyncResourceVersion()
 	prev := rw.lastSyncRV[gvr]
-	if rv != "" && rv != prev && gi.Informer().HasSynced() {
+	if watchHealed(rv, prev, gi.Informer().HasSynced()) {
+		delete(rw.listRefused, gvr) // #796 — a relist succeeded
 		if _, broken := rw.watchBroken[gvr]; broken {
 			delete(rw.watchBroken, gvr)
 			slog.Info("cache.watch.recovered",
@@ -436,6 +547,16 @@ func (rw *ResourceWatcher) applyConfirmLocked(
 	if rv != "" {
 		rw.lastSyncRV[gvr] = rv
 	}
+}
+
+// watchHealed is THE recovery rule for a broken watch: the reflector has
+// listed successfully since its position was prev — its position rv advanced
+// past prev and the informer is synced. The live copy's conjunct-3 recovery
+// (prev = the position the last confirm pass observed) and a build
+// candidate's install (prev = its position at its latest error, #928 F1) both
+// apply it.
+func watchHealed(rv, prev string, synced bool) bool {
+	return rv != "" && rv != prev && synced
 }
 
 // ConfirmResourceType runs ONE conjunct-3/4 confirmation pass SCOPED to a
@@ -529,6 +650,10 @@ func (rw *ResourceWatcher) confirmResourceTypeWithVerbs(ctx context.Context, gvr
 		}
 	}
 
+	// #1146 — the informer's position, read with no lock held; it counts
+	// below only if that informer is still the registered one.
+	readGI, readRV := rw.informerPositionOf(gvr)
+
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	// Re-check registration under the write lock: a concurrent
@@ -548,7 +673,7 @@ func (rw *ResourceWatcher) confirmResourceTypeWithVerbs(ctx context.Context, gvr
 		return
 	}
 	rw.ensureConfirmMapsLocked()
-	rw.applyConfirmLocked(gvr, curGI, disco != nil, res.served, res.known, res.reason, confirmRetractScopedConfirm)
+	rw.applyConfirmLocked(ctx, gvr, curGI, positionIfCurrent(curGI, readGI, readRV), disco != nil, res.served, res.known, res.reason, confirmRetractScopedConfirm)
 }
 
 // ConfirmResourceTypes runs the scoped conjunct-3/4 confirmation pass over a
@@ -618,6 +743,18 @@ func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []sche
 		}
 	}
 
+	// #1146 — each informer's position, read with no lock held; a reading
+	// counts below only if its informer is still the registered one.
+	type readPosition struct {
+		gi informers.GenericInformer
+		rv string
+	}
+	reads := make(map[schema.GroupVersionResource]readPosition, len(gvrs))
+	for _, gvr := range gvrs {
+		gi, rv := rw.informerPositionOf(gvr)
+		reads[gvr] = readPosition{gi, rv}
+	}
+
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	rw.ensureConfirmMapsLocked()
@@ -631,8 +768,32 @@ func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []sche
 			continue
 		}
 		r := lookups[groupVersionString(gvr)].resultFor(gvr.Resource)
-		rw.applyConfirmLocked(gvr, curGI, disco != nil, r.served, r.known, r.reason, confirmRetractWalkConfirm)
+		read := reads[gvr]
+		rw.applyConfirmLocked(ctx, gvr, curGI, positionIfCurrent(curGI, read.gi, read.rv), disco != nil, r.served, r.known, r.reason, confirmRetractWalkConfirm)
 	}
+}
+
+// informerPositionOf returns gvr's registered informer and its
+// LastSyncResourceVersion, read with rw.mu NOT held (#1146). Callers MUST NOT
+// hold rw.mu.
+func (rw *ResourceWatcher) informerPositionOf(gvr schema.GroupVersionResource) (informers.GenericInformer, string) {
+	rw.mu.RLock()
+	gi := rw.informers[gvr]
+	rw.mu.RUnlock()
+	if gi == nil {
+		return nil, ""
+	}
+	return gi, gi.Informer().LastSyncResourceVersion()
+}
+
+// positionIfCurrent keeps a position read off the lock (informerPositionOf)
+// only if the informer it was read from is cur, the one registered now (N2:
+// the recovery is bound to the CURRENT informer); "" otherwise.
+func positionIfCurrent(cur, read informers.GenericInformer, rv string) string {
+	if cur == nil || cur != read {
+		return ""
+	}
+	return rv
 }
 
 // ServableGVRStatus is a read-only per-GVR servability snapshot row,
@@ -1323,7 +1484,19 @@ func (rw *ResourceWatcher) FireWatchError(gvr schema.GroupVersionResource) {
 		rw.watchBroken = map[schema.GroupVersionResource]struct{}{}
 	}
 	rw.watchBroken[gvr] = struct{}{}
+	bumpServabilityEpoch(gvr) // #854 — as the production handler does
 	rw.mu.Unlock()
+}
+
+// InvokeWatchErrorHandlerForTest drives gvr's REAL reflector error handler
+// (watchErrorHandlerFor) with err, as client-go would after a failed
+// List/Watch. Unlike FireWatchError it classifies err (#796 listRefused).
+// Tests only.
+func (rw *ResourceWatcher) InvokeWatchErrorHandlerForTest(gvr schema.GroupVersionResource, err error) {
+	if rw == nil {
+		return
+	}
+	rw.watchErrorHandlerFor(gvr)(nil, err)
 }
 
 // MarkWatchRecovered simulates a successful relist clearing gvr's broken
@@ -1336,6 +1509,7 @@ func (rw *ResourceWatcher) MarkWatchRecovered(gvr schema.GroupVersionResource) {
 	}
 	rw.mu.Lock()
 	delete(rw.watchBroken, gvr)
+	delete(rw.listRefused, gvr)
 	rw.mu.Unlock()
 }
 

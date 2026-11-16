@@ -50,18 +50,20 @@ func threeClassDeps(t *testing.T) (*DepTracker, string, string, string) {
 	gvr := gvrCompositions()
 	ns, name := "ns", "obj"
 	// self: its own dispatched object IS (gvr, ns, name).
-	store.Put("L1self", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, name)})
+	store.put("L1self", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, name)})
 	d.Record(context.Background(), "L1self", gvr, ns, name)
 	// exact_dep: own object is a DIFFERENT object; GET-depends on (gvr,ns,name).
-	store.Put("L1exact", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "owner")})
+	store.put("L1exact", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "owner")})
 	d.Record(context.Background(), "L1exact", gvr, ns, name)
 	// list_dep: LIST-depends on (gvr, ns, *).
-	store.Put("L1list", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "listowner")})
+	store.put("L1list", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "listowner")})
 	d.RecordList(context.Background(), "L1list", gvr, ns)
 	return d, "L1self", "L1exact", "L1list"
 }
 
 func TestIssue239_A_ObjectPathAttribution(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr := gvrCompositions()
 	ns, name := "ns", "obj"
 
@@ -109,9 +111,9 @@ func TestIssue239_A_TypePathAttribution(t *testing.T) {
 		d := newTestDepTracker(t, 1_000)
 		store := newResolvedCache(100, 1<<20, time.Hour)
 		d.SetStore(store)
-		store.Put("L1exact", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, "ns", "owner")})
+		store.put("L1exact", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, "ns", "owner")})
 		d.Record(context.Background(), "L1exact", gvr, "ns", "obj")
-		store.Put("L1list", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, "ns", "listowner")})
+		store.put("L1list", &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, "ns", "listowner")})
 		d.RecordList(context.Background(), "L1list", gvr, "ns")
 		return d
 	}
@@ -132,9 +134,10 @@ func TestIssue239_A_TypePathAttribution(t *testing.T) {
 		cause string
 		call  func(*DepTracker)
 	}{
+		// #870 deleted the schema_relist and store_repair causes: a schema
+		// widen and a store repair swap the store in and mark only what
+		// changed, through ordinary object events.
 		{"crd_delete", dmCauseCRDDelete, func(d *DepTracker) { d.OnResourceTypeRemoved(gvr) }},
-		{"schema_relist", dmCauseSchemaRelist, func(d *DepTracker) { d.OnResourceTypeSchemaRelisted(gvr) }},
-		{"store_repair", dmCauseStoreRepair, func(d *DepTracker) { d.OnResourceTypeStoreRepaired(gvr) }},
 	} {
 		t.Run(tc.name+" marks both list and exact", func(t *testing.T) {
 			d := newTypeDeps(t)
@@ -154,17 +157,19 @@ func TestIssue239_A_SubmitSourceAttribution(t *testing.T) {
 	// Each source lands in its OWN bucket (pre-dedup submit axis).
 	d.recordSubmitSource(dmSourceWatch)
 	d.recordSubmitSource(dmSourceWatch)
-	d.recordSubmitSource(dmSourceRelistBridge)
+	d.recordSubmitSource(dmSourceStoreSwap)
 	d.recordSubmitSource(dmSourceReconcile)
 	src := d.dirtyMarkSubmitSourceSnapshot()
-	if src[dmSourceWatch] != 2 || src[dmSourceRelistBridge] != 1 || src[dmSourceReconcile] != 1 {
-		t.Fatalf("submit-source snapshot=%v, want watch=2 relist_bridge=1 reconcile=1", src)
+	if src[dmSourceWatch] != 2 || src[dmSourceStoreSwap] != 1 || src[dmSourceReconcile] != 1 {
+		t.Fatalf("submit-source snapshot=%v, want watch=2 store_swap=1 reconcile=1", src)
 	}
 }
 
 // TestIssue239_B_Discrimination — the load-bearing arm: benign fan-out vs an
 // amplifier must produce DIFFERENT distributions.
 func TestIssue239_B_Discrimination(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr := gvrCompositions()
 	ns, name := "ns", "obj"
 
@@ -181,7 +186,7 @@ func TestIssue239_B_Discrimination(t *testing.T) {
 		t.Fatalf("benign delete marked a self entry (%d) — fixture wrong", got)
 	}
 	if got := dmCount(amp, dmPathObject, dmCauseDegraded, dmClassSelf); got == 0 {
-		t.Fatalf("the amplified (degraded) scenario did NOT mark the self entry — the instrument cannot "+
+		t.Fatalf("the amplified (degraded) scenario did NOT mark the self entry — the instrument cannot " +
 			"show a degrade storm re-marking entries a delete would evict, so it does not discriminate")
 	}
 	// The distributions DIFFER at the self class — the amplifier signature.
@@ -198,7 +203,7 @@ func TestIssue239_B_Discrimination(t *testing.T) {
 	hi.SetStore(histore)
 	for i := 0; i < 4; i++ {
 		k := "L1_" + itoa(i)
-		histore.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "o"+itoa(i))})
+		histore.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "o"+itoa(i))})
 		hi.RecordList(context.Background(), k, gvr, ns)
 	}
 	hi.OnObjectEvent(gvr, ns, name, objExists) // ONE event, fan-out 4
@@ -214,7 +219,7 @@ func TestIssue239_B_Discrimination(t *testing.T) {
 	lo.SetStore(lostore)
 	for i := 0; i < 4; i++ {
 		k := "L1_" + itoa(i)
-		lostore.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "o"+itoa(i))})
+		lostore.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, ns, "o"+itoa(i))})
 		lo.Record(context.Background(), k, gvr, ns, "n"+itoa(i)) // exact dep on a distinct coordinate each
 	}
 	for i := 0; i < 4; i++ {
@@ -247,8 +252,8 @@ func TestIssue239_C_SumInvariant(t *testing.T) {
 	// Exercise both emit paths and several causes/classes.
 	d.OnObjectEvent(gvr, ns, name, objExists)          // object add_update
 	d.OnObjectEvent(gvr, ns, name, objUnknownDegraded) // object degraded
-	d.OnResourceTypeRemoved(gvr)                        // type crd_delete
-	d.OnResourceTypeSchemaRelisted(gvr)                // type schema_relist
+	d.OnResourceTypeRemoved(gvr)                       // type crd_delete
+	d.OnResourceTypeAvailable(gvr)                     // type crd_add
 	d.OnObjectEvent(gvr, ns, name, objAbsent)          // object delete (self evicted)
 
 	total := d.dirtyMarkTotal.Load()

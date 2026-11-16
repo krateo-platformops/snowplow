@@ -11,15 +11,13 @@ import (
 // line (#453 review). Pre-fix call.go and list.go logged the whole
 // endpoints.Endpoint via slog.Any. At debug the JSON handler then rendered
 // Username, Token, Password and AwsSecretKey in clear, and the text handler
-// also rendered ClientKeyData and ClientCertificateData. Only the redacted
-// username, the server URL and the auth kind are logged here, never a
-// credential.
+// also rendered ClientKeyData and ClientCertificateData. Only the server URL and
+// the auth kind are logged here, never a username (#1192) or a credential.
 func endpointLogAttr(ep *endpoints.Endpoint) slog.Attr {
 	if ep == nil {
 		return slog.String("endpoint", "<nil>")
 	}
 	return slog.Group("endpoint",
-		slog.String("user", redact.User(ep.Username)),
 		slog.String("server_url", logServerURL(ep.ServerURL)),
 		slog.String("auth", endpointAuthKind(ep)),
 	)

@@ -76,7 +76,7 @@ authenticated requests get `503` until the key set can be fetched. Details in th
 
 ## Quickstart on Kind
 
-A full single-node walkthrough (namespace, JWT secret, minting a user token, RBAC,
+A full single-node walkthrough (namespace, signing keypair + JWKS, minting a user token, RBAC,
 NodePort install, executing your first RESTAction):
 [Installing snowplow on Kind](../go/snowplow/howto/install.md). Then run the
 [examples](./examples.md).

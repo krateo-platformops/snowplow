@@ -42,6 +42,7 @@ import (
 	"log/slog"
 
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -395,7 +396,11 @@ func discoverGroupResources(ctx context.Context, rc *rest.Config, group string, 
 	// Per-group singleflight — serialize concurrent discovery hops
 	// for the same group across goroutines.
 	lock := discoverGroupLock(group)
+	// #1054 — a request blocked here waits on another goroutine's discovery
+	// hop for the same group: the lock wait of its slow-call record.
+	held := slowcall.StartWait(ctx, slowcall.PhaseLockWait, "discovery_group", group, "")
 	lock.Lock()
+	held.End()
 	defer lock.Unlock()
 
 	if ctx.Err() != nil {
@@ -407,7 +412,7 @@ func discoverGroupResources(ctx context.Context, rc *rest.Config, group string, 
 	// round-trips are now served from the memcache after the first read.
 	disco, err := getCachedDiscovery(rc)
 	if err != nil {
-		slog.Warn("cache.discovery.client_build_failed",
+		slog.WarnContext(ctx, "cache.discovery.client_build_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("group", group),
 			slog.Any("err", err),
@@ -433,7 +438,7 @@ func discoverGroupResources(ctx context.Context, rc *rest.Config, group string, 
 	if err != nil {
 		// Group may not exist yet — common during cluster boot. Soft
 		// fail; subsequent walks retry.
-		slog.Warn("cache.discovery.server_groups_failed",
+		slog.WarnContext(ctx, "cache.discovery.server_groups_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("group", group),
 			slog.Any("err", err),
@@ -450,7 +455,7 @@ func discoverGroupResources(ctx context.Context, rc *rest.Config, group string, 
 		gv := schema.GroupVersion{Group: group, Version: version}
 		list, lerr := disco.ServerResourcesForGroupVersion(gv.String())
 		if lerr != nil || list == nil {
-			slog.Warn("cache.discovery.server_resources_failed",
+			slog.WarnContext(ctx, "cache.discovery.server_resources_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("group_version", gv.String()),
 				slog.Any("err", lerr),
@@ -476,7 +481,7 @@ func discoverGroupResources(ctx context.Context, rc *rest.Config, group string, 
 				continue
 			}
 
-			added, _ := rw.EnsureResourceType(gvr)
+			added, _ := rw.ensureResourceType(ctx, gvr)
 			if added {
 				// FD1 (Ship D / 0.30.114) — preserved invariant:
 				// dirty-mark stale-negative LIST entries when a

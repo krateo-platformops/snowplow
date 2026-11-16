@@ -41,6 +41,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -119,6 +120,8 @@ func TestRefilter_ConcurrentIteratorWorkers_Race(t *testing.T) {
 		NamespaceFrom: ".metadata.namespace",
 	}
 	ctx := ctxWithUser("cyberjoker", "devs")
+	// The stage lists compositions: its items are objects of that resource.
+	compositionsGR := schema.GroupResource{Group: "composition.krateo.io", Resource: "compositions"}
 
 	var wg sync.WaitGroup
 	errs := make([]error, K)
@@ -133,7 +136,7 @@ func TestRefilter_ConcurrentIteratorWorkers_Race(t *testing.T) {
 			pig := map[string]any{
 				"compositions": map[string]any{"items": nsItems(M, granted, denied)},
 			}
-			res := applyUserAccessFilterOnPig(ctx, pig, nil, "compositions", sharedUAF)
+			res := applyUserAccessFilterOnPig(ctx, pig, nil, "compositions", sharedUAF, compositionsGR, true)
 			kept[k] = res.Kept
 			if res.Kept != M/2 || res.Dropped != M/2 {
 				errs[k] = &countMismatch{worker: k, kept: res.Kept, dropped: res.Dropped, want: M / 2}

@@ -17,7 +17,7 @@ package dispatchers
 //       object is never SA-dialled (#677 (1)).
 //   R2  (H4) GRANT: a Role RULE edit grants the ConfigMap; the next dirty mark
 //       re-resolves and Puts the fuller body.
-//   R5  (H2/H8) mixed: a denial plus a 404 is NOT Put and the window ends
+//   R5  (H2/H8) mixed: a denial plus a 5xx is NOT Put and the window ends
 //       KNOWN-STALE(declined), exactly as before #681.
 //   H10 census: every dispatchers Put gate that reads a StageErrorSink count
 //       goes through cache.DenialOnly (no gate site can be missed).
@@ -148,6 +148,13 @@ func i677Setup(t *testing.T, ra *unstructured.Unstructured) *i677Env {
 	cache.ResetDepsForTest()
 	cache.ResetRefresherForTest()
 	cache.ResetDenialOnlyPutForTest()
+	// The cell below is stored under a hand-built key (sub-generation 0). The
+	// sub-generation counters are process-global: another arm's RBAC edit must
+	// not move this arm's representative off that key.
+	cache.ResetPendingSubGenBumpsForTest()
+	cache.ResetRBACSubGenForTest()
+	t.Cleanup(cache.ResetPendingSubGenBumpsForTest)
+	t.Cleanup(cache.ResetRBACSubGenForTest)
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 	t.Cleanup(cache.ResetDepsForTest)
 	t.Cleanup(cache.ResetRefresherForTest)
@@ -157,6 +164,7 @@ func i677Setup(t *testing.T, ra *unstructured.Unstructured) *i677Env {
 		"/api/v1/namespaces/team-b/configmaps/catalog",
 		"/api/v1/namespaces/team-a/configmaps/other",
 		"/api/v1/namespaces/team-a/configmaps/ghost",
+		"/api/v1/namespaces/team-a/configmaps/boom",
 	} {
 		e.byPath[p] = &atomic.Int64{}
 	}
@@ -168,6 +176,12 @@ func i677Setup(t *testing.T, ra *unstructured.Unstructured) *i677Env {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		seg := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if strings.HasSuffix(r.URL.Path, "/boom") {
+			// A transient apiserver failure (#1080: never a definite answer).
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"InternalError","code":500,"message":"boom"}`)
+			return
+		}
 		if len(seg) == 6 && seg[0] == "api" && seg[4] == "configmaps" && !e.missing[seg[5]] {
 			_, _ = fmt.Fprintf(w, `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"namespace":%q,"name":%q},"data":{"k":"v"}}`, seg[3], seg[5])
 			return
@@ -231,7 +245,7 @@ func i677Setup(t *testing.T, ra *unstructured.Unstructured) *i677Env {
 		SubjectBindingSet:      rbac.SubjectBindingSetDigest(i677Rep, nil),
 	}
 	e.key = cache.ComputeKey(e.inputs)
-	e.store.Put(e.key, &cache.ResolvedEntry{RawJSON: []byte(`{"prior":true}`), Inputs: &e.inputs})
+	e.store.PutResolved(fixtureStoreVerdict, e.key, &cache.ResolvedEntry{RawJSON: []byte(`{"prior":true}`), Inputs: &e.inputs})
 	// ONE refresher pool for the whole arm: its stop resets the refresher
 	// (including the #547 dirty windows the arms read).
 	_, stop := i1126Loop(t, "restactions", e.saEP, e.saRC)
@@ -263,6 +277,7 @@ const (
 	i677Denied  = "/api/v1/namespaces/team-b/configmaps/catalog"
 	i677Allowed = "/api/v1/namespaces/team-a/configmaps/other"
 	i677Ghost   = "/api/v1/namespaces/team-a/configmaps/ghost"
+	i677Boom    = "/api/v1/namespaces/team-a/configmaps/boom"
 )
 
 func i677DefaultRA() *unstructured.Unstructured {
@@ -328,27 +343,46 @@ func TestIssue681_R1_DenialOnlyRefresh_IsPut_WindowClosesFresh(t *testing.T) {
 	}
 }
 
-func TestIssue681_R2_GrantRotates_NextRefreshPutsFuller(t *testing.T) {
+// R2 — a grant by a Role rules edit ROTATES the representative's key (the
+// role's rules edit bumps the sub-generation of the subjects bound to it), so
+// the cell stored under the pre-grant class is no longer anybody's: the next
+// refresh must not keep its denied body alive. The refresher finds the
+// representative has left the cell's RBAC class, with no in-class replacement,
+// and evicts it; the next request resolves fresh, under the post-grant key.
+//
+// (Until #1458 this arm ran with the bindings index never built, a state
+// production does not have: no rules edit bumped any subject, the key stayed,
+// and the arm asserted a fuller re-Put under the same key. With a live watcher
+// the index is now always fed by its events, as in production.)
+func TestIssue681_R2_GrantRotates_RefreshDropsThePreGrantCell(t *testing.T) {
 	e := i677Setup(t, i677DefaultRA())
 	e.cycle(t)
 	denied := e.body(t)
+	if denied == `{"prior":true}` || !strings.Contains(denied, "forbidden") && !strings.Contains(denied, "Forbidden") {
+		t.Fatalf("PRE: the first refresh must have Put the denial-only body (the denied stage's 403), the cell holds: %s", denied)
+	}
+	sg0 := cache.RBACSubGenForSubject(i677Rep, nil)
 	e.grant(t)
-	d0 := e.pathDials(i677Denied)
+	i1126WaitFor(t, 10*time.Second, "the grant's sub-generation bump", func() bool {
+		return cache.RBACSubGenForSubject(i677Rep, nil) > sg0
+	})
 	e.cycle(t)
-	if e.pathDials(i677Denied)-d0 != 1 || e.body(t) == denied {
-		t.Fatalf("R2 RED: after the grant the next refresh did not read the ConfigMap and re-Put the fuller body (dials %d)",
-			e.pathDials(i677Denied)-d0)
+	if got, ok := e.store.GetNoTouch(e.key); ok {
+		t.Fatalf("R2 RED: after the grant rotated the representative's key, the refresh kept the pre-grant cell alive: %s", got.RawJSON)
 	}
 }
 
+// R5 — the other error is a 5xx. (Before #1080 it was a 404 of team-a/ghost;
+// the configmaps informer this resolve registers makes that a watched named
+// object's NotFound, a definite answer itself — issue1080's arms.)
 func TestIssue681_R5_MixedDenialAndOtherError_Declined_KnownStale(t *testing.T) {
-	e := i677Setup(t, i677RAObject(i677Stage("catalog", i677Denied), i677Stage("ghost", i677Ghost)))
+	e := i677Setup(t, i677RAObject(i677Stage("catalog", i677Denied), i677Stage("boom", i677Boom)))
 	e.cycle(t)
-	if e.pathDials(i677Ghost) != 1 {
-		t.Fatalf("precondition: the 404 stage dialled %d", e.pathDials(i677Ghost))
+	if e.pathDials(i677Boom) != 1 {
+		t.Fatalf("precondition: the 5xx stage dialled %d", e.pathDials(i677Boom))
 	}
 	if e.body(t) != `{"prior":true}` {
-		t.Fatalf("R5 RED: a denial + 404 refresh was Put: %s", e.body(t))
+		t.Fatalf("R5 RED: a denial + 5xx refresh was Put: %s", e.body(t))
 	}
 	if _, reason, ok := cache.KnownStale(e.key); !ok || reason != "declined" {
 		t.Fatalf("R5 (H8): the declined refresh must end KNOWN-STALE(declined); got ok=%v reason=%q", ok, reason)
@@ -356,9 +390,9 @@ func TestIssue681_R5_MixedDenialAndOtherError_Declined_KnownStale(t *testing.T) 
 }
 
 // H10 — every function in this package (non-test) that reads a stage-error
-// sink count as a Put gate also calls cache.DenialOnly. The identity-free
-// widget-content gate (widget_content.go, `sink`) is excluded by construction:
-// it never holds a per-identity denial (DenialOnly is false for that class).
+// sink count as a Put gate decides through the shared Put-gate verdict
+// (cache.PutGateVerdict, which applies cache.DenialOnly). #912 re-review moved
+// the four gates from calling DenialOnly by hand to the verdict.
 func TestIssue681_H10_EveryStageErrorPutGateUsesDenialOnly(t *testing.T) {
 	ents, err := os.ReadDir(".")
 	if err != nil {
@@ -381,6 +415,13 @@ func TestIssue681_H10_EveryStageErrorPutGateUsesDenialOnly(t *testing.T) {
 				continue
 			}
 			readsStage, usesDenialOnly := false, false
+			// A gate handed the verdict its caller took (a cache.PutVerdict
+			// parameter, e.g. declineSeedPutOnError) decides through it too.
+			for _, p := range fd.Type.Params.List {
+				if sel, ok := p.Type.(*ast.SelectorExpr); ok && sel.Sel.Name == "PutVerdict" {
+					usesDenialOnly = true
+				}
+			}
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
 				ce, ok := n.(*ast.CallExpr)
 				if !ok {
@@ -394,7 +435,7 @@ func TestIssue681_H10_EveryStageErrorPutGateUsesDenialOnly(t *testing.T) {
 					if id.Name == "stageErrSink" && sel.Sel.Name == "Count" {
 						readsStage = true
 					}
-					if id.Name == "cache" && sel.Sel.Name == "DenialOnly" {
+					if id.Name == "cache" && sel.Sel.Name == "PutGateVerdict" {
 						usesDenialOnly = true
 					}
 				}
@@ -412,6 +453,6 @@ func TestIssue681_H10_EveryStageErrorPutGateUsesDenialOnly(t *testing.T) {
 		t.Fatalf("census found %d gate functions, want >= 4 (restactions, widgets, refresher, seed) — the scan is not seeing them", checked)
 	}
 	if len(offenders) > 0 {
-		t.Fatalf("H10: stage-error Put gates that bypass cache.DenialOnly: %v", offenders)
+		t.Fatalf("H10: stage-error Put gates that bypass the shared verdict (cache.PutGateVerdict): %v", offenders)
 	}
 }

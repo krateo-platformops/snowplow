@@ -52,6 +52,8 @@ import (
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -122,6 +124,16 @@ type Unresolved struct {
 // synthetic CA.
 var saRESTConfigForInspectFn = dynamic.ServiceAccountRESTConfig
 
+// SetServiceAccountRESTConfigForInspectForTest swaps saRESTConfigForInspectFn
+// and returns a restore func, so a handler-level test can drive the REAL
+// InspectReadSet (e.g. GET /rbac's #1116 arm). TEST-ONLY: production code
+// MUST NOT call it.
+func SetServiceAccountRESTConfigForInspectForTest(fn func() (*rest.Config, error)) func() {
+	prev := saRESTConfigForInspectFn
+	saRESTConfigForInspectFn = fn
+	return func() { saRESTConfigForInspectFn = prev }
+}
+
 // InspectReadSet walks `in.Spec.API` in topologicalSort order and returns the
 // in-cluster (group, version, resource, verb) read-set that resolving `in`
 // would touch, plus any stages that could not be enumerated from the
@@ -141,6 +153,15 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 	}
 
 	stages := in.Spec.API
+	// #1116 — the same rule the resolver holds (reserved_extras.go): extras
+	// that name a stage, an errorKey or slice would stand in for the stage's
+	// output here exactly as they would in ResolveWithFailure, and the read-set
+	// would be enumerated from a forged value for a /call that is always
+	// refused. The refusal is returned as the *ReservedExtrasError; GET /rbac
+	// answers the same 400 /call does.
+	if err := RefuseReservedExtras(ctx, stages, extras, in.GetNamespace(), in.GetName()); err != nil {
+		return nil, nil, err
+	}
 	// The inspect dict holds ONLY extras — the seed the dispatcher would
 	// start the first stage with. Upstream stage outputs are deliberately
 	// absent: a stage that needs them is UNRESOLVABLE (reported, not guessed).
@@ -213,7 +234,7 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 				})
 				continue
 			}
-			rows, sErr := inspectUAFStage(rc, uaf, resources)
+			rows, sErr := inspectUAFStage(ctx, rc, uaf, resources)
 			if sErr != nil {
 				unresolved = append(unresolved, Unresolved{Stage: name, Reason: sErr.Error()})
 				continue
@@ -232,7 +253,7 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 
 		// (3) In-cluster GET stage. Evaluate the path against the empty dict
 		// WITHOUT dispatching, then classify the concrete URI.
-		rows, sErr := inspectInClusterStage(rc, stage, dict, log)
+		rows, sErr := inspectInClusterStage(ctx, rc, stage, dict, log)
 		if sErr != nil {
 			unresolved = append(unresolved, Unresolved{Stage: name, Reason: sErr.Error()})
 			continue
@@ -287,11 +308,11 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 // template whose RESOURCE collapsed (/apis/apps/v1/ from
 // `${ "/apis/apps/v1/" + .kind }`) comes back looking like a legitimate bare
 // discovery path. Same reason the two in-tree skeleton analysers exist.
-func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[string]any, log *slog.Logger) ([]Resource, error) {
+func inspectInClusterStage(ctx context.Context, rc *rest.Config, stage *templates.API, dict map[string]any, log *slog.Logger) ([]Resource, error) {
 	// The iterator error (#638) is not consumed here: inspect is a
 	// dispatch-free read-set enumeration, unchanged — an errored iterator
 	// enumerates what it enumerated, exactly as before.
-	opts, skips, _ := createRequestOptionsWithSkips(context.Background(), log, stage, dict)
+	opts, skips, _ := createRequestOptionsWithSkips(pagebudget.Detach(ctx), log, stage, dict, true) // an in-cluster stage
 	if len(opts) == 0 && len(skips) == 0 {
 		return nil, fmt.Errorf("stage produced no request path")
 	}
@@ -321,7 +342,7 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 		if !co.OK {
 			return nil, fmt.Errorf("stage path has no static (group, version, resource) to enumerate: %s", sk.reason.detail)
 		}
-		if err := validateGVR(rc, co.GVR); err != nil {
+		if err := validateGVR(ctx, rc, co.GVR); err != nil {
 			return nil, fmt.Errorf("discovery validation failed for %s: %w", co.GVR.String(), err)
 		}
 		// #504 ruling 2 — the verb comes from the three-state NAME, not from the
@@ -349,7 +370,7 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 
 		// Resource path → GVR (the dominant case).
 		if gvr, ns, name, ok := cache.ParseAPIServerPathToDep(path); ok {
-			if err := validateGVR(rc, gvr); err != nil {
+			if err := validateGVR(ctx, rc, gvr); err != nil {
 				return nil, fmt.Errorf("discovery validation failed for %s: %w", gvr.String(), err)
 			}
 			// The RBAC verb is determined by the path SHAPE, not a constant:
@@ -401,14 +422,14 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 		if _, ok := cache.ParseAPIServerDiscoveryPath(path); ok {
 			if co := cache.ReadSetSkeleton(stage.Path); co.ResourceTemplated {
 				return nil, fmt.Errorf("path %q renders as bare discovery but the stage's RESOURCE segment is templated — "+
-					"the read coordinate is undetermined (#504)", path)
+					"the read coordinate is undetermined (#504)", redact.Path(path))
 			}
 			continue
 		}
 
 		// Anything else: residual ${...}, upstream-dependent, or non-kube →
 		// the whole stage is UNRESOLVABLE.
-		return nil, fmt.Errorf("path %q is not an enumerable in-cluster apiserver path (residual template, upstream-dependent, or non-kube)", path)
+		return nil, fmt.Errorf("path %q is not an enumerable in-cluster apiserver path (residual template, upstream-dependent, or non-kube)", redact.Path(path))
 	}
 
 	return rows, nil
@@ -426,12 +447,12 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 // discovery-VALIDATED for EXISTENCE (does the group serve it under ANY served
 // version?); a bogus plural the apiserver serves nowhere → error → the stage
 // is UNRESOLVABLE/fail-loud, never silently emitted.
-func inspectUAFStage(rc *rest.Config, uaf *templates.UserAccessFilterSpec, resources []string) ([]Resource, error) {
+func inspectUAFStage(ctx context.Context, rc *rest.Config, uaf *templates.UserAccessFilterSpec, resources []string) ([]Resource, error) {
 	for _, plural := range resources {
 		if plural == "" {
 			continue // resolveUAFResources already skips these; defensive.
 		}
-		exists, err := pluralExistsInGroup(rc, uaf.Group, plural)
+		exists, err := pluralExistsInGroup(ctx, rc, uaf.Group, plural)
 		if err != nil {
 			return nil, fmt.Errorf("userAccessFilter resource %q (group %q): %w", plural, uaf.Group, err)
 		}
@@ -461,13 +482,13 @@ func inspectUAFStage(rc *rest.Config, uaf *templates.UserAccessFilterSpec, resou
 // gvr.Version via discovery. A discovery miss (group/version not served, or the
 // plural absent from the GroupVersion's resource list) is an error — the stage
 // would 404 at /call, so emitting it as a granted resource would be wrong.
-func validateGVR(rc *rest.Config, gvr schema.GroupVersionResource) error {
+func validateGVR(ctx context.Context, rc *rest.Config, gvr schema.GroupVersionResource) error {
 	cli, err := discoveryClientFor(rc)
 	if err != nil {
 		return err
 	}
 	gv := schema.GroupVersion{Group: gvr.Group, Version: gvr.Version}.String()
-	list, err := cli.ServerResourcesForGroupVersion(gv)
+	list, err := serverResourcesForGroupVersion(ctx, cli, gv) // #1115 N1: on the request ctx
 	if err != nil {
 		return fmt.Errorf("discovery for %s: %w", gv, err)
 	}
@@ -483,13 +504,15 @@ func validateGVR(rc *rest.Config, gvr schema.GroupVersionResource) error {
 // a bogus UAF plural without attaching a non-deterministic version to the row
 // (Q1 ruling). A group the apiserver does not serve at all → (false, nil),
 // which the caller turns into UNRESOLVABLE.
-func pluralExistsInGroup(rc *rest.Config, group, plural string) (bool, error) {
+func pluralExistsInGroup(ctx context.Context, rc *rest.Config, group, plural string) (bool, error) {
 	cli, err := discoveryClientFor(rc)
 	if err != nil {
 		return false, err
 	}
 
-	groups, err := cli.ServerGroups()
+	// #1115 N1 — client-go's ServerGroups, transcribed exactly but sent on the
+	// request's ctx (serverGroups; client-go's own sends on context.TODO()).
+	groups, err := serverGroups(ctx, cli)
 	if err != nil {
 		return false, fmt.Errorf("discovery ServerGroups: %w", err)
 	}
@@ -510,7 +533,7 @@ func pluralExistsInGroup(rc *rest.Config, group, plural string) (bool, error) {
 
 	for _, v := range versions {
 		gv := schema.GroupVersion{Group: group, Version: v}.String()
-		list, lerr := cli.ServerResourcesForGroupVersion(gv)
+		list, lerr := serverResourcesForGroupVersion(ctx, cli, gv) // #1115 N1
 		if lerr != nil {
 			continue
 		}

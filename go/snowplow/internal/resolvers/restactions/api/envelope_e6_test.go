@@ -113,14 +113,14 @@ type e6Row struct {
 
 func e6Table(t *testing.T) []e6Row {
 	rw := newF1Watcher(t)
-	items, servable := rw.ListObjectsServable(f1WidgetsGVR, "")
+	items, servable := rw.ListObjectsServable(context.Background(), f1WidgetsGVR, "")
 	if !servable || len(items) == 0 {
 		t.Fatalf("setup: widgets GVR not servable after sync")
 	}
 	av, lk := apiVersionForGVR(f1WidgetsGVR), listKindForResource(f1WidgetsGVR.Resource)
 	stored := e6StoredEnvelope(t, items)
 	ctx := xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: f1NarrowUser}))
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: f1BroadUser})) // #961: the gated rows LIST cluster-wide, which needs a cluster grant
 	decode := func(t *testing.T, b []byte, err error) any {
 		t.Helper()
 		if err != nil {
@@ -186,16 +186,16 @@ func e6Table(t *testing.T) []e6Row {
 			}},
 		{"content hit, gated: gateListItems(parseListEnvelope(stored with metadata))",
 			[]string{"api.parseListEnvelope", "api.listEnvelopeValue"}, func(t *testing.T) any {
-				v, ok := gateListItems(ctx, f1WidgetsGVR, parsed(t))
-				if !ok {
+				v, gerr := gateListItems(ctx, f1WidgetsGVR, "", "", parsed(t))
+				if gerr != nil {
 					t.Fatal("not served")
 				}
 				return v
 			}},
 		{"rebuild: gateListEnvelope(stored with metadata)",
 			[]string{"api.parseListEnvelope", "api.listEnvelopeValue"}, func(t *testing.T) any {
-				v, ok := gateListEnvelope(ctx, f1WidgetsGVR, stored)
-				if !ok {
+				v, gerr := gateListEnvelope(ctx, f1WidgetsGVR, "", "", stored)
+				if gerr != nil {
 					t.Fatal("not served")
 				}
 				return v
@@ -210,8 +210,8 @@ func e6Table(t *testing.T) []e6Row {
 			}},
 		{"cluster-list collapse, gated (stored with metadata)",
 			[]string{"api.validateClusterListShape", "api.listEnvelopeValue"}, func(t *testing.T) any {
-				v, ok := gateListItems(ctx, f1WidgetsGVR, cluster(t))
-				if !ok {
+				v, gerr := gateListItems(ctx, f1WidgetsGVR, "", "", cluster(t))
+				if gerr != nil {
 					t.Fatal("not served")
 				}
 				return v
@@ -228,7 +228,7 @@ func e6Table(t *testing.T) []e6Row {
 		// #676). Its empty result used to drop apiVersion/kind.
 		{"cache: ListServableEnvelopeJSONWhere, every item",
 			[]string{"cache.ListServableEnvelopeJSONWhere"}, func(t *testing.T) any {
-				b, ok := rw.ListServableEnvelopeJSONWhere(f1WidgetsGVR, "", nil)
+				b, ok := rw.ListServableEnvelopeJSONWhere(context.Background(), f1WidgetsGVR, "", nil)
 				if !ok {
 					t.Fatal("not servable")
 				}
@@ -236,7 +236,7 @@ func e6Table(t *testing.T) []e6Row {
 			}},
 		{"cache: ListServableEnvelopeJSONWhere, a selector that matches nothing",
 			[]string{"cache.ListServableEnvelopeJSONWhere"}, func(t *testing.T) any {
-				b, ok := rw.ListServableEnvelopeJSONWhere(f1WidgetsGVR, "", func(*unstructured.Unstructured) bool { return false })
+				b, ok := rw.ListServableEnvelopeJSONWhere(context.Background(), f1WidgetsGVR, "", func(*unstructured.Unstructured) bool { return false })
 				if !ok {
 					t.Fatal("not servable")
 				}

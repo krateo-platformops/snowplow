@@ -50,6 +50,12 @@
 //     (a heartbeat, up to 20s in prod). The comment byte is what forces
 //     gzhttp onto startPlain so headers commit. This is why the /refreshes
 //     handler emits `: connected` before its initial flush at both sites.
+//
+//   - GZIP-ONLY NEGOTIATION (#838): a table of the Accept-Encoding values real
+//     clients send (Chrome's "gzip, deflate, br, zstd", zstd-only, k6, Go)
+//     against the expected Content-Encoding. gzip is the only encoding ever
+//     chosen, and SSE is never encoded. RED: drop gzhttp.EnableZstd(false)
+//     and the chrome and zstd-only rows get zstd.
 package middleware
 
 import (
@@ -402,5 +408,80 @@ func TestGzip_SSE_C1_RED_NoPreambleHeadersWithheld(t *testing.T) {
 	arrived := connectHeadersArrive(t, func(h http.Handler) http.Handler { return Gzip(h) }, false, 500*time.Millisecond)
 	if arrived {
 		t.Fatalf("C-1 MUTATION expected headers WITHHELD without the preamble, but they arrived — gzhttp may no longer buffer headers on a zero-byte flush (semantics changed?); the preamble's necessity must be re-evaluated")
+	}
+}
+
+// sseBigHandler writes a text/event-stream body larger than gzhttp's 1 KiB
+// minSize, so the only thing that keeps it uncompressed is the SSE exclusion,
+// not the size floor.
+func sseBigHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", sseContentType)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: " + string(bigJSONBody) + "\n\n"))
+	})
+}
+
+// TestGzip_AcceptEncodingNegotiation_GzipOnly pins the Content-Encoding the
+// production wrapper picks for the Accept-Encoding values real clients send
+// (#838). gzhttp in klauspost/compress >= 1.18.7 enables zstd by default and
+// prefers it at equal qvalues. Without EnableZstd(false), Chrome's
+// "gzip, deflate, br, zstd" gets zstd and a zstd-only client gets zstd instead
+// of identity. Both rows go RED if that option is removed. The other tests in
+// this file send only "gzip" and cannot see the change.
+func TestGzip_AcceptEncodingNegotiation_GzipOnly(t *testing.T) {
+	cases := []struct {
+		name           string
+		handler        http.Handler
+		acceptEncoding string
+		want           string // expected Content-Encoding; "" = identity
+	}{
+		{"chrome", cannedJSONHandler(), "gzip, deflate, br, zstd", "gzip"},
+		{"zstd-only", cannedJSONHandler(), "zstd", ""},
+		{"k6-http", cannedJSONHandler(), "gzip, deflate", "gzip"},
+		{"gzip", cannedJSONHandler(), "gzip", "gzip"},
+		{"sse-chrome", sseBigHandler(), "gzip, deflate, br, zstd", ""},
+		{"sse-zstd-only", sseBigHandler(), "zstd", ""},
+		{"sse-gzip", sseBigHandler(), "gzip", ""},
+	}
+	// DisableCompression: the transport must neither add Accept-Encoding nor
+	// decode the body behind the test's back.
+	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(Gzip(tc.handler))
+			defer srv.Close()
+
+			req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Accept-Encoding", tc.acceptEncoding)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("do: %v", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+
+			if got := resp.Header.Get("Content-Encoding"); got != tc.want {
+				t.Fatalf("Accept-Encoding %q: Content-Encoding = %q, want %q", tc.acceptEncoding, got, tc.want)
+			}
+			if tc.want == "gzip" {
+				gr, err := gzip.NewReader(bytes.NewReader(body))
+				if err != nil {
+					t.Fatalf("gzip reader: %v", err)
+				}
+				if body, err = io.ReadAll(gr); err != nil {
+					t.Fatalf("gunzip: %v", err)
+				}
+			}
+			if !bytes.Contains(body, bigJSONBody) {
+				t.Fatalf("decoded body does not carry the handler's payload (%d bytes)", len(body))
+			}
+		})
 	}
 }

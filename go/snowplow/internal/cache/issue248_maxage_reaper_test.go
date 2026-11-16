@@ -31,7 +31,7 @@ func i248PutSuppressedOld(t *testing.T, store *ResolvedCacheStore, name string, 
 	inputs := widgetInputs(gvr, ns, name)
 	key := ComputeKey(*inputs)
 	born := time.Now().Add(-age)
-	store.Put(key, &ResolvedEntry{
+	store.put(key, &ResolvedEntry{
 		RawJSON:   []byte(`{"frozen":"` + name + `"}`),
 		Inputs:    inputs,
 		BornAt:    born,
@@ -73,6 +73,8 @@ func i248PutSuppressedOld(t *testing.T, store *ResolvedCacheStore, name string, 
 // MetadataForKey is read-only (no lazy Get evict, no LRU touch, no counter), so a
 // disappearance is the REAPER, not a read-triggered eviction.
 func TestIssue248_MaxAgeReaper(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS", "60")
@@ -110,7 +112,7 @@ func TestIssue248_MaxAgeReaper(t *testing.T) {
 	// isolation is ever needed again.
 	warmInputs := widgetInputs(gvrFlexes(), ns, "warmseed")
 	warmKey := ComputeKey(*warmInputs)
-	store.Put(warmKey, &ResolvedEntry{
+	store.put(warmKey, &ResolvedEntry{
 		RawJSON:      []byte(`{"warm":"seed"}`),
 		Inputs:       warmInputs,
 		BornAt:       time.Now().Add(-2 * time.Hour),
@@ -181,6 +183,8 @@ func TestIssue248_MaxAgeReaper(t *testing.T) {
 // by the NEXT tick, after the current bounded/batched walk returns, so there is no
 // mid-walk preemption. Behavioral only (did the tick reap?), NOT a predicate re-test.
 func TestIssue248_MaxAgeReaper_WiredIntoSummaryTick(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS", "60")

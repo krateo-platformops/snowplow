@@ -180,7 +180,7 @@ func i703Setup(t *testing.T, carolBound bool) (*ResourceWatcher, dynamic.Interfa
 	if got := i703SnapGrants(i703User); got != carolBound {
 		t.Fatalf("precondition: snapshot binds carol=%v, want %v", got, carolBound)
 	}
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "panels"}})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "panels"}})
 	t.Cleanup(ResetBindingsByGVRIndexForTest)
 	ResetPendingSubGenBumpsForTest()
 

@@ -7,11 +7,14 @@
 //
 //   EMIT (post-dedup, OTLP-alertable): a {path, cause, class} distribution.
 //     path  = object_event | type_event
-//     cause = add_update|delete|degraded (object) or crd_add|crd_delete|
-//             schema_relist|store_repair (type)
+//     cause = add_update|delete|degraded (object) or crd_add|crd_delete
+//             (type). #870 deleted schema_relist and store_repair: a schema
+//             widen and a store repair now swap the store in and mark only
+//             what changed, through ordinary per-object events.
 //     class = self | list_dep | exact_dep
 //   SUBMIT (pre-dedup): a per-source count at submitDepEvent (watch |
-//     relist_bridge | reconcile) — the ONLY place "which mechanism submits the
+//     store_swap | reconcile; #870 replaced relist_bridge with store_swap, the
+//     swap's per-key deliveries) — the ONLY place "which mechanism submits the
 //     most events" is soundly answerable, because the workqueue dedups
 //     same-coordinate submits ACROSS sources so the emit site cannot know the
 //     submitter.
@@ -40,21 +43,19 @@ const (
 	dmPathObject = "object_event"
 	dmPathType   = "type_event"
 
-	dmCauseAddUpdate    = "add_update"
-	dmCauseDelete       = "delete"
-	dmCauseDegraded     = "degraded"
-	dmCauseCRDAdd       = "crd_add"
-	dmCauseCRDDelete    = "crd_delete"
-	dmCauseSchemaRelist = "schema_relist"
-	dmCauseStoreRepair  = "store_repair"
+	dmCauseAddUpdate = "add_update"
+	dmCauseDelete    = "delete"
+	dmCauseDegraded  = "degraded"
+	dmCauseCRDAdd    = "crd_add"
+	dmCauseCRDDelete = "crd_delete"
 
 	dmClassSelf     = "self"
 	dmClassListDep  = "list_dep"
 	dmClassExactDep = "exact_dep"
 
-	dmSourceWatch        = "watch"
-	dmSourceRelistBridge = "relist_bridge"
-	dmSourceReconcile    = "reconcile"
+	dmSourceWatch     = "watch"
+	dmSourceStoreSwap = "store_swap" // #870: a swap delivery (store_swap.go)
+	dmSourceReconcile = "reconcile"
 
 	// dmGVRCap bounds the /debug/vars-only per-GVR drill-down; overflow folds
 	// into dmGVROther (the fallthroughCells cardinality idiom).
@@ -162,12 +163,10 @@ func dmValidBuckets() []dmBucket {
 		dmBucket{dmPathObject, dmCauseDelete, dmClassExactDep},
 		dmBucket{dmPathType, dmCauseCRDAdd, dmClassListDep},
 	)
-	for _, cause := range []string{dmCauseCRDDelete, dmCauseSchemaRelist, dmCauseStoreRepair} {
-		out = append(out,
-			dmBucket{dmPathType, cause, dmClassListDep},
-			dmBucket{dmPathType, cause, dmClassExactDep},
-		)
-	}
+	out = append(out,
+		dmBucket{dmPathType, dmCauseCRDDelete, dmClassListDep},
+		dmBucket{dmPathType, dmCauseCRDDelete, dmClassExactDep},
+	)
 	return out
 }
 
@@ -180,7 +179,7 @@ func newDMAttribution() *dmAttribution {
 	for _, b := range dmValidBuckets() {
 		a.byBucket[b] = new(atomic.Uint64)
 	}
-	for _, s := range []string{dmSourceWatch, dmSourceRelistBridge, dmSourceReconcile} {
+	for _, s := range []string{dmSourceWatch, dmSourceStoreSwap, dmSourceReconcile} {
 		a.bySource[s] = new(atomic.Uint64)
 	}
 	return a
@@ -205,10 +204,6 @@ func dirtyMarkCauseForEventType(eventType string) string {
 		return dmCauseCRDAdd
 	case "CRD_DELETE":
 		return dmCauseCRDDelete
-	case "SCHEMA_RELIST":
-		return dmCauseSchemaRelist
-	case "STORE_REPAIR":
-		return dmCauseStoreRepair
 	default:
 		return eventType
 	}

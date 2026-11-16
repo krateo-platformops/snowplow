@@ -1,23 +1,25 @@
 package redact
 
-// log_guard_test.go is the #453 structural guard. No slog site in the module
-// may emit an identity in clear.
+// log_guard_test.go is the structural guard of #453 and #1192. No slog site in
+// the module may emit an identity, in clear or as a label.
 //
 // The guard parses every non-test .go file of the module directly, so build
 // constraints are not applied and every tag (unit, integration, the debug
 // builds) is covered. For each slog call it checks:
 //
 //   - an attribute (slog.String/Any/... or a key/value pair of a log method or
-//     a With) whose KEY is an identity key (user, username, groups, identity,
-//     cohort, rep, subject, cn, ...);
+//     a With) or a slog.Group whose KEY is an identity key (user, username,
+//     groups, identity, cohort, rep, subject, cn, ...), whatever its value;
+//   - any attribute VALUE, and the message, whose expression calls an identity
+//     labeller (redact.User, cache.LearnedClassLabel, ...): a label is the
+//     identity under another name once a traceId joins its line to the audit
+//     record;
 //   - any attribute VALUE, and the message, whose expression reads an identity
 //     source (x.Username, x.Groups, x.CommonName, x.Subjects, or a local named
 //     username, groups, cohort, ui, ...).
 //
-// Each one must be a call into this package (redact.User / Group / Groups /
-// Identity / Prefixed / Digest), a call to a registered redacting helper, or a
-// literal. A registered helper must itself return only redact output, and the
-// guard checks every return statement of each one.
+// It also refuses a call to plumbing's use.Logger, which attaches the caller's
+// name and groups to the request logger from a file this scan cannot see.
 //
 // The API-group "group" attribute (gvr.Group, opts.Group, a discovery group)
 // is not an identity, so "group" is deliberately not an identity key and .Group
@@ -33,8 +35,8 @@ package redact
 // pointers, slices, arrays or maps. A type that renders itself (slog.LogValuer,
 // error) is trusted to its own method.
 //
-// RESIDUAL (tracked in its own issue, not checked here): an err VALUE whose
-// text came from the apiserver or plumbing ('User "x" cannot list ...').
+// An err VALUE whose text came from the apiserver or plumbing ('User "x" cannot
+// list ...') is not this guard's: ScrubLogAttr takes it out at the handler.
 
 import (
 	"fmt"
@@ -52,14 +54,23 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-// identityKeys are attribute keys that name an identity. Their value must be
-// redacted, whatever expression it is.
+// identityKeys are attribute keys that name an identity. Nothing may be logged
+// under them, redacted or not. Any key starting with "user" counts too
+// (isIdentityKey).
 var identityKeys = map[string]bool{
-	"user": true, "username": true, "user_name": true, "users": true,
 	"groups": true, "identity": true, "cohort": true, "rep": true,
 	"representative": true, "requester": true, "subject": true,
 	"subjects": true, "cn": true, "who": true, "principal": true,
 	"member": true, "members": true, "secret_name": true,
+}
+
+func isIdentityKey(key string) bool {
+	return identityKeys[key] || strings.HasPrefix(strings.ToLower(key), "user")
+}
+
+// identityLabellers render one identity as a stable label.
+var identityLabellers = map[string]bool{
+	"User": true, "StaleSubject": true, "LearnedClassLabel": true,
 }
 
 // identitySelectors are field names whose value is an identity fact.
@@ -74,15 +85,6 @@ var identityIdents = map[string]bool{
 	"ui": true, "userInfo": true, "user": true, "cohort": true,
 	"refreshUser": true, "refreshGroups": true, "rankKey": true,
 	"subject": true, "subjects": true, "secretName": true,
-}
-
-// redactingHelpers are module functions that return only redact output. The
-// guard checks their bodies (checkHelpers); a value wrapped in one is clean.
-var redactingHelpers = map[string]bool{
-	"LearnedClassLabel":        true, // internal/cache
-	"cohortLogLabel":           true, // internal/handlers/dispatchers
-	"seedIdentityLabelFromCtx": true, // internal/handlers/dispatchers
-	"refreshLogUser":           true, // internal/handlers/dispatchers
 }
 
 var logMethods = map[string]int{ // method -> index of the message argument (-1: none)
@@ -116,7 +118,6 @@ func (f finding) String() string { return fmt.Sprintf("%s: %s", f.pos, f.what) }
 type scanner struct {
 	fset     *token.FileSet
 	findings []finding
-	labels   map[string]bool // identifiers declared redact.Label in the current func
 }
 
 func (s *scanner) add(n ast.Node, format string, a ...any) {
@@ -138,58 +139,44 @@ func calleeName(fun ast.Expr) (pkg, name string) {
 	return "", ""
 }
 
-// isLabelType reports whether t is the redact.Label type.
-func isLabelType(t ast.Expr) bool {
-	sel, ok := t.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "Label" {
-		return false
-	}
-	id, ok := sel.X.(*ast.Ident)
-	return ok && id.Name == "redact"
-}
-
-// clean reports whether e is a redacted value: a redact.* call, a registered
-// helper call, a literal, a redact.* constant, or an identifier declared as a
-// redact.Label in the enclosing function. A redact.Label(x) conversion is
-// clean only when x is.
+// clean reports whether e is a value that cannot carry an identity: a literal
+// or a call into this package other than an identity labeller.
 func (s *scanner) clean(e ast.Expr) bool {
 	switch v := e.(type) {
 	case *ast.BasicLit:
 		return true
 	case *ast.ParenExpr:
 		return s.clean(v.X)
-	case *ast.Ident:
-		return s.labels[v.Name]
 	case *ast.SelectorExpr:
-		if id, ok := v.X.(*ast.Ident); ok && id.Name == "redact" {
-			return true
-		}
-		return s.labels["."+v.Sel.Name]
-	case *ast.IndexExpr: // labels[i] of a []redact.Label is not tracked; plain index is not clean
-		return false
+		id, ok := v.X.(*ast.Ident)
+		return ok && id.Name == "redact"
 	case *ast.CallExpr:
 		pkg, name := calleeName(v.Fun)
-		if pkg == "redact" && name == "Label" {
-			return len(v.Args) == 1 && s.clean(v.Args[0])
-		}
-		if pkg == "redact" || redactingHelpers[name] {
-			return true
-		}
-		// label.String() / string(label) of a clean label.
-		if sel, ok := v.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "String" && len(v.Args) == 0 {
-			return s.clean(sel.X)
-		}
-		if id, ok := v.Fun.(*ast.Ident); ok && id.Name == "string" && len(v.Args) == 1 {
-			return s.clean(v.Args[0])
+		if pkg == "redact" {
+			return !identityLabellers[name]
 		}
 		// slog.StringValue / AnyValue of a clean value (an Attr literal's Value).
 		if pkg == "slog" && slogValueCtors[name] && len(v.Args) == 1 {
 			return s.clean(v.Args[0])
 		}
-	case *ast.BinaryExpr: // "x" + redact.User(u)
+	case *ast.BinaryExpr: // "x" + redact.URL(u)
 		return v.Op == token.ADD && s.clean(v.X) && s.clean(v.Y)
 	}
 	return false
+}
+
+// labelledIdentity returns the identity labeller e calls ("" when none).
+func labelledIdentity(e ast.Expr) string {
+	hit := ""
+	ast.Inspect(e, func(n ast.Node) bool {
+		if c, ok := n.(*ast.CallExpr); ok && hit == "" {
+			if _, name := calleeName(c.Fun); identityLabellers[name] {
+				hit = name
+			}
+		}
+		return hit == ""
+	})
+	return hit
 }
 
 // identityExpr returns the first identity source e reads, outside any
@@ -222,15 +209,19 @@ func (s *scanner) identityExpr(e ast.Expr) string {
 }
 
 func (s *scanner) checkAttr(n ast.Node, key string, val ast.Expr) {
+	if isIdentityKey(key) {
+		s.add(n, "identity key %q: no identity reaches a log line, redacted or not", key)
+		return
+	}
+	if fn := labelledIdentity(val); fn != "" {
+		s.add(n, "attribute %q is an identity label (%s)", key, fn)
+		return
+	}
 	if s.clean(val) {
 		return
 	}
-	if identityKeys[key] {
-		s.add(n, "identity key %q carries an unredacted value", key)
-		return
-	}
 	if src := s.identityExpr(val); src != "" {
-		s.add(n, "attribute %q reads identity source %s unredacted", key, src)
+		s.add(n, "attribute %q reads identity source %s", key, src)
 	}
 }
 
@@ -255,8 +246,10 @@ func (s *scanner) checkKV(args []ast.Expr) {
 				continue // visited as its own call
 			}
 		}
-		if src := s.identityExpr(args[i]); src != "" {
-			s.add(args[i], "log argument reads identity source %s unredacted", src)
+		if fn := labelledIdentity(args[i]); fn != "" {
+			s.add(args[i], "log argument is an identity label (%s)", fn)
+		} else if src := s.identityExpr(args[i]); src != "" {
+			s.add(args[i], "log argument reads identity source %s", src)
 		}
 	}
 }
@@ -304,9 +297,15 @@ func (s *scanner) checkAttrLiteral(cl *ast.CompositeLit) {
 func (s *scanner) visitCall(c *ast.CallExpr) {
 	pkg, name := calleeName(c.Fun)
 	if pkg == "slog" && slogValueCtors[name] && len(c.Args) == 1 {
-		if src := s.identityExpr(c.Args[0]); src != "" {
-			s.add(c, "slog.%s reads identity source %s unredacted", name, src)
+		if fn := labelledIdentity(c.Args[0]); fn != "" {
+			s.add(c, "slog.%s is an identity label (%s)", name, fn)
+		} else if src := s.identityExpr(c.Args[0]); src != "" {
+			s.add(c, "slog.%s reads identity source %s", name, src)
 		}
+		return
+	}
+	if pkg == "use" && name == "Logger" {
+		s.add(c, "use.Logger attaches the caller's name and groups to the request logger; mount middleware.RequestLogger")
 		return
 	}
 	if pkg == "slog" && slogAttrCtors[name] {
@@ -318,6 +317,9 @@ func (s *scanner) visitCall(c *ast.CallExpr) {
 			key = ""
 		}
 		if name == "Group" {
+			if isIdentityKey(key) {
+				s.add(c, "identity group %q: no identity reaches a log line, redacted or not", key)
+			}
 			s.checkKV(c.Args[1:])
 			return
 		}
@@ -328,8 +330,10 @@ func (s *scanner) visitCall(c *ast.CallExpr) {
 	// log package. Every argument after the writer must be identity-free.
 	if first, ok := printSinks[pkg+"."+name]; ok {
 		for _, a := range c.Args[min(first, len(c.Args)):] {
-			if src := s.identityExpr(a); src != "" {
-				s.add(a, "%s.%s argument reads identity source %s unredacted", pkg, name, src)
+			if fn := labelledIdentity(a); fn != "" {
+				s.add(a, "%s.%s argument is an identity label (%s)", pkg, name, fn)
+			} else if src := s.identityExpr(a); src != "" {
+				s.add(a, "%s.%s argument reads identity source %s", pkg, name, src)
 			}
 		}
 		return
@@ -345,8 +349,10 @@ func (s *scanner) visitCall(c *ast.CallExpr) {
 		if len(c.Args) <= msgIdx {
 			return
 		}
-		if src := s.identityExpr(c.Args[msgIdx]); src != "" {
-			s.add(c, "log message reads identity source %s unredacted", src)
+		if fn := labelledIdentity(c.Args[msgIdx]); fn != "" {
+			s.add(c, "log message is an identity label (%s)", fn)
+		} else if src := s.identityExpr(c.Args[msgIdx]); src != "" {
+			s.add(c, "log message reads identity source %s", src)
 		}
 		s.checkKV(c.Args[msgIdx+1:])
 		return
@@ -354,97 +360,11 @@ func (s *scanner) visitCall(c *ast.CallExpr) {
 	s.checkKV(c.Args)
 }
 
-// checkHelpers verifies every return of a registered redacting helper is clean.
-func (s *scanner) checkHelpers(f *ast.File, seen map[string]bool) {
+func (s *scanner) scanFile(f *ast.File) {
 	for _, d := range f.Decls {
-		fd, ok := d.(*ast.FuncDecl)
-		if !ok || fd.Body == nil || !redactingHelpers[fd.Name.Name] {
-			continue
-		}
-		seen[fd.Name.Name] = true
-		s.labels = labelsOf(fd)
-		ast.Inspect(fd.Body, func(n ast.Node) bool {
-			if _, ok := n.(*ast.FuncLit); ok {
-				return false
-			}
-			r, ok := n.(*ast.ReturnStmt)
-			if !ok {
-				return true
-			}
-			for _, res := range r.Results {
-				if !s.clean(res) {
-					s.add(res, "redacting helper %s returns an unredacted value", fd.Name.Name)
-				}
-			}
-			return true
-		})
-	}
-}
-
-// labelsOf collects the identifiers a node declares as redact.Label:
-// parameters (of a function and its closures), typed var declarations, and
-// struct fields (keyed "."+name, matched against a selector's field). A Label
-// value can only come from a guarded conversion or a redact call, so a
-// Label-typed field or variable is clean wherever it is read.
-func labelsOf(root ast.Node) map[string]bool {
-	out := map[string]bool{}
-	fields := func(fl *ast.FieldList, prefix string) {
-		if fl == nil {
-			return
-		}
-		for _, f := range fl.List {
-			if isLabelType(f.Type) {
-				for _, n := range f.Names {
-					out[prefix+n.Name] = true
-				}
-			}
-		}
-	}
-	ast.Inspect(root, func(n ast.Node) bool {
-		switch v := n.(type) {
-		case *ast.FuncType:
-			fields(v.Params, "")
-		case *ast.StructType:
-			fields(v.Fields, ".")
-		case *ast.ValueSpec:
-			if v.Type != nil && isLabelType(v.Type) {
-				for _, n := range v.Names {
-					out[n.Name] = true
-				}
-			}
-		}
-		return true
-	})
-	return out
-}
-
-// checkLabelConversions flags a redact.Label(x) conversion of a non-clean x
-// anywhere (not only at log sites): it is the one way to launder a plaintext
-// identity into a Label.
-func (s *scanner) checkLabelConversion(c *ast.CallExpr) {
-	if pkg, name := calleeName(c.Fun); pkg == "redact" && name == "Label" && !s.clean(c) {
-		s.add(c, "redact.Label conversion of an unredacted value")
-	}
-}
-
-func (s *scanner) scanFile(f *ast.File, helpers map[string]bool) {
-	s.labels = map[string]bool{}
-	s.checkHelpers(f, helpers)
-	fileFields := map[string]bool{}
-	for k := range labelsOf(f) {
-		if strings.HasPrefix(k, ".") {
-			fileFields[k] = true
-		}
-	}
-	for _, d := range f.Decls {
-		s.labels = labelsOf(d)
-		for k := range fileFields {
-			s.labels[k] = true
-		}
 		ast.Inspect(d, func(n ast.Node) bool {
 			if c, ok := n.(*ast.CallExpr); ok {
 				s.visitCall(c)
-				s.checkLabelConversion(c)
 			}
 			if cl, ok := n.(*ast.CompositeLit); ok {
 				s.checkAttrLiteral(cl)
@@ -462,7 +382,7 @@ func scanSource(t *testing.T, src string) []finding {
 		t.Fatal(err)
 	}
 	s := &scanner{fset: fset}
-	s.scanFile(f, map[string]bool{})
+	s.scanFile(f)
 	return s.findings
 }
 
@@ -472,7 +392,6 @@ func TestS453_NoLogSiteEmitsAnIdentityInClear(t *testing.T) {
 	root := filepath.Join("..", "..")
 	fset := token.NewFileSet()
 	s := &scanner{fset: fset}
-	helpers := map[string]bool{}
 	files := 0
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -492,7 +411,7 @@ func TestS453_NoLogSiteEmitsAnIdentityInClear(t *testing.T) {
 			return perr
 		}
 		files++
-		s.scanFile(f, helpers)
+		s.scanFile(f)
 		return nil
 	})
 	if err != nil {
@@ -501,17 +420,12 @@ func TestS453_NoLogSiteEmitsAnIdentityInClear(t *testing.T) {
 	if files < 200 {
 		t.Fatalf("NON-VACUITY: only %d files scanned; the walk root is wrong", files)
 	}
-	for h := range redactingHelpers {
-		if !helpers[h] {
-			t.Errorf("registered redacting helper %s was not found in the module; drop it from the registry", h)
-		}
-	}
 	sort.Slice(s.findings, func(i, j int) bool { return s.findings[i].String() < s.findings[j].String() })
 	for _, f := range s.findings {
-		t.Errorf("#453 identity in clear: %s", f)
+		t.Errorf("#1192 identity on a log line: %s", f)
 	}
 	if len(s.findings) > 0 {
-		t.Logf("route each through internal/redact (User/Group/Groups/Identity) — %d site(s)", len(s.findings))
+		t.Logf("drop each (%d): a log line reaches identity through its traceId and the audit record", len(s.findings))
 	}
 }
 
@@ -535,13 +449,28 @@ func TestS453_GuardDetectsEveryShape(t *testing.T) {
 		"attrs slice":        `attrs := []any{slog.String("user", user)}; _ = attrs`,
 		"cn ident":           `log.Info("m", slog.String("subjectcn", cn))`,
 		"secret name":        `log.Info("m", slog.String("s", secretName))`,
-		"label laundering":   `x := redact.Label(ui.Username); _ = x`,
 		"stderr lane":        `fmt.Fprintf(os.Stderr, "user=%s groups=%v\n", username, groups)`,
 		"std log":            `log.Printf("user=%s", ui.Username)`,
 		"attr literal key":   `a := slog.Attr{Key: "user", Value: slog.StringValue(u)}; _ = a`,
 		"attr literal pos":   `a := slog.Attr{"who_else", slog.StringValue(ui.Username)}; _ = a`,
 		"string value":       `v := slog.StringValue(ui.Username); _ = v`,
 		"any value groups":   `v := slog.AnyValue(ui.Groups); _ = v`,
+		// #1192: a label, a literal or a constant under an identity key is
+		// still an identity attribute.
+		"redacted user":     `log.Warn("m", slog.String("user", redact.User(u)))`,
+		"literal user":      `log.Info("m", slog.String("user", "<none>"))`,
+		"user_hash":         `log.Info("m", slog.String("user_hash", redact.User(u)))`,
+		"label under other": `log.Info("m", slog.String("target", "rep "+redact.User(u)))`,
+		"label in message":  `log.Info("rep " + redact.User(u))`,
+		"label kv":          `log.Info("m", "x", redact.User(u))`,
+		"learned label":     `log.Info("m", slog.String("x", cache.LearnedClassLabel(u, g)))`,
+		"stale subject":     `log.Info("m", slog.String("x", cache.StaleSubject(u)))`,
+		"label to stderr":   `fmt.Fprintf(os.Stderr, "u=%s\n", redact.User(username))`,
+		"label value":       `v := slog.StringValue(redact.User(u)); _ = v`,
+		"attr literal":      `a := slog.Attr{Key: "user", Value: slog.StringValue(redact.User(u))}; _ = a`,
+		"group of identity": `log.With(slog.Group("user", slog.String("name", n), slog.String("groups", g)))`,
+		"plumbing logger":   `c := use.NewChain(use.Logger(log)); _ = c`,
+		"identity kv with":  `l := log.With("traceId", id, "user", u); _ = l`,
 	}
 	for name, stmt := range leaks {
 		src := "package p\nfunc f() {\n" + stmt + "\n}\n"
@@ -550,36 +479,20 @@ func TestS453_GuardDetectsEveryShape(t *testing.T) {
 		}
 	}
 	cleanShapes := map[string]string{
-		"redact user":     `log.Warn("m", slog.String("user", redact.User(u)))`,
-		"redact groups":   `log.Info("m", slog.Any("groups", redact.Groups(ui.Groups)))`,
-		"redact id":       `log.Info("m", slog.String("identity", redact.Identity(ui.Username, ui.Groups)))`,
-		"helper":          `log.Info("m", slog.String("cohort", cohortLogLabel(c)))`,
-		"api group":       `log.Info("m", slog.String("group", gvr.Group))`,
-		"literal":         `log.Info("m", slog.String("user", "<none>"))`,
-		"count":           `log.Info("m", slog.Int("groups_n", len(redact.Groups(groups))))`,
-		"prefix concat":   `log.Info("m", slog.String("target", "rep "+redact.User(u)))`,
-		"non-log Info":    `x.Info()`,
-		"label convert":   `x := redact.Label(redact.User(u)); _ = x`,
-		"stderr redacted": `fmt.Fprintf(os.Stderr, "user=%s groups=%v\n", redact.User(username), redact.Groups(groups))`,
-		"attr literal ok": `a := slog.Attr{Key: "user", Value: slog.StringValue(redact.User(u))}; _ = a`,
+		"api group":     `log.Info("m", slog.String("group", gvr.Group))`,
+		"count":         `log.Info("m", slog.Int("n", len(x)))`,
+		"prefix concat": `log.Info("m", slog.String("target", "url "+redact.URL(u)))`,
+		"opaque label":  `log.Info("m", slog.String("key", redact.Prefixed("key", k)))`,
+		"scrubbed err":  `log.Info("m", slog.String("err", redact.Err(err)))`,
+		"non-log Info":  `x.Info()`,
+		"other logger":  `c := use.NewChain(use.TraceId(), middleware.RequestLogger(log)); _ = c`,
+		"group of attr": `log.Info("m", slog.Group("page", slog.Int("size", n)))`,
 	}
 	for name, stmt := range cleanShapes {
 		src := "package p\nfunc f() {\n" + stmt + "\n}\n"
 		if got := scanSource(t, src); len(got) != 0 {
 			t.Errorf("clean shape %q flagged: %v", name, got)
 		}
-	}
-	labelParam := "package p\nfunc f(cohortLabel redact.Label, target string) {\n log.Info(\"m\", slog.String(\"cohort\", cohortLabel.String()), slog.Any(\"cohort2\", cohortLabel))\n}\n"
-	if got := scanSource(t, labelParam); len(got) != 0 {
-		t.Errorf("a redact.Label parameter must be loggable: %v", got)
-	}
-	strParam := "package p\nfunc f(cohortLabel string) {\n log.Info(\"m\", slog.String(\"cohort\", cohortLabel))\n}\n"
-	if got := scanSource(t, strParam); len(got) == 0 {
-		t.Error("RED: a plain-string cohort parameter under an identity key was not detected")
-	}
-	helperLeak := "package p\nfunc refreshLogUser(user, source string) string {\n if source == \"x\" { return redact.User(user) }\n return user\n}\n"
-	if got := scanSource(t, helperLeak); len(got) == 0 {
-		t.Error("RED: a registered helper returning a plaintext username was not detected")
 	}
 }
 

@@ -89,6 +89,25 @@ func registerRefresherMetrics() {
 		expvar.Publish("snowplow_refresher_yielded_total", refresherStatFunc("yielded"))
 		expvar.Publish("snowplow_refresher_capped_total", refresherStatFunc("capped"))
 		expvar.Publish("snowplow_refresher_floored_total", refresherStatFunc("floored"))
+		// #765 — the viewed tier (refresher_viewed.go).
+		expvar.Publish("snowplow_refresher_viewed_enqueue_total", refresherStatFunc("viewed_enqueue"))
+		expvar.Publish("snowplow_refresher_viewed_promoted_total", refresherStatFunc("viewed_promoted"))
+		expvar.Publish("snowplow_refresher_viewed_dequeued_total", refresherStatFunc("viewed_dequeued"))
+		expvar.Publish("snowplow_refresher_viewed_skipped_consumed_total", refresherStatFunc("viewed_skipped_consumed"))
+		expvar.Publish("snowplow_refresher_viewed_customer_triggered_total", refresherStatFunc("viewed_customer_triggered"))
+		expvar.Publish("snowplow_refresher_viewed_unsubscribed_total", refresherStatFunc("viewed_unsubscribed"))
+		expvar.Publish("snowplow_refresher_viewed_queue_depth", refresherStatFunc("viewed_queue_depth"))
+		expvar.Publish("snowplow_refresher_deferred_in_flight_total", refresherStatFunc("deferred_in_flight"))
+		// Completions by tier and the age of the change a dequeue runs, by
+		// side: the counters #1085's run-22 pair compares between its arms.
+		expvar.Publish("snowplow_refresher_normal_completed_total", refresherStatFunc("normal_completed"))
+		expvar.Publish("snowplow_refresher_viewed_completed_total", refresherStatFunc("viewed_completed"))
+		// #1069 — parks of the reserved worker (the viewed reservation).
+		expvar.Publish("snowplow_refresher_viewed_reserve_parks_total", refresherStatFunc("viewed_reserve_parks"))
+		expvar.Publish("snowplow_refresher_viewed_dirty_age_ms_p95", refresherStatFunc("viewed_dirty_age_ms_p95"))
+		expvar.Publish("snowplow_refresher_viewed_dirty_age_ms_max", refresherStatFunc("viewed_dirty_age_ms_max"))
+		expvar.Publish("snowplow_refresher_unviewed_dirty_age_ms_p95", refresherStatFunc("unviewed_dirty_age_ms_p95"))
+		expvar.Publish("snowplow_refresher_unviewed_dirty_age_ms_max", refresherStatFunc("unviewed_dirty_age_ms_max"))
 		expvar.Publish("snowplow_refresher_suppressed_set_total", refresherStatFunc("suppressed_set"))
 		expvar.Publish("snowplow_refresher_suppressed_skips_total", refresherStatFunc("suppressed_skips"))
 		expvar.Publish("snowplow_refresher_suppressed_keys", refresherStatFunc("suppressed_keys"))

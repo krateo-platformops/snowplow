@@ -25,8 +25,13 @@
 //   - UAF refilter:     applyUserAccessFilterOnPig / evalSingle
 //     (internal/resolvers/restactions/api/refilter.go) — EvaluateRBAC(uaf.verb,
 //     uaf.group, uaf.resource|resourcesFrom, per-object ns, per-object name).
-//   - widget resourcesRefs: rbac.UserCan(verb, group-resource, namespace)
-//     (internal/resolvers/widgets/resourcesrefs/resolve.go) — no name.
+//   - widget resourcesRefs: rbac.UserCan(verb, group-resource, namespace, NAME)
+//     (internal/resolvers/widgets/resourcesrefs/resolve.go) — since #1046 the
+//     ref's own name, carried for an item verb (get/update/patch/delete) by
+//     rbac.ObjectCheck. NOTE: resourceRef below still derives a NAME-LESS class
+//     for it (this file is dark); before any digest built from D is folded into
+//     a serving key, that class must fold the ref's name, or two requesters
+//     with name-scoped grants on different refs would project the same answer.
 //   - widget apiRef:     a GET of the referenced RESTAction CR, then D(that RA).
 // The path→GVR shape parser mirrors cache.ParseAPIServerPathToDep verbatim for
 // literal paths; templated paths are handled by a sentinel-aware skeleton
@@ -333,7 +338,9 @@ func (st *deriveState) widget(widget map[string]any) {
 		}
 	}
 
-	// Row 2 — static resourcesRefs entries: rbac.UserCan(verb, GR, namespace).
+	// Row 2 — static resourcesRefs entries: rbac.UserCan(verb, GR, namespace,
+	// name) at runtime (#1046); the class below does not fold the name yet —
+	// see the file header.
 	if refs, err := widgets.GetResourcesRefs(widget); err == nil {
 		for i := range refs {
 			st.resourceRef(refs[i].APIVersion, refs[i].Resource, refs[i].Namespace, refs[i].Verb)
@@ -352,8 +359,10 @@ func (st *deriveState) widget(widget map[string]any) {
 }
 
 // resourceRef adds the class for one (templated-or-literal) widget resource ref.
-// The runtime check is rbac.UserCan(verb, group-resource, namespace) with NO
-// name (resourcesrefs/resolve.go), one per mapped verb.
+// The runtime check is rbac.UserCan(verb, group-resource, namespace, name)
+// (resourcesrefs/resolve.go, #1046: the ref's name for an item verb), one per
+// mapped verb. This DARK class is still name-less (exact(..., "")): it must fold
+// the ref's name before D's digest can key a served cell (file header).
 func (st *deriveState) resourceRef(apiVersion, resource, namespace, restVerb string) {
 	if resource == "" && apiVersion == "" {
 		return

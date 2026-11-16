@@ -25,14 +25,20 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 )
 
 // learnedRedactionTokens returns the strings a learned class's logs must never
-// carry: the username, its clientconfig Secret name (the DNS-1123 form authn
-// writes) and every group except system:authenticated (a constant every
-// identity carries, not an identity fact). Longest first, so a token that
-// contains another is replaced whole.
+// carry: the username, every name its credential Secrets may have (the
+// session and, #994, the step-up Secret, each under its exact and its legacy
+// DNS-1123 name, #1382: credsecret.AllNames) and every group except
+// system:authenticated (an apiserver-defined constant name, not an identity
+// fact). #1334: not every identity carries it any more (one presenting
+// system:unauthenticated does not), but the exemption never depended on that —
+// it only keeps a Kubernetes constant readable in logs. system:unauthenticated
+// is NOT exempted, so it is redacted like any other group (over-redaction is
+// the safe direction). Longest first, so a token that contains another is
+// replaced whole.
 func learnedRedactionTokens(username string, groups []string) []string {
 	seen := map[string]struct{}{}
 	var out []string
@@ -48,7 +54,10 @@ func learnedRedactionTokens(username string, groups []string) []string {
 	}
 	add(username)
 	if username != "" {
-		add(kubeutil.MakeDNS1123Compatible(username) + "-clientconfig")
+		// #1382 — every name either Secret may have: exact and legacy.
+		for _, name := range credsecret.AllNames(username) {
+			add(name)
+		}
 		add(kubeutil.MakeDNS1123Compatible(username))
 	}
 	for _, g := range groups {
@@ -165,24 +174,18 @@ func learnedRedactingLogger(base *slog.Logger, username string, groups []string)
 	})
 }
 
-// learnedSeedLabelKey marks a seed ctx built for a learned class; the value is
-// the class's sha256 label, the only form a log line may carry.
-type learnedSeedLabelKey struct{}
+// learnedSeedMarkKey marks a seed ctx built for a learned class.
+type learnedSeedMarkKey struct{}
 
-func withLearnedSeedLabel(ctx context.Context, label redact.Label) context.Context {
-	return context.WithValue(ctx, learnedSeedLabelKey{}, label)
-}
-
-func learnedSeedLabelFromCtx(ctx context.Context) (redact.Label, bool) {
-	l, ok := ctx.Value(learnedSeedLabelKey{}).(redact.Label)
-	return l, ok && l != ""
+func withLearnedSeedMark(ctx context.Context) context.Context {
+	return context.WithValue(ctx, learnedSeedMarkKey{}, true)
 }
 
 // seedDiagLogger is the logger the seed primitives' key diagnostic uses: the
 // ctx logger of a learned seed (redacting), else slog.Default() exactly as
 // before.
 func seedDiagLogger(ctx context.Context) *slog.Logger {
-	if _, learned := learnedSeedLabelFromCtx(ctx); learned {
+	if learned, _ := ctx.Value(learnedSeedMarkKey{}).(bool); learned {
 		return xcontext.Logger(ctx)
 	}
 	return slog.Default()

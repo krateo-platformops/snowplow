@@ -30,6 +30,7 @@
 package cache
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"errors"
@@ -42,7 +43,10 @@ import (
 type StaleServeSink struct {
 	l1Key string
 	class string
-	mu    sync.Mutex
+	// subject (#1062) is the requester (StaleSubject): the stale-push ledger
+	// pairs this response's serve with that user's /refreshes stream only.
+	subject string
+	mu      sync.Mutex
 	// served is the content cells this resolve was served stale. Their reads
 	// were metric-neutral; Commit counts them as the request's hits.
 	served []staleServedRef
@@ -52,6 +56,20 @@ type StaleServeSink struct {
 	state           staleSinkState
 	replaceOnCommit bool
 	servedAt        time.Time
+	// servedBody (#1321) is the stale-derived body the committed response wrote.
+	servedBody []byte
+	// wrote (#905): a write stage of this resolve was sent. From then on no read
+	// of it is served stale (NoteIfNoWrite refuses, under the lock BeginWrite
+	// takes), so it can never be withdrawn and re-run, which would send the
+	// write a second time.
+	wrote bool
+	// declaredWrite (#905, #913 re-review): a RESTAction resolved for this
+	// request DECLARES a write stage. It is known from the spec before any stage
+	// runs, so the request is never served stale from then on: a top-level
+	// write RESTAction is never stale-derived at all, and the hold / withdraw /
+	// re-run machinery only ever applies to a write first seen inside a nested
+	// resolve, after a read was already served stale.
+	declaredWrite bool
 }
 
 type staleServedRef struct {
@@ -118,12 +136,13 @@ func StaleServeDisabled(ctx context.Context) bool {
 // of class (restactions, widgets) — eligible for the D2 stale serve — and
 // returns the sink its content reads note stale serves on. Install it ONLY on
 // a customer dispatch path whose stored cell is armed for /refreshes; never on
-// a background, inert or identity-free resolve.
-func WithStaleServeSink(ctx context.Context, l1Key, class string) (context.Context, *StaleServeSink) {
+// a background, inert or identity-free resolve. subject is the requester
+// (StaleSubject of the authenticated username, #1062).
+func WithStaleServeSink(ctx context.Context, l1Key, class, subject string) (context.Context, *StaleServeSink) {
 	if ctx == nil || l1Key == "" || StaleServeDisabled(ctx) {
 		return ctx, nil
 	}
-	s := &StaleServeSink{l1Key: l1Key, class: class}
+	s := &StaleServeSink{l1Key: l1Key, class: class, subject: subject}
 	return context.WithValue(ctx, ctxKeyStaleServeSink, s), s
 }
 
@@ -143,6 +162,38 @@ func StaleServeSinkFromContext(ctx context.Context) *StaleServeSink {
 		return nil
 	}
 	return s
+}
+
+// StaleServeSinkForWrite (#905) is the customer request's sink WHATEVER L1 key
+// the resolve is filling now. A write anywhere under the request — in a nested
+// resolve that re-scoped to its own cell included — is sent or held for the
+// request as a whole, because it is the request that is withdrawn and re-run.
+func StaleServeSinkForWrite(ctx context.Context) *StaleServeSink {
+	if ctx == nil {
+		return nil
+	}
+	s, _ := ctx.Value(ctxKeyStaleServeSink).(*StaleServeSink)
+	return s
+}
+
+// NoteIfNoWrite (#905) is Note, atomic with BeginWrite: it records the stale
+// serve of contentKey and returns true, unless a write of this resolve was
+// already sent, in which case it records nothing and returns false (the read
+// must read through). Under the sink's lock, so a stale read and a write
+// running in parallel (nested resolve:true items of one stage) can never both
+// happen: either the stale serve is noted first and the write is held, or the
+// write is begun first and the read is not served stale. Nil-safe (true).
+func (s *StaleServeSink) NoteIfNoWrite(contentKey string) bool {
+	if s == nil {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wrote {
+		return false
+	}
+	s.served = append(s.served, staleServedRef{key: contentKey})
+	return true
 }
 
 // L1Key is the dependent customer cell's key. Nil-safe.
@@ -184,6 +235,55 @@ func (s *StaleServeSink) StaleDerived() bool {
 	return len(s.served) > 0
 }
 
+// BeginWrite (#905) is asked before a write stage item of this resolve is
+// sent. A customer resolve that is stale-derived (D2) is withdrawn and re-run
+// at its write point whenever its Put is declined — and a sent write always
+// declines it (an external touch) — so a write sent from it would be sent again
+// by the re-run. BeginWrite therefore answers:
+//   - false when the resolve is already stale-derived: the write must not be
+//     sent from this pass (its re-run, with D2 disabled, sends it once);
+//   - true otherwise, and records that a write was sent: a parallel read that
+//     reaches serveStaleWithDebt afterwards is refused (NoteIfNoWrite), so the
+//     request is never served stale after its write and never re-run. (A read
+//     that STARTS after the write never gets that far: the RESTAction that
+//     sent it marked the sink DeclaredWrite before its first stage.)
+//
+// Nil-safe: no sink (no D2 for this resolve) → true.
+func (s *StaleServeSink) BeginWrite() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.served) > 0 {
+		return false
+	}
+	s.wrote = true
+	return true
+}
+
+// NoteDeclaredWrite records that a RESTAction resolved for this request
+// declares a write stage (see declaredWrite). Nil-safe.
+func (s *StaleServeSink) NoteDeclaredWrite() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.declaredWrite = true
+	s.mu.Unlock()
+}
+
+// DeclaredWrite reports whether a RESTAction resolved for this request declares
+// a write stage (NoteDeclaredWrite). Nil-safe.
+func (s *StaleServeSink) DeclaredWrite() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.declaredWrite
+}
+
 // NoteServedAt records the first stale serve's time (the stale_to_push
 // origin). Nil-safe.
 func (s *StaleServeSink) NoteServedAt(t time.Time) {
@@ -207,11 +307,25 @@ func (s *StaleServeSink) ServedAt() time.Time {
 	return s.servedAt
 }
 
+// ServedBody is the stale-derived body the committed response wrote (nil
+// before Commit). Nil-safe. #1321: the dependent's replace publishes no frame
+// when the cell then holds exactly these bytes.
+func (s *StaleServeSink) ServedBody() []byte {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.servedBody
+}
+
 // Commit is the dispatcher's accepted-Put outcome for a stale-derived
 // response: it sets the key's owed-push mark and reports whether a content
 // debt already cleared (the caller then replaces the cell now). False after a
-// withdrawal or a previous commit.
-func (s *StaleServeSink) Commit() (replaceNow bool) {
+// withdrawal or a previous commit. body is the stale-derived body the response
+// writes (the bytes its accepted Put stored): #1321 — a replacement with the
+// same bytes owes this client no frame (ServedBody, the ledger, the owed mark).
+func (s *StaleServeSink) Commit(body []byte) (replaceNow bool) {
 	if s == nil {
 		return false
 	}
@@ -220,12 +334,29 @@ func (s *StaleServeSink) Commit() (replaceNow bool) {
 		s.mu.Unlock()
 		return false
 	}
+	s.servedBody = body
+	// #1062 — the stale-derived body is about to be written under its armed
+	// key: one apistage stale serve, timed from the D2 serve until the frame
+	// that follows its replacement is written to a stream (stale_push.go).
+	//
+	// #1198 — BEFORE Committed is visible, under s.mu: DebtCleared starts the
+	// replacement the moment it reads Committed, and a replacing Put that lands
+	// before the serve is open has nothing to mark, so its frame would close
+	// nothing and the overdue scan would report a viewer who has the fresh frame.
+	//
+	// The lock order this adds is s.mu → the ledger's lock, on top of the existing
+	// staleDebtsMu → s.mu (serveStaleWithDebt). It cannot invert: the ledger's lock
+	// is a leaf (stale_push.go), and noteStaleServeNow takes no other lock, so
+	// nothing under s.mu ever waits on staleDebtsMu.
+	noteStaleServeNow(s.l1Key, s.subject, layerAPIStage, s.servedAt, body)
 	s.state = staleSinkCommitted
 	replaceNow = s.replaceOnCommit
 	served := append([]staleServedRef(nil), s.served...)
-	servedAt := s.servedAt
 	s.mu.Unlock()
-	MarkStaleOwed(s.l1Key, servedAt)
+	if fn := staleCommitVisibleHookForTest.Load(); fn != nil {
+		(*fn)()
+	}
+	MarkStaleOwed(s.l1Key, body)
 	// The stale bodies are now written: count their reads as this request's
 	// hits, exactly once (a withdrawn pass never reaches here), through the one
 	// customer hit funnel — Get (hit_total, LRU warmth, the #354/#547
@@ -237,6 +368,21 @@ func (s *StaleServeSink) Commit() (replaceNow bool) {
 		}
 	}
 	return replaceNow
+}
+
+// staleCommitVisibleHookForTest runs in Commit the moment Committed is visible
+// to DebtCleared, so an arm can complete a whole replacement there (#1198: the
+// serve must already be open). TEST-ONLY (nil in production).
+var staleCommitVisibleHookForTest atomic.Pointer[func()]
+
+// SetStaleCommitVisibleHookForTest installs (nil clears) the hook. TEST-ONLY.
+func SetStaleCommitVisibleHookForTest(fn func()) (restore func()) {
+	var p *func()
+	if fn != nil {
+		p = &fn
+	}
+	prev := staleCommitVisibleHookForTest.Swap(p)
+	return func() { staleCommitVisibleHookForTest.Store(prev) }
 }
 
 // Withdraw is the dispatcher's declined-Put outcome: the stale body is never
@@ -285,34 +431,29 @@ var (
 	staleOwed      = map[string]*list.Element{} // value: *staleOwedMark
 	staleOwedOrder = list.New()
 
-	// staleOwedArmRecorder records stale_to_push for an owed push delivered at
-	// arm time (the tab armed after the replacement was published): the
-	// histogram lives with the D2 family (restactions/api), which installs it.
-	staleOwedArmRecorder atomic.Pointer[func(servedAt time.Time)]
-
 	staleOwedDropped   atomic.Uint64
 	staleOwedArmEmits  atomic.Uint64
 	staleOwedDelivered atomic.Uint64
+	staleOwedSettled   atomic.Uint64 // #1321
 )
 
-// staleOwedMark is one owed push: its key and the EARLIEST stale serve still
-// owed (the stale_to_push origin for an arm-time delivery).
+// staleOwedMark is one owed push. Its timing lives in the stale-push ledger
+// (stale_push.go, #1062): the mark only carries the push to a late arm.
+//
+// #1321 — body is the stale-derived body every response under the mark was
+// written with; mixed is set once two different (or unknown) bodies were. A
+// replacement with exactly body owes nobody a frame (SettleStaleOwed).
 type staleOwedMark struct {
-	key      string
-	servedAt time.Time
+	key   string
+	body  []byte
+	mixed bool
 }
 
-// SetStaleOwedArmRecorder installs the arm-time stale_to_push recorder.
-func SetStaleOwedArmRecorder(f func(servedAt time.Time)) { staleOwedArmRecorder.Store(&f) }
-
-// MarkStaleOwed sets key's owed-push mark, keeping the earliest servedAt still
-// owed (a zero servedAt means "now").
-func MarkStaleOwed(key string, servedAt time.Time) {
+// MarkStaleOwed sets key's owed-push mark for a stale-derived response written
+// with body (nil: unknown).
+func MarkStaleOwed(key string, body []byte) {
 	if key == "" {
 		return
-	}
-	if servedAt.IsZero() {
-		servedAt = time.Now()
 	}
 	limit := defaultResolvedCacheMaxEntries
 	if c := ResolvedCache(); c != nil && c.maxEntries > 0 {
@@ -321,13 +462,13 @@ func MarkStaleOwed(key string, servedAt time.Time) {
 	staleOwedMu.Lock()
 	defer staleOwedMu.Unlock()
 	if e, ok := staleOwed[key]; ok {
-		if m := e.Value.(*staleOwedMark); servedAt.Before(m.servedAt) {
-			m.servedAt = servedAt
-		}
 		staleOwedOrder.MoveToBack(e)
+		if m := e.Value.(*staleOwedMark); body == nil || !bytes.Equal(m.body, body) {
+			m.mixed, m.body = true, nil
+		}
 		return
 	}
-	staleOwed[key] = staleOwedOrder.PushBack(&staleOwedMark{key: key, servedAt: servedAt})
+	staleOwed[key] = staleOwedOrder.PushBack(&staleOwedMark{key: key, body: body, mixed: body == nil})
 	for staleOwedOrder.Len() > limit {
 		front := staleOwedOrder.Front()
 		staleOwedOrder.Remove(front)
@@ -360,36 +501,53 @@ func staleOwedReady(key string) bool {
 	return true
 }
 
+// clearStaleOwed clears key's mark; false when it had none.
 func clearStaleOwed(key string) bool {
-	_, ok := takeStaleOwed(key)
-	return ok
-}
-
-// takeStaleOwed clears key's mark and returns its earliest owed servedAt.
-func takeStaleOwed(key string) (time.Time, bool) {
 	staleOwedMu.Lock()
 	defer staleOwedMu.Unlock()
 	e, ok := staleOwed[key]
 	if !ok {
-		return time.Time{}, false
+		return false
 	}
 	staleOwedOrder.Remove(e)
 	delete(staleOwed, key)
-	return e.Value.(*staleOwedMark).servedAt, true
+	return true
+}
+
+// SettleStaleOwed clears key's owed-push mark when every response under it was
+// written with exactly cur — the bytes the cell now holds, no longer
+// stale-derived — and reports whether it did (#1321). Those clients hold the
+// current bytes, so no push is owed and none is published (finishStaleReplace);
+// without this the mark would wait for an arm or the capacity bound, and a
+// capacity drop reads as a guarantee failure (staleOwedDropped). A mark whose
+// bodies differ (mixed) or whose body differs from cur stays.
+func SettleStaleOwed(key string, cur []byte) bool {
+	if key == "" || cur == nil {
+		return false
+	}
+	staleOwedMu.Lock()
+	defer staleOwedMu.Unlock()
+	e, ok := staleOwed[key]
+	if !ok {
+		return false
+	}
+	m := e.Value.(*staleOwedMark)
+	if m.mixed || !bytes.Equal(m.body, cur) {
+		return false
+	}
+	staleOwedOrder.Remove(e)
+	delete(staleOwed, key)
+	staleOwedSettled.Add(1)
+	return true
 }
 
 // noteStaleOwedArmEmit is the arm-time delivery of an owed push: it clears
-// the mark, counts the emit, and records stale_to_push = now − servedAt (the
-// tab showed the stale body all that time — the slowest corrections, which a
-// publish-time-only record would drop).
+// the mark and counts the emit. Its stale_to_push (now − the serve: the tab
+// showed the stale body all that time, #710 F2) is recorded when the handler
+// WRITES the frame offered here (stale_push.go, #1062), like every push.
 func noteStaleOwedArmEmit(key string) {
-	servedAt, ok := takeStaleOwed(key)
-	if !ok {
-		return
-	}
-	staleOwedArmEmits.Add(1)
-	if f := staleOwedArmRecorder.Load(); f != nil {
-		(*f)(servedAt)
+	if clearStaleOwed(key) {
+		staleOwedArmEmits.Add(1)
 	}
 }
 
@@ -407,9 +565,10 @@ func noteRefreshFanout(key string, offered int) {
 
 // StaleOwedStats is the owed-mark family: open marks, marks dropped by the
 // capacity bound (a guarantee failure), pushes emitted at arm time, and marks
-// cleared by a delivered publish.
+// cleared by a delivered publish, and (#1321) marks settled because the
+// replacement's bytes equal every body written under them (no push owed).
 type StaleOwedStats struct {
-	Open, Dropped, ArmEmits, Delivered uint64
+	Open, Dropped, ArmEmits, Delivered, Settled uint64
 }
 
 // StaleOwedStatsSnapshot reads the owed-mark family.
@@ -418,7 +577,8 @@ func StaleOwedStatsSnapshot() StaleOwedStats {
 	open := uint64(len(staleOwed))
 	staleOwedMu.Unlock()
 	return StaleOwedStats{Open: open, Dropped: staleOwedDropped.Load(),
-		ArmEmits: staleOwedArmEmits.Load(), Delivered: staleOwedDelivered.Load()}
+		ArmEmits: staleOwedArmEmits.Load(), Delivered: staleOwedDelivered.Load(),
+		Settled: staleOwedSettled.Load()}
 }
 
 // ResetStaleOwedForTest drops every mark and zeroes the family. Production
@@ -431,6 +591,7 @@ func ResetStaleOwedForTest() {
 	staleOwedDropped.Store(0)
 	staleOwedArmEmits.Store(0)
 	staleOwedDelivered.Store(0)
+	staleOwedSettled.Store(0)
 }
 
 // KnownStaleMark returns key's known-stale window: the dep-event seq of its
@@ -471,7 +632,10 @@ func RunRefreshNow(ctx context.Context, l1Key string) error {
 	if fn == nil {
 		return ErrRefreshNowNoHandler
 	}
-	return fn(ctx, l1Key, *entry.Inputs)
+	// #1070 — measurement only: a direct refresh is timed from here to its Put
+	// (no queue, so no wait).
+	ctx = withRefreshCycle(ctx, l1Key, RefreshTierDirect, windowNow())
+	return runRefreshFunc(ctx, fn, l1Key, *entry.Inputs)
 }
 
 // staleServeQuiesce stops and joins the D2 goroutines (debt refills, push

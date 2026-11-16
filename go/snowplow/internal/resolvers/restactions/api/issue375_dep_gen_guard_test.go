@@ -74,13 +74,15 @@ func newWatcher375(t *testing.T) dynamic.Interface {
 	for _, ns := range []string{"team-a", "team-b"} {
 		seed = append(seed, obj375(f1WidgetsGVR, "Widget", ns, "widget-"+ns))
 		seed = append(seed, obj375(g375Gadgets, "Gadget", ns, "gadget-"+ns))
-		seed = append(seed, &rbacv1.RoleBinding{
-			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
-			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "c375-" + u375},
-			Subjects:   []rbacv1.Subject{{Kind: rbacv1.UserKind, APIGroup: "rbac.authorization.k8s.io", Name: u375}},
-			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "c375-lister"},
-		})
 	}
+	// The stages LIST cluster-wide: since #961 that needs a cluster grant, as on
+	// the apiserver.
+	seed = append(seed, &rbacv1.ClusterRoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: "c375-" + u375},
+		Subjects:   []rbacv1.Subject{{Kind: rbacv1.UserKind, APIGroup: "rbac.authorization.k8s.io", Name: u375}},
+		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "c375-lister"},
+	})
 	seed = append(seed, &rbacv1.ClusterRole{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
 		ObjectMeta: metav1.ObjectMeta{Name: "c375-lister"},
@@ -209,8 +211,8 @@ func armChurnSeam(t *testing.T, dyn dynamic.Interface, armed *atomic.Bool, churn
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
 	var done sync.Map
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
-		raw, ok := dispatchViaInformer(ctx, call)
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
+		raw, ok, fctx, _ := dispatchViaInformer(ctx, call)
 		if armed.Load() {
 			for g, kn := range churns {
 				if strings.HasSuffix(call.Path, "/"+g.Resource) {
@@ -220,7 +222,7 @@ func armChurnSeam(t *testing.T, dyn dynamic.Interface, armed *atomic.Bool, churn
 				}
 			}
 		}
-		return raw, ok
+		return raw, ok, fctx
 	}
 }
 
@@ -252,7 +254,7 @@ func TestIssue375_Arm1_ApistageReadToRecordWindow_OuterRemarks(t *testing.T) {
 	if got := names375(dict, "w"); strings.Contains(strings.Join(got, ","), "late-widget") {
 		t.Fatalf("setup: the resolve must have read PRE-churn data (the seam returns the @N bytes), got %v", got)
 	}
-	if !store.PutIfGen(octx, outerKey, &cache.ResolvedEntry{RawJSON: outerBody375(dict, "w")}, gen0) {
+	if !store.PutResolvedIfGen(octx, fixtureStoreVerdict, outerKey, &cache.ResolvedEntry{RawJSON: outerBody375(dict, "w")}, gen0) {
 		t.Fatalf("setup: outer PutIfGen refused")
 	}
 	if got := rem.get(outerKey); got != 1 {
@@ -315,7 +317,7 @@ func runConvergenceArm375(t *testing.T, stages []*templates.API, churns map[sche
 		gen0 := store.CaptureGen(k)
 		rctx := cache.WithL1KeyContext(hctx, k) // hctx carries the consumed trigger set
 		dict := resolve375(rctx, stages...)
-		store.ReplaceIfGen(rctx, k, &cache.ResolvedEntry{RawJSON: outerBody375(dict, ids...), Inputs: &used}, gen0)
+		store.ReplaceResolvedIfGen(rctx, fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: outerBody375(dict, ids...), Inputs: &used}, gen0)
 		outerOnce.Do(func() { close(outerDone) })
 		return nil
 	})
@@ -328,11 +330,11 @@ func runConvergenceArm375(t *testing.T, stages []*templates.API, churns map[sche
 		}
 		gen0 := store.CaptureGen(k)
 		path := "/apis/" + used.Group + "/" + used.Version + "/" + used.Resource
-		raw, ok := dispatchViaInformer(cache.WithApistageContentResolve(hctx),
+		raw, ok, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(hctx),
 			httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{Path: path, Verb: ptr.To(http.MethodGet)}})
 		if ok {
 			rctx := cache.WithL1KeyContext(hctx, k)
-			store.ReplaceIfGen(rctx, k, &cache.ResolvedEntry{RawJSON: raw, Inputs: &used}, gen0)
+			store.ReplaceResolvedIfGen(rctx, fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: raw, Inputs: &used}, gen0)
 		}
 		return nil
 	})
@@ -366,7 +368,7 @@ func runConvergenceArm375(t *testing.T, stages []*templates.API, churns map[sche
 			t.Fatalf("setup: the initial resolve must have served PRE-churn data, got %s", stale)
 		}
 	}
-	if !store.PutIfGen(octx, outerKey, &cache.ResolvedEntry{RawJSON: stale, Inputs: &outerIn}, gen0) {
+	if !store.PutResolvedIfGen(octx, fixtureStoreVerdict, outerKey, &cache.ResolvedEntry{RawJSON: stale, Inputs: &outerIn}, gen0) {
 		t.Fatalf("setup: outer PutIfGen refused")
 	}
 
@@ -431,10 +433,10 @@ func TestIssue375_ContentOwnDepChurn_ContentKeyRemarked_ConvergesFresh(t *testin
 	cache.RegisterRefreshFunc(cache.CacheEntryClassApistage, func(hctx context.Context, k string, used cache.ResolvedKeyInputs) error {
 		gen0 := store.CaptureGen(k)
 		path := "/apis/" + used.Group + "/" + used.Version + "/" + used.Resource
-		raw, ok := dispatchViaInformer(cache.WithApistageContentResolve(hctx),
+		raw, ok, _, _ := dispatchViaInformer(cache.WithApistageContentResolve(hctx),
 			httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{Path: path, Verb: ptr.To(http.MethodGet)}})
 		if ok {
-			store.ReplaceIfGen(cache.WithL1KeyContext(hctx, k), k, &cache.ResolvedEntry{RawJSON: raw, Inputs: &used}, gen0)
+			store.ReplaceResolvedIfGen(cache.WithL1KeyContext(hctx, k), fixtureStoreVerdict, k, &cache.ResolvedEntry{RawJSON: raw, Inputs: &used}, gen0)
 		}
 		return nil
 	})

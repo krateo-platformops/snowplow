@@ -132,6 +132,38 @@ func main() {
 		return
 	}
 
+	// Site-class 4 only, over explicit package patterns (the gate's own
+	// discrimination fixture: `-verdict-only ./testdata/verdict`).
+	if os.Args[1] == "-verdict-only" {
+		findings, files, err := checkVerdictSites(".", os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: verdict: %v\n", err)
+			os.Exit(2)
+		}
+		if len(findings) > 0 {
+			reportVerdictFindings(findings)
+			os.Exit(1)
+		}
+		fmt.Printf("OK: no resolve-output write bypasses the Put-gate verdict; %d file(s) scanned.\n", files)
+		return
+	}
+
+	// Site-class 6 only, over explicit package patterns (the gate's own
+	// discrimination fixture: `-admission-only ./testdata/admission`).
+	if os.Args[1] == "-admission-only" {
+		findings, files, err := checkAdmissionSites(".", os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: admission: %v\n", err)
+			os.Exit(2)
+		}
+		if len(findings) > 0 {
+			reportAdmissionFindings(findings)
+			os.Exit(1)
+		}
+		fmt.Printf("OK: every store write is admitted by admitWrite; %d file(s) scanned.\n", files)
+		return
+	}
+
 	fset := token.NewFileSet()
 	var entryFindings []entryFinding
 	var scanned, entrySites, bootScopeStamps int
@@ -213,6 +245,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "       is intentional, consciously lower bootScopeStampFloor in this checker with a note.\n")
 	}
 
+	// Site-class 5 (#911 re-review): every dispatcher Put site of a resolve
+	// output keeps the stage outcomes, or says why its class never answers a
+	// RESTAction /call.
+	for _, root := range os.Args[1:] {
+		findings, sites, err := checkStageOutcomesTree(root)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: stage outcomes: %v\n", err)
+			os.Exit(2)
+		}
+		if len(findings) > 0 {
+			failed = true
+			reportStageOutcomesFindings(findings)
+		} else if sites > 0 {
+			fmt.Printf("OK: %d dispatcher ResolvedEntry Put site(s) keep %s or carry a waiver.\n", sites, stageOutcomesField)
+		}
+	}
+
 	// Site-class 3 (#643): the resolve path's L1 body reads, typed. Runs when a
 	// scanned root is the production `internal` tree.
 	serveProbes, serveScoped := 0, false
@@ -237,8 +286,64 @@ func main() {
 		}
 	}
 
+	// Site-class 4 (#912 re-review): the resolve-output packages write a
+	// ResolvedEntry only through a write that takes the Put-gate verdict. Runs
+	// when a scanned root is the production `internal` tree.
+	verdictFiles, verdictScoped := 0, false
+	for _, root := range os.Args[1:] {
+		if filepath.Base(filepath.Clean(root)) != "internal" {
+			continue
+		}
+		verdictScoped = true
+		var patterns []string
+		for _, p := range verdictScope {
+			patterns = append(patterns, "./"+filepath.ToSlash(filepath.Join(root, strings.TrimPrefix(p, "./internal/"))))
+		}
+		findings, files, err := checkVerdictSites(".", patterns)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: verdict: %v\n", err)
+			os.Exit(2)
+		}
+		verdictFiles += files
+		if len(findings) > 0 {
+			failed = true
+			reportVerdictFindings(findings)
+		}
+	}
+
+	// Site-class 6 (#1233): every write of the store is admitted by admitWrite,
+	// the one place the "no shared Put on an incomplete RBAC snapshot" rule sits.
+	// Runs when a scanned root is the production `internal` tree.
+	admissionFiles, admissionScoped := 0, false
+	for _, root := range os.Args[1:] {
+		if filepath.Base(filepath.Clean(root)) != "internal" {
+			continue
+		}
+		admissionScoped = true
+		var patterns []string
+		for _, p := range admissionScope {
+			patterns = append(patterns, "./"+filepath.ToSlash(filepath.Join(root, strings.TrimPrefix(p, "./internal/"))))
+		}
+		findings, files, err := checkAdmissionSites(".", patterns)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "checkresolvedentrysites: admission: %v\n", err)
+			os.Exit(2)
+		}
+		admissionFiles += files
+		if len(findings) > 0 {
+			failed = true
+			reportAdmissionFindings(findings)
+		}
+	}
+
 	if failed {
 		os.Exit(1)
+	}
+	if admissionScoped {
+		fmt.Printf("OK: every store write is admitted by admitWrite; %d file(s) scanned.\n", admissionFiles)
+	}
+	if verdictScoped {
+		fmt.Printf("OK: no resolve-output write bypasses the Put-gate verdict; %d file(s) scanned.\n", verdictFiles)
 	}
 
 	fmt.Printf("OK: %d ResolvedEntry Put site(s) all set %s or carry a waiver; %d boot-scope stamp site(s) (floor %d); %d files scanned.\n",

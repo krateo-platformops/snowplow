@@ -257,7 +257,7 @@ func waitForServeObject(t *testing.T, rw *cache.ResourceWatcher,
 			if !rw.IsServable(gvr) {
 				return false, nil
 			}
-			_, hit := rw.GetObject(gvr, ns, name)
+			_, hit := rw.GetObject(context.Background(), gvr, ns, name)
 			return hit, nil
 		})
 	if err != nil {
@@ -422,7 +422,7 @@ func TestGet_InformerServed_DoesNotMutateStore(t *testing.T) {
 
 	// The served object MUST be a distinct pointer from the store
 	// object — otherwise stripForServe would have mutated shared state.
-	stored, hit := rw.GetObject(serveTestGVR, "default", "alpha")
+	stored, hit := rw.GetObject(context.Background(), serveTestGVR, "default", "alpha")
 	if !hit {
 		t.Fatalf("store re-read: object disappeared from informer store")
 	}
@@ -432,7 +432,7 @@ func TestGet_InformerServed_DoesNotMutateStore(t *testing.T) {
 
 	// Mutate the served copy; the store object must be unaffected.
 	res.Unstructured.Object["spec"].(map[string]any)["marker"] = "MUTATED"
-	stored2, _ := rw.GetObject(serveTestGVR, "default", "alpha")
+	stored2, _ := rw.GetObject(context.Background(), serveTestGVR, "default", "alpha")
 	if got := stored2.Object["spec"].(map[string]any)["marker"]; got != "m" {
 		t.Fatalf("mutating the served copy bled into the shared store: store spec.marker=%v", got)
 	}

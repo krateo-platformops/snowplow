@@ -181,7 +181,7 @@ var resetExemptions = map[string]resetExemption{
 	"resetRefreshBroadcasterForTest":     {exemptUnmeasured, "closes live SSE subscribers; only the arms that open them reset it"},
 	"ResetSecretsInformerForTest":        {exemptUnmeasured, "secrets informer wiring flags + its assertion ledger"},
 	"ResetSecretsSnapshotForTest":        {exemptUnmeasured, "published secrets snapshot + publish seq"},
-	"resetStoreRepairForTest":            {exemptUnmeasured, "store-repair queue and in-flight flag"},
+	"ResetStoreSwapForTest":              {exemptWrapper, "#870 cross-package shim over resetStoreSwapStatsForTest, composed via ResetStoreVerificationStatsForTest"},
 	"resetStoreVerificationStateForTest": {exemptUnmeasured, "per-GVR verification state"},
 
 	// --- the one METHOD reset in the package -------------------------------

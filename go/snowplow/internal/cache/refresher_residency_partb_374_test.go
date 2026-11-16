@@ -74,6 +74,8 @@ func TestFalsifier374_PartB_NonResidentSkipsPark(t *testing.T) {
 // does NOT skip the park for real work), then after release still RE-RESOLVES
 // (the dequeue Get is authoritative; a resident key is never dropped by Part B).
 func TestFalsifier374_PartB_ResidentStillYieldsAndRefreshes(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 
@@ -85,7 +87,7 @@ func TestFalsifier374_PartB_ResidentStillYieldsAndRefreshes(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-resident-374"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"y":1}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"y":1}`), Inputs: &inputs})
 
 	handlerRan := make(chan struct{}, 1)
 	RegisterRefreshFunc("widgets", func(_ context.Context, _ string, _ ResolvedKeyInputs) error {

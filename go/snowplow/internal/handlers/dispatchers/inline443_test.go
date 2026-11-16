@@ -692,8 +692,12 @@ func TestS443_Inline(t *testing.T) {
 	})
 
 	// d — WriteVerbStageNeverDispatched: a POST stage aimed at the fake
-	// apiserver and one at an external server; both receive zero requests,
-	// and the envelope carries the dry-run stage error.
+	// apiserver and one at an external server; both receive zero requests.
+	// The apiserver stage carries the dry-run stage error. The "external"
+	// stage names no endpointRef, so it targets this cluster: its absolute-URL
+	// path would be sent to the apiserver as `/http://…/hook`, a path the
+	// apiserver reads differently from how it is written, and since #1137 the
+	// plan refuses it before the dry-run check is reached.
 	t.Run("d_WriteVerbStageNeverDispatched", func(t *testing.T) {
 		f := in443Setup(t)
 		var extHits atomic.Int64
@@ -727,7 +731,8 @@ func TestS443_Inline(t *testing.T) {
 			t.Errorf("the external server received %d requests from a dry-run resolve", n)
 		}
 		body := rec.Body.String()
-		for _, want := range []string{`dry-run: stage \"create\" verb POST is not executed`, `dry-run: stage \"webhook\" verb POST is not executed`} {
+		for _, want := range []string{`dry-run: stage \"create\" verb POST is not executed`,
+			`write stage \"webhook\" verb POST was not sent: the apiserver would read its rendered path as a different path (#1137)`} {
 			if !strings.Contains(body, want) {
 				t.Errorf("envelope lacks the stage error %s: %s", want, psTrunc(body, 600))
 			}

@@ -32,9 +32,12 @@ var resolvedEntryBodyFields = map[string]bool{"RawJSON": true, "Inputs": true}
 var resolvedEntryMetadataInPlace = map[string]string{
 	"CreatedAt":       "putPreamble stamps the incoming entry's write time",
 	"BornAt":          "putPreamble / ReplaceIfGenRefresh / putCoreLocked lifetime clock (incoming entry); SetBornAtForTest",
+	"resolveStart":    "#1198 putPreamble stamps where the incoming entry's resolve began (metadata: the stale-push ledger only)",
+	"hasResolveStart": "#1198 stamped with resolveStart",
 	"Pinned":          "putCoreLocked demotes a pin request on the incoming entry",
 	"contentVersion":  "#406 raLayerCommitLocked versions the incoming RAFullList entry",
 	"hitters":         "NoteHitter: the representative pool, metadata",
+	"SeedOrigin":      "#841 putCoreLocked's replace keeps the key's seed origin on the incoming entry (metadata: counters only)",
 	"items":           "EnsureItems: lazily-derived parse of RawJSON, published once",
 	"itemsAPIVersion": "EnsureItems: derived",
 	"itemsKind":       "EnsureItems: derived",

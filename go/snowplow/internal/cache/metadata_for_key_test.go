@@ -29,6 +29,8 @@ import (
 )
 
 func TestMetadataForKey_ReturnsAHashNeverTheBody(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 
 	const secret = `{"children":["agents-header"],"tenantSecretish":"do-not-leak"}`
@@ -43,7 +45,7 @@ func TestMetadataForKey_ReturnsAHashNeverTheBody(t *testing.T) {
 		BindingUID:      "uid-cohort-a",
 	}
 	const key = "L1_inspect_me"
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(secret), Inputs: inputs})
+	store.put(key, &ResolvedEntry{RawJSON: []byte(secret), Inputs: inputs})
 
 	meta, ok := store.MetadataForKey(key)
 	if !ok {
@@ -73,7 +75,7 @@ func TestMetadataForKey_ReturnsAHashNeverTheBody(t *testing.T) {
 		t.Fatalf("BodySHA256 = %q, want %q", meta.BodySHA256, want)
 	}
 	// And it must discriminate: a different body must hash differently.
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"children":["agents-main"]}`), Inputs: inputs})
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{"children":["agents-main"]}`), Inputs: inputs})
 	after, _ := store.MetadataForKey(key)
 	if after.BodySHA256 == want {
 		t.Fatalf("BodySHA256 did not change across a re-Put with different content — the field "+
@@ -88,12 +90,14 @@ func TestMetadataForKey_ReturnsAHashNeverTheBody(t *testing.T) {
 }
 
 func TestMetadataForKey_DoesNotTouchTheEntry(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 
 	store := newResolvedCache(10, 1<<20, time.Hour)
 	inputs := &ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "w"}
-	store.Put("L1_a", &ResolvedEntry{RawJSON: []byte(`{"a":1}`), Inputs: inputs})
-	store.Put("L1_b", &ResolvedEntry{RawJSON: []byte(`{"b":1}`), Inputs: inputs})
+	store.put("L1_a", &ResolvedEntry{RawJSON: []byte(`{"a":1}`), Inputs: inputs})
+	store.put("L1_b", &ResolvedEntry{RawJSON: []byte(`{"b":1}`), Inputs: inputs})
 
 	beforeHits := store.Stats().HitTotal
 	beforeMiss := store.Stats().MissTotal

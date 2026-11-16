@@ -217,7 +217,7 @@ func TestC8_DeliveryFailureMatrix_MutationProbe(t *testing.T) {
 			t.Errorf("the checker did not reject %q (defects: %v) — the guard is not reading the tree", w, defects)
 		}
 	}
-	good := []c8Row{{"G1", "store", "ok", "`snowplow_deps.evict_delete_total`, `snowplow_refresher_dropped_total`, `snowplow_resolved_cache.evict_max_age_total`, `snowplow_crd_discovery.relist_bridge_timeout_total`", "`TestC8_DeliveryFailureMatrix_MutationProbe`", "PINNED — ok"}}
+	good := []c8Row{{"G1", "store", "ok", "`snowplow_deps.evict_delete_total`, `snowplow_refresher_dropped_total`, `snowplow_resolved_cache.evict_max_age_total`, `snowplow_crd_discovery.schema_relists_fired`", "`TestC8_DeliveryFailureMatrix_MutationProbe`", "PINNED — ok"}}
 	if d := c8CheckRows(good, tests, fams); len(d) != 0 {
 		t.Errorf("a valid row was rejected: %v", d)
 	}

@@ -471,8 +471,8 @@ func TestRBACSnapshot_DegradeToDeny(t *testing.T) {
 // the §6 mechanism test.
 func TestRBACSnapshot_MissCanary(t *testing.T) {
 	before := RBACSnapshotMissCount()
-	RecordRBACSnapshotMiss("ClusterRole", "", "phantom-role")
-	RecordRBACSnapshotMiss("Role", "ns-x", "phantom-role")
+	RecordRBACSnapshotMiss(context.Background(), "ClusterRole", "", "phantom-role")
+	RecordRBACSnapshotMiss(context.Background(), "Role", "ns-x", "phantom-role")
 	after := RBACSnapshotMissCount()
 	if after-before != 2 {
 		t.Errorf("RBACSnapshotMissCount delta = %d; want 2", after-before)

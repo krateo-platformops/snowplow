@@ -31,6 +31,11 @@ func h643RetiredCount(reason string) uint64 {
 }
 
 func TestIssue643_F3e_ExpiredServedCell_RetiresTheMark(t *testing.T) {
+	// #882 F1 (owner ruling) — an INCREMENTAL list cell never dies of old age (no
+	// TTL or max entry age applies to it; a body change moves its served
+	// identity instead, #854 F7b). This arm pins the age bound for a PLAIN list
+	// cell, so it runs with anchoring off.
+	t.Cleanup(cache.SetListCellAnchoringForTest(false))
 	env := h643Setup(t, h643Opts{cohorts: h643K, internal: 1, things: 2, extra: []h643Extra{h643IterExtra}})
 	cache.ResetDeclinedExternalRetiredForTest()
 	t.Cleanup(cache.ResetDeclinedExternalRetiredForTest)

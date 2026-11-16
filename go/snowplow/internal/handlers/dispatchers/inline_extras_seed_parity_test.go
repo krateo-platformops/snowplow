@@ -44,6 +44,8 @@ func seedKeyExtrasFor(crObj map[string]any) map[string]any {
 // Seed a widget carrying BOTH inline maps under the SEED's per-cohort key, then
 // look up under the DISPATCHER's serve-time key (no ?extras=) → MUST HIT.
 func TestInlineExtras_6_SeedParity_PerCohortWidgetCell(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	ctx := ctxWithIdentity()
 	const (
@@ -59,7 +61,7 @@ func TestInlineExtras_6_SeedParity_PerCohortWidgetCell(t *testing.T) {
 		t.Fatal("expected a live per-cohort cache handle + key under the seed ctx")
 	}
 	body := []byte(`{"status":{"widgetData":{"label":"acme"}}}`)
-	seedHandle.Put(seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
+	putFixture(seedHandle, seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
 
 	// SERVE key: union with the EMPTY request extras (no ?extras= on the /call).
 	serveKey, serveHandle, _ := dispatchCacheLookupKey(ctx, "widgets",
@@ -86,6 +88,8 @@ func TestInlineExtras_6_SeedParity_PerCohortWidgetCell(t *testing.T) {
 // request), so the seeded full-list cell is HIT on the first paginated /call.
 // The resourcesRefsTemplateExtras map MUST NOT perturb this cell (§1).
 func TestInlineExtras_6_SeedParity_RAFullListSubCell(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	const (
 		rg, rv, rr, rns, rname = "templates.krateo.io", "v1", "restactions", "demo-system", "some-ra"
@@ -118,7 +122,7 @@ func TestInlineExtras_6_SeedParity_RAFullListSubCell(t *testing.T) {
 		t.Fatal("expected a live resolved cache")
 	}
 	full := map[string]any{"items": []any{map[string]any{"x": float64(1)}}}
-	c.PutRAFullList(seedRAKey, cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
+	c.PutRAFullList(fixtureStoreVerdict, seedRAKey, cache.RAFullListKeyInputsForTest(rg, rv, rr, rns, rname, bUID,
 		widgets.GetApiRefExtras(cr)), full)
 	if _, hit := c.Get(serveRAKey); !hit {
 		t.Fatal("FALSIFIER #6 FAILED (RAFullList sub-cell): serve-key lookup MISSED the seeded full-list cell")

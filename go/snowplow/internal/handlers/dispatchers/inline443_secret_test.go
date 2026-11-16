@@ -120,8 +120,9 @@ func TestS443_InlineSecret(t *testing.T) {
 		assertInlineEcho(t, rec, "f1")
 		assertNoRefreshKey(t, rec, "f1")
 		out := parseOutcomes443(t, rec.Header().Get("X-Snowplow-Stage-Outcomes"))
-		if row, ok := out["secret"]; !ok || !row.OK || row.Reason == api.StageReasonNotExecuted {
-			t.Errorf("f1: the Secret stage must be EXECUTED (ok, not %s); outcome=%+v", api.StageReasonNotExecuted, row)
+		// #904 — a succeeded stage is absent from the header.
+		if row, listed := out["secret"]; listed {
+			t.Errorf("f1: the Secret stage must be EXECUTED and succeed (not listed; not %s); outcome=%+v", api.StageReasonNotExecuted, row)
 		}
 		time.Sleep(50 * time.Millisecond) // a registration would be synchronous; settle any async edge
 		assertSecretHeldNowhere(t, "f1")
@@ -207,8 +208,9 @@ func TestS443_InlineSecret(t *testing.T) {
 			t.Errorf("alice (list+get secrets in x) was not served her Secret; body=%s", psTrunc(rec.Body.String(), 400))
 		}
 		out := parseOutcomes443(t, rec.Header().Get("X-Snowplow-Stage-Outcomes"))
-		if row, ok := out["secrets"]; !ok || !row.OK {
-			t.Errorf("f3: the UAF Secret stage must be EXECUTED (ok); outcome=%+v", row)
+		// #904 — a succeeded stage is absent from the header.
+		if row, listed := out["secrets"]; listed {
+			t.Errorf("f3: the UAF Secret stage must be EXECUTED and succeed (not listed); outcome=%+v", row)
 		}
 		assertNoRefreshKey(t, rec, "f3")
 		time.Sleep(50 * time.Millisecond)

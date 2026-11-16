@@ -47,7 +47,7 @@ func TestR3_PreParsedGateByteIdentical(t *testing.T) {
 
 	// A real raw LIST envelope: marshalAsList over every seeded widget,
 	// exactly the shape dispatchViaInformer stores in a content entry.
-	items, servable := rw.ListObjectsServable(f1WidgetsGVR, "")
+	items, servable := rw.ListObjectsServable(context.Background(), f1WidgetsGVR, "")
 	if !servable {
 		t.Fatalf("setup: widgets GVR not servable after sync")
 	}
@@ -67,8 +67,8 @@ func TestR3_PreParsedGateByteIdentical(t *testing.T) {
 	// Path A — the unmarshal-inside-gate fallback path. Ship 0.30.128
 	// P-CORE-2: the gate now returns the DECODED envelope value, not
 	// []byte.
-	gatedA, okA := gateListEnvelope(ctx, f1WidgetsGVR, raw)
-	if !okA {
+	gatedA, gateErrA := gateListEnvelope(ctx, f1WidgetsGVR, "team-a", "", raw)
+	if gateErrA != nil {
 		t.Fatalf("path A (gateListEnvelope) returned served=false; want a gated envelope")
 	}
 
@@ -78,8 +78,8 @@ func TestR3_PreParsedGateByteIdentical(t *testing.T) {
 	if !parseOK {
 		t.Fatalf("path B: parseListEnvelope failed on a well-formed envelope")
 	}
-	gatedB, okB := gateListItems(ctx, f1WidgetsGVR, parsed)
-	if !okB {
+	gatedB, gateErrB := gateListItems(ctx, f1WidgetsGVR, "team-a", "", parsed)
+	if gateErrB != nil {
 		t.Fatalf("path B (gateListItems) returned served=false; want a gated envelope")
 	}
 
@@ -114,6 +114,8 @@ func TestR3_PreParsedGateByteIdentical(t *testing.T) {
 // entry carrying Items must weigh strictly MORE than the same entry with
 // only RawJSON.
 func TestR3_EntryItemsAccountedInBytes(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()
@@ -135,7 +137,7 @@ func TestR3_EntryItemsAccountedInBytes(t *testing.T) {
 
 	// Entry 1 — RawJSON only (no pre-parsed Items).
 	plain := &cache.ResolvedEntry{RawJSON: raw, Inputs: apistageInputs}
-	store.Put("r3-plain", plain)
+	store.PutResolved(fixtureStoreVerdict, "r3-plain", plain)
 	plainBytes := store.Bytes()
 
 	// Entry 2 — same RawJSON PLUS pre-parsed Items. f1WidgetsGVR is a
@@ -151,7 +153,7 @@ func TestR3_EntryItemsAccountedInBytes(t *testing.T) {
 		ItemsAPIVersion: parsed.apiVersion,
 		ItemsKind:       parsed.kind,
 	}
-	store.Put("r3-with-items", withItems)
+	store.PutResolved(fixtureStoreVerdict, "r3-with-items", withItems)
 	bothBytes := store.Bytes()
 
 	// The Items-carrying entry must add strictly more than its RawJSON

@@ -1,0 +1,929 @@
+# issue1124_portal_uaf_ras.yaml — five REAL portal RESTActions, vendored
+# verbatim (whole documents, blank template lines included) from
+# `helm template` of krateo-platformops/portal main 10e359e, for the #1124 arms
+# (issue1124_uaf_own_resource_test.go).
+#
+#   compositions-list   (portal)           allCompositions: objects of every
+#   composition-detail  (compositions-page) found:          discovered plural,
+#                                           resourcesFrom over the plural set
+#   projects            (portal)           namespaces: scope pruning, OR across
+#   blueprint-formdef   (blueprints-page)  namespaces: the plural set, items are
+#   agent-formdef       (portal-agents)    namespaces: namespaces
+#
+# A regression corpus, not a mirror: refresh a document only when the portal
+# changes the stage the arms exercise.
+---
+# Source: portal/templates/restaction.compositions-list.yaml
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: compositions-list
+  namespace: krateo-system
+  annotations:
+    "krateo.io/verbose": "true"
+spec:
+  api:
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  - name: crds
+    path: /apis/core.krateo.io/v1alpha1/compositiondefinitions
+    verb: GET
+    userAccessFilter:
+      verb: list
+      group: core.krateo.io
+      resource: compositiondefinitions
+      namespaceFrom: .metadata.namespace
+    filter: "[.crds.items[]? | select(.status.resource != null and .status.apiVersion != null) | {plural: .status.resource, version: (.status.apiVersion | split(\"/\")[1])}] | unique"
+    continueOnError: true
+    errorKey: crdsError
+  - name: allCompositions
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    dependsOn:
+      name: crds
+      iterator: ".crds"
+    path: ${ "/apis/composition.krateo.io/" + (.version) + "/" + (.plural) }
+    verb: GET
+    continueOnError: true
+    errorKey: allCompositionsError
+    userAccessFilter:
+      verb: list
+      group: composition.krateo.io
+      resourcesFrom: "[ (.crds // [])[] | .plural ]"
+      namespaceFrom: .metadata.namespace
+    filter: >
+      [.allCompositions.items[]?
+       | {uid: .metadata.uid, name: .metadata.name, ns: .metadata.namespace, ts: .metadata.creationTimestamp, kind: .kind, av: .apiVersion, conditions: (.status.conditions // []), wh: .status.workloadHealthy, whMsg: (.status.healthMessage // ""), platform: ((((.metadata.labels // {})["krateo.io/composition-name"]) == "installer") or (((.metadata.labels // {})["krateo.io/composition-definition-name"]) == "installer"))}]
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  filter: >
+    (((.projects // "") | split(",") | map(select(. != ""))) as $projSel
+     | ((.project // .namespace) // "") as $proj
+     | if ($projSel | length) > 0 then $projSel elif $proj != "" then [$proj] else [] end) as $projects
+    | (.status // "all") as $status
+    | (.scope // "workloads") as $scope
+    | ((.q // "") | ascii_downcase) as $q
+    | now as $now
+    | ((.allCompositions // []) | map(select(($projects | length) == 0 or (([.ns] - $projects) | length == 0))) | map(. + ((.conditions // []) as $c | (any($c[]?; .type == "Ready" and .status == "True")) as $ready | (any($c[]?; .type == "Ready" and .status == "False")) as $notready | (any($c[]?; .type == "Synced" and .status == "False")) as $unsynced | ($ready and (.wh == false)) as $degraded | {conditions: ((.conditions // []) + (if .wh == false then [{type: "Workload", status: "False", reason: "Unhealthy", message: (.whMsg // "")}] else [] end)), state: (if $notready then "failed" elif $degraded then "degraded" elif $ready then "healthy" else "pending" end), railState: (if $notready then "failed" elif $degraded then "degraded" elif $ready and ($unsynced | not) then "healthy" elif $ready and $unsynced then "drift" else "pending" end), healthPercent: (if $notready then 20 elif $degraded then 50 elif $ready and ($unsynced | not) then 100 elif $ready and $unsynced then 50 else 50 end)}))) as $all
+    | $all as $dated
+    | ($dated | map(select(if $scope == "all" then true elif $scope == "platform" then .platform else (.platform | not) end))) as $scoped
+    | {
+        list: $all,
+        filtered: ($scoped | map(select((if $status == "drift" then (.railState == "drift") else ($status == "all" or .state == $status) end) and ($q == "" or ((.name // "") | ascii_downcase | contains($q)) or ((.kind // "") | ascii_downcase | contains($q)))))),
+        counts: {all: ($scoped | length), healthy: ($scoped | map(select(.state == "healthy")) | length), drift: ($scoped | map(select(.railState == "drift")) | length), pending: ($scoped | map(select(.state == "pending")) | length), degraded: ($scoped | map(select(.state == "degraded")) | length), failed: ($scoped | map(select(.state == "failed")) | length)},
+        scopeCounts: {workloads: ($dated | map(select(.platform | not)) | length), platform: ($dated | map(select(.platform)) | length), all: ($dated | length)},
+        scope: $scope,
+        status: $status,
+        q: ((.q // "") | tostring),
+        projects: ((.projects // "") | tostring)
+      }
+---
+# Source: portal/templates/restaction.projects.yaml
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: projects
+  namespace: krateo-system
+  annotations:
+    "krateo.io/verbose": "true"
+spec:
+  api:
+    
+    
+    - name: crds
+      path: /apis/core.krateo.io/v1alpha1/compositiondefinitions
+      verb: GET
+      userAccessFilter:
+        verb: list
+        group: core.krateo.io
+        resource: compositiondefinitions
+        namespaceFrom: .metadata.namespace
+      filter: "[.crds.items[]? | select(.status.resource != null) | .status.resource] | unique"
+      continueOnError: true
+      errorKey: crdsError
+    
+    - name: namespaces
+      path: /api/v1/namespaces
+      verb: GET
+      dependsOn:
+        name: crds
+      continueOnError: true
+      errorKey: namespacesError
+      userAccessFilter:
+        verb: list
+        group: composition.krateo.io
+        resourcesFrom: "[ (.crds // [])[] ]"
+        namespaceFrom: .metadata.name
+  
+  
+  filter: >
+    {
+      options: (
+        [ .namespaces.items[]? | { label: .metadata.name, value: .metadata.name } ]
+        | sort_by(.value)
+      )
+    }
+---
+# Source: compositions-page/templates/restaction.composition-detail.yaml
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: composition-detail
+  namespace: krateo-compositions
+  annotations:
+    krateo.io/verbose: "true"
+spec:
+  api:
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    - name: crds
+      path: /apis/core.krateo.io/v1alpha1/compositiondefinitions
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      userAccessFilter:
+        verb: list
+        group: core.krateo.io
+        resource: compositiondefinitions
+        namespaceFrom: .metadata.namespace
+      filter: "[.crds.items[]? | select(.status.resource != null and .status.apiVersion != null) | {plural: .status.resource, version: (.status.apiVersion | split(\"/\")[1]), kind: (.status.kind // \"\"), group: (.status.apiVersion | split(\"/\")[0]), cdName: (.metadata.name // \"\"), cdNamespace: (.metadata.namespace // \"\")}]"
+      continueOnError: true
+    - name: found
+      dependsOn:
+        name: crds
+        iterator: 'if (.namespace // "") == "" or (.name // "") == "" then [] else [ .crds | arrays | .[] | objects ] | unique_by([.version, .plural]) end'
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      path: ${ "/apis/composition.krateo.io/" + .version + "/" + .plural }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      continueOnError: true
+      userAccessFilter:
+        verb: list
+        group: composition.krateo.io
+        resourcesFrom: "[ (.crds // [])[] | .plural ]"
+        namespaceFrom: .metadata.namespace
+      filter: "(.extras.name // \"\") as $n | (.extras.namespace // \"\") as $ns | [.found.items[]? | select(.metadata.name == $n and .metadata.namespace == $ns) | del(.metadata.managedFields, .metadata.annotations[\"kubectl.kubernetes.io/last-applied-configuration\"])]"
+  filter: >
+    .name as $n
+    | .namespace as $ns
+    | ([ .found[]? | select(.metadata.name == $n and .metadata.namespace == $ns) ][0] // {}) as $d
+    | ($d.apiVersion // "") as $av
+    | ($d.metadata.name // $n) as $cn
+    | ($d.metadata.namespace // $ns) as $cns
+    | ([ .crds[]? | select((.kind // "") != "" and .kind == ($d.kind // "__none__")) ][0] // null) as $bp
+    | {
+        detail: $d,
+        conditions: (($d.status.conditions // []) + (if $d.status.workloadHealthy == false then [{type: "Workload", status: "False", reason: "Unhealthy", message: ($d.status.healthMessage // "")}] else [] end)),
+        workloadHealthy: $d.status.workloadHealthy,
+        healthMessage: ($d.status.healthMessage // ""),
+        gvr: {
+          apiVersion: $av,
+          resource: ([ .crds[]? | select(.group == ($av | split("/")[0]) and .kind == $d.kind) ][0].plural // ""),
+          name: $cn,
+          namespace: $cns
+        },
+        blueprintName: ($bp.cdName // ""),
+        blueprintNamespace: ($bp.cdNamespace // ""),
+        blueprintHref: (if $bp != null then ("/blueprints/" + ($bp.cdNamespace // "") + "/" + ($bp.cdName // "")) else "/blueprints" end),
+        diagnoseHref: ("/compositions/" + $cns + "/" + $cn + "?ask="
+          + (("Diagnose composition \"" + $cn + "\" in namespace \"" + $cns
+             + "\": is it healthy? If not, explain what is wrong from its conditions and managed"
+             + " resources, and how to fix it.") | @uri))
+      }
+---
+# Source: blueprints-page/templates/restaction.blueprint-formdef.yaml
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: blueprint-formdef
+  namespace: krateo-blueprints
+  annotations:
+    krateo.io/verbose: "true"
+spec:
+  api:
+    
+    
+    - name: compdef
+      dependsOn:
+        name: ""
+        iterator: '[ { namespace: (.namespace // ""), name: (.name // "") } | select(.namespace != "" and .name != "") ]'
+      path: ${ "/apis/core.krateo.io/v1alpha1/namespaces/" + .namespace + "/compositiondefinitions/" + .name }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    - name: jsonschema
+      path: ${ "/api/v1/namespaces/" + .namespace + "/configmaps/" + .resource + "-" + .version + "-jsonschema-configmap" }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      dependsOn:
+        name: compdef
+        iterator: '[ .compdef | objects | { namespace: (.metadata.namespace // "krateo-system"), resource: (.status.resource // ""), version: (((.status.apiVersion // "") | split("/"))[1] // "") } | select(.resource != "" and .version != "") ]'
+      continueOnError: true
+      errorKey: jsonschemaError
+    
+    - name: crd
+      dependsOn:
+        name: compdef
+        iterator: '[ .compdef | objects | { resource: (.status.resource // ""), group: (((.status.apiVersion // "") | split("/"))[0] // "") } | select(.resource != "" and .group != "") ]'
+      path: ${ "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/" + .resource + "." + .group }
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      
+      
+      continueOnError: true
+      errorKey: crdError
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    - name: namespaces
+      path: /api/v1/namespaces
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      dependsOn:
+        name: crd
+      userAccessFilter:
+        verb: create
+        group: composition.krateo.io
+        resourcesFrom: "[.compdef.status.resource // empty]"
+        namespaceFrom: .metadata.name
+      filter: "[.namespaces.items[] | .metadata.name]"
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  filter: |
+    # Where the value of the TOP-LEVEL key $key opens (the index of its `{`) in JSON text, or null.
+    # A string scan that tracks depth and skips string contents, because `index("\"properties\": ")`
+    # finds the FIRST occurrence: a blueprint whose schema puts an `if: { properties: … }` (or any
+    # nested `properties`) before its own top-level `properties` had the identity fields spliced
+    # into that inner object, and the form lost its Name and Namespace. The text is never parsed and
+    # re-emitted (gojq would sort the keys); only the position is computed. `first` stops the scan
+    # at the match, which in every real schema is in its first few hundred characters.
+    def toplevel_object_start($key):
+      . as $s
+      | ("\"" + $key + "\"") as $needle
+      | ($needle | length) as $nl
+      | ($s | explode) as $cs
+      | (first(
+          foreach range(0; $cs | length) as $i (
+            { d: 0, str: false, esc: false, hit: null };
+            .hit = null
+            | if .str then
+                if .esc then .esc = false
+                elif $cs[$i] == 92 then .esc = true
+                elif $cs[$i] == 34 then .str = false
+                else . end
+              elif $cs[$i] == 34 then
+                (if .d == 1 and $s[$i:($i + $nl)] == $needle
+                    and ($s[($i + $nl):] | test("^\\s*:\\s*\\{")) then .hit = $i else . end)
+                | .str = true
+              elif $cs[$i] == 123 or $cs[$i] == 91 then .d += 1
+              elif $cs[$i] == 125 or $cs[$i] == 93 then .d -= 1
+              else . end;
+            select(.hit != null) | .hit
+          )
+        ) // null) as $h
+      | if $h == null then null else $h + $nl + ($s[($h + $nl):] | index("{")) end;
+    # NOT READY — the CompositionDefinition has no generated kind yet (core-provider has not
+    # reconciled it: the first seconds after an Install), its CRD is not served yet, or this runs with
+    # no blueprint named (a background prewarm). Every path above is null-safe for it, and the form
+    # says so instead of failing to resolve: `split` on a null apiVersion used to fail the whole
+    # widget. The Form widget renders a schema with no fields as its title and description.
+    (((.username // "anon") | gsub("[^a-zA-Z0-9_.-]"; "-"))
+        + "__" + ((.namespace // "") | gsub("[^a-zA-Z0-9_.-]"; "-"))
+        + "__" + ((.name // "") | gsub("[^a-zA-Z0-9_.-]"; "-"))) as $ownerKey
+    | ((.compdef.status.apiVersion // "") | tostring) as $cdApiVersion
+    # THE CRD IS NO LONGER REQUIRED (#261). A CRD read is CLUSTER-SCOPED and is dialled as the
+    # caller, so requiring it here meant every persona that can reach /blueprints/{ns}/{name}/new
+    # needed a ClusterRole — which is what `devs-get-list-any-customresourcedefinition-in-cluster`
+    # existed for. The namespaced jsonschema ConfigMap carries the same schema in authoring order
+    # and is what `stringSchema` (the Form's PREFERRED source) is built from; it is present for
+    # every reconciled CompositionDefinition (55 of 55 on krateo-057). So "not ready" now means
+    # NEITHER source resolved, and a caller who cannot read CRDs gets the real form from the CM
+    # instead of "This blueprint is still being registered".
+    | if ($cdApiVersion | contains("/") | not)
+         or ((.compdef.status.resource // "") == "")
+         or (((.crd.spec // null) == null) and (((.jsonschema.data["values.schema.json"]) // null) == null)) then
+        ([ (.compdef.status.conditions // [])[]? | select(.type == "Ready" and .status == "False") | (.message // "") | select(. != "") ][0]) as $why
+        | { stringSchema: "",
+            schemaSpec: { type: "object",
+                          title: "This blueprint is still being registered",
+                          description: ("Its kind has not been generated yet, so there is no form to fill in. This usually takes under a minute — reload the page."
+                                        + (if $why == null then "" else " core-provider reports: " + $why end)) },
+            propertiesToHide: [],
+            initialValues: { __owner: $ownerKey },
+            optionRefs: [],
+            apiVersion: "", kind: "", resource: "" }
+      else
+    ($cdApiVersion | split("/")[1]) as $ver
+    | ((.namespace // "") | if . == "" then "krateo-system" else . end) as $blueprintNs
+    # #66 (tenant self-service): the composition RECORD namespace (metadata.namespace) must be one
+    # the USER can `create` this composition in — NOT blindly the blueprint's namespace. A tenant's
+    # blueprints live in a read-only krateo-blueprints ns where the tenant has NO create RBAC, so
+    # pinning to $blueprintNs made the create POST 403. `.namespaces` is the api-step's
+    # userAccessFilter output (namespaces where the user CAN create this resource — all existent,
+    # RBAC-verified). Offer those as the picker; default to $blueprintNs when it's allowed (platform
+    # admin case → unchanged), else the first allowed ns (tenant case → their own ns). Empty (no
+    # create RBAC anywhere) → fall back to [$blueprintNs] so the form still renders one option. This
+    # does NOT reintroduce the old synthetic-`namespace` bug: __composition_namespace__ is an
+    # UNDERSCORE-FENCED identity key (never collides with a blueprint's own spec `namespace`), and
+    # every option is a real, create-permitted namespace (no nonexistent-ns 404).
+    | (.namespaces // []) as $nsAll
+    | (if ($nsAll | length) > 0 then $nsAll else [$blueprintNs] end) as $nsOpts
+    | (if ($nsOpts | index($blueprintNs)) then $blueprintNs else $nsOpts[0] end) as $nsDefault
+    # WRAPPED IN AN ARRAY, and that is load-bearing rather than tidy: with no CRD read the
+    # generator `.crd.spec.versions[]?` yields ZERO values, and `(empty) as $spec` makes the whole
+    # filter produce no output — which snowplow treats as a failed stage ("jq filter yielded no
+    # value"), not as a null. `[...] | first` always yields exactly one value, null included.
+    | ([ .crd.spec.versions[]? | select(.name == $ver) | .schema.openAPIV3Schema.properties.spec ] | first) as $spec
+    # Fields the blueprint marks hidden (title contains "(should be hidden)") are
+    # omitted from the generated form — propertiesToHide derived from the schema, not hardcoded.
+    | ([ ($spec.properties // {}) | to_entries[] | select((.value.title // "") | test("should be hidden"; "i")) | .key ]) as $hidden
+    # Draft key (CLIENT-SIDE resume): per-user (extras.username) + per-blueprint
+    # (extras.namespace/.name), sanitized to the localStorage-key charset. __owner is the key
+    # itself — it rides in the form store (initialValues) so the Form knows which localStorage
+    # entry to read/write, WITHOUT recomputing identity client-side. The draft VALUES live ONLY
+    # in the browser (localStorage) — never on the backend — so nothing is read for them here.
+    | (((.username // "anon") | gsub("[^a-zA-Z0-9_.-]"; "-"))
+        + "__" + ((.namespace // "") | gsub("[^a-zA-Z0-9_.-]"; "-"))
+        + "__" + ((.name // "") | gsub("[^a-zA-Z0-9_.-]"; "-"))) as $draftKey
+    # stringSchema (authoring order): the blueprint's raw values.schema.json (from the jsonschema
+    # CM) with __composition_name__/__composition_namespace__ identity STRING-spliced in as the
+    # first properties and a top-level required injected. Kept as a STRING — never parsed/re-emitted
+    # — so JSON key order survives to the client (which JSON.parses it). null when the CM is absent
+    # or has no "properties": — the Form then falls back to schemaSpec. __composition_namespace__ is
+    # spliced with enum:$nsOpts / default:$nsDefault (the userAccessFilter create-permitted set — see
+    # the #66 B.2 note above), IDENTICAL to the schemaSpec branch: a picker over namespaces the user
+    # can create in, defaulting to $blueprintNs when allowed (admin) else the first allowed ns
+    # (tenant → own ns). Renders single-option/pre-filled only when exactly one ns is permitted.
+    | ((.jsonschema.data["values.schema.json"]) // null) as $raw
+    # "" (never null) when there is no raw schema: the Form CRD types stringSchema a string and snowplow
+    # refuses a resolved widget it does not admit; the Form reads "" as absent and uses schemaSpec.
+    | (if $raw == null then ""
+       else ($raw | toplevel_object_start("properties")) as $pi
+         | (if $pi == null then ""
+            else ($raw[0:$pi]) as $pfx
+              | ($raw[$pi:]) as $rst
+              | ({ __composition_name__:      { type: "string", title: "Name",      description: "Name for the new composition instance" },
+                   __composition_namespace__: { type: "string", title: "Composition namespace", description: "Where the composition record is created (must be one you can create in) — distinct from any namespace the blueprint itself provisions", enum: $nsOpts, default: $nsDefault } } | tojson) as $id
+              # `{}` (a schema that declares no fields yet) takes the identity object whole: a
+              # trailing comma before its `}` would make the string unparseable.
+              | ($pfx + $id[:-1] + (if ($rst[1:] | test("^\\s*\\}")) then "" else "," end) + $rst[1:]) as $spliced
+              # The two identity keys MUST be `required` so they render UP-FRONT, not under the
+              # "Advanced" collapse (SchemaFields partitions on required). The old code PREPENDED a
+              # "required":[...] key, but the blueprint's raw schema carries its OWN top-level
+              # "required" later in the string; JSON.parse's duplicate-key-LAST-wins made the raw one
+              # win, dropping the identity keys into Advanced. Fix: read the raw required (read-only
+              # parse — the required ARRAY's order is irrelevant to rendering; only PROPERTY order must
+              # survive, which the splice above preserves) and APPEND the merged required as the LAST
+              # key so it wins. Identity keys first, then the blueprint's own required (minus any dup —
+              # the blueprint's own `namespace`, if present, stays required as a real spec field).
+              | (((try ($raw | fromjson | .required) catch null) // []) - ["__composition_name__","__composition_namespace__"]) as $rawReq
+              | (["__composition_name__","__composition_namespace__"] + $rawReq) as $req
+              | (($spliced | sub("\\s+$"; "")) | .[:-1]) as $body
+              | ($body + ",\"required\":" + ($req | tojson) + "}")
+            end)
+       end) as $stringSchema
+    # x-krateo-options sources (a field whose options a RESTAction returns): every `ref` in the raw
+    # schema becomes one GET ref of the Form (form.blueprint-create's resourcesRefsTemplate), so
+    # snowplow resolves the path and whether THIS user may call it — the browser never builds a
+    # call from schema text. `ref` is `name` (a RESTAction in the blueprint's own namespace, applied
+    # with its CompositionDefinition) or `namespace/name` (a shared one, e.g. the portal's
+    # form-options-namespaces). Anything that is not a Kubernetes name is dropped, never sent.
+    # Read from the RAW schema only: the CRD drops every x-krateo-* key, so the schemaSpec fallback
+    # has none.
+    | ((.compdef.metadata.namespace // $blueprintNs) | tostring) as $cdNs
+    | ([ (try ($raw | fromjson) catch null) | .. | objects | .["x-krateo-options"]? | objects | .ref? | strings
+         | gsub("^\\s+|\\s+$"; "")
+         | select(test("^([a-z0-9]([-a-z0-9]*[a-z0-9])?/)?[a-z0-9]([-.a-z0-9]*[a-z0-9])?$")) ]
+       | unique
+       | map(split("/") as $p | { id: ., name: $p[-1], namespace: (if ($p | length) == 2 then $p[0] else $cdNs end) })) as $optionRefs
+    | {
+        stringSchema: $stringSchema,
+        optionRefs: $optionRefs,
+        schemaSpec: ($spec
+          | .properties = ({
+              __composition_name__:      { type: "string", title: "Name",      description: "Name for the new composition instance" },
+              __composition_namespace__: { type: "string", title: "Composition namespace", description: "Where the composition record is created (must be one you can create in) — distinct from any namespace the blueprint itself provisions", enum: $nsOpts, default: $nsDefault }
+            } + (.properties // {}))
+          | .required = (["__composition_name__", "__composition_namespace__"] + (.required // []))
+          # Only read when stringSchema is "" (no jsonschema ConfigMap): say what that costs,
+          # instead of silently rendering a form without its field order or dynamic options.
+          | if $stringSchema == "" then
+              .["x-krateo-notice"] = "This form is built from the blueprint's CRD because its schema ConfigMap was not found: fields are in alphabetical order, and options a field loads at runtime are not available."
+            else . end),
+        propertiesToHide: $hidden,
+        initialValues: { __owner: $draftKey },
+        apiVersion: .compdef.status.apiVersion,
+        kind: .compdef.status.kind,
+        resource: .compdef.status.resource
+      }
+      end
+---
+# Source: portal-agents/templates/restaction.agent-formdef.yaml
+#    Verified by dry-run: `spec: {declarative: {}}` is ACCEPTED and defaults to
+#    `{type: Declarative, declarative: {runtime: python}}` — an agent with no model, no prompt and
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: agent-formdef
+  namespace: krateo-agents
+  annotations:
+    krateo.io/verbose: "true"
+spec:
+  api:
+    - name: crd
+      path: /apis/apiextensions.k8s.io/v1/customresourcedefinitions/agents.kagent.dev
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+    
+    
+    
+    - name: models
+      path: /apis/kagent.dev/v1alpha2/modelconfigs
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      userAccessFilter:
+        verb: list
+        group: kagent.dev
+        resource: modelconfigs
+        namespaceFrom: .metadata.namespace
+      continueOnError: true
+      errorKey: modelsError
+    
+    
+    - name: servers
+      path: /apis/kagent.dev/v1alpha2/remotemcpservers
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      userAccessFilter:
+        verb: list
+        group: kagent.dev
+        resource: remotemcpservers
+        namespaceFrom: .metadata.namespace
+      continueOnError: true
+      errorKey: serversError
+    
+    - name: agents
+      path: /apis/kagent.dev/v1alpha2/agents
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      userAccessFilter:
+        verb: list
+        group: kagent.dev
+        resource: agents
+        namespaceFrom: .metadata.namespace
+      continueOnError: true
+      errorKey: agentsError
+    
+    
+    
+    - name: namespaces
+      path: /api/v1/namespaces
+      verb: GET
+      headers:
+        - 'Accept: application/json'
+      dependsOn:
+        name: crd
+      userAccessFilter:
+        verb: create
+        group: kagent.dev
+        resourcesFrom: '["agents"]'
+        namespaceFrom: .metadata.name
+      continueOnError: true
+      errorKey: namespacesError
+      filter: '[ (.namespaces.items // [])[] | .metadata.name ]'
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  filter: |
+    def commonNames($byNs; $nsList):
+      if ($nsList | length) == 0 then []
+      else ( [ $nsList[] | (($byNs[.] // []) | unique) ]
+             | reduce .[] as $x (null; if . == null then $x else (. - (. - $x)) end) ) // []
+      end;
+    # A step that fails under continueOnError writes its reason to the declared errorKey as an
+    # ACCUMULATING SLICE — snowplow accumulateErrorKey (internal/resolvers/restactions/api/
+    # resolve.go:189) always stores []any, one entry per failed item — and each entry is either the
+    # apiserver Status envelope decoded to a map (response.AsMap, resolve.go:1149) or a bare message
+    # string. errText flattens all three shapes (slice / map / scalar) into one line, and returns ""
+    # when the key is absent, i.e. when the step SUCCEEDED. Never use `length > 0` on the payload to
+    # infer this: an empty list and a swallowed 404 are the same length.
+    def errText($e):
+      if $e == null then ""
+      else ( [ ( $e | if type == "array" then .[] else . end )
+               | if type == "object" then ((.message // .reason // (. | tojson)))
+                 elif . == null then ""
+                 else tostring end ]
+             | map(select(. != "")) | unique | join("; ") )
+      end;
+    "v1alpha2" as $ver
+    # Read state of each list step, bound once and consulted by every description that could
+    # otherwise present a failed read as an empty cluster.
+    | (errText(.modelsError))     as $mcErr
+    | (errText(.serversError))    as $srvErr
+    | (errText(.agentsError))     as $agErr
+    | (errText(.namespacesError)) as $nsErr
+    | (.crd.spec.versions[]? | select(.name == $ver) | .schema.openAPIV3Schema.properties.spec) as $spec
+    | ($spec.properties.description // { type: "string" }) as $pDesc
+    | ($spec.properties.declarative.properties.runtime // { type: "string" }) as $pRuntime
+    | ($spec.properties.declarative.properties.systemMessage // { type: "string" }) as $pSysMsg
+    # ── namespaces × model configs ──────────────────────────────────────────────────────────────
+    | ( [ (.namespaces // [])[] ] | unique ) as $nsCreate
+    | ( reduce ((.models.items // [])[]) as $m ({};
+          .[$m.metadata.namespace] = ((.[$m.metadata.namespace] // []) + [$m.metadata.name])) ) as $mcByNs
+    | ( [ $nsCreate[] | select($mcByNs[.] != null) ] ) as $nsWithMc
+    | ( commonNames($mcByNs; $nsWithMc) ) as $mcCommon
+    | ( if ($nsWithMc | length) == 0 then []
+        elif ($mcCommon | length) > 0 then $nsWithMc
+        else $nsWithMc[0:1] end ) as $nsOpts
+    | ( if ($nsOpts | length) == 0 then []
+        elif ($mcCommon | length) > 0 then ($mcCommon | sort)
+        else (($mcByNs[$nsOpts[0]] // []) | unique) end ) as $mcOpts
+    | ( if ($nsOpts | index("krateo-system")) then "krateo-system" else ($nsOpts[0] // "") end ) as $nsDefault
+    | ( if ($mcOpts | index("default-model-config")) then "default-model-config" else ($mcOpts[0] // "") end ) as $mcDefault
+    # What each offered ModelConfig actually resolves to, folded into the field description.
+    # NOTE the `. as $m` bindings here and below: `$list | index(.foo)` evaluates its ARGUMENT with
+    # `.` already re-bound to $list by the pipe, so `.metadata.namespace` would index the array and
+    # abort the whole filter ("Cannot index array with string"). Bind the item first, always.
+    | ( [ (.models.items // [])[]
+          | . as $m
+          | select(($nsOpts | index($m.metadata.namespace)) and ($mcOpts | index($m.metadata.name)))
+          | ($m.metadata.name + " → " + ($m.spec.model // "?")) ] | unique | join(" · ") ) as $mcHint
+    # ── tool catalogue (servers present in EVERY offered namespace) ──────────────────────────────
+    | ( reduce ((.servers.items // [])[]) as $s ({};
+          .[$s.metadata.namespace] = ((.[$s.metadata.namespace] // []) + [$s.metadata.name])) ) as $srvByNs
+    | ( commonNames($srvByNs; $nsOpts) ) as $srvOpts
+    | ( [ (.servers.items // [])[]
+          | . as $sv
+          | select(($nsOpts | index($sv.metadata.namespace)) and ($srvOpts | index($sv.metadata.name)))
+          | (($sv.status.discoveredTools // [])[] | .name)
+          | ($sv.metadata.name + "/" + .) ] | unique ) as $toolOpts
+    # ── delegation targets ──────────────────────────────────────────────────────────────────────
+    # Fan-out ORCHESTRATORS are excluded: the orchestrator is what routes work INTO this new agent
+    # (that is what krateo-autopilot's extraAgents does), so offering it back as a delegate target
+    # builds a cycle — autopilot → new agent → autopilot.
+    #
+    # The test is "delegates to MORE THAN ONE agent", not "delegates at all". On krateo-057 that
+    # excludes exactly autopilot (10 delegates) and autopilot-bench (3) while keeping
+    # frontend-agent, which sub-delegates to snowplow-agent alone — a specialist that calls one
+    # peer is a legitimate delegate target and an "any delegation at all" test wrongly hid it.
+    # This is a calibrated guard against the obvious cycle, not a hard invariant: a genuine
+    # specialist that fans out to two peers would also be withheld. If that ever bites, drop the
+    # filter rather than raising the threshold — the cycle is a judgement call for the author.
+    | ( [ (.agents.items // [])[]
+          | select( ([ (.spec.declarative.tools // [])[] | select(.type == "Agent") ] | length) <= 1 ) ] ) as $delegatable
+    | ( reduce ($delegatable[]) as $a ({};
+          .[$a.metadata.namespace] = ((.[$a.metadata.namespace] // []) + [$a.metadata.name])) ) as $agByNs
+    | ( commonNames($agByNs; $nsOpts) | sort ) as $agentOpts
+    # CASCADE. Every enum below is intersected across $nsOpts, so when $nsOpts is empty the tools
+    # and delegate pickers come back empty for a reason that has nothing to do with the servers or
+    # agents read. Without this, a failed modelconfigs read would make the Tools field claim "no
+    # RemoteMCPServer is readable" — an absence nobody observed. $nsBlocked names the real cause and
+    # every dependent description defers to it before reporting an emptiness of its own.
+    | ( if ($nsOpts | length) > 0 then ""
+        elif $nsErr != "" then ("the namespace list could not be read (" + $nsErr + ")")
+        elif $mcErr != "" then ("ModelConfigs could not be read (" + $mcErr + ")")
+        else "no namespace you can create Agents in holds a ModelConfig you can read" end ) as $nsBlocked
+    # Per-user client draft key (localStorage), seeded as __owner but never rendered/validated —
+    # same mechanism as alert-create. .username is the snowplow-injected JWT principal
+    # (identityContext: [username] on the Form); absent → "anon".
+    | (((.username // "anon") | gsub("[^a-zA-Z0-9_.-]"; "-")) + "__agent-create") as $draftKey
+    # $props is an ARRAY, not an object, and that is the whole point — see the header note. gojq
+    # preserves array order; it does NOT preserve object key order through tojson. The rendered
+    # order below IS the rendered order on screen (required partition first, then Advanced).
+    | [
+        { k: "__agent_name__",
+          v: {
+            type: "string",
+            title: "Name",
+            description: "Name for the new Agent (metadata.name). This is also the Service name the gateway route has to be registered against, so pick it deliberately — renaming later means re-registering."
+          } },
+        { k: "__agent_namespace__",
+          v: ({
+            type: "string",
+            title: "Namespace",
+            description: ("Namespace to create the Agent in. Limited to namespaces you can create Agents in that also hold a readable ModelConfig — kagent resolves the model in the Agent's own namespace."
+              + (if $nsErr != "" then (" The namespace list could not be read (" + $nsErr + "), so this picker is empty because that READ FAILED — not because you have no namespaces.")
+                 elif ($nsOpts | length) == 0 then
+                   (if $mcErr != "" then (" ModelConfigs could not be read (" + $mcErr + "), so no namespace could be qualified. This picker is empty because a READ FAILED, not because no namespace qualifies.")
+                    else " No namespace you can create Agents in holds a ModelConfig you can read." end)
+                 else "" end)),
+            enum: $nsOpts
+          } + (if $nsDefault == "" then {} else { default: $nsDefault } end)) },
+        { k: "description",
+          v: ($pDesc + {
+            title: "What it is for",
+            description: "One line the orchestrator reads when deciding whether to hand work to this agent. Write it as a capability (\"reads ClickHouse traces and correlates them with pod restarts\"), not as a name."
+          }) },
+        { k: "__model_config__",
+          v: ({
+            type: "string",
+            title: "Model",
+            description: ("The kagent ModelConfig backing this agent."
+              + (if $mcErr != "" then (" ModelConfigs could not be read (" + $mcErr + ") — this picker is empty because that READ FAILED, not because none exist. Nothing can be created until the read succeeds; do not read the empty list as an absence.")
+                 elif $nsErr != "" then (" No namespace could be offered because the namespace list could not be read (" + $nsErr + "), so nothing could be qualified here. That is a FAILED READ, not an absence of models.")
+                 elif $mcHint == "" then " No ModelConfig is readable in a namespace you can create Agents in — this form cannot create a working agent until one exists and you can read it."
+                 else (" Available: " + $mcHint + ".") end)),
+            enum: $mcOpts
+          } + (if $mcDefault == "" then {} else { default: $mcDefault } end)) },
+        { k: "runtime",
+          v: ($pRuntime + { title: "Runtime" }) },
+        # The CRD description for systemMessage is about promptTemplate/Go-template machinery this
+        # form does not expose, so it would describe behaviour the user cannot reach. Type comes
+        # from the CRD; the prose is written for what this form actually does.
+        { k: "systemMessage",
+          v: ($pSysMsg + {
+            title: "System message",
+            description: "The agent's standing instructions — its whole behaviour. Say what it may do, what it must refuse, and what it should hand back to the orchestrator."
+          }) },
+        # Tools BEFORE approvals: the approvals description refers to "the tools above", and the
+        # Advanced collapse renders these in exactly this order.
+        { k: "__tools__",
+          v: {
+            type: "array",
+            title: "Tools",
+            description: ("Tools this agent may call, as <server>/<tool> over the RemoteMCPServers on this cluster."
+              + (if $srvErr != "" then (" The RemoteMCPServer list could not be read (" + $srvErr + ") — this list is empty because that READ FAILED, not because there are no tools. Add tools once the read works rather than concluding the cluster has none.")
+                 elif $nsBlocked != "" then (" Nothing could be offered here because " + $nsBlocked + " — see the Namespace field. This is not a statement about which tools exist.")
+                 elif ($toolOpts | length) == 0 then " No RemoteMCPServer is readable in the offered namespaces, so this agent would have no tools."
+                 else (" " + ($toolOpts | length | tostring) + " available.") end)),
+            items: { type: "string", enum: $toolOpts }
+          } },
+        { k: "__approvals__",
+          v: {
+            type: "array",
+            title: "Require human approval (HITL)",
+            description: ("The subset of the tools above that must pause for a human to approve or reject before the agent may run them. Anything selected here that is not also selected above is dropped on submit."
+              + (if $srvErr != "" then (" The tool list could not be read (" + $srvErr + "), so there is nothing to select here — that is a failed read, not an agent with no tools.")
+                 elif $nsBlocked != "" then (" Nothing could be offered here because " + $nsBlocked + " — see the Namespace field.")
+                 else "" end)),
+            items: { type: "string", enum: $toolOpts }
+          } },
+        { k: "__delegates__",
+          v: {
+            type: "array",
+            title: "Delegate to",
+            description: ("Existing agents this one may hand work to. Fan-out orchestrators are excluded — delegating back to the agent that routes work here would build a cycle."
+              + (if $agErr != "" then (" The Agent list could not be read (" + $agErr + ") — this list is empty because that READ FAILED, not because there are no agents to delegate to.")
+                 elif $nsBlocked != "" then (" Nothing could be offered here because " + $nsBlocked + " — see the Namespace field. This is not a statement about which agents exist.")
+                 elif ($agentOpts | length) == 0 then " No other agent is readable in the offered namespaces."
+                 else "" end)),
+            items: { type: "string", enum: $agentOpts }
+          } }
+      ] as $props
+    | ["__agent_name__", "__agent_namespace__", "description", "__model_config__", "runtime", "systemMessage"] as $required
+    # Assembled as TEXT so the properties block never becomes a jq object. Each node still goes
+    # through tojson, where key order carries no meaning.
+    | ( "{\"type\":\"object\",\"properties\":{"
+        + ( [ $props[] | ((.k | tojson) + ":" + (.v | tojson)) ] | join(",") )
+        + "},\"required\":" + ($required | tojson) + "}" ) as $schemaString
+    | {
+        schemaString: $schemaString,
+        propertiesToHide: [],
+        initialValues: { __owner: $draftKey },
+        apiVersion: "kagent.dev/v1alpha2",
+        kind: "Agent",
+        resource: "agents",
+        namespace: $nsDefault
+      }

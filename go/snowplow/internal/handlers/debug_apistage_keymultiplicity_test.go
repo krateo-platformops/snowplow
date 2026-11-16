@@ -24,6 +24,8 @@ import (
 )
 
 func TestDebugApistage_CarriesKeyMultiplicityAttributionFields(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	// SELF-ARMING, and it FAILS rather than skips if the store is absent.
 	// A conditional t.Skip here would make the arm silently vacuous in the
 	// default suite run — the instrument's own wire shape would then be
@@ -58,8 +60,8 @@ func TestDebugApistage_CarriesKeyMultiplicityAttributionFields(t *testing.T) {
 		t.Fatalf("precondition: the two inputs must derive distinct keys")
 	}
 	inBase, inSib := base, sibling
-	store.Put(kBase, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &inBase})
-	store.Put(kSib, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &inSib})
+	store.PutResolved(fixtureStoreVerdict, kBase, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &inBase})
+	store.PutResolved(fixtureStoreVerdict, kSib, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &inSib})
 
 	rec := httptest.NewRecorder()
 	DebugApistage()(rec, httptest.NewRequest(http.MethodGet, "/debug/apistage", nil))
@@ -143,6 +145,8 @@ func TestDebugApistage_CarriesKeyMultiplicityAttributionFields(t *testing.T) {
 // exists to avoid. Every identity-free class row carries a zero, so this is
 // the common case, not an edge one.
 func TestDebugApistage_ZeroSubGenStillSerialises(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	store := cache.ResolvedCache()
@@ -163,7 +167,7 @@ func TestDebugApistage_ZeroSubGenStillSerialises(t *testing.T) {
 	}
 	key := cache.ComputeKey(in)
 	stamped := in
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &stamped})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"ok":true}`), Inputs: &stamped})
 
 	rec := httptest.NewRecorder()
 	DebugApistage()(rec, httptest.NewRequest(http.MethodGet, "/debug/apistage?key_hash="+key, nil))

@@ -29,7 +29,7 @@ other GVR falls through to a raw apiserver passthrough.
                                               │
             ┌─────────────────────────────────┴──────────────────────────────────┐
             │  main.go  mux.Handle("GET /call", chain.Append(                      │
-            │     middleware.UserConfig(signKey, authnNS)   ← authn: JWT → UserInfo│
+            │     middleware.UserConfig(jwtKeys, authnNS)   ← authn: JWT → UserInfo│
             │     cache.FallthroughScopeMiddleware(ScopeCallGeneric)               │
             │     handlers.Dispatcher(dispatchers.All()))   ← routes by GVR group  │
             │   .Then(handlers.Call()))                     ← fallthrough handler  │
@@ -105,7 +105,7 @@ bytes leave the pod (`widget_content.go`). The shell is never served verbatim.
   reversal this flips only after the synchronous boot seed (or its backstop) —
   see [prewarm.md](prewarm.md).
 - `GET /call` — the canonical read path. Its middleware chain is
-  `middleware.UserConfig(signKey, authnNS)` → `FallthroughScopeMiddleware(ScopeCallGeneric)`
+  `middleware.UserConfig(jwtKeys, authnNS)` → `FallthroughScopeMiddleware(ScopeCallGeneric)`
   → `handlers.Dispatcher(dispatchers.All())`, finally `.Then(handlers.Call())`.
 - `POST/PUT/PATCH/DELETE /call` — same `UserConfig` middleware and a
   write-scope `FallthroughScopeMiddleware`, but **no** `Dispatcher` in the
@@ -140,12 +140,16 @@ bytes leave the pod (`widget_content.go`). The shell is never served verbatim.
   `GET /debug/pprof/*` registered on this mux directly (the server does not
   use `http.DefaultServeMux`); `GET /debug/servable` and `GET /debug/apistage`
   — cache diagnostics; `GET /debug/refreshes` — the refresh-subscription
-  registry, auth-gated with the same `RefreshAuth` as `/refreshes`.
+  registry. Every `/debug/*` route (`registerDebugRoutes`, `debug_routes.go`)
+  is authenticated with the same `RefreshAuth` as `/refreshes` and then
+  authorized by `middleware.DebugAuthz`, an RBAC non-resource check
+  (`nonResourceURLs: ["/debug/*"]`) for the JWT's identity (#1362).
 
 The mux is wrapped (inner → outer) by **gzip** (`gzhttp` via
 `middleware/compression.go` — Accept-Encoding-gated, SSE-excluded so
 `/refreshes` keeps per-event flush; non-gzip clients are byte-identical), then
-**otelhttp** (no-op spans unless tracing is enabled — see
+**otelhttp** via `tracing.NewServerHandler` (one `Server` span per request,
+named `<METHOD> <route>`; no-op spans unless tracing is enabled — see
 [observability.md](observability.md)), then the **audit middleware**
 (`internal/support/audit` — session correlation rides W3C `baggage`
 `session.id`), then **CORS** (`snowplowCORSOptions` in `main.go`: exposes the

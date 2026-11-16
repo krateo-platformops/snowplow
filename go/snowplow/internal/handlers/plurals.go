@@ -70,7 +70,7 @@ func (r *pluralsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	rc, err := credhttp.InClusterConfig()
 	if err != nil {
-		log.Error("unable to load in-cluster rest config",
+		log.ErrorContext(req.Context(), "unable to load in-cluster rest config",
 			slog.String("gvk", gvk.String()), slog.Any("err", err))
 		response.InternalError(wri, err)
 		return
@@ -120,7 +120,7 @@ func (r *pluralsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	enc := json.NewEncoder(wri)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(&tmp); err != nil {
-		log.Error("unable to serve api call response", slog.Any("err", err))
+		log.ErrorContext(req.Context(), "unable to serve api call response", slog.Any("err", err))
 	}
 }
 

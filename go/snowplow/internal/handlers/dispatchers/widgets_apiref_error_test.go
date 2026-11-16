@@ -21,8 +21,8 @@
 package dispatchers
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -33,22 +33,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// runWidgetErrorBlock mirrors the dispatcher's
-// internal/handlers/dispatchers/widgets.go:226-237 error-encoding
-// sub-block exactly. Returns the recorder so the test can assert the
-// wire shape. Any divergence from the production block here would
-// silently void the test; the block is short enough that mirroring is
-// the safer pattern (cleaner than refactoring the production handler
-// purely for testability).
+// runWidgetErrorBlock runs the dispatcher's resolve-error encoding.
+// #853 — it used to mirror the widgets.go block; the block is now
+// encodeWidgetResolveError, so the test calls production directly and
+// cannot drift from it.
 func runWidgetErrorBlock(wri http.ResponseWriter, err error) {
-	var statusErr *apierrors.StatusError
-	if errors.As(err, &statusErr) {
-		code := int(statusErr.Status().Code)
-		msg := fmt.Errorf("%s", statusErr.Status().Message)
-		response.Encode(wri, response.New(code, msg))
-		return
-	}
-	response.InternalError(wri, err)
+	encodeWidgetResolveError(context.Background(), wri, err)
 }
 
 // makeApiRefForbidden builds the exact error shape `apiref.Resolve`
@@ -113,9 +103,11 @@ func TestDispatcherWidgetError_ForbiddenChainEmits403(t *testing.T) {
 	}
 }
 
-// TestDispatcherWidgetError_NotFoundChainEmits404 — sister case for
-// objects.Get's IsNotFound branch. Same dispatcher contract.
-func TestDispatcherWidgetError_NotFoundChainEmits404(t *testing.T) {
+// TestDispatcherWidgetError_NotFoundChainEmits424 — sister case for
+// objects.Get's IsNotFound branch. #853: the widget CR was read, so a
+// missing apiRef RESTAction is a failed dependency (424), not a missing
+// widget (404, answered only by the CR read).
+func TestDispatcherWidgetError_NotFoundChainEmits424(t *testing.T) {
 	statusErr := &apierrors.StatusError{
 		ErrStatus: metav1.Status{
 			Status:  response.StatusFailure,
@@ -130,7 +122,7 @@ func TestDispatcherWidgetError_NotFoundChainEmits404(t *testing.T) {
 	wri := httptest.NewRecorder()
 	runWidgetErrorBlock(wri, wrapped)
 
-	if got, want := wri.Result().StatusCode, http.StatusNotFound; got != want {
+	if got, want := wri.Result().StatusCode, http.StatusFailedDependency; got != want {
 		t.Errorf("HTTP status: got %d, want %d", got, want)
 	}
 }

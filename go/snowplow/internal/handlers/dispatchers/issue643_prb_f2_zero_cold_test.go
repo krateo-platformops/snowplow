@@ -7,10 +7,14 @@ package dispatchers
 // fresh harness twice — once as shipped, once with the consult forced off
 // through its one seam (declinedExternalSkipFn) — and compares the resulting L1:
 // the key set AND the sha256 of every body must be identical. The fixture
-// carries W_int: a widget whose RESTAction names the external endpointRef
-// (apiref.DeclaresExternalEndpoint == true) but whose path is an apiserver path,
-// so it dispatches internal-rest-config and IS cacheable. It must be Put in both
-// runs.
+// carries W_int: a widget whose RESTAction DECLARES the external endpointRef
+// (apiref.DeclaresExternalEndpoint == true) but never dials it — the external
+// stage iterates over no items — while its other stage reads this cluster with
+// no endpointRef. It touches no external endpoint and IS cacheable. It must be
+// Put in both runs. (Before #1017 W_int was "an external endpointRef on an
+// apiserver path": that stage was answered from this cluster, the #1017 defect.
+// A named endpointRef is now always sent to its endpoint, so a declared-but-not-
+// dialled external stage is the shape that keeps I-5's distinction.)
 //
 // F2-m (mutation): the consult is replaced by the #594 predicate
 // (DeclaresExternalEndpoint) — the criterion I-5 forbids. The differential must
@@ -33,14 +37,17 @@ import (
 
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 )
 
-// h643WInt is W_int: external endpointRef, apiserver path → internal dispatch.
+// h643WInt is W_int: it declares the external endpointRef (stage s1) but
+// dials it for no item, and reads this cluster with stage s0 (no endpointRef).
 var h643WInt = h643Extra{
 	widget: "wint-w", ra: "wint-ra", external: false,
-	api: []any{h643ExtStage("s0", "/apis/"+h643ThingsGVR.Group+"/"+h643ThingsGVR.Version+"/namespaces/"+h643NS+"/"+h643ThingsGVR.Resource)},
+	api: []any{
+		h643OwnStage("s0", "/apis/"+h643ThingsGVR.Group+"/"+h643ThingsGVR.Version+"/namespaces/"+h643NS+"/"+h643ThingsGVR.Resource),
+		h643Iterate(h643ExtStage("s1", "/external/${ .id }"), "[]"),
+	},
 }
 
 // h643L1Snapshot is every L1 key with the sha256 of its body.
@@ -82,7 +89,7 @@ type h643F2Run struct {
 // the skip consult when non-nil.
 // Each run is its own subtest: the harness holds engineLatchTestMu until the
 // subtest's cleanup, so two runs cannot share one test's lifetime.
-func h643F2Sequence(t *testing.T, slow bool, consult func(context.Context, string, string, string, redact.Label) bool) h643F2Run {
+func h643F2Sequence(t *testing.T, slow bool, consult func(context.Context, string, string, string) bool) h643F2Run {
 	t.Helper()
 	var out h643F2Run
 	name := "skip-as-shipped"
@@ -95,7 +102,7 @@ func h643F2Sequence(t *testing.T, slow bool, consult func(context.Context, strin
 	return out
 }
 
-func h643F2SequenceRun(t *testing.T, slow bool, consult func(context.Context, string, string, string, redact.Label) bool) h643F2Run {
+func h643F2SequenceRun(t *testing.T, slow bool, consult func(context.Context, string, string, string) bool) h643F2Run {
 	t.Helper()
 	o := h643Opts{cohorts: h643K, external: h643M, internal: h643N, things: 2, extra: []h643Extra{h643WInt}}
 	if slow {
@@ -149,7 +156,7 @@ func h643L1Diff(a, b map[string]string) []string {
 	return d
 }
 
-func h643ForcedOff(context.Context, string, string, string, redact.Label) bool { return false }
+func h643ForcedOff(context.Context, string, string, string) bool { return false }
 
 func h643F2Differential(t *testing.T, slow bool) {
 	t.Setenv("RESOLVER_SEED_EXTERNAL_FETCH_TIMEOUT_MS", "200")
@@ -163,7 +170,7 @@ func h643F2Differential(t *testing.T, slow bool) {
 		t.Fatalf("precondition: the forced-off run still skipped %d units — the seam did not reach the consult", off.skipped)
 	}
 	if len(on.wint) != h643K || len(off.wint) != h643K {
-		t.Fatalf("W_int (endpointRef → apiserver path, cacheable) must be Put for all %d cohorts in BOTH runs: skip-on=%d skip-off=%d", h643K, len(on.wint), len(off.wint))
+		t.Fatalf("W_int (declares the external endpointRef, dials it for no item; cacheable) must be Put for all %d cohorts in BOTH runs: skip-on=%d skip-off=%d", h643K, len(on.wint), len(off.wint))
 	}
 	if d := h643L1Diff(on.l1, off.l1); len(d) != 0 {
 		t.Fatalf("I-1 VIOLATED: skip on vs off produced different L1 (%d keys vs %d):\n%s", len(on.l1), len(off.l1), strings.Join(d, "\n"))
@@ -187,7 +194,7 @@ func TestIssue643_F2m_DeclaresExternalEndpointAsTheCriterionFailsF2(t *testing.T
 	for i := 0; i < h643N; i++ {
 		raOf[h643NS+"/int-w"+itoaLine(i)] = "int-ra" + itoaLine(i)
 	}
-	mutant := func(ctx context.Context, key, class, target string, _ redact.Label) bool {
+	mutant := func(ctx context.Context, key, class, target string) bool {
 		ra, ok := raOf[target]
 		if class != "widgets" || !ok {
 			return false
@@ -205,7 +212,7 @@ func TestIssue643_F2m_DeclaresExternalEndpointAsTheCriterionFailsF2(t *testing.T
 		t.Fatal("F2-m: with DeclaresExternalEndpoint as the skip criterion the differential found NO difference — F2 cannot see the I-5 defect it exists for")
 	}
 	if len(mut.wint) != 0 {
-		t.Fatalf("F2-m: the mutant should leave W_int cold (it declares an external endpoint but dispatches internally), yet %d W_int cells were Put", len(mut.wint))
+		t.Fatalf("F2-m: the mutant should leave W_int cold (it declares an external endpoint but never dials it), yet %d W_int cells were Put", len(mut.wint))
 	}
 	t.Logf("F2-m RED as required: %d L1 differences, W_int Put by the mutant: %d of %d", len(d), len(mut.wint), h643K)
 }

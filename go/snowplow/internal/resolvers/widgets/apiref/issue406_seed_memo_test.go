@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -60,7 +59,7 @@ func TestIssue406_SeedMemo_RAEditBeforeSeed_AllSeededWidgetsConverge(t *testing.
 	if err != nil {
 		t.Fatalf("pre-warm resolve: %v", err)
 	}
-	store.PutRAFullList(raKey, raIn, full)
+	store.PutRAFullList(fixtureStoreVerdict, raKey, raIn, full)
 	cache.RecordSliceability(raKey, seedFullListShape(gRA, ns, raName, ra(raSliceJQ)), true)
 	d.Record(context.Background(), raKey, gRA, ns, raName)
 
@@ -84,7 +83,7 @@ func TestIssue406_SeedMemo_RAEditBeforeSeed_AllSeededWidgetsConverge(t *testing.
 	}
 
 	// The seed pass: three widgets share (RA, identity, page) → one memo MISS + two HITs.
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	memo := cache.NewSeedResolveMemo()
 	opts := ResolveOptions{
 		ApiRef: templatesv1.ObjectReference{
 			Reference:  templatesv1.Reference{Name: raName, Namespace: ns},
@@ -102,7 +101,7 @@ func TestIssue406_SeedMemo_RAEditBeforeSeed_AllSeededWidgetsConverge(t *testing.
 			t.Fatalf("seed Resolve(%s): %v", w, err)
 		}
 		// Boot seed terminal Put: plain (#323), via PutThenRemark(resCtx) (seedTerminalPut).
-		store.PutThenRemark(ctx, w, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, body), Inputs: edge3WidgetInputs("w406seed" + itoa2(i))})
+		store.PutResolvedThenRemark(ctx, fixtureStoreVerdict, w, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, body), Inputs: edge3WidgetInputs("w406seed" + itoa2(i))})
 	}
 	if got := cache.RAFullListServeSnapshot().Hit - hit0; got != 1 {
 		t.Fatalf("[prove-path] want exactly one 4a fast-path HIT (the memo MISS), the rest memo HITs; got %d", got)
@@ -142,7 +141,7 @@ func TestIssue406_SeedMemo_RAEditBeforeSeed_AllSeededWidgetsConverge(t *testing.
 			}
 			e = &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, got), Inputs: edge3WidgetInputs(k)}
 		}
-		if !store.ReplaceIfGen(rctx, k, e, gen0) {
+		if !store.ReplaceResolvedIfGen(rctx, fixtureStoreVerdict, k, e, gen0) {
 			t.Fatalf("refresh %s: ReplaceIfGen refused", k)
 		}
 	}

@@ -118,11 +118,11 @@ func i408Boot(t *testing.T, n int, churnInWindow, churnBackground, guarded bool)
 		Deps().Record(ctx, key, gvr, "ns", "own-"+strconv.Itoa(i)) // cold bucket → inherits the GVR floor
 		e := &ResolvedEntry{RawJSON: []byte(`{}`)}
 		if guarded {
-			if !c.PutIfGen(ctx, key, e, gen0) {
+			if !c.putIfGen(ctx, key, e, gen0) {
 				t.Errorf("setup: PutIfGen refused for %s", key)
 			}
 		} else {
-			c.PutThenRemark(ctx, key, e)
+			c.putThenRemark(ctx, key, e)
 		}
 	}
 
@@ -194,6 +194,8 @@ func (r i408Result) assertBound(t *testing.T, label string) {
 }
 
 func TestIssue408_BootRemarkAmplification_ProductionScale(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Run("quiet-boot_zero-remarks", func(t *testing.T) {
 		r := i408Boot(t, i408BootUnits, false, false, false)
 		t.Logf("#408 quiet boot: %s", r)
@@ -234,6 +236,8 @@ func TestIssue408_BootRemarkAmplification_ProductionScale(t *testing.T) {
 // including a C3 re-check remark (moved_after_put) after a boot Put. A quiet Put counts
 // nowhere.
 func TestIssue408_MovedRemarkCounters_AttributeTheCarrier(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	resetRefresherForTest()
@@ -257,12 +261,12 @@ func TestIssue408_MovedRemarkCounters_AttributeTheCarrier(t *testing.T) {
 	ctx := WithL1KeyContext(context.Background(), "c408-boot")
 	Deps().Record(ctx, "c408-boot", g408Churn, "ns", "b")
 	Deps().OnUpdate(g408Churn, "ns", "b")
-	c.PutThenRemark(ctx, "c408-boot", &ResolvedEntry{RawJSON: []byte(`{}`)})
+	c.putThenRemark(ctx, "c408-boot", &ResolvedEntry{RawJSON: []byte(`{}`)})
 
 	// boot, the dep is Recorded AFTER the Put and moved in [check, Record) → C3
 	// "moved_after_put", still attributed to boot.
 	ctx2 := WithL1KeyContext(context.Background(), "c408-boot-c3")
-	c.PutThenRemark(ctx2, "c408-boot-c3", &ResolvedEntry{RawJSON: []byte(`{}`)})
+	c.putThenRemark(ctx2, "c408-boot-c3", &ResolvedEntry{RawJSON: []byte(`{}`)})
 	Deps().OnUpdate(g408Quiet, "ns", "late")
 	Deps().Record(ctx2, "c408-boot-c3", g408Quiet, "ns", "late")
 
@@ -271,14 +275,14 @@ func TestIssue408_MovedRemarkCounters_AttributeTheCarrier(t *testing.T) {
 	gen := c.CaptureGen("c408-guarded")
 	Deps().Record(ctx3, "c408-guarded", g408Churn, "ns", "g")
 	Deps().OnUpdate(g408Churn, "ns", "g")
-	if !c.PutIfGen(ctx3, "c408-guarded", &ResolvedEntry{RawJSON: []byte(`{}`)}, gen) {
+	if !c.putIfGen(ctx3, "c408-guarded", &ResolvedEntry{RawJSON: []byte(`{}`)}, gen) {
 		t.Fatal("setup: PutIfGen refused")
 	}
 
 	// quiet boot Put → nothing.
 	ctx4 := WithL1KeyContext(context.Background(), "c408-quiet")
 	Deps().Record(ctx4, "c408-quiet", g408Churn, "ns", "q")
-	c.PutThenRemark(ctx4, "c408-quiet", &ResolvedEntry{RawJSON: []byte(`{}`)})
+	c.putThenRemark(ctx4, "c408-quiet", &ResolvedEntry{RawJSON: []byte(`{}`)})
 
 	mu.Lock()
 	defer mu.Unlock()

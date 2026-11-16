@@ -43,6 +43,8 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
 // Resolver-cache env knobs (defaults match chart-0.30.7 spec).
@@ -267,12 +269,50 @@ type ResolvedEntry struct {
 	// starts a fresh entry without the flag.
 	StaleDerived bool
 
+	// resolveStart (#1198) is where the resolve that produced this body began on
+	// the dep-event sequence (its #375 startSeq), and hasResolveStart whether it
+	// had one. Set by every Put (putPreamble) before the entry is published. It
+	// lets a stale serve that opens after this Put ask the cell what the Put could
+	// not tell it (replaces, stale_push.go).
+	resolveStart    uint64
+	hasResolveStart bool
+
+	// SeedOrigin (#841, metadata only) is the seed class whose seed INSERTED
+	// this cell — SeedOriginBase / SeedOriginLearned — or "" for a cell traffic
+	// or the refresher created. It belongs to the key's lineage like BornAt:
+	// putCoreLocked's replace-in-place keeps the prior entry's origin whatever
+	// the re-Put carries. Never read by warmLocked, a key or a log line; it
+	// feeds snowplow_prewarm_seed_origin only (seed_origin.go).
+	SeedOrigin string
+
+	// StageOutcomes (#904; every resolving class since #1319) is the
+	// X-Snowplow-Stage-Outcomes value of the resolve that produced RawJSON, so
+	// an L1 hit answers with the same header as the cold resolve did: a
+	// RESTAction cell's own stages, a widget cell's apiRef RESTAction's stages,
+	// a RESTAction full list's (replayed to the widget sliced from it). ""
+	// means every stage succeeded (a RESTAction header is then [], a widget
+	// carries none), which is the only outcome most stored cells can have: a
+	// cell is stored only when no stage failed, or when every failure is a
+	// per-identity denial (#681 DenialOnly). Stage names and reason codes
+	// only, never identity or data.
+	StageOutcomes string
+
 	// Inputs is the canonical key-input bundle the entry was resolved
 	// from. The refresher uses it to drive a re-resolve when an
 	// UPDATE/PATCH event fires for any of this entry's dep tuples.
 	// Nil-safe: a missing Inputs (e.g., legacy 0.30.7 entries during a
 	// rolling restart) skips refresh but still serves TTL+LRU correctly.
 	Inputs *ResolvedKeyInputs
+
+	// ContentAsOf — #765 option A, the content stamp: for an identity-free apistage
+	// content cell stored by a fill leader, the dep-event seq its data read started
+	// at (the fill flight's #375 content-sink startSeq). A refresher re-resolve reuses
+	// the cell instead of re-filling it when ContentStampCovers says the read is not
+	// older than the change that triggered the refresh. 0 = unknown (every other
+	// producer): the refresher re-fills, as before #765. Set before the Put, never
+	// mutated after; in-memory only, so it never outlives the process whose
+	// depEventSeq it counts.
+	ContentAsOf uint64
 
 	// Items / ItemsAPIVersion / ItemsKind — Ship 0.30.121 R3 — the
 	// pre-parsed LIST envelope for a CacheEntryClassApistage CONTENT
@@ -311,15 +351,25 @@ type ResolvedEntry struct {
 	// generation (the field is only ever written on a fresh entry, so a
 	// rebuilt cell starts empty again and re-materialises on demand).
 	//
-	// ATOMIC POINTER, NOT A MUTEX OR sync.Once. Reads are lock-free on the
-	// serve path. A concurrent double-parse is harmless and deliberately
-	// tolerated: each racer strips and builds its OWN private maps, the CAS
-	// publishes exactly one of them, and EnsureItems returns the PUBLISHED
-	// value to every caller — so the maps every serve aliases are the same
-	// maps, and the loser's trees are simply dropped. That preserves the
-	// invariant the eager path depends on (stripManagedFields runs while the
-	// map is still private, never on a map already aliased by a serve).
-	itemsLazy atomic.Pointer[lazyListItems]
+	// ATOMIC POINTER FOR THE READ, ONE PARSE PER ENTRY (#883 F3). Reads of a
+	// published value are lock-free on the serve path. The FIRST materialisation
+	// runs exactly once: itemsParseMu admits one parser, and every concurrent
+	// first reader waits on it and then returns the value that parser published.
+	// Before #883 a concurrent double-parse was tolerated as "harmless" (the CAS
+	// kept one tree and dropped the rest); bench run 15 measured what that costs
+	// on a 50K-item list — N first readers ran N full parses at once, and that
+	// burst was the 1.12.54 OOM kill. A waiter is never slower than running its
+	// own parse: the parse it waits on started first. The published maps are
+	// still built privately by the one parser (stripManagedFields runs before
+	// any serve aliases them), the invariant the eager path depends on.
+	itemsLazy    atomic.Pointer[lazyListItems]
+	itemsParseMu sync.Mutex
+
+	// listCell — #854: an ANCHORED apistage LIST content cell keeps its items
+	// incrementally (list_cell.go). Such an entry has no RawJSON and no Items;
+	// readers take a generation through ListCell().Snapshot, and every body
+	// reader goes through Raw() / RawLen(). Set only by NewListCellEntry.
+	listCell *ListCell
 
 	// Ship 0.30.242 H.c-layered Phase 2 step 2a (commit subsequent to
 	// 1d93d02): the previous `CohortGates atomic.Pointer[CohortGateMemoStore]`
@@ -361,6 +411,13 @@ type ResolvedEntry struct {
 	// Written only under mu before the entry is readable; never mutated after.
 	contentVersion uint64
 
+	// digest — #1324: the memoised ContentDigest of the entry's body (Raw()),
+	// computed on first use (the first armed response that stamps
+	// X-Snowplow-Refresh-Digest, or the first /refreshes arm that compares
+	// against it) and published once (content_digest.go). A pure function of
+	// the immutable body, so every racer computes the same value.
+	digest atomic.Pointer[string]
+
 	// recentHitters — #444: the last few DISTINCT identities (username + groups,
 	// nothing else) that were served this cell on a customer hit, most recent
 	// first, at most recentHittersCap. The refresher draws a replacement
@@ -371,6 +428,14 @@ type ResolvedEntry struct {
 	// rules). Copy-on-write behind an atomic pointer, so noting a hit takes no
 	// store lock; putCoreLocked carries it across a replace-in-place.
 	recentHitters atomic.Pointer[[]HitterIdentity]
+
+	// servedViews — #1430: the digests of what each identity is served from
+	// this cell when it is gated per requester, keyed by every input of the
+	// gate (served_view_memo.go). It belongs to the cell's ANSWER: putCoreLocked
+	// carries it across a replace-in-place and the first read for an entry with
+	// another answer drops it. Digests only, never a body; in-memory only,
+	// never logged, exported or copied into ResolvedEntryMeta.
+	servedViews atomic.Pointer[servedViewMemo]
 
 	// TTLOverride — R1 Layer 2 (#36) bounded-staleness backstop. When > 0,
 	// THIS entry expires after TTLOverride instead of the store's standard
@@ -440,10 +505,6 @@ const (
 	// winning subject matched only through an implicit group (an RBAC fact from
 	// EvaluateRBAC's WinningSubjectClassOut).
 	AtRiskImplicitGroup
-	// AtRiskRolerefUnresolved — #261 case-3: the mint-time first-permitting
-	// BindingUID was roleRef-unresolved at the last bindings_by_gvr index build
-	// (a cache-index fact from IsRoleRefUnresolvedAtBuild).
-	AtRiskRolerefUnresolved
 )
 
 type ResolvedKeyInputs struct {
@@ -581,29 +642,24 @@ type ResolvedKeyInputs struct {
 	// their new sub-gen. UNLIKE HasUAF this IS folded into ComputeKey →
 	// resolvedKeyVersion (v4→v5→v6 across (c) and (c)-v2).
 	//
-	// #682 — RBACSubGenForSubject also adds the process-wide boot-window epoch
-	// (rbac_subgen_epoch.go). That is a term of THIS existing dimension, not a
-	// new identity input: no key-format change, no resolvedKeyVersion bump, and
+	// #682 — RBACSubGenForSubject also folds the process-wide boot-window epoch
+	// (rbac_subgen_epoch.go; since #1439 the fold is the latest state of the
+	// RBAC state clock, not a sum). That is a term of THIS existing dimension,
+	// not a new identity input: no key-format change, no resolvedKeyVersion bump, and
 	// identity-free classes (which do not fold RBACSubGen) never rotate on it.
 	RBACSubGen uint64
 
 	// AtRiskClass — #261 serve-time-detector MARK-AT-MINT. Computed by
 	// dispatchCacheLookupKey as a byproduct of the SAME EvaluateRBAC call that
-	// derives BindingUID (case-2 via WinningSubjectClassOut) plus a
-	// bindings_by_gvr IsRoleRefUnresolvedAtBuild query (case-3), so the L1
-	// hit-site READS this mark and bumps the matching detector counter WITHOUT
-	// re-evaluating RBAC or the index at hit (pm load-bearing #4). Both classes
-	// flow through ONE hit-site read+bump.
+	// derives BindingUID (case-2 via WinningSubjectClassOut), so the L1
+	// hit-site READS this mark and bumps the detector counter WITHOUT
+	// re-evaluating RBAC at hit (pm load-bearing #4). (The case-3 class, a
+	// binding skipped at the index build, was retired with that skip, #1449.)
 	//
 	// EXCLUDED FROM COMPUTEKEY. Like RepresentativeUsername/Groups and HasUAF
 	// above, this is bookkeeping carried on the derived inputs, NOT key material
 	// — ComputeKey does not hash it, so adding it does NOT shift the key space
-	// (no resolvedKeyVersion bump) and a cell keeps the SAME key. When both
-	// carriers hold for one cell (rare — a case-3 binding re-resolved since
-	// build whose winning subject is also implicit), AtRiskImplicitGroup takes
-	// precedence (the RBAC-fact carrier the plan lists first); the class as a
-	// whole still bumps, so off-zero → reassess is preserved (no silent
-	// false-zero for the at-risk population).
+	// (no resolvedKeyVersion bump) and a cell keeps the SAME key.
 	AtRiskClass AtRiskClass
 }
 
@@ -710,6 +766,17 @@ type ResolvedCacheStore struct {
 	// #603 PR-0). nil until DepTracker.SetStore installs it.
 	entryClassNote atomic.Pointer[entryClassFn]
 
+	// clock (#930) is the store's time source: every instant the store stamps on
+	// a cell (CreatedAt, BornAt, lastRead) and every age it compares against a
+	// bound (TTL, maxEntryAge, the #378 re-mint window, the #316 refresh lead)
+	// is read from it, so ONE clock decides a cell's whole lifetime. nil reads
+	// time.Now, which is all production ever uses. A test installs a virtual
+	// clock to drive the reaper and the lazy bounds through exact instants
+	// instead of sleeping through real ones (issue378_remint_test.go F4a).
+	// Pure work-duration measurements (the batch hold timers) stay on the real
+	// clock: they time this process, not a cell.
+	clock atomic.Pointer[func() time.Time]
+
 	// LRU eviction order: front = most-recently-used.
 	order *list.List
 	// layers — #406: the raKey <-> widget consumer index (ra_full_list_layers.go).
@@ -753,6 +820,9 @@ type ResolvedCacheStore struct {
 	// representative could be found to refresh them (a cold, correct refill
 	// instead of a stale cell until the TTL).
 	evictNoRepresentativeTotal atomic.Uint64
+	// #1255: cells evicted because a later resolve of their key proved it can
+	// no longer be stored (EvictOnPermanentDecline / EvictUnstorable).
+	evictUnstorableTotal atomic.Uint64
 
 	// #248 — resident cells carrying a live refreshSuppressed marker, recomputed
 	// on every reaper walk (startResolvedCacheSummary tick). This is a GAUGE, not
@@ -885,36 +955,21 @@ type ResolvedCacheStore struct {
 	// moved between capture and write). Atomic; safe to read without mu.
 	putRefusedGenerationMovedTotal atomic.Uint64
 
-	// serveMissedRotationAtriskRolerefUnresolved counts serve-time L1 HITs of a
-	// cell whose serve-time first-permitting BindingUID was roleRef-UNRESOLVED
-	// at the last bindings_by_gvr index build (#261 case-3). Bumped HIT-GATED
-	// ONLY from the restactions serve hit-site.
-	//
-	// T1/T3 SEMANTICS (documented in code per the plan): this measures the
-	// AT-RISK SERVE POPULATION — a STRUCTURAL PROXY for the bounded
-	// self-stale-leak class where a BindingUID identity key can rotate with no
-	// sub-gen bump — NOT a confirmed-stale-leak count. Off-zero means an
-	// at-risk-keyed cell was served → REASSESS (the keying fix is v7-deferred);
-	// it is NEVER "N leaks". Zero means no at-risk cell was served (matches the
-	// 057 0/2517 baseline). It reads NON-ZERO exactly during the defect surface
-	// (a real at-risk serve), so it is a during-defect detector, not a
-	// zero-reads-as-health non-detector. Atomic; safe to read without mu.
-	serveMissedRotationAtriskRolerefUnresolved atomic.Uint64
-
 	// serveMissedRotationAtriskImplicitGroup counts serve-time L1 HITs of a cell
 	// whose serve-time first-permitting binding's WINNING subject matched only
 	// through an IMPLICIT group — system:authenticated, or a synthetic
 	// system:serviceaccounts[:ns] group (#261 case-2, the RBAC-fact carrier).
-	// RBACSubGenForSubject sums only the requester's PRESENTED groups, so a
-	// grant/revoke through such a binding rotates the serve-time first-match
-	// BindingUID with NO sub-gen bump — the bounded self-stale-leak carrier.
+	// When the detector was written the key fold read only the requester's
+	// PRESENTED groups, so a grant/revoke through such a binding rotated no key.
+	// Since #424 (system:authenticated) and #1443 (the ServiceAccount groups) the
+	// fold reads every subject the evaluator matches with (SubjectMatcher), so
+	// such a change now rotates the key: the counter no longer marks a rotation
+	// gap, it says how the served request was permitted.
 	// Bumped HIT-GATED ONLY from the restactions serve hit-site, off a MARK the
-	// key-mint stamped (never re-evaluated at hit). Same T1/T3 SEMANTICS as
-	// serveMissedRotationAtriskRolerefUnresolved above: this is the AT-RISK
-	// SERVE POPULATION (a structural proxy), NOT a confirmed-stale-leak count —
-	// off-zero means an at-risk-keyed cell was served → REASSESS (the keying fix
-	// is v7-deferred), never "N leaks"; zero means no at-risk cell served
-	// (matches the 057 baseline). Atomic; safe to read without mu.
+	// key-mint stamped (never re-evaluated at hit). It was never a
+	// confirmed-stale-leak count: off-zero means a cell permitted through an
+	// implicit group was served, never "N leaks"; zero means none was (matches
+	// the 057 baseline). Atomic; safe to read without mu.
 	serveMissedRotationAtriskImplicitGroup atomic.Uint64
 
 	// Ship E (0.30.116) api-stage counters. apistageStoreTotal counts
@@ -1050,6 +1105,10 @@ type lruItem struct {
 	// never read; a boot-seed carries warmth via SeededAtBoot until real traffic
 	// stamps a read here. Covered under -race by the reaper/walk concurrency arm.
 	lastRead time.Time
+	// seedHitSeen (#841) — a customer has hit this seed-inserted cell at least
+	// once (snowplow_prewarm_seed_origin cells_hit). Written and read under c.mu
+	// on the Get-HIT path; like lastRead it rides a replace-in-place.
+	seedHitSeen bool
 }
 
 var (
@@ -1199,6 +1258,37 @@ func ResolvedCache() *ResolvedCacheStore {
 
 // newResolvedCache constructs a fresh cache. Exported for tests; in
 // production the singleton path goes through ResolvedCache().
+// now is the store clock (see ResolvedCacheStore.clock).
+func (c *ResolvedCacheStore) now() time.Time {
+	if f := c.clock.Load(); f != nil {
+		return (*f)()
+	}
+	return time.Now()
+}
+
+// Now reads the store clock. Every age of a stamp this store made on a cell
+// (CreatedAt, BornAt) is Now() minus that stamp, wherever it is decided — the
+// keep-warm age-skip and the /debug views read it here, never time.Now, so one
+// clock decides a cell's age in and out of the store (#930). Nil-safe.
+func (c *ResolvedCacheStore) Now() time.Time {
+	if c == nil {
+		return time.Now()
+	}
+	return c.now()
+}
+
+// SetClockForTest installs now as the store clock (nil: time.Now) and returns
+// the restore. TEST-ONLY: production never calls it.
+func (c *ResolvedCacheStore) SetClockForTest(now func() time.Time) (restore func()) {
+	prev := c.clock.Load()
+	if now == nil {
+		c.clock.Store(nil)
+	} else {
+		c.clock.Store(&now)
+	}
+	return func() { c.clock.Store(prev) }
+}
+
 func newResolvedCache(maxEntries int, maxBytes int64, ttl time.Duration) *ResolvedCacheStore {
 	if maxEntries <= 0 {
 		maxEntries = defaultResolvedCacheMaxEntries
@@ -1410,15 +1500,47 @@ func (c *ResolvedCacheStore) effectiveTTLLocked(entry *ResolvedEntry) time.Durat
 // front and bumps hitTotal — the customer-warmth effects. GetNoTouch is the
 // internal, non-stamping twin.
 func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
-	entry, ok := c.getCore(key, true)
-	if ok {
+	entry, miss := c.GetReportingMiss(key)
+	return entry, miss == LookupHit
+}
+
+// LookupMiss is what one Get found under its key (#1265 P0): a live cell
+// (LookupHit), or why it returned nothing.
+//
+// SCOPE: it is what THIS lookup saw. A cell already gone before it (an LRU or
+// DELETE eviction, a declined Put, a cell never stored, or a TTL / max-age
+// expiry that an earlier read or the reaper already removed) reads
+// LookupAbsent. Only a cell this lookup itself finds past a bound reads
+// LookupExpiredTTL or LookupPastMaxAge.
+type LookupMiss uint8
+
+const (
+	// LookupAbsent — no cell under the key. It is the zero value, so a
+	// LookupMiss nobody set (a default, a stub) never reads as a hit.
+	LookupAbsent LookupMiss = iota
+	// LookupHit — a live cell was found and is returned.
+	LookupHit
+	// LookupExpiredTTL — the cell was past its TTL (its TTLOverride, else the
+	// store TTL) and this lookup evicted it.
+	LookupExpiredTTL
+	// LookupPastMaxAge — the cell was past the max entry age (#378) and this
+	// lookup evicted it.
+	LookupPastMaxAge
+)
+
+// GetReportingMiss is Get plus what the lookup found (LookupMiss). Get is
+// exactly this call with the reason folded to a bool: the same lookup, the same
+// customer-warmth effects and the same miss accounting.
+func (c *ResolvedCacheStore) GetReportingMiss(key string) (*ResolvedEntry, LookupMiss) {
+	entry, miss := c.getCore(key, true)
+	if miss == LookupHit {
 		// #354 P3 (C) — AFTER c.mu is released (getCore's deferred unlock). Get is
 		// the one funnel every hit_total-counted hit goes through
 		// (TestIssue354_P3_StaleServeNoteCoversEveryCountedHit), so a stale serve
 		// is counted on exactly the hit_total population.
 		c.noteServeWhileDirty(key)
 	}
-	return entry, ok
+	return entry, miss
 }
 
 // noteServeWhileDirty counts a customer hit on a cell whose invalidation→fresh
@@ -1432,7 +1554,7 @@ func (c *ResolvedCacheStore) noteServeWhileDirty(key string) {
 		return
 	}
 	c.staleServedTotal.Add(1)
-	c.staleServedAge.observe(float64(time.Since(s.t0).Milliseconds()))
+	c.staleServedAge.observe(float64(windowNow().Sub(s.t0).Milliseconds()))
 	noteKnownStaleServe(s)
 }
 
@@ -1446,7 +1568,8 @@ func (c *ResolvedCacheStore) noteServeWhileDirty(key string) {
 // it the prompt orphan backstop at maxAge (a customer-cold cell an internal read
 // touches past maxAge is still evicted, not stranded to the reaper tick).
 func (c *ResolvedCacheStore) GetNoTouch(key string) (*ResolvedEntry, bool) {
-	return c.getCore(key, false)
+	entry, miss := c.getCore(key, false)
+	return entry, miss == LookupHit
 }
 
 // getCore is the shared body of Get (touch=true) and GetNoTouch (touch=false). The
@@ -1455,9 +1578,9 @@ func (c *ResolvedCacheStore) GetNoTouch(key string) (*ResolvedEntry, bool) {
 // AND the miss accounting, so a GetNoTouch read is fully metric-neutral — it never
 // inflates hit_total NOR miss_total (freshness-audit: full metric neutrality for
 // internal reads). One implementation so the evict discipline can never drift.
-func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bool) {
+func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, LookupMiss) {
 	if c == nil {
-		return nil, false
+		return nil, LookupAbsent
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1467,13 +1590,13 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		if touch {
 			c.missTotal.Add(1)
 		}
-		return nil, false
+		return nil, LookupAbsent
 	}
 	item := el.Value.(*lruItem)
 	// #315/#316 — one time reference for both bound checks AND the lastRead
 	// stamp below, so the read-recency signal is exactly the instant the two
 	// lazy bounds are evaluated against (no second time.Now, no new lock).
-	now := time.Now()
+	now := c.now()
 	// R1 Layer 2 (#36): a per-entry TTLOverride (the short
 	// CATALOG_UNSERVABLE_TTL_SECONDS set on entries stored while their GVR
 	// was not servable) takes precedence over the store's standard ttl, so a
@@ -1493,7 +1616,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		if touch {
 			c.missTotal.Add(1)
 		}
-		return nil, false
+		return nil, LookupExpiredTTL
 	}
 	// 1.12.6 C5 (design §7) — bounded LIFETIME, measured from the first Put
 	// under this key (BornAt), which a refresh re-Put does not reset. Past
@@ -1503,6 +1626,16 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 	// from-scratch resolve. Counted separately from TTL so the two reasons
 	// for leaving stay distinguishable. KEPT on the GetNoTouch path too (the
 	// internal-read orphan backstop).
+	//
+	// #882 F1 (owner ruling) — the ONE exception: an anchored incremental LIST
+	// content cell (list_cell.go) is under neither bound (itemExpiredLocked).
+	// Its body is rebuilt from informer deltas, never by a Put, so CreatedAt
+	// and BornAt say nothing about its freshness; the two bounds only removed a
+	// correct 50K list hourly and made every reader re-fill it (#882, the
+	// run-15 OOM). Its from-scratch check is the comparator pass, which
+	// REPLACES the 24 h rebuild for it; it leaves through its own unanchor
+	// signals (mismatch, lost event, comparator divergence) or byte /
+	// entry-count pressure (LRU).
 	//
 	// #378 — a WARM cell evicted here is split by reader: on the customer path it
 	// is a cold navigation of the working set (the owner's P5 trigger); on the
@@ -1522,7 +1655,7 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		if touch {
 			c.missTotal.Add(1)
 		}
-		return nil, false
+		return nil, LookupPastMaxAge
 	}
 	// Customer-warmth effects — ONLY on the touch (customer Get) path (#376). A HIT
 	// here means a customer served this cell, so it is warm as of `now`: move to
@@ -1533,8 +1666,9 @@ func (c *ResolvedCacheStore) getCore(key string, touch bool) (*ResolvedEntry, bo
 		c.order.MoveToFront(el)
 		item.lastRead = now
 		c.hitTotal.Add(1)
+		noteSeedOriginHitLocked(item) // #841
 	}
-	return item.entry, true
+	return item.entry, LookupHit
 }
 
 // Has reports whether key is currently resident, WITHOUT any of Get's side
@@ -1560,9 +1694,10 @@ func (c *ResolvedCacheStore) Has(key string) bool {
 // Put stores entry under key, evicting LRU tail entries until both
 // entry-count and byte-budget caps are satisfied. The entry's CreatedAt
 // is set to time.Now() if zero. Putting under a key that already exists
-// replaces the entry and adjusts curBytes accordingly.
-func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
-	c.putPlain(context.Background(), false, key, entry)
+// replaces the entry and adjusts curBytes accordingly. It reports whether it
+// wrote: the store's admission (admitWrite) can refuse.
+func (c *ResolvedCacheStore) put(key string, entry *ResolvedEntry) bool {
+	return c.putPlain(context.Background(), false, false, key, entry).Stored()
 }
 
 // PutEndingKnownStale is Put for the carrier that is a PLAIN store write by
@@ -1575,19 +1710,28 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 // (generation preserved, unknown provenance for the #406 layer index); ctx only
 // ends the known-stale state, inside the same critical section as the write
 // (#734).
-func (c *ResolvedCacheStore) PutEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) {
-	c.putPlain(ctx, false, key, entry)
+//
+// #1321 — it reports the write's outcome (writeOutcome): the external-TTL
+// widget Put hands it to the publish gate, like every write of a cell a
+// /refreshes stream can be armed on.
+func (c *ResolvedCacheStore) putEndingKnownStale(ctx context.Context, key string, entry *ResolvedEntry) PutOutcome {
+	return c.putPlain(ctx, false, true, key, entry)
 }
 
-func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool, key string, entry *ResolvedEntry) {
+// putPlain is the plain write the methods above share. It reports the write's
+// outcome: PutRefused, or (#1321) PutIdentical / PutChanged against the entry
+// it replaced when outcome is set (writeOutcome). With outcome unset a stored
+// write reports PutChanged without comparing: the caller asks only Stored().
+func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown, outcome bool, key string, entry *ResolvedEntry) PutOutcome {
 	if c == nil || entry == nil {
-		return
+		return PutRefused
 	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
-	if Inert(ctx) {
-		return
+	// #443 (a) / #1233 — the store's admission: an inert resolve, or a write
+	// while the RBAC snapshot is incomplete, stores nothing.
+	if !admitWrite(ctx, entry) {
+		return PutRefused
 	}
-	bytes, extrasHash := c.putPreamble(entry)
+	bytes, extrasHash := c.putPreamble(ctx, entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
 	// 1.12.6 C4 (§6.4) — a real Put is by definition the "next real Put" a
 	// refresh suppression waits for: clear the marker (and the consecutive-
@@ -1603,14 +1747,16 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 	// resurrect a raced DELETE; the request-path carriers use PutIfGen.
 	// Plain Put is never a re-mint (no ctx, exempt carriers) → freshMint=false.
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
+	replaced := c.replacedForOutcomeLocked(outcome, key)      // #1321
 	c.putCoreLocked(key, entry, bytes, extrasHash, c.currentGenLocked(key), false)
+	c.reassertOwnEdgesLocked(ctx, key) // #890
 	layerRemarks := c.raLayerCommitLocked(ctx, provenanceKnown, key, samePrior, entry)
-	ksT0, ksSample := endKnownStaleOnPut(ctx, key) // #547/#734 — see PutIfGen (no sink on a plain Put: a no-op)
+	ksEnd := endKnownStaleOnPut(ctx, key) // #547/#734/#884 — see PutIfGen (no sink on a plain Put: a no-op)
 	c.mu.Unlock()
-	if ksSample {
-		sampleFreshAfterPut(ksT0)
-	}
+	ksEnd.afterUnlock(key)
+	noteStalePushPut(key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	remarkLayerConsumers(layerRemarks)
+	return writeOutcome(outcome, replaced, samePrior, entry)
 }
 
 // PutThenRemark is a plain Put followed by the #375 PUT-THEN-REMARK check
@@ -1632,16 +1778,75 @@ func (c *ResolvedCacheStore) putPlain(ctx context.Context, provenanceKnown bool,
 // #406 — the store runs with provenanceKnown=true (putPlain): ctx's sink also holds
 // the raKey versions the body Go-sliced, so the layer check judges this Put by them.
 // #323's plain no-gen semantics are unchanged.
-func (c *ResolvedCacheStore) PutThenRemark(ctx context.Context, key string, entry *ResolvedEntry) {
-	if c == nil || entry == nil {
-		return
+//
+// #1321 — it reports the write's outcome (writeOutcome) for the publish gate.
+func (c *ResolvedCacheStore) putThenRemark(ctx context.Context, key string, entry *ResolvedEntry) PutOutcome {
+	// #547 — ends a known-stale state in-lock (a boot / seed re-Put of a fresh
+	// body). A write the store did not admit (an inert resolve, an incomplete
+	// RBAC snapshot) stored nothing, and there is nothing to remark.
+	put := c.putPlain(ctx, true, true, key, entry)
+	if !put.Stored() {
+		return PutRefused
 	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
-	if Inert(ctx) {
-		return
-	}
-	c.putPlain(ctx, true, key, entry) // #547 — ends a known-stale state in-lock (a boot / seed re-Put of a fresh body)
 	Deps().remarkIfDepsMovedFrom(ctx, key, true)
+	return put
+}
+
+// #890 / #893 — EDGES OF A CELL THAT IS NOT STORED.
+//
+// A resolve records dep edges under its L1 key while it runs, before its write.
+// When the write does not land — refused (#189: the cell was evicted during the
+// resolve), declined by a Put gate, or never reached (an error) — and the cell is
+// not resident, those edges belong to no cell, and nothing would strip them: the
+// eviction already ran. They keep dirty-marking a key with no entry, and, since
+// #883, keep the resolve-memo entries linked to that key alive.
+//
+// The mechanism has two halves, and they only work together:
+//
+//   - releaseUnstoredLocked STRIPS the edges of a NON-resident key (the refusal
+//     here; DepTracker.ReleaseUnstored at every resolve's end for declines and
+//     errors). It strips every edge of the key, including those of another
+//     resolve of the same key still in flight — so, alone, that resolve could be
+//     stored with edges someone else took away.
+//   - reassertOwnEdgesLocked closes that: an ACCEPTED write re-records, under the
+//     same lock that publishes the cell, every edge its own resolve recorded under
+//     the key that is no longer there (depGenSink.own). A stored cell therefore
+//     always holds its resolve's edges, whatever was stripped meanwhile.
+//
+// Nothing is fenced: no generation is bumped, so overlapping fills of a hot key are
+// never refused by a strip (the #506 failure of the first #890 design, where every
+// refusal bumped the generation and refused the next overlapping fill in turn). And
+// nothing here reads a generation, so the reuse of generation numbers after a
+// tombstone expires cannot matter.
+
+// releaseUnstoredLocked strips key's dep edges if key is not resident. mu held.
+func (c *ResolvedCacheStore) releaseUnstoredLocked(key string) {
+	if _, live := c.index[key]; live {
+		return // a resident cell's edges are its own write's
+	}
+	if edgeHeld(key) {
+		return // a registered holder judges its facts by these edges (RegisterEdgeHolder)
+	}
+	c.stripDepEdges(key)
+}
+
+// releaseUnstored is releaseUnstoredLocked taking the lock.
+func (c *ResolvedCacheStore) releaseUnstored(key string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.releaseUnstoredLocked(key)
+	c.mu.Unlock()
+}
+
+// reassertOwnEdgesLocked re-records the edges ctx's resolve recorded under key
+// that the tracker no longer holds (see above). Called by every accepted write
+// that carries the resolve's ctx, right after putCoreLocked. mu held.
+func (c *ResolvedCacheStore) reassertOwnEdgesLocked(ctx context.Context, key string) {
+	if d := Deps(); d != nil {
+		d.reassertOwnEdges(ctx, key)
+	}
 }
 
 // PutIfGen is the #189 generation-guarded write. It stores entry under key ONLY
@@ -1651,15 +1856,35 @@ func (c *ResolvedCacheStore) PutThenRemark(ctx context.Context, key string, entr
 // between, the Put is REFUSED and the pre-delete body is not resurrected. The
 // check and the write are ONE c.mu critical section — no Get-then-Put TOCTOU.
 // Returns true iff the entry was stored.
-func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+func (c *ResolvedCacheStore) putIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+	return c.putIfGenWrite(ctx, key, entry, capturedGen, false).Stored()
+}
+
+// putIfGenOutcome is putIfGen reporting whether the accepted Put changed the
+// stored bytes (#1321, put_outcome.go): every caller hands the outcome to the
+// publish gate. A fill of an absent key is PutChanged; a #547 demand
+// revalidation or a keep-warm re-Put over a resident cell with the same bytes
+// is PutIdentical. The compare is writeOutcome's: against the entry this write
+// replaced, read in the write's own critical section (no extra c.mu), and run
+// off the lock.
+func (c *ResolvedCacheStore) putIfGenOutcome(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome {
+	return c.putIfGenWrite(ctx, key, entry, capturedGen, true)
+}
+
+// putIfGenWrite is the gen-guarded write putIfGen and putIfGenOutcome share.
+// outcome says whether the caller consumes the outcome (writeOutcome). Only
+// then is anything compared beyond #406's own RAFullList compare: putIfGen's
+// callers (the GET-only content cells, the raFullList layer, fixtures) take no
+// frame decision, so they pay no compare (#1321 M1).
+func (c *ResolvedCacheStore) putIfGenWrite(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64, outcome bool) PutOutcome {
 	if c == nil || entry == nil {
-		return false
+		return PutRefused
 	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
-	if Inert(ctx) {
-		return false
+	// #443 (a) / #1233 — the store's admission (admitWrite).
+	if !admitWrite(ctx, entry) {
+		return PutRefused
 	}
-	bytes, extrasHash := c.putPreamble(entry)
+	bytes, extrasHash := c.putPreamble(ctx, entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
 
 	c.mu.Lock()
@@ -1667,25 +1892,28 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 		// The key was DELETE-evicted (or otherwise removed) between capture and
 		// now — the eviction is authoritative; drop the stale body on the floor.
 		c.putRefusedGenerationMovedTotal.Add(1)
+		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
 		NoteRefreshWrite(ctx, key, false) // #547: a demand revalidation's outcome
-		return false
+		return PutRefused
 	}
 	// Committing a real Put: clear the refresh-suppression marker (a real Put is
 	// the "next real Put" a suppression waits for). Only on ACCEPT — a refused
 	// Put populated nothing, so its key's suppression marker must stand.
 	clearRefreshSuppression(key)
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
+	replaced := c.replacedForOutcomeLocked(outcome, key)      // #1321
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
+	c.reassertOwnEdgesLocked(ctx, key) // #890
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
-	// #547 — end a KNOWN-STALE state this post-mark resolve has made fresh. #734 —
-	// in the critical section that publishes the body, so no reader sees the fresh
-	// body still flagged known-stale (endKnownStaleOnPut).
-	ksT0, ksSample := endKnownStaleOnPut(ctx, key)
+	// #547/#884 — an accepted Put ends a KNOWN-STALE state (a newer mark leaves an
+	// ordinary open window). #734 — in the critical section that publishes the
+	// body, so no reader sees the new body still flagged known-stale
+	// (endKnownStaleOnPut).
+	ksEnd := endKnownStaleOnPut(ctx, key)
 	c.mu.Unlock()
-	if ksSample {
-		sampleFreshAfterPut(ksT0)
-	}
+	ksEnd.afterUnlock(key)
+	noteStalePushPut(key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	// #547 — a demand revalidation re-runs the customer cold path, whose terminal
 	// write is THIS Put: report it to the revalidation's outcome sink (a no-op on
 	// any ctx without one, and for any key but the revalidated one). BEFORE the
@@ -1699,7 +1927,7 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 	// #406 — a raKey commit with changed content remarks the widgets holding a slice of
 	// the old body; a widget Put of a slice of a since-superseded raKey remarks itself.
 	remarkLayerConsumers(layerRemarks)
-	return true
+	return writeOutcome(outcome, replaced, samePrior, entry)
 }
 
 // ReplaceIfGen is the #189 generation-guarded REPLACE. It stores entry under key
@@ -1710,15 +1938,15 @@ func (c *ResolvedCacheStore) PutIfGen(ctx context.Context, key string, entry *Re
 // preserves the "a non-resurrecting refresh emits no live-refresh signal"
 // contract while closing the resurrection race in one c.mu section. Request-path
 // COLD fills use PutIfGen (which inserts on absent). Returns true iff stored.
-func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+func (c *ResolvedCacheStore) replaceIfGen(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
 	if c == nil || entry == nil {
 		return false
 	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
-	if Inert(ctx) {
+	// #443 (a) / #1233 — the store's admission (admitWrite).
+	if !admitWrite(ctx, entry) {
 		return false
 	}
-	bytes, extrasHash := c.putPreamble(entry)
+	bytes, extrasHash := c.putPreamble(ctx, entry)
 	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
 
 	c.mu.Lock()
@@ -1728,18 +1956,19 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 		// generation (a cold request re-inserted it) — refuse, do not clobber or
 		// resurrect. The eviction / newer write is authoritative.
 		c.putRefusedGenerationMovedTotal.Add(1)
+		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
 		return false
 	}
 	clearRefreshSuppression(key)
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, false)
+	c.reassertOwnEdgesLocked(ctx, key) // #890
 	layerRemarks := c.raLayerCommitLocked(ctx, true, key, samePrior, entry)
-	ksT0, ksSample := endKnownStaleOnPut(ctx, key) // #547/#734 — see PutIfGen
+	ksEnd := endKnownStaleOnPut(ctx, key) // #547/#734/#884 — see PutIfGen
 	c.mu.Unlock()
-	if ksSample {
-		sampleFreshAfterPut(ksT0)
-	}
+	ksEnd.afterUnlock(key)
+	noteStalePushPut(key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
@@ -1766,6 +1995,11 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 // same key with every freshness and isolation guarantee the refresh already
 // carries.
 //
+// #882 F1 (owner ruling) — NOT for the anchored incremental LIST content cell.
+// The cap does not apply to it (itemExpiredLocked), its refresh writes nothing
+// (resolve_populate.go: a Snapshot, no store write), and its from-scratch check
+// is the comparator pass, which REPLACES this 24 h rebuild for it.
+//
 // #506 item 2 SUPERSEDES the original no-added-resolve promise. This comment
 // used to end "No extra resolve is ever spent on a re-mint (F4a)" — that was
 // true while the ONLY way into the lead window was a refresh that was happening
@@ -1791,28 +2025,43 @@ func (c *ResolvedCacheStore) ReplaceIfGen(ctx context.Context, key string, entry
 // #375 — like PutIfGen / ReplaceIfGen it takes the resolve ctx and, on ACCEPT,
 // runs remarkIfDepsMoved off-lock: a dep that moved during the re-mint resolve
 // remarks the key, and the follow-up refresh (BornAt age ≈ 0) inherits the new
-// birth. #375's arm-9 reflective enumeration covers this method. Returns true
-// iff stored.
-func (c *ResolvedCacheStore) ReplaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) bool {
+// birth. #375's arm-9 reflective enumeration covers this method.
+//
+// #1321 — it returns the Put's outcome: PutRefused, or PutIdentical /
+// PutChanged from the #1070 compare confirmed under c.mu (the `identical`
+// verdict below). The caller publishes a frame only for PutChanged
+// (PublishRefreshed): an identical refresh still runs and still Puts, but it
+// announces nothing the subscriber does not already hold.
+func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string, entry *ResolvedEntry, capturedGen uint64) PutOutcome {
 	if c == nil || entry == nil {
-		return false
+		return PutRefused
 	}
-	// #443 (a) — an inert (dry-run) resolve persists nothing.
-	if Inert(ctx) {
-		return false
+	// #443 (a) / #1233 — the store's admission (admitWrite).
+	if !admitWrite(ctx, entry) {
+		return PutRefused
 	}
-	bytes, extrasHash := c.putPreamble(entry)
-	equalPrior := c.raLayerEqualPrior(key, entry) // #406: byte compare OFF c.mu
+	bytes, extrasHash := c.putPreamble(ctx, entry)
+	// #1070 — ONE byte compare of the refresh Put against the resident prior,
+	// OFF c.mu: it counts the Put identical or changed, and it is #406's compare
+	// for an RAFullList body (raLayerEqualOf), so no body is compared twice.
+	same := c.sameBytesPrior(key, entry)
+	equalPrior := c.raLayerEqualOf(entry, same) // #406
 
 	c.mu.Lock()
 	el, live := c.index[key]
 	if !live || el.Value.(*lruItem).gen != capturedGen {
 		// Absent or gen-moved: refuse exactly like ReplaceIfGen.
 		c.putRefusedGenerationMovedTotal.Add(1)
+		c.releaseUnstoredLocked(key) // #890
 		c.mu.Unlock()
-		return false
+		return PutRefused
 	}
-	now := time.Now()
+	// #1070 — identical only if the prior that compared equal is the one replaced
+	// here; any other resident entry (a write landed after the compare) counts the
+	// Put as changed, as #406 voids its compare. #1321 — the same verdict decides
+	// the frame (the return value).
+	identical := same != nil && el.Value.(*lruItem).entry == same
+	now := c.now()
 	freshMint := c.inRemintWindowLocked(el.Value.(*lruItem), now)
 	if freshMint {
 		// A fresh birth NOW (not the caller's CreatedAt, which may have been
@@ -1822,6 +2071,7 @@ func (c *ResolvedCacheStore) ReplaceIfGenRefresh(ctx context.Context, key string
 	clearRefreshSuppression(key)
 	samePrior := c.raLayerConfirmPriorLocked(key, equalPrior) // #406
 	c.putCoreLocked(key, entry, bytes, extrasHash, capturedGen, freshMint)
+	c.reassertOwnEdgesLocked(ctx, key) // #890
 	if freshMint {
 		c.noteRemintLocked(entry)
 	}
@@ -1829,16 +2079,22 @@ func (c *ResolvedCacheStore) ReplaceIfGenRefresh(ctx context.Context, key string
 	// #734 — the refresher's own terminal re-Put ends a known-stale state too (its
 	// dequeue stamp is in flight: the flag ends here, the window is still settled
 	// and sampled by the dequeue). See PutIfGen.
-	ksT0, ksSample := endKnownStaleOnPut(ctx, key)
+	ksEnd := endKnownStaleOnPut(ctx, key)
 	c.mu.Unlock()
-	if ksSample {
-		sampleFreshAfterPut(ksT0)
+	ksEnd.afterUnlock(key)
+	// #1070 — measurement only: the accepted refresh Put, timed on the
+	// dirty-window clock with the rest of the refresh cycle (refresh_cycle.go).
+	class := ""
+	if entry.Inputs != nil {
+		class = entry.Inputs.CacheEntryClass
 	}
+	noteRefreshPut(ctx, key, class, identical, windowNow())
+	noteStalePushPut(key, entry) // #1062 — replaces the stale serves this accepted Put corrects, before any publish
 	// #375 (option c) — see PutIfGen: PUT-THEN-REMARK on the accepted branch, off-lock.
 	Deps().remarkIfDepsMoved(ctx, key)
 	// #406 — see PutIfGen.
 	remarkLayerConsumers(layerRemarks)
-	return true
+	return putOutcomeOf(identical)
 }
 
 // remintLead is the #378 lead L: how long before the cap the refresher terminal
@@ -2063,13 +2319,13 @@ func (c *ResolvedCacheStore) bumpGenTombstoneLocked(key string, gen uint64) {
 	if c.tombstones == nil {
 		c.tombstones = map[string]tombstone{}
 	}
-	c.tombstones[key] = tombstone{gen: gen + 1, expireAt: time.Now().Add(c.tombstoneTTL)}
+	c.tombstones[key] = tombstone{gen: gen + 1, expireAt: c.now().Add(c.tombstoneTTL)}
 	c.maybeSweepTombstonesLocked()
 }
 
 // tombstoneExpiredLocked reports whether t is past its window. Callers hold c.mu.
 func (c *ResolvedCacheStore) tombstoneExpiredLocked(t tombstone) bool {
-	return !t.expireAt.IsZero() && time.Now().After(t.expireAt)
+	return !t.expireAt.IsZero() && c.now().After(t.expireAt)
 }
 
 // maybeSweepTombstonesLocked amortises expired-tombstone reclamation to at most
@@ -2081,7 +2337,7 @@ func (c *ResolvedCacheStore) maybeSweepTombstonesLocked() {
 	if c.tombstoneTTL <= 0 || len(c.tombstones) == 0 {
 		return
 	}
-	now := time.Now()
+	now := c.now()
 	if !c.tombstoneSweepAt.IsZero() && now.Sub(c.tombstoneSweepAt) < c.tombstoneTTL {
 		return
 	}
@@ -2109,9 +2365,9 @@ func (c *ResolvedCacheStore) SetTombstoneTTL(d time.Duration) {
 // putPreamble does the off-critical-path preparation shared by Put and PutIfGen:
 // stamp CreatedAt/BornAt and compute the LRU byte weight + the #247 extras hash
 // (both marshal/hash work that does not need the store lock).
-func (c *ResolvedCacheStore) putPreamble(entry *ResolvedEntry) (bytes int64, extrasHash string) {
+func (c *ResolvedCacheStore) putPreamble(ctx context.Context, entry *ResolvedEntry) (bytes int64, extrasHash string) {
 	if entry.CreatedAt.IsZero() {
-		entry.CreatedAt = time.Now()
+		entry.CreatedAt = c.now()
 	}
 	// 1.12.6 C5 — a first Put is the entry's birth; a replace-in-place Put
 	// INHERITS the prior entry's BornAt in putCoreLocked, so a refresh re-Put
@@ -2119,6 +2375,9 @@ func (c *ResolvedCacheStore) putPreamble(entry *ResolvedEntry) (bytes int64, ext
 	if entry.BornAt.IsZero() {
 		entry.BornAt = entry.CreatedAt
 	}
+	// #1198 — where this body's resolve began, for a stale serve that opens after
+	// this Put. Here, not under c.mu: the entry is not published yet.
+	entry.resolveStart, entry.hasResolveStart = DepGenStartSeqFromContext(ctx)
 	return entryBytes(entry), extrasHashForEntry(entry)
 }
 
@@ -2197,8 +2456,24 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 		}
 		// #444 — the recent hitters belong to the KEY too: a refresh re-Put must
 		// not forget who the cell is served to (they are its representative pool).
+		if old.entry != nil && old.entry != entry && old.entry.listCell != entry.listCell {
+			// #854 — the incremental cell the replaced entry carried stops.
+			closeListCellOf(old.entry, "replaced")
+		}
 		if old.entry != nil && old.entry != entry && entry.recentHitters.Load() == nil {
 			entry.recentHitters.Store(old.entry.recentHitters.Load())
+		}
+		// #1430 — the served-view digests belong to the ANSWER: a re-Put of the
+		// same answer keeps them, and servedViewMemoOf drops them on first use
+		// when the answer differs (no compare under c.mu).
+		if old.entry != nil && old.entry != entry && entry.servedViews.Load() == nil {
+			entry.servedViews.Store(old.entry.servedViews.Load())
+		}
+		// #841 — the seed origin belongs to the KEY too, and only an insert sets
+		// it: a refresh re-Put of a seeded cell keeps counting the hits the seed
+		// bought, and a seed re-Put of a cell traffic created does not claim it.
+		if old.entry != nil {
+			entry.SeedOrigin = old.entry.SeedOrigin
 		}
 		// freshMint re-mint (#378): skip the inherit → entry.BornAt stays the fresh
 		// birth ReplaceIfGenRefresh stamped → the replace-in-place is a FRESH birth
@@ -2252,6 +2527,7 @@ func (c *ResolvedCacheStore) putCoreLocked(key string, entry *ResolvedEntry, byt
 	c.storeTotal.Add(1)
 	c.bumpClassStoreLocked(apistage, widgetContent, raFullList)
 	c.noteEntryClassLocked(key, entry)
+	noteSeedOriginInsertLocked(entry) // #841
 
 	c.evictUntilUnderCapsLocked()
 }
@@ -2343,11 +2619,49 @@ func entryBytes(entry *ResolvedEntry) int64 {
 	if entry == nil {
 		return 0
 	}
+	if entry.listCell != nil {
+		// #854 — the SAME number a full fill of the same state would be
+		// accounted at: the exact envelope length (never built) plus the
+		// decoded tree's overhead.
+		b := int64(entry.RawLen())
+		if entry.itemCount() > 0 {
+			b += b * itemsTreeOverheadFactor
+		}
+		return b
+	}
 	b := int64(len(entry.RawJSON))
 	if len(entry.Items) > 0 {
 		b += int64(len(entry.RawJSON)) * itemsTreeOverheadFactor
 	}
 	return b
+}
+
+// reaccountEntry re-reads an incremental entry's size after a generation build
+// (#854) and moves the store's byte accounting by the difference. A no-op when
+// the key no longer holds that entry. No generation move, no Put identity, no
+// recency: the entry did not change, its cell's body did.
+func (c *ResolvedCacheStore) reaccountEntry(key string, e *ResolvedEntry) {
+	if c == nil || e == nil {
+		return
+	}
+	b := entryBytes(e)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.index[key]
+	if !ok {
+		return
+	}
+	item := el.Value.(*lruItem)
+	if item.entry != e || item.bytes == b {
+		return
+	}
+	if e.Pinned {
+		c.curResidentBytes += b - item.bytes
+	} else {
+		c.curBytes += b - item.bytes
+	}
+	item.bytes = b
+	c.evictUntilUnderCapsLocked()
 }
 
 // Len returns the number of entries currently held. Safe to call
@@ -2387,7 +2701,9 @@ type ResolvedCacheStats struct {
 	EvictMaxAgeTotal uint64 // 1.12.6 C5: evicted past RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS (Get-lazy + #248 reaper)
 	// #444: evicted by the refresher because no in-class representative was found.
 	EvictNoRepresentativeTotal uint64
-	EvictDeleteTotal           uint64 // 0.30.8: DELETE-event-driven evictions
+	// #1255: evicted because a later resolve proved the key can no longer be stored.
+	EvictUnstorableTotal uint64
+	EvictDeleteTotal     uint64 // 0.30.8: DELETE-event-driven evictions
 
 	// #248 — resident-suppressed gauge (see suppressedResidentGauge). Non-zero
 	// DURING the UAF-decline-freeze; distinguishes decline-frozen from
@@ -2506,17 +2822,11 @@ type ResolvedCacheStats struct {
 	// exactly when the write-side resurrection race is being closed.
 	PutRefusedGenerationMovedTotal uint64
 
-	// #261 case-3 — serve-time L1 HITs of a cell whose first-permitting
-	// BindingUID was roleRef-unresolved at the last bindings_by_gvr index build.
-	// AT-RISK SERVE POPULATION proxy (see the store field's T1/T3 note), NOT a
-	// confirmed-leak count: off-zero => reassess, never N leaks.
-	ServeMissedRotationAtriskRolerefUnresolved uint64
-
 	// #261 case-2 — serve-time L1 HITs of a cell whose first-permitting
 	// binding's winning subject matched only through an IMPLICIT group
-	// (system:authenticated / synthetic system:serviceaccounts[:ns]). AT-RISK
-	// SERVE POPULATION proxy (see the store field's T1/T3 note), NOT a
-	// confirmed-leak count: off-zero => reassess, never N leaks.
+	// (system:authenticated / synthetic system:serviceaccounts[:ns]). Not a
+	// leak count, and since #1443 not a rotation-gap signal (see the store
+	// field's note).
 	ServeMissedRotationAtriskImplicitGroup uint64
 }
 
@@ -2543,6 +2853,7 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		EvictTTLTotal:                c.evictTTLTotal.Load(),
 		EvictMaxAgeTotal:             c.evictMaxAgeTotal.Load(),
 		EvictNoRepresentativeTotal:   c.evictNoRepresentativeTotal.Load(),
+		EvictUnstorableTotal:         c.evictUnstorableTotal.Load(),
 		EvictDeleteTotal:             c.evictDeleteTotal.Load(),
 		SuppressedResident:           c.suppressedResidentGauge.Load(),
 		WarmPastMaxAge:               c.warmPastMaxAgeGauge.Load(),
@@ -2585,8 +2896,6 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 
 		PutRefusedGenerationMovedTotal: c.putRefusedGenerationMovedTotal.Load(),
 
-		ServeMissedRotationAtriskRolerefUnresolved: c.serveMissedRotationAtriskRolerefUnresolved.Load(),
-
 		ServeMissedRotationAtriskImplicitGroup: c.serveMissedRotationAtriskImplicitGroup.Load(),
 	}
 }
@@ -2595,8 +2904,7 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 // at-risk-serve counter. Called HIT-GATED ONLY from the restactions serve
 // hit-site (dispatchers) when the served cell's mint-carried at-risk class is
 // implicit_group (the first-permitting binding's winning subject matched via an
-// implicit group). Nil-safe. Mirrors the roleref-unresolved bump discipline
-// (atomic, off-mu). The value it feeds is a STRUCTURAL PROXY for the AT-RISK
+// implicit group). Nil-safe. Atomic, off-mu. The value it feeds is a STRUCTURAL PROXY for the AT-RISK
 // SERVE POPULATION, not a confirmed-leak count (see the store field's T1/T3
 // note).
 func (c *ResolvedCacheStore) BumpServeMissedRotationAtriskImplicitGroup() {
@@ -2604,20 +2912,6 @@ func (c *ResolvedCacheStore) BumpServeMissedRotationAtriskImplicitGroup() {
 		return
 	}
 	c.serveMissedRotationAtriskImplicitGroup.Add(1)
-}
-
-// BumpServeMissedRotationAtriskRolerefUnresolved increments the #261 case-3
-// at-risk-serve counter. Called HIT-GATED ONLY from the restactions serve
-// hit-site (dispatchers) when the served cell's first-permitting BindingUID
-// was roleRef-unresolved at the last bindings_by_gvr index build. Nil-safe.
-// Mirrors the putRefusedGenerationMovedTotal.Add(1) bump discipline (atomic,
-// off-mu). The value it feeds is a STRUCTURAL PROXY for the AT-RISK SERVE
-// POPULATION, not a confirmed-leak count (see the store field's T1/T3 note).
-func (c *ResolvedCacheStore) BumpServeMissedRotationAtriskRolerefUnresolved() {
-	if c == nil {
-		return
-	}
-	c.serveMissedRotationAtriskRolerefUnresolved.Add(1)
 }
 
 // ResolvedEntryMeta is the METADATA-ONLY projection of one cached
@@ -2709,6 +3003,12 @@ type ResolvedEntryMeta struct {
 	// TTLOverrideSeconds is the per-entry override when one is stamped (UAF
 	// cells), 0 otherwise. It can only ever SHORTEN the effective TTL.
 	TTLOverrideSeconds int64 `json:"ttlOverrideSeconds,omitempty"`
+	// Incremental (#882 F1) — an anchored incremental LIST content cell
+	// (list_cell.go). No TTL or max entry age applies to it: it leaves through
+	// its own unanchor signals or byte / entry-count pressure (LRU), and its from-scratch check is
+	// the comparator pass, not the #378 rebuild. AgeSeconds, LifetimeSeconds and
+	// TTLRemainingSeconds still report the clocks; nothing acts on them.
+	Incremental bool `json:"incremental,omitempty"`
 	// RBACSubGen is the per-subject RBAC sub-generation folded into this
 	// cell's key (#247 instrument). Together with PerPage/Page/ExtrasHash
 	// below, ResolvedEntryMeta now carries EVERY ComputeKey input except the
@@ -2819,7 +3119,7 @@ func (c *ResolvedCacheStore) RangeMetadata(fn func(ResolvedEntryMeta) bool) {
 	if c == nil {
 		return
 	}
-	now := time.Now()
+	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for el := c.order.Front(); el != nil; el = el.Next() {
@@ -2873,7 +3173,7 @@ func (c *ResolvedCacheStore) rangeMetadataBatched(batch int, fn func(metas []Res
 		keys = keys[n:]
 		metas := make([]ResolvedEntryMeta, 0, n)
 		warms := make([]bool, 0, n)
-		now := time.Now()
+		now := c.now()
 		t1 := time.Now()
 		c.mu.Lock()
 		for _, k := range chunk {
@@ -2911,7 +3211,7 @@ func (c *ResolvedCacheStore) RangeMetadataSample(n int, fn func(ResolvedEntryMet
 	if c == nil || n <= 0 {
 		return
 	}
-	now := time.Now()
+	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	seen := 0
@@ -2965,8 +3265,8 @@ func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) Res
 		Pinned:          entry.Pinned,
 		LastReadSeconds: lastReadSecondsOf(item, now),
 		SeededAtBoot:    entry.SeededAtBoot,
-		ItemsCount:      len(entry.Items),
-		RawJSONBytes:    len(entry.RawJSON),
+		ItemsCount:      entry.itemCount(),
+		RawJSONBytes:    entry.RawLen(),
 	}
 	if eff := c.effectiveTTLLocked(entry); eff > 0 {
 		rem := eff - now.Sub(entry.CreatedAt)
@@ -2976,6 +3276,7 @@ func (c *ResolvedCacheStore) metaForItemLocked(item *lruItem, now time.Time) Res
 		meta.TTLRemainingSeconds = int64(rem.Seconds())
 	}
 	meta.TTLOverrideSeconds = int64(entry.TTLOverride.Seconds())
+	meta.Incremental = entry.incremental() // #882 F1
 	// #247 instrument — the extras identity is NOT derived here. It was
 	// computed once at Put and carried on the item, so this stays O(1) and
 	// the full walk never hashes under c.mu (see lruItem.extrasHash).
@@ -3028,7 +3329,7 @@ func (c *ResolvedCacheStore) MetadataForKey(key string) (ResolvedEntryMeta, bool
 	if c == nil || key == "" {
 		return out, false
 	}
-	now := time.Now()
+	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for el := c.order.Front(); el != nil; el = el.Next() {
@@ -3037,7 +3338,7 @@ func (c *ResolvedCacheStore) MetadataForKey(key string) (ResolvedEntryMeta, bool
 			continue
 		}
 		out = c.metaForItemLocked(item, now)
-		out.BodySHA256 = fmt.Sprintf("%x", sha256.Sum256(item.entry.RawJSON))
+		out.BodySHA256 = fmt.Sprintf("%x", sha256.Sum256(item.entry.Raw()))
 		return out, true
 	}
 	return out, false
@@ -3190,6 +3491,7 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	delete(c.index, item.key)
 	c.order.Remove(el)
 	c.raLayerForgetLocked(item.key) // #406
+	closeListCellOf(item.entry, "evicted") // #854
 	// 1.12.6 C4 (§6.4) — a refresh-suppression marker must not outlive its
 	// key (every eviction path but deleteForDep funnels through here).
 	clearRefreshSuppression(item.key)
@@ -3373,6 +3675,7 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	delete(c.index, item.key)
 	c.order.Remove(el)
 	c.raLayerForgetLocked(item.key) // #406
+	closeListCellOf(item.entry, "deleted") // #854
 	// 1.12.7 F6a — strip the dep edges HERE, under the same hold as the
 	// index delete, so no window exists in which the key is gone and its
 	// edges are not. The strip is a sync.Map operation that takes no store
@@ -3479,6 +3782,12 @@ var proactiveRefreshDisabledForTest atomic.Bool
 // BornAt on an accepted refresh inside the lead window [maxAge − L, …), so a warm
 // cell the refresher keeps fresh reaches neither this gauge nor the cap.
 //
+// #882 F1 — an anchored incremental LIST content cell takes none of the three
+// decisions and is in none of the #378 gauges: no TTL or max entry age applies
+// to it (itemExpiredLocked), so it is never reaped by age, never proactively
+// refreshed by a body or birth clock (the informer deltas keep it current; its
+// from-scratch check is the comparator pass), and never at risk at the cap.
+//
 // #378 — the walk also publishes oldestWarmBornAgeGauge: the max LifetimeSeconds
 // over WARM cells (0 if none). It is the scope of the warm-evict detectors: a zero
 // evict_max_age_warm_customer_total is evidence only on a pod where this exceeded
@@ -3539,7 +3848,7 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 			// #378 — the verdict is warmLocked, evaluated per item under the batch
 			// hold (the same predicate getCore and reapOneMaxAgeCold use).
 			warm := warms[i]
-			if warm && m.LifetimeSeconds > oldestWarm {
+			if warm && !m.Incremental && m.LifetimeSeconds > oldestWarm {
 				oldestWarm = m.LifetimeSeconds
 			}
 			// #376 — decompose the warm set by SOURCE over this same walk. Seeded wins
@@ -3565,6 +3874,9 @@ func (c *ResolvedCacheStore) reapPastMaxEntryAge() int {
 				if m.KeyedExtras {
 					warmKeyedExtras[b]++
 				}
+			}
+			if m.Incremental {
+				continue // #882 F1 — no age bound applies; see the doc above
 			}
 			_, suppressed := RefreshSuppressedReason(m.KeyHash)
 			pastMaxAge := maxAgeSec > 0 && m.LifetimeSeconds > maxAgeSec
@@ -3791,8 +4103,11 @@ func (c *ResolvedCacheStore) reapOneMaxAgeSuppressed(key string) bool {
 		return false // un-suppressed since the walk (e.g. a customer re-Put) — R2 leaves it
 	}
 	item := el.Value.(*lruItem)
-	if item.entry == nil || item.entry.BornAt.IsZero() || time.Since(item.entry.BornAt) <= c.maxEntryAge {
+	if item.entry == nil || item.entry.BornAt.IsZero() || c.now().Sub(item.entry.BornAt) <= c.maxEntryAge {
 		return false // read/re-validated young — never over-evict a within-cap cell
+	}
+	if item.entry.incremental() {
+		return false // #882 F1 — no max entry age applies to an incremental cell
 	}
 	c.removeElementLocked(el)
 	c.evictMaxAgeTotal.Add(1)
@@ -3826,11 +4141,14 @@ func (c *ResolvedCacheStore) reapOneMaxAgeCold(key string) bool {
 		return false // became suppressed since the walk — the #248 path owns it next tick
 	}
 	item := el.Value.(*lruItem)
-	if item.entry == nil || item.entry.BornAt.IsZero() || time.Since(item.entry.BornAt) <= c.maxEntryAge {
+	if item.entry == nil || item.entry.BornAt.IsZero() || c.now().Sub(item.entry.BornAt) <= c.maxEntryAge {
 		return false // young / re-validated within cap
 	}
+	if item.entry.incremental() {
+		return false // #882 F1 — no max entry age applies to an incremental cell
+	}
 	// C3 re-validation: a Get between the walk and now stamps lastRead=now → warm.
-	if c.warmLocked(item, time.Now()) {
+	if c.warmLocked(item, c.now()) {
 		return false // served/seeded since the walk — NEVER evict a warm cell (C3)
 	}
 	c.removeElementLocked(el)
@@ -3869,6 +4187,7 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 	resolvedCacheSummaryWG.Add(1)
 	go func() {
 		defer resolvedCacheSummaryWG.Done()
+		workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for {
@@ -3963,6 +4282,8 @@ func resetResolvedCacheForTest() {
 	// clears resolvedCacheStarted so a subsequent ResolvedCache() — after
 	// the Once below is reset — starts a fresh summary.
 	stopResolvedCacheSummaryForTest()
+	// #854 — the incremental list cells belong to the store being dropped.
+	ResetListCellsForTest()
 	resolvedCacheInstance = nil
 	resolvedCacheOnce = sync.Once{}
 	// 1.12.4 §7b — drop the observability handle too, else a test that
@@ -4016,6 +4337,8 @@ func stopResolvedCacheSummaryForTest() {
 // Production code MUST NOT call it.
 func ResetResolvedCacheForTest() {
 	resetResolvedCacheForTest()
+	// #1062 — the stale-push ledger is keyed by L1 keys of the store being dropped.
+	ResetStalePushForTest()
 	// #643 — the engine-wide declined-external set is process-lived and keyed
 	// by L1 keys: a fresh store must not inherit marks for keys it never held.
 	ResetEngineDeclinedExternalSetForTest()
@@ -4246,6 +4569,7 @@ func positiveIntFromEnv(key string, def int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
+		// log-ctx-waiver: process-once: an env value read at a singleton init; the line is about the process configuration
 		slog.Warn("cache.env.parse_rejected",
 			slog.String("subsystem", "cache"),
 			slog.String("key", key),
@@ -4256,6 +4580,7 @@ func positiveIntFromEnv(key string, def int) int {
 		return def
 	}
 	if n <= 0 {
+		// log-ctx-waiver: process-once: an env value read at a singleton init; the line is about the process configuration
 		slog.Warn("cache.env.out_of_range",
 			slog.String("subsystem", "cache"),
 			slog.String("key", key),
@@ -4293,6 +4618,7 @@ func int64BytesFromEnv(key string, def int64) int64 {
 	}
 	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 		if n < 0 {
+			// log-ctx-waiver: process-once: an env value read at a singleton init; the line is about the process configuration
 			slog.Warn("cache.env.out_of_range",
 				slog.String("subsystem", "cache"),
 				slog.String("key", key),
@@ -4307,6 +4633,7 @@ func int64BytesFromEnv(key string, def int64) int64 {
 	// strconv.ParseInt failed — try scientific / float notation (#154).
 	f, ferr := strconv.ParseFloat(v, 64)
 	if ferr != nil {
+		// log-ctx-waiver: process-once: an env value read at a singleton init; the line is about the process configuration
 		slog.Warn("cache.env.parse_rejected",
 			slog.String("subsystem", "cache"),
 			slog.String("key", key),
@@ -4317,6 +4644,7 @@ func int64BytesFromEnv(key string, def int64) int64 {
 		return def
 	}
 	if f < 0 {
+		// log-ctx-waiver: process-once: an env value read at a singleton init; the line is about the process configuration
 		slog.Warn("cache.env.out_of_range",
 			slog.String("subsystem", "cache"),
 			slog.String("key", key),

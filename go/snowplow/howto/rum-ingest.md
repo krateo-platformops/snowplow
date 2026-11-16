@@ -1,0 +1,180 @@
+# Browser RUM ingest: `POST /telemetry/v1/traces`
+
+This is for the portal frontend (#1015, acmp X5).
+
+The portal sends its browser RUM spans to **snowplow**, authenticated as the signed-in user. It never sends them to a collector route: the collector stays ClusterIP-only. snowplow keeps only the allowlisted fields, rebuilds the payload, and forwards it to the same OTel collector its own spans go to.
+
+The portal's `krateo.widget.fetch` spans link to snowplow's `Server` spans (#1013) through the W3C `traceparent` the fetch carries.
+
+## Endpoint
+
+| | |
+|---|---|
+| URL | `<snowplow base URL>/telemetry/v1/traces`: the same base the portal uses for `/call` (on 057: `<origin>/content/telemetry/v1/traces`) |
+| Method | `POST` |
+| Content type | `application/json`, **OTLP/JSON only** (`@opentelemetry/exporter-trace-otlp-http`). Protobuf (`application/x-protobuf`) gets `415`. Send no `Content-Encoding`. |
+| Auth | `Authorization: Bearer <JWT>`, the same header as `/call`. Without a valid one: `401`. |
+| CORS | The preflight allows `Authorization`, `Content-Type`, `traceparent`, `tracestate` and `baggage` (`snowplowCORSOptions`, every route). |
+| Enabled | Only when snowplow's own tracing is on (`OTEL_TRACING_ENABLED`, defaulting to `OTEL_ENABLED`) **and** `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Otherwise the route answers `404` to everyone. |
+
+Exporter configuration, as a sketch:
+
+```js
+new OTLPTraceExporter({
+  url: `${snowplowBase}/telemetry/v1/traces`,
+  headers: { Authorization: `Bearer ${jwt}` },
+});
+// BatchSpanProcessor: keep maxExportBatchSize <= 512 (the default).
+```
+
+## Limits
+
+| limit | value | answer |
+|---|---|---|
+| body | 512 KiB, with or without `Content-Length` | `413` |
+| spans per request | 512 | `413` |
+| attributes per span | 64 sent (at most 4 are forwarded, see the allowlist; the rest are dropped) | `413` |
+| resource attributes | 64 | `413` |
+| resource spans / scope spans per request | 16 / 64 | `413` |
+| a key repeated within any JSON object | refused | `400` |
+| requests per user | 1/s sustained, bursts of 10 | `429` with `Retry-After` (seconds) |
+| requests in flight per user | 1 | `429` with `Retry-After: 1` |
+| decodes in flight, all users | GOMAXPROCS of the pod | `429` with `Retry-After: 1` |
+| spans into the collector, all users | 2000/s, bursts of 2048 | `429` with `Retry-After` |
+
+- **Structural limits:** the span, attribute and container caps are enforced *while* the body is decoded. The decoder stops at cap+1, so what a request allocates is set by the caps, not by the shape of the body.
+- **Per-user limit:** one user hitting it does not affect another. The browser exporter's default 5 s batching uses about 0.2 requests/s per tab.
+- **Repeated keys:** a JSON key that appears twice in one object (a span, a resource, a resource span, a scope span, an attribute or its value) gets `400`. A repeat used to restart the attribute count (#1020 delta D1).
+- **What remains, by design** (#1020 delta D2/D3):
+  - **Decode slots:** one user can hold at most one of them. But GOMAXPROCS *distinct* authenticated users sending slow bodies together can still hold every slot. That blocks **telemetry only** (others get `429`), never the portal. Each slot is bounded by the server's 10 s read timeout.
+  - **Span budget:** the per-user limit counts *requests*, not spans. So a few users at their limit with full 512-span batches can use up the shared 2000 spans/s, and other users' batches get `429` until it refills.
+- **Refusal log:** every refusal (400, 413, 415, 429) writes a sampled WARN line `rum.ingest.refused` with the status and the reason. It carries nothing about the caller: no identity reaches a snowplow log line (#1192).
+
+## Allowlist
+
+Everything not listed here is dropped. Nothing is forwarded as sent: the payload is rebuilt from the fields below.
+
+- **Resource:** `service.name` must be exactly `krateo-frontend`. Any other value drops the whole resource's spans. No other resource attribute is forwarded: the forwarded resource carries `service.name=krateo-frontend` only. Scope is set by snowplow to `snowplow/rum-ingest`.
+- **Span names:** `krateo.page.load`, `krateo.composition.open`, `krateo.form.submit`, `krateo.page.publish`, `krateo.widget.fetch`, `krateo.agentiko.claim.unbacked`, `krateo.agentiko.a2a`. A name matches exactly (case, whitespace and suffixes included). Any other name is dropped.
+- **Span fields kept:**
+  - `traceId`, `spanId`, `parentSpanId`, as hex, the OTLP/JSON encoding;
+  - `kind`;
+  - `startTimeUnixNano` and `endTimeUnixNano` (the duration);
+  - `status.code`. `status.message` is dropped.
+  - Events, links and trace state are dropped.
+  - A span with a malformed id or time is dropped.
+- **Span attributes kept:** the allowlist is per span name. A key is kept only on the spans that list it, and only when its value passes the key's check.
+
+| key | on spans | allowed values |
+|---|---|---|
+| `http.route` | the first five and `krateo.agentiko.a2a` (not `krateo.agentiko.claim.unbacked`) | on `krateo.widget.fetch`: exactly one of snowplow's registered routes. On the page-level spans and `krateo.agentiko.a2a`: a route **template** (`/compositions/{namespace}/{name}`) that starts with `/`, uses only `A-Z a-z 0-9 / _ . : { } -`, is at most 256 characters, and has no segment of 24 characters or more and no JWT-shaped segment; a query string, fragment or `%`-escape fails the character check. See the contract below. |
+| `http.request.method` | the first five and `krateo.agentiko.a2a` | on the first five: `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` (upper case). On `krateo.agentiko.a2a`: exactly `POST` (`stringValue`). |
+| `http.response.status_code` | the first five and `krateo.agentiko.a2a` | an integer from 100 to 599 (`intValue`) |
+| `krateo.interaction.abandoned` | `krateo.composition.open`, `krateo.form.submit`, `krateo.page.publish` only | exactly `true` (`boolValue`). See below. |
+| `krateo.agentiko.claim.family` | `krateo.agentiko.claim.unbacked` only | a string (`stringValue`) matching `^[a-z][a-z0-9_]{0,31}$`. See below. |
+| `krateo.agentiko.claim.outcome` | `krateo.agentiko.claim.unbacked` only | a string (`stringValue`) matching `^[a-z][a-z0-9_]{0,31}$`. See below. |
+| `krateo.a2a.method` | `krateo.agentiko.a2a` only | exactly one of `message/stream`, `message/send`, `tasks/get`, `tasks/resubscribe` (`stringValue`). See below. |
+
+Every other attribute is dropped and counted, as is an allowlisted key on a span that does not list it, or whose value fails its check. That includes `enduser.id`, `url.full` and any header.
+
+### `krateo.interaction.abandoned`: the frontend contract
+
+Agreed with the frontend owner on 2026-11-01. The frontend sets it on an interaction the user left before it finished.
+
+- **Meaning:** the interaction is **excluded from the latency SLI, but not dropped.** It still counts for throughput and for the error rate.
+- **Why an attribute, not a status:** encoding it as span status `ERROR` would move it into the error-rate SLI. Leave the status as it is and send the attribute.
+- **Value:** the bool `true`, sent as `{"boolValue": true}`. It is never sent as `false`: absent means not abandoned.
+- **Spans:** only `krateo.composition.open`, `krateo.form.submit` and `krateo.page.publish`. It is not valid on `krateo.widget.fetch` (a child span: its parent interaction carries the mark) or on `krateo.page.load`.
+
+What snowplow does with it:
+
+| sent | result |
+|---|---|
+| `{"boolValue": true}` on one of the three interaction spans | forwarded as the bool `true` |
+| absent | nothing added; the span is forwarded as before |
+| `{"boolValue": false}`, `{"stringValue": "true"}`, an `intValue`, a `doubleValue`, an `arrayValue`, or a `true` with any other member beside it (`stringValue`, `intValue`, `doubleValue`, `arrayValue`, `kvlistValue`, `bytesValue`: an OTLP `AnyValue` holds exactly one) | dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; the span is still forwarded |
+| on `krateo.widget.fetch` or `krateo.page.load` | dropped and counted; the span is still forwarded |
+| `{"boolValue": "true"}` (a JSON string where OTLP/JSON requires a bool) | the body is not OTLP/JSON: the request is refused `400` |
+
+### `krateo.agentiko.claim.unbacked`: the frontend contract
+
+Agreed with the frontend session on 2026-11-09 (Diego's decision to accept it). The portal emits it for an agentiko claim that is not backed.
+
+- **Attributes:** `krateo.agentiko.claim.family` and `krateo.agentiko.claim.outcome`, and **nothing else**. No `http.*`, no session or conversation id, no identity: snowplow drops and counts any other key on this span, including `krateo.agentiko.*` keys outside these two.
+- **Values:** each is a `stringValue` matching `^[a-z][a-z0-9_]{0,31}$`: a lower-case ASCII letter, then up to 31 lower-case letters, digits or `_` (at most 32 characters). They are classifiers, never free text, an id or a name.
+- **Span fields:** as every other span: ids, `kind`, start and end time, `status.code` (never `status.message`). The resource must be `service.name=krateo-frontend`; the forwarded scope is `snowplow/rum-ingest`.
+
+What snowplow does with each of the two attributes:
+
+| sent | result |
+|---|---|
+| a `stringValue` that matches, e.g. family `"preview"`, `"publish"`, `"apply"`, `"controller"`, `"compose"`, `"chart"` and outcome `"missing"`, `"refused"`, `"failed"`, `"declined"`, `"dropped"` (the values the frontend sends today; snowplow checks the shape, not this list) | forwarded as the same string |
+| upper case anywhere, a leading digit or `_`, empty, longer than 32, any other character (`-`, `.`, space, a non-ASCII letter) | that attribute is dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; the span is still forwarded |
+| not a string (`intValue`, `boolValue`, `doubleValue`, `arrayValue`, …), or a matching string with any other member beside it | dropped and counted; the span is still forwarded |
+| on any other span | dropped and counted; the span is still forwarded |
+
+### `krateo.agentiko.a2a`: the frontend contract
+
+Agreed with the frontend on 2026-11-13 (#1398; frontend 1.8.43). The portal emits it for each of the agent's JSON-RPC `POST`s under the Agentiko A2A base. It is the browser's fetch span, renamed by the portal, so its context is the request's `traceparent` and the gateway's `POST /api/a2a/*` span is its child.
+
+- **Attributes:** `http.request.method`, `http.response.status_code`, `http.route` and `krateo.a2a.method`, and **nothing else**. No user, token, session, conversation or message content: snowplow drops and counts any other key on this span.
+- **Values:**
+  - `http.request.method`: exactly `POST`. The availability-probe `GET` is never exported, so any other method breaks the contract.
+  - `http.response.status_code`: an integer from 100 to 599. When no complete response was read (a stream that fails or is aborted after the `200`), the portal omits it and sets span status `ERROR` instead. snowplow forwards the status code, never its message. It does not accept `0`.
+  - `http.route`: the template `/api/a2a/{namespace}/{agent}`, never the concrete path. The A2A route is the gateway's, not snowplow's, so it passes the page-span template check, not the registered-route check. That check cannot tell a short concrete path (`/api/a2a/ns1/agent1`) from a template (see the `http.route` contract below). Sending the template is the frontend's guarantee.
+  - `krateo.a2a.method`: one of `message/stream`, `message/send`, `tasks/get`, `tasks/resubscribe`.
+- **Duration:** to the end of the response body. For `message/stream` that is the whole streamed turn, up to the last SSE byte. A stream that errors or aborts ends the span there. A tab closed mid-stream never ends it, so nothing is exported.
+
+What snowplow does with each attribute:
+
+| sent | result |
+|---|---|
+| the values above | forwarded as sent |
+| `http.request.method` other than `POST` (`GET`, `post`, …); a `krateo.a2a.method` outside the four; a concrete path with a query string, escape or token-shaped segment in `http.route`; a status outside 100–599 | that attribute is dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; the span is still forwarded |
+| no `http.response.status_code`, with span status `ERROR` | forwarded with status `ERROR` and nothing dropped |
+| any other key, including `enduser.id`, on this span; `krateo.a2a.method` on any other span | dropped and counted; the span is still forwarded |
+
+`krateo.widget.fetch` is unchanged: an `http.route` under `/api/a2a/` is not a snowplow route, so it is dropped and counted there.
+
+### `http.route`: the frontend contract
+
+Diego's ruling (2026-10-30, #1020 F3): **exact where possible, trust the rest.**
+
+| span | what `http.route` must be | what snowplow checks |
+|---|---|---|
+| `krateo.widget.fetch` | the **snowplow route** the widget called: `/call`, `/call/read`, `/export`, … with no query string | **Exact:** the route must be one of snowplow's own registered routes, looked up on snowplow's live routing table (never a hand-written list). Anything else is dropped and counted in `snowplow_rum_ingest_widget_routes_unregistered_total` |
+| `krateo.page.load`, `krateo.composition.open`, `krateo.form.submit`, `krateo.page.publish` | the **pattern your router matched**, e.g. `/compositions/:namespace/:name` or `/compositions/{namespace}/{name}` | **Trusted as sent,** with today's checks: no query string, fragment, escape or space; no segment of 24+ characters; no JWT-shaped segment |
+
+**Never send `location.pathname`.** Send the router's matched pattern.
+- **Why:** a concrete path such as `/compositions/team-a/prod-db` carries names.
+- **The limit of the page-span checks:** they cannot catch a short, word-shaped name, because `/users/alice/profile` and `/users/settings/profile` look the same to any syntax rule.
+- **So:** for page spans, the frontend sending the matched pattern is the guarantee.
+
+**Spans carry no identity.** snowplow uses the authenticated user only for the rate limit and never adds it to a span.
+
+## Response
+
+- `200` with `{}` when every span was forwarded.
+- `200` with `{"partialSuccess":{"rejectedSpans":"<n>","errorMessage":"…"}}` when spans were dropped by the allowlist or because the forward queue was full.
+- `400` for a body that is not OTLP/JSON, plus the codes above.
+
+Forwarding is asynchronous and bounded (a 64-batch queue, one worker, 5 s per post). A slow or absent collector never delays the response: what cannot be queued is dropped and counted.
+
+## Metrics
+
+**Uploads get no Server span.** `POST /telemetry/v1/traces` is excluded from snowplow's own Server spans exactly like the health probes (Diego, 2026-10-30, #1020 D6). It is telemetry about the portal, not platform API, so it is never in the API SLIs.
+
+Read upload health from these counters instead:
+- `requests_total{outcome=accepted}` against the `dropped_*` outcomes: refused, busy, rate;
+- `spans_total{outcome=forwarded}` against `forward_rate_limited`, `forward_overflow` and `forward_failed`.
+
+They are on `/debug/vars` as `snowplow_rum_ingest`, and over OTLP:
+
+| metric | `outcome` values |
+|---|---|
+| `snowplow_rum_ingest_requests_total` | `accepted`, `dropped_auth`, `dropped_size`, `dropped_rate`, `dropped_content_type`, `dropped_malformed`, `dropped_busy` |
+| `snowplow_rum_ingest_spans_total` | `accepted`, `dropped_service`, `dropped_name`, `dropped_invalid`, `forwarded`, `forward_failed`, `forward_overflow`, `forward_rate_limited` |
+| `snowplow_rum_ingest_attributes_dropped_total` | (none) |
+| `snowplow_rum_ingest_widget_routes_unregistered_total` | (none): `krateo.widget.fetch` routes that are not a snowplow route (a subset of the above) |
+
+No audit event is written: this is telemetry, not a mutation.

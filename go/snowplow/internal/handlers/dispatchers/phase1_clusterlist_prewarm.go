@@ -86,6 +86,17 @@ func makeClusterListPrewarmFn(h *contentPrewarmHarvester, saEP endpoints.Endpoin
 			return
 		}
 
+		// #1233 — the prewarm writes cells: run it on a complete RBAC snapshot, or
+		// its writes would be refused and its cells left cold.
+		if err := cache.WaitRBACSnapshotComplete(parent); err != nil {
+			log.WarnContext(parent, "cluster_list.prewarm.skipped",
+				slog.String("subsystem", "cache"),
+				slog.String("reason", "the RBAC snapshot did not complete before the prewarm's deadline"),
+				slog.Any("err", err),
+			)
+			return
+		}
+
 		refs := h.snapshot()
 		if len(refs) == 0 {
 			log.Info("cluster_list.prewarm.no_restactions_harvested",

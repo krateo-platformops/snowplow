@@ -14,10 +14,12 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/plumbing/http/response"
-	"github.com/krateo-platformops/plumbing/http/util"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 	"sigs.k8s.io/yaml"
 )
@@ -52,7 +54,7 @@ const maxUnstructuredResponseTextBytes = 2048
 //
 // The TLS/CA/client-cert/proxy/timeout/auth apparatus
 // (HTTPClientForEndpoint, the bearer/basic/AWS roundtrippers,
-// util.NewRetryClient, ComputeAwsHeaders) is REUSED verbatim from
+// ComputeAwsHeaders) is REUSED verbatim from
 // plumbing — the only hand-written part is the request assembly and the
 // 2xx body conversion (AC7; falsifier (k) asserts the auth header on the
 // wire).
@@ -101,11 +103,25 @@ const maxUnstructuredResponseTextBytes = 2048
 // (ProxyURL, not ServerURL) leaking by a different mechanism; it is the #453 /
 // #500 error-prose class and is tracked as #536.
 func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions) (*response.Status, []byte, string, error) {
+	return httpFetchConverting(ctx, opts, toJSONBytes, nil)
+}
+
+// httpFetchConverting is httpFetchAllowingNonJSON with the 2xx body conversion
+// as a parameter: toJSONBytes, or the content-addressed memo of it
+// (external_fetch_cache.go), which returns exactly what toJSONBytes returns for
+// the same bytes. The request, the response handling and every error path are
+// the same for both.
+//
+// share, when set, wraps the finished transport chain (#1320,
+// external_fetch_flight.go): it is the outermost layer on the client, directly
+// under credhttp.Send, so the send policy above it is this caller's own and
+// everything below it — the credential, the Impersonate-* headers, the host
+// pin, the tracing headers — is on the one request that reaches the wire.
+func httpFetchConverting(ctx context.Context, opts httpcall.RequestOptions, convert func(string, []byte) ([]byte, error), share func(http.RoundTripper, *http.Request) http.RoundTripper) (*response.Status, []byte, string, error) {
 	// --- request assembly (transcribed from request.go:36-95) ---
-	uri := strings.TrimSuffix(opts.Endpoint.ServerURL, "/")
-	if len(opts.Path) > 0 {
-		uri = fmt.Sprintf("%s/%s", uri, strings.TrimPrefix(opts.Path, "/"))
-	}
+	// #1137 — the URL is built by the one builder the plan's check reads
+	// (credhttp.RequestURL), so the path checked is the path sent.
+	uri := credhttp.RequestURL(opts.Endpoint.ServerURL, opts.Path)
 
 	u, err := url.Parse(uri)
 	if err != nil {
@@ -201,10 +217,15 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 	// snowplow#229 / audit A1: this was `httpcall.HTTPClientForEndpoint`
 	// verbatim, which DROPS the CA bundle of a TOKEN-AUTH endpoint
 	// (plumbing transport.go:37 returns before the CA install when
-	// !HasCertAuth()). That is snowplow's own SA endpoint — the default
-	// for every api-step with no `endpointRef` — so every non-GET such
-	// step failed TLS with x509-unknown-authority while GETs escaped by
-	// being intercepted upstream. httpClientForEndpoint covers exactly
+	// !HasCertAuth()). That is snowplow's own SA endpoint, which at #229
+	// was the default for every api-step with no `endpointRef`, so every
+	// non-GET such step failed TLS with x509-unknown-authority while GETs
+	// escaped by being intercepted upstream. Since #268/#292 a customer
+	// api-step with no `endpointRef` dials the caller's own clientconfig;
+	// the SA endpoint is dialled by a userAccessFilter stage (GET/HEAD
+	// only: #1281 refuses any other verb) and, through the ctx-carried
+	// internal endpoint, by background resolves (the seed, the refresher,
+	// prewarm). httpClientForEndpoint covers exactly
 	// that shape and DELEGATES to plumbing verbatim for every other one,
 	// so the live cert-auth population is byte-identical. See
 	// endpoints_tls.go for the full trace.
@@ -230,6 +251,9 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 	// byte-identical. The existing shortid X-Krateo-TraceId header set
 	// above is UNTOUCHED — both correlation ids ride the same request.
 	cli.Transport = tracing.WrapTransport(cli.Transport)
+	// #1054 — every attempt the retry client below makes (a 429's 2 s sleep, a
+	// 5xx backoff) is recorded on the request's dial.
+	cli.Transport = slowcall.Transport(cli.Transport)
 	// #615 — a non-UAF SA-endpoint dial under the impersonated-dial marker reads
 	// as the cohort (branche_impersonation.go). No-op for every other dial.
 	cli.Transport = impersonateEndpointTransport(ctx, cli.Transport)
@@ -240,11 +264,15 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 	if saDial {
 		cli.Transport = pinSADialHost(u, cli.Transport)
 	}
+	if share != nil {
+		cli.Transport = share(cli.Transport, call)
+	}
 
-	// REUSED verbatim: retry wrapper.
-	retryCli := util.NewRetryClient(cli)
-
-	respo, err := retryCli.Do(call)
+	// #1088 — the endpoint send policy: a write (any method but GET, HEAD,
+	// OPTIONS, TRACE) is sent once and never re-sent once its bytes may have
+	// reached the server; a safe request keeps plumbing's RetryClient, with every
+	// retry counted and logged with its cause (credhttp/send.go).
+	respo, err := credhttp.Send(credhttp.SendSiteStage, cli, call)
 	if err != nil {
 		// #523: net/http already wraps a transport failure in a *url.Error whose
 		// URL went through its own stripPassword — which replaces the PASSWORD
@@ -252,11 +280,26 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		// the "https://svc@host/base?token=…" shape still renders its token in
 		// clear. redact.URL removes both.
 		redErr := redact.ErrorURL(err)
+		// #1115 — the request's page budget ended the exchange: 504 Timeout,
+		// with the ExhaustedError's identity-free text (no URL in it).
+		if st, ok := credhttp.BudgetStatus(err); ok {
+			return st, nil, "", redErr
+		}
+		// #1131 — the destination policy refused the address: 502
+		// DestinationRefused, with the refusal's own text (no URL in it).
+		if st, ok := credhttp.DestinationStatus(err); ok {
+			return st, nil, "", redErr
+		}
 		return response.New(http.StatusInternalServerError, redErr), nil, "", redErr
 	}
 	defer respo.Body.Close()
 
 	ct := respo.Header.Get("Content-Type")
+	// AUDIT-4 — what the authority answered, for the audit record only
+	// (stage_audit.go): Send recorded the status line, or why there is none, on
+	// the dial's Answer (credhttp/answer.go); a 2xx body not used is noted
+	// below. The returned envelope is unchanged.
+	answer := credhttp.AnswerFrom(ctx)
 
 	// --- non-2xx shaping (transcribed BYTE-IDENTICALLY from
 	// request.go:98-116) --- (AC5; falsifier (j)).
@@ -278,6 +321,7 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 	dat, rerr := io.ReadAll(respo.Body)
 	if rerr != nil {
 		// #523: same transport class as the non-2xx read above.
+		answer.Note(audit.NoteBodyUnread)
 		redErr := redact.ErrorURL(rerr)
 		return response.New(http.StatusInternalServerError, redErr), nil, ct, redErr
 	}
@@ -288,7 +332,7 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		return response.New(http.StatusOK, nil), []byte("null"), ct, nil
 	}
 
-	jsonBytes, cerr := toJSONBytes(ct, dat)
+	jsonBytes, cerr := convert(ct, dat)
 	if cerr != nil {
 		// Conversion failed (malformed YAML / HTML garbage). Surface as a
 		// StatusFailure envelope so the caller's recordItemError honours
@@ -296,6 +340,7 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		// resolve), NO panic. The envelope message is the conversion
 		// error only; the endpoint auth never appears in it (AC6;
 		// falsifiers (e),(g)).
+		answer.Note(audit.NoteBodyUnconvertible)
 		return response.New(http.StatusUnprocessableEntity, cerr), nil, ct, nil
 	}
 
@@ -325,8 +370,10 @@ func nonOKStatus(code int, dat []byte) *response.Status {
 	if len(bytes.TrimSpace(dat)) == 0 {
 		return failureStatus(code, fmt.Errorf("upstream answered %d %s with an empty body", code, http.StatusText(code)))
 	}
-	res := &response.Status{}
-	if jerr := json.Unmarshal(dat, res); jerr != nil {
+	// #1429 — the upstream's envelope without its "details"
+	// (credhttp.DecodeUpstreamStatus, the one decoder of an upstream body).
+	res := credhttp.DecodeUpstreamStatus(dat)
+	if res == nil {
 		return failureStatus(code, fmt.Errorf("%s", string(dat)))
 	}
 	// #714 — the status line is the truth: a body cannot claim another code,
@@ -420,14 +467,13 @@ func isJSONObjectOrArray(b []byte) bool {
 	return strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[")
 }
 
-// failureStatus is response.New for a non-2xx answer, always a Failure.
-// plumbing's response.New marks every code it does not list (a 3xx, 429, 502,
-// 504, ...) as SUCCESS, so a refused redirect (#723/#724: the credentialed
-// client hands back the 3xx itself) with an HTML or empty body would have been
-// taken for a success and fed a nil body onward. The code stays the status
-// line's; the reason stays whatever response.New derives from that code.
+// failureStatus is the envelope of a non-2xx answer whose body is not a
+// Status: always a Failure, so a refused redirect (#723/#724: the credentialed
+// client hands back the 3xx itself) with an HTML or empty body is never taken
+// for a success (plumbing before v1.84.0 marked every code it did not list as
+// one). The code stays the status line's. #1481: the reason is the one derived
+// from the code that agrees with it (credhttp.ReasonForCode): an upstream 502
+// carries none, never plumbing's InternalError, the reason of a 500.
 func failureStatus(code int, err error) *response.Status {
-	res := response.New(code, err)
-	res.Status = response.StatusFailure
-	return res
+	return credhttp.FailureStatus(code, err)
 }

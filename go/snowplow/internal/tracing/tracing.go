@@ -66,24 +66,57 @@ const (
 	EnvOTLPEndpoint = "OTEL_EXPORTER_OTLP_ENDPOINT"
 )
 
-// SAMPLING (1.12.4). This package installs NO sampler: NewTracerProvider
-// below passes no WithSampler, so the SDK's samplerFromEnv reads
-// OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG and those env vars are
-// the live knob. The chart ships "traceidratio" at 0.05 — the ROOT-
-// deciding family, deliberately NOT parentbased_traceidratio. On the
-// 057 topology snowplow sits behind the agent gateway, whose tracing
-// policy is attached with randomSampling "100", so it creates a SAMPLED
-// span for every forwarded request and propagates sampled=1 upstream. A
-// parent-based sampler would honour that flag and span 100% of customer
-// /call traffic — precisely the traffic the ratio was meant to bound.
-// traceidratio makes snowplow's own 5% decision regardless of any
-// parent, which is also correct on the LoadBalancer topology where there
-// is no parent at all. The documented trade is that snowplow's decision
-// DIVERGES from the gateway's: 5% complete end-to-end traces plus 95%
-// gateway-only traces, partial by design and bounded.
+// SAMPLING (#1013, Diego's ruling of 2026-10-30). This package installs NO
+// sampler: NewTracerProvider below passes no WithSampler, so the SDK's
+// samplerFromEnv reads OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG and
+// those env vars are the live knob (chart value env.OTEL_TRACES_SAMPLER;
+// installer key componentValues.snowplow.env.OTEL_TRACES_SAMPLER).
+//
+// The chart ships "parentbased_always_on". The platform API SLIs
+// (availability, p95) are computed over snowplow's Server spans and are
+// COUNTS, so they need every request's span, and Diego ruled that they come
+// from server spans sampled at 100%, effective now. A root span (no
+// traceparent: in-cluster callers, the LoadBalancer path) is always
+// sampled; a span with a parent follows the parent's sampled flag, and the
+// client spans of a request follow its server span.
+//
+// This overrules the 1.12.4 reasoning, which shipped "traceidratio" 0.05 to
+// BOUND customer /call traffic: the agent gateway's tracing policy samples
+// 100% (randomSampling "100") and propagates sampled=1, so a parent-based
+// sampler spans every customer request. That is now the point, not the
+// cost. On 057 that is 3.5K-35K server spans a day, mean ~19K (2026-10-23
+// to -29, from the unsampled http.server.request.duration counter; the query
+// is in the PR that fixes #1013), about 68 compressed bytes per span.
+//
+// THE CHOSEN TRADE (installer#402, landed on 057 2026-11-09). The
+// platform gateway traces 100% and decides nothing: agentgateway-policies
+// >= 0.2.19 exposes `tracing.platform.filter`, and the installer sets it to
+// "" (installer rev 460, applied 2026-11-09 06:27:08Z), so the gateway
+// propagates sampled=1 for every request it forwards here and exports every
+// span. That is the shape of remedy (a) in the #1013 PR (sampled=1 for every
+// request, the ratio applied after the sampling decision), with the ratio
+// taken off the gateway altogether: sampling happens once, at the
+// collectors' tail sampler (observability#118, Diego's choice), which keeps
+// every trace with an error, a 4xx or a JWT, plus 5% of the rest. snowplow
+// stays parentbased_always_on (#1013), so every request still gets its
+// Server span, and the SLIs stay exact because the collectors compute span
+// metrics BEFORE tail sampling. Not taken: (b) a snowplow sampler that
+// always samples Server spans whatever the parent says, and (c) moving the
+// SLIs to spans the gateway always keeps. Measured on 057 over
+// 9-minute windows of the same browsing, snowplow spans whose gateway parent
+// is not stored went 94/102 (92%) -> 0/104 (0%) (snowplow#849, closed).
+//
+// WHAT WOULD BREAK IT. A gateway that starts sampling at its edge: a
+// request it drops arrives with sampled=0, the parent-based sampler records
+// no Server span for it, and the SLIs silently become estimates. Or a snowplow
+// sampler that drops spans on its own (traceidratio, as 1.12.4 shipped, or
+// parentbased_traceidratio, which applies its ratio to every root span): the
+// same result from this side. Keep the sampling decision in the tail sampler,
+// after the span metrics, and change neither half alone.
 const (
-	// serviceName is the span-scope name passed to otelhttp.NewHandler
-	// in main. The resource service.name lives in internal/otelresource.
+	// serviceName is the span-scope name NewServerHandler passes to
+	// otelhttp. The resource service.name lives in internal/otelresource
+	// and is the same string.
 	serviceName = otelresource.ServiceName
 )
 

@@ -7,25 +7,29 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/http/response"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
 
 func fetchObject(req *http.Request) (got objects.Result) {
+	defer slowcall.Start(req.Context(), slowcall.PhaseObjectFetch).End() // #1054
 	log := xcontext.Logger(req.Context())
 
 	// #443 part 2 — an inline RESTAction (POST /call/read body "object",
@@ -65,22 +69,32 @@ func fetchObject(req *http.Request) (got objects.Result) {
 }
 
 func paginationInfo(log *slog.Logger, req *http.Request) (perPage, page int) {
+	return paginationFromQuery(req.Context(), log, req.URL.Query())
+}
+
+// paginationFromQuery is THE derivation of a /call's pagination from its query
+// string: the raw perPage/page values, then normalizePagination. paginationInfo
+// applies it to a request; prewarmPaginationFor (#966) applies it to the /call
+// path the browser will request, so a prewarm cell and the request for the same
+// URL fold the same pagination for EVERY shape the URL can take — not only the
+// canonical one buildPath emits.
+func paginationFromQuery(ctx context.Context, log *slog.Logger, q url.Values) (perPage, page int) {
 	perPage, page = -1, -1
 
-	if val := req.URL.Query().Get("perPage"); val != "" {
+	if val := q.Get("perPage"); val != "" {
 		var err error
 		perPage, err = strconv.Atoi(val)
 		if err != nil {
-			log.Error("unable convert perPage parameter to int",
+			log.ErrorContext(ctx, "unable convert perPage parameter to int",
 				slog.Any("err", err))
 		}
 	}
 
-	if val := req.URL.Query().Get("page"); val != "" {
+	if val := q.Get("page"); val != "" {
 		var err error
 		page, err = strconv.Atoi(val)
 		if err != nil {
-			log.Error("unable convert page parameter to int",
+			log.ErrorContext(ctx, "unable convert page parameter to int",
 				slog.Any("err", err))
 		}
 	}
@@ -131,7 +145,14 @@ var evaluateRBACFn = rbac.EvaluateRBAC
 
 // checkDispatchRBAC is the cache=on permission gate (Revision 2
 // binding, Tag 0.30.4). Returns true iff the user identified by ctx is
-// permitted to GET the dispatched CR in namespace.
+// permitted to GET the dispatched CR obj.
+//
+// #1046 — the check is about obj ITSELF: its namespace AND its name are read
+// from the object (rbac.TargetOfObject) and the options are built by
+// rbac.ObjectCheck, so a resourceNames-scoped grant (`get restactions
+// resourceNames: [x]`) is honoured exactly as the apiserver honours the
+// cache=off GET of x. Taking the object rather than loose coordinates is what
+// keeps a caller from passing the namespace and forgetting the name.
 //
 // The check runs against the *dispatch target* (RestAction or Widget
 // CR) — the same object the cache=off fetchObject branch hits the
@@ -141,12 +162,13 @@ var evaluateRBACFn = rbac.EvaluateRBAC
 // Callers MUST only invoke this in cache=on mode (`!cache.Disabled()`).
 // In cache=off mode the gate is implicit in fetchObject's per-user
 // apiserver call.
-func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, namespace string) bool {
+func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj rbac.ObjectNamer) bool {
+	defer slowcall.Start(ctx, slowcall.PhaseRBACCheck).End() // #1054
 	log := xcontext.Logger(ctx)
 
 	ui, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		log.Error("checkDispatchRBAC: unable to extract UserInfo",
+		log.ErrorContext(ctx, "checkDispatchRBAC: unable to extract UserInfo",
 			slog.Any("err", err),
 		)
 		return false
@@ -156,22 +178,17 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, nam
 	// (allowed, matchedBindingUID, err). This per-item caller ignores
 	// matchedBindingUID; cache-key callers consume it (helpers.go:202 +
 	// :306 via the per-request memo, Phase 2b).
-	allowed, _, evalErr := evaluateRBACFn(ctx, rbac.EvaluateOptions{
-		Username:  ui.Username,
-		Groups:    ui.Groups,
-		Verb:      "get",
-		Group:     gvr.Group,
-		Resource:  gvr.Resource,
-		Namespace: namespace,
-		// Ship L1 (0.30.252): per-item caller discards
-		// matchedBindingUID — skip the CRB/RB stable-sort.
-		SkipBindingUID: true,
-	})
+	target := rbac.TargetOfObject(gvr, obj)
+	opts := rbac.ObjectCheck(ui.Username, ui.Groups, "get", target)
+	// Ship L1 (0.30.252): per-item caller discards matchedBindingUID — skip
+	// the CRB/RB stable-sort.
+	opts.SkipBindingUID = true
+	allowed, _, evalErr := evaluateRBACFn(ctx, opts)
 	if evalErr != nil {
-		log.Error("checkDispatchRBAC: EvaluateRBAC error",
-			slog.String("user", redact.User(ui.Username)),
+		log.ErrorContext(ctx, "checkDispatchRBAC: EvaluateRBAC error",
 			slog.String("gvr", gvr.String()),
-			slog.String("namespace", namespace),
+			slog.String("namespace", target.Namespace),
+			slog.String("name", target.Name),
 			slog.Any("err", evalErr),
 		)
 		return false
@@ -223,6 +240,33 @@ func dispatchWidgetContentKey(ctx context.Context, group, version, resource, nam
 	return cache.ComputeKey(inputs), c, &inputs
 }
 
+// keyMintInputs is the store and identity dispatchCacheLookupKey mints a key
+// under, or why it mints none (bypass != ""): the one place those three
+// early-outs are decided, so the #1265 served-cold counter names the same
+// reason the key mint acted on (coldCauseOfLookup).
+//
+//   - coldCauseDryRun — #443 (f): an inert (dry-run) resolve mints no key and
+//     gets no handle: no L1 lookup, no capture, no Put. This is also a
+//     CORRECTNESS rule: an inline draft named like a stored RESTAction must
+//     never be served the stored cell.
+//   - coldCauseCacheOff — no resolved-output store (the cache or the L1 is off).
+//   - coldCauseIneligibleKey — defence in depth: without an identity we cannot
+//     key safely, so the request skips the cache.
+func keyMintInputs(ctx context.Context) (*cache.ResolvedCacheStore, jwtutil.UserInfo, string) {
+	if cache.Inert(ctx) {
+		return nil, jwtutil.UserInfo{}, coldCauseDryRun
+	}
+	c := cache.ResolvedCache()
+	if c == nil {
+		return nil, jwtutil.UserInfo{}, coldCauseCacheOff
+	}
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return nil, jwtutil.UserInfo{}, coldCauseIneligibleKey
+	}
+	return c, ui, ""
+}
+
 // dispatchCacheLookupKey builds the L1 resolved-output cache key and
 // returns the live cache handle, if the L1 layer is enabled. Returns
 // (key, nil, nil) when L1 is disabled — callers MUST treat handle==nil
@@ -254,21 +298,9 @@ func dispatchWidgetContentKey(ctx context.Context, group, version, resource, nam
 // collapses to the empty-identity row — same shape as cache=off's
 // transparent fallback, project_cache_off_is_transparent_fallback).
 func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle, *cache.ResolvedKeyInputs) {
-	// #443 (f) — an inert (dry-run) resolve mints no key and gets no handle:
-	// no L1 lookup, no capture, no Put. This is also a CORRECTNESS rule: an
-	// inline draft named like a stored RESTAction must never be served the
-	// stored cell.
-	if cache.Inert(ctx) {
-		return "", nil, nil
-	}
-	c := cache.ResolvedCache()
-	if c == nil {
-		return "", nil, nil
-	}
-	ui, err := xcontext.UserInfo(ctx)
-	if err != nil {
-		// Defence in depth — without an identity we cannot key
-		// safely. Skip the cache for this request.
+	defer slowcall.Start(ctx, slowcall.PhaseKeyMint).End() // #1054
+	c, ui, bypass := keyMintInputs(ctx)
+	if bypass != "" {
 		return "", nil, nil
 	}
 	// Path B direct call — derive BindingUID for the layer's GET-permit.
@@ -276,34 +308,21 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 	// #261 MARK-AT-MINT (pm load-bearing #4): the serve-time at-risk class is
 	// computed HERE, as a byproduct of the key-derivation EvaluateRBAC call, and
 	// carried on inputs.AtRiskClass so the L1 hit-site merely READS it — never
-	// re-evaluating RBAC or the bindings_by_gvr index at hit. winClass captures
+	// re-evaluating RBAC at hit. winClass captures
 	// the case-2 RBAC fact (implicit-group winning subject) via the OPTIONAL
 	// out-param; EvaluateRBAC's public (bool,string,error) signature is
 	// unchanged. On deny/err the out-param is left at its default (regular).
 	var winClass rbac.WinningSubjectClass
-	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:               ui.Username,
-		Groups:                 ui.Groups,
-		Verb:                   "get",
-		Group:                  group,
-		Resource:               resource,
-		Namespace:              namespace,
-		Name:                   name,
-		WinningSubjectClassOut: &winClass,
-	})
+	keyCheck := rbac.ObjectCheck(ui.Username, ui.Groups, "get",
+		rbac.ObjectTarget{Group: group, Resource: resource, Namespace: namespace, Name: name})
+	keyCheck.WinningSubjectClassOut = &winClass
+	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, keyCheck)
 	// Assemble the mint-time at-risk MARK. Only meaningful for a real permit (a
 	// non-empty first-match BindingUID); a "" BindingUID serves as a MISS
-	// (serveFromCacheEligible) so it can never reach the hit-site bump. Case-2
-	// (implicit-group, the RBAC fact) takes precedence over case-3
-	// (roleref-unresolved, the index fact) in the rare overlap — see AtRiskClass.
+	// (serveFromCacheEligible) so it can never reach the hit-site bump.
 	atRiskClass := cache.AtRiskNone
-	if bindingUID != "" {
-		switch {
-		case winClass == rbac.SubjectClassImplicitGroup:
-			atRiskClass = cache.AtRiskImplicitGroup
-		case cache.IsRoleRefUnresolvedAtBuild(bindingUID):
-			atRiskClass = cache.AtRiskRolerefUnresolved
-		}
+	if bindingUID != "" && winClass == rbac.SubjectClassImplicitGroup {
+		atRiskClass = cache.AtRiskImplicitGroup
 	}
 	inputs := cache.ResolvedKeyInputs{
 		CacheEntryClass: handlerKind,
@@ -534,6 +553,18 @@ func requestExtrasFullyDeclared(cr map[string]any, requestExtras map[string]any)
 		if _, ok := identityDimensionKeys[k]; ok {
 			continue // A2/A6 identity axis — folder handles it, never shared-cell pollution
 		}
+		// #777 b′ — an undeclared request extra can only shape the body through
+		// an extras-reading spec surface (apiRef, widgetDataTemplate,
+		// resourcesRefsTemplate). A widget with none of them renders the same
+		// bytes whatever extras arrive, so its body is safe in the declared-only
+		// cell: the key is unchanged (filterDeclaredKeyExtras already drops these
+		// keys). Decided here, at the first undeclared key, so the exemption
+		// counter moves only when it changed the outcome — the same population
+		// the decline counter would otherwise have counted.
+		if widgets.WidgetReadsNoRequestExtras(cr) {
+			bumpWidgetUndeclaredExtrasExempt()
+			return true
+		}
 		return false // a genuinely-undeclared body-affecting request extra → quarantine
 	}
 	return true
@@ -670,34 +701,64 @@ func inlineParentIdentityForKey(ctx context.Context, cr map[string]any) map[stri
 	return out
 }
 
+// l1Get is a customer dispatch's L1 read of its response cell, timed as the
+// request's l1_get phase (#1054): the store's single mutex plus a map read,
+// so time here is that lock. miss is what the lookup found (cache.LookupHit on
+// a hit), the #1265 served-cold counter's cause for a miss.
+func l1Get(ctx context.Context, h cacheHandle, key string) (*cache.ResolvedEntry, cache.LookupMiss) {
+	defer slowcall.Start(ctx, slowcall.PhaseL1Get).End()
+	return h.GetReportingMiss(key)
+}
+
 // cacheHandle is the narrow interface the dispatchers depend on. The
 // real implementation is *cache.resolvedCache; tests can substitute
 // stubs without dragging in the whole singleton. Kept package-private
 // so it never leaks beyond dispatchers.
 type cacheHandle interface {
 	Get(key string) (*cache.ResolvedEntry, bool)
+	// #1265 P0 — Get plus what the lookup found (cache.LookupMiss): the
+	// customer serve's read (l1Get), so a cold serve names its cause.
+	GetReportingMiss(key string) (*cache.ResolvedEntry, cache.LookupMiss)
+	// #930 — Now is the store clock: a cell's age (the keep-warm age-skip) is
+	// Now() minus the CreatedAt the store stamped on that clock, never
+	// time.Since, so the decision and the store's own TTL agree on one clock.
+	Now() time.Time
 	// #376 — GetNoTouch is Get minus the three customer-warmth stamps (MoveToFront,
 	// lastRead, hit_total) and the miss accounting; it KEEPS the lazy TTL/maxAge
 	// evicts. Internal seed-sweep reads (phase1_pip_seed seedSkipDecision) use it so
 	// they never fake #315/#316 warmth or contaminate the customer hit/miss ratio.
 	GetNoTouch(key string) (*cache.ResolvedEntry, bool)
-	Put(key string, entry *cache.ResolvedEntry)
 	// #189 — generation-guarded write. CaptureGen reads the key's generation
-	// before a resolve; PutIfGen stores only if it has not moved (a DELETE-
-	// eviction during the resolve would refuse the write rather than resurrect
-	// the pre-delete body).
+	// before a resolve; PutResolvedIfGenOutcome stores only if it has not moved
+	// (a DELETE-eviction during the resolve would refuse the write rather than
+	// resurrect the pre-delete body).
+	//
+	// #912 re-review — every write a dispatcher makes takes the resolve's
+	// Put-gate verdict (cache.PutGateVerdict) and stores nothing unless it
+	// allows the Put: there is no ungated write on this interface.
+	//
+	// #1321 — and every write on this interface reports its cache.PutOutcome,
+	// which the writer hands to the publish gate (publishIfSubscribed): a write
+	// that changes a resident cell's bytes is announced by that write. There is
+	// no outcome-discarding write here (the bool PutResolvedIfGen is not on the
+	// interface), and TestIssue1321_C1w_EveryWriteSiteHandsItsOutcomeToThePublishGate
+	// pins that each call site passes the outcome on.
 	CaptureGen(key string) uint64
-	PutIfGen(ctx context.Context, key string, entry *cache.ResolvedEntry, capturedGen uint64) bool
+	PutResolvedIfGenOutcome(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry, capturedGen uint64) cache.PutOutcome
 	// #408 — a plain Put plus the #375 remark, for the PRE-readyz boot seed
-	// carriers. Never refuses; re-marks the key once if a dep recorded on ctx's
-	// dep-gen sink moved since the resolve began.
-	PutThenRemark(ctx context.Context, key string, entry *cache.ResolvedEntry)
+	// carriers. Never refuses a storing verdict; re-marks the key once if a dep
+	// recorded on ctx's dep-gen sink moved since the resolve began.
+	PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome
 	// #547/#734 — the external-TTL widget's plain Put: exactly Put, plus ending a
 	// KNOWN-STALE state in the write's own critical section (ctx's dep-gen sink).
-	PutEndingKnownStale(ctx context.Context, key string, entry *cache.ResolvedEntry)
+	PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, key string, entry *cache.ResolvedEntry) cache.PutOutcome
 	// #378 — no seed write re-mints: the only BornAt-resetting write is the
 	// refresher terminal's ReplaceIfGenRefresh (resolve_populate.go), which uses
 	// the concrete store, not this handle.
+	//
+	// #1255 — a resolve whose decline proves the key unstorable evicts the cell
+	// it could not replace (evict_unstorable.go).
+	unstorableEvicter
 }
 
 // emitResolvedCacheLookup writes the per-request falsifier line per
@@ -812,15 +873,8 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 		// its two consumers gate on: behaviour is unchanged wherever a
 		// consumer actually runs (kind/bench INFO, or the diag env), and
 		// the cost is dropped exactly when the value would be discarded.
-		_, bindingUID, _ = rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-			Username:  username,
-			Groups:    groups,
-			Verb:      "get",
-			Group:     group,
-			Resource:  resource,
-			Namespace: namespace,
-			Name:      name,
-		})
+		_, bindingUID, _ = rbac.EvaluateRBAC(ctx, rbac.ObjectCheck(username, groups, "get",
+			rbac.ObjectTarget{Group: group, Resource: resource, Namespace: namespace, Name: name}))
 	}
 	log.Info("dispatch.cache_key.computed",
 		slog.String("subsystem", "cache"),
@@ -831,8 +885,6 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 		// sorted binding ids — never a name or a body). Read off the inputs,
 		// so it costs nothing at warn; "" when no inputs were derived.
 		slog.String("subject_binding_set", sbsOfInputs(inputs)),
-		slog.String("username", redact.User(username)),
-		slog.Any("groups", redact.Groups(groups)),
 		slog.String("handler_kind", handlerKind),
 		slog.String("gvr", fmt.Sprintf("%s/%s, Resource=%s", group, version, resource)),
 		slog.String("namespace", namespace),
@@ -890,8 +942,8 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 	// string).
 	if env.True("DISPATCH_KEY_DIAG_ENABLED") {
 		fmt.Fprintf(os.Stderr,
-			"DISPATCH_KEY_DIAG site=%s key=%s buid=%s user=%s groups=%v handler=%s gvr=%s/%s/%s ns=%s name=%s pp=%d p=%d xlen=%d\n",
-			site, cacheKey, bindingUID, redact.User(username), redact.Groups(groups),
+			"DISPATCH_KEY_DIAG site=%s key=%s buid=%s handler=%s gvr=%s/%s/%s ns=%s name=%s pp=%d p=%d xlen=%d\n",
+			site, cacheKey, bindingUID,
 			handlerKind, group, version, resource, namespace, name, perPage, page, len(extras),
 		)
 	}

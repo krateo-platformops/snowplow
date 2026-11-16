@@ -55,7 +55,7 @@ import (
 )
 
 // f4WidgetKey derives the production widget cell key EXACTLY as seedOneWidget
-// derives it (same KeyPerPage/KeyPage tuple off the entry + the same inline-
+// derives it (same Pagination off the entry + the same inline-
 // extras union off the CR), so a test can pre-Put a live cell under the key the
 // primitive's fresh-skip will re-derive internally. This is NOT a hand-fed skip
 // key: it is the SAME single derivation the primitive runs — the arm asserts the
@@ -69,7 +69,7 @@ func f4WidgetKey(ctx context.Context, e navWidgetEntry) (string, cacheHandle, *c
 	return dispatchCacheLookupKey(ctx, "widgets",
 		e.GVR.Group, e.GVR.Version, e.GVR.Resource,
 		e.W.GetNamespace(), e.W.GetName(),
-		e.KeyPerPage, e.KeyPage, seedKeyExtras)
+		e.Pagination.PerPage, e.Pagination.Page, seedKeyExtras)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -312,8 +312,8 @@ func TestF4_FreshSkip_RealSeedOneWidget_SkipsLiveCell(t *testing.T) {
 	e := fixCWidgetEntry()
 	granted := fixCCohortCtx("userGranted")
 
-	// Derive the production key exactly as seedOneWidget will (same KeyPerPage/
-	// KeyPage + inline-extras union — see f4WidgetKey) so we can Put a live cell
+	// Derive the production key exactly as seedOneWidget will (same Pagination
+	// + inline-extras union — see f4WidgetKey) so we can Put a live cell
 	// under the key the primitive's fresh-skip re-derives internally.
 	key, handle, inputs := f4WidgetKey(granted, e)
 	if handle == nil || key == "" || inputs == nil || inputs.BindingUID == "" {
@@ -337,7 +337,7 @@ func TestF4_FreshSkip_RealSeedOneWidget_SkipsLiveCell(t *testing.T) {
 	// Put that warmed this target). This is not a hand-fed skip key — it is the
 	// key the primitive itself derived above, and the skip lookup will re-derive
 	// the SAME key internally.
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
 	if _, live := handle.Get(key); !live {
 		t.Fatal("F4-C2 setup: the seeded cell must be live under the production key")
 	}
@@ -406,7 +406,7 @@ func TestF4_FreshSkip_MisKeyedLookupDoesNotSkip_MutationShape(t *testing.T) {
 	// Put a live cell under a WRONG key (the mutation: skip lookup keyed on
 	// something other than the production key). The real primitive derives the
 	// PRODUCTION key, finds NO live cell there, and does NOT skip.
-	handle.Put(key+"-WRONG", &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
+	putFixture(handle, key+"-WRONG", &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
 
 	skipBefore := pipSeedFreshSkipTotal.Load()
 	_ = seedOneWidget(granted, e, "authn-ns", seedModeBoot)
@@ -440,7 +440,7 @@ func TestF4_Boundary_GVRDiscoveredScopeNeverSkipsLiveCell(t *testing.T) {
 		t.Fatal("setup: real key derivation")
 	}
 	// Install a live cell — the exact condition boot-scope WOULD fresh-skip.
-	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
+	putFixture(handle, key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
 	if _, live := handle.Get(key); !live {
 		t.Fatal("setup: live cell installed")
 	}

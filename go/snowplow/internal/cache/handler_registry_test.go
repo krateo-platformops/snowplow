@@ -36,6 +36,18 @@ type fakeRegistration struct{}
 
 func (fakeRegistration) HasSynced() bool { return true }
 
+// HasSyncedChecker completes the client-go v0.36 registration interface: the
+// fake is synced from the start, so its checker is already done.
+func (fakeRegistration) HasSyncedChecker() clientcache.DoneChecker { return fakeDoneChecker{} }
+
+// syncedDone is the closed channel every fakeDoneChecker reports.
+var syncedDone = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
+
+type fakeDoneChecker struct{}
+
+func (fakeDoneChecker) Name() string          { return "fakeRegistration" }
+func (fakeDoneChecker) Done() <-chan struct{} { return syncedDone }
+
 type errFakeAddFailed struct{}
 
 func (errFakeAddFailed) Error() string { return "fake add failed" }

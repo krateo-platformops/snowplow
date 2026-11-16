@@ -41,6 +41,8 @@ import (
 // non-suppressed cell is never evicted (it is the exact #315 hole — and the
 // cell the #248 test asserts KEPT, an assertion #315 inverts).
 func TestIssue315_ColdNonSuppressedPastMaxAge_IsReaped(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS", "60")
@@ -84,10 +86,12 @@ func TestIssue315_ColdNonSuppressedPastMaxAge_IsReaped(t *testing.T) {
 // real traffic reads it — the clean way to observe the Get stamp in isolation (a
 // cold-fill Put is warm at insert, see TestIssue315_ColdFillPut_IsImmediatelyWarm).
 func TestIssue315_GetHitStampsLastRead(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "team-a", Name: "w"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in, SeededAtBoot: true})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in, SeededAtBoot: true})
 
 	// Seeded, never traffic-read → LastReadSeconds == -1.
 	if m, ok := c.MetadataForKey(key); !ok || m.LastReadSeconds != -1 {
@@ -112,7 +116,7 @@ func i316WarmApproachingTTL(t *testing.T, c *ResolvedCacheStore, name string, tt
 	const ns = "team-a"
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: ns, Name: name}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in, CreatedAt: time.Now().Add(-ttlAgo)})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &in, CreatedAt: time.Now().Add(-ttlAgo)})
 	Deps().Record(context.Background(), key, gvr, ns, name)
 	if warmViaGet {
 		if _, ok := c.Get(key); !ok {
@@ -130,6 +134,8 @@ func i316WarmApproachingTTL(t *testing.T, c *ResolvedCacheStore, name string, tt
 // RED on the base tree: no pass exists, so the cell stays v1 until a Get cold-navs
 // it at TTL; proactive_refresh_total is 0.
 func TestIssue316_MissedDirtyMark_WarmCellProactivelyRefreshed(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 4, 0)
 	defer cleanup()
 	t.Setenv("CACHE_ENABLED", "true")
@@ -154,7 +160,7 @@ func TestIssue316_MissedDirtyMark_WarmCellProactivelyRefreshed(t *testing.T) {
 
 	// FRESH indexer: the refresher re-resolves to v2.
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
 		return nil
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -194,6 +200,8 @@ func TestIssue316_MissedDirtyMark_WarmCellProactivelyRefreshed(t *testing.T) {
 // still serves v1. This keeps #316's claim honest: it fixes missed-ENQUEUE with a
 // fresh indexer, NOT a stale indexer (that is #244's self-heal domain).
 func TestIssue316_StaleSource_PassCannotManufactureFreshness(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 4, 0)
 	defer cleanup()
 	t.Setenv("CACHE_ENABLED", "true")
@@ -219,7 +227,7 @@ func TestIssue316_StaleSource_PassCannotManufactureFreshness(t *testing.T) {
 	// informer cache — #244, not #316).
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
 		reresolves.Add(1)
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(coherenceV1), Inputs: &used})
 		return nil
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -258,6 +266,8 @@ func TestIssue316_StaleSource_PassCannotManufactureFreshness(t *testing.T) {
 // the pass — refresh is scoped to the approaching-TTL warm set, never
 // refresh-everything (the 0.30.185 amplification the floor exists to prevent).
 func TestIssue316_NoAmplification_WithinTTLWarmNotEnqueued(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "20") // TTL/4 = 5s
@@ -295,6 +305,8 @@ func TestIssue316_NoAmplification_WithinTTLWarmNotEnqueued(t *testing.T) {
 // proactively refreshed. Refreshing it resets CreatedAt and extends the very life
 // the override deliberately bounds. Left to its own short-TTL expiry.
 func TestIssue316_TTLOverrideCell_NotProactivelyRefreshed(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "20") // standard TTL/4 = 5s
@@ -315,7 +327,7 @@ func TestIssue316_TTLOverrideCell_NotProactivelyRefreshed(t *testing.T) {
 	key := ComputeKey(in)
 	// TTLOverride=8s, body 7s old → EFFECTIVE TTLRemaining ~1s (< standard TTL/4=5),
 	// so it WOULD be a refresh candidate if not for the TTLOverride exclusion.
-	c.Put(key, &ResolvedEntry{
+	c.put(key, &ResolvedEntry{
 		RawJSON:     []byte(coherenceV1),
 		Inputs:      &in,
 		CreatedAt:   time.Now().Add(-7 * time.Second),
@@ -340,18 +352,20 @@ func TestIssue316_TTLOverrideCell_NotProactivelyRefreshed(t *testing.T) {
 // genuinely-used cell would be treated COLD for one cycle and cold-nav at TTL. A
 // boot-seed Put, by contrast, leaves lastRead unset (warm via the seed signal).
 func TestIssue315_ColdFillPut_IsImmediatelyWarm(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "team-a", Name: "coldfill"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in}) // cold-fill (SeededAtBoot=false)
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &in}) // cold-fill (SeededAtBoot=false)
 	if m, ok := c.MetadataForKey(key); !ok || m.LastReadSeconds < 0 {
 		t.Fatalf("a cold-fill (non-seeded) Put must be immediately warm (LastReadSeconds>=0, no 2nd read); ok=%v got=%d", ok, m.LastReadSeconds)
 	}
 
 	sin := ResolvedKeyInputs{CacheEntryClass: "widgets", Namespace: "team-a", Name: "seed"}
 	skey := ComputeKey(sin)
-	c.Put(skey, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &sin, SeededAtBoot: true})
+	c.put(skey, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: &sin, SeededAtBoot: true})
 	if m, ok := c.MetadataForKey(skey); !ok || m.LastReadSeconds != -1 {
 		t.Fatalf("a boot-seed Put must leave LastReadSeconds=-1 (warm via SeededAtBoot, not lastRead); ok=%v got=%d", ok, m.LastReadSeconds)
 	}
@@ -368,6 +382,8 @@ func TestIssue315_ColdFillPut_IsImmediatelyWarm(t *testing.T) {
 // It must be COUNTED in warm_past_max_age (C4) and NEVER cold-evicted (C3) — proving
 // the reaper's warm check does not rely on the false seed-only invariant.
 func TestIssue315_LastReadWarmPastMaxAge_NotEvicted(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS", "60")
@@ -385,7 +401,7 @@ func TestIssue315_LastReadWarmPastMaxAge_NotEvicted(t *testing.T) {
 	const ns = "krateo-system"
 	in := widgetInputs(gvrFlexes(), ns, "lastread-warm")
 	key := ComputeKey(*in)
-	store.Put(key, &ResolvedEntry{
+	store.put(key, &ResolvedEntry{
 		RawJSON:   []byte(`{"lrw":1}`),
 		Inputs:    in,
 		BornAt:    time.Now().Add(-2 * time.Hour), // past the 60s cap

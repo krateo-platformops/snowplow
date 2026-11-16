@@ -496,6 +496,8 @@ func TestRestVerbToKube(t *testing.T) {
 // populateWidgetContentL1; the resolved cache MUST then carry an entry
 // under the identity-free key.
 func TestPopulateWidgetContentL1_PutHappensWhenEnabled(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")
@@ -511,7 +513,7 @@ func TestPopulateWidgetContentL1_PutHappensWhenEnabled(t *testing.T) {
 	}, "status", "resourcesRefs", "items")
 
 	gvr := someWidgetContentGVR()
-	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res, 0)
+	populateWidgetContentL1(withWidgetContentPutSinks(context.Background()), gvr, in, 5, 1, res, 0)
 
 	// The cache MUST now hold the entry under the identity-free key.
 	c := cache.ResolvedCache()
@@ -559,7 +561,7 @@ func TestPopulateWidgetContentL1_NoOpWhenLayerOff(t *testing.T) {
 
 	in := newUnstructuredWidget("ns", "w")
 	res := newUnstructuredWidget("ns", "w")
-	populateWidgetContentL1(context.Background(), someWidgetContentGVR(), in, 5, 1, res, 0)
+	populateWidgetContentL1(withWidgetContentPutSinks(context.Background()), someWidgetContentGVR(), in, 5, 1, res, 0)
 
 	c := cache.ResolvedCache()
 	if c == nil {
@@ -581,7 +583,7 @@ func TestPopulateWidgetContentL1_NoOpWhenCacheOff(t *testing.T) {
 
 	in := newUnstructuredWidget("ns", "w")
 	res := newUnstructuredWidget("ns", "w")
-	populateWidgetContentL1(context.Background(), someWidgetContentGVR(), in, 5, 1, res, 0)
+	populateWidgetContentL1(withWidgetContentPutSinks(context.Background()), someWidgetContentGVR(), in, 5, 1, res, 0)
 
 	// ResolvedCache MUST be nil under CACHE_ENABLED=false — nothing to inspect.
 	if c := cache.ResolvedCache(); c != nil {
@@ -621,6 +623,8 @@ func TestRegisterRefreshHandlers_WidgetContentRegistered(t *testing.T) {
 // then after Put call recordWidgetDeps for self-dep + apiRef + resourcesRefs
 // deps (Edge types 1+2). This test pins the latter half of the contract.
 func TestPopulateWidgetContentL1_RecordsDepEdges(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")
@@ -692,7 +696,7 @@ func TestPopulateWidgetContentL1_RecordsDepEdges(t *testing.T) {
 		t.Fatalf("RecordTotal baseline = %d; want 0 after ResetDepsForTest", beforeRecord)
 	}
 
-	populateWidgetContentL1(context.Background(), gvr, in, 5, 1, res, 0)
+	populateWidgetContentL1(withWidgetContentPutSinks(context.Background()), gvr, in, 5, 1, res, 0)
 
 	// AC-G.5 PRIMARY ASSERTION: the dep tracker MUST have advanced.
 	afterRecord := cache.Deps().Stats().RecordTotal

@@ -114,7 +114,7 @@ func buildF3AdminsParityWatcher(t *testing.T) {
 	_, _ = rw.EnsureResourceType(f3WidgetGVR)
 	_ = rw.WaitForCacheSync(ctx, 5*time.Second)
 	cache.RebuildRBACSnapshotForTest(rw)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{f3WidgetGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{f3WidgetGVR})
 	prev := cache.Global()
 	cache.SetGlobal(rw)
 	t.Cleanup(func() {
@@ -194,7 +194,7 @@ func buildF3SAOnlyWatcher(t *testing.T) {
 	_, _ = rw.EnsureResourceType(f3WidgetGVR)
 	_ = rw.WaitForCacheSync(ctx, 5*time.Second)
 	cache.RebuildRBACSnapshotForTest(rw)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{f3WidgetGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{f3WidgetGVR})
 	prev := cache.Global()
 	cache.SetGlobal(rw)
 	t.Cleanup(func() {

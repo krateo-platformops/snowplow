@@ -41,6 +41,16 @@ the *tool* has changed:
   inline mint in [`install.md`](install.md) §4 (a stdlib-only Python HS256
   signer producing the same token the shared library would).
 
+> **Superseded by [#146](https://github.com/krateo-platformops/snowplow/pull/146)
+> (2026-08-13):** the two bullets above describe the HS256 / `JWT_SIGN_KEY`
+> contract, which no longer exists. snowplow now verifies **RS256** tokens
+> against public keys fetched from a JWKS document (authn's
+> `<URL_AUTHN>/.well-known/jwks.json` by default, chart `jwt.jwksUrl` to
+> override), and holds no key of its own. [`install.md`](install.md) §3–4 now
+> generates an RSA keypair, serves its JWKS in-cluster and mints an RS256
+> token. The current contract is in
+> [ADR 0001](../docs/adr/0001-decouple-authn.md#token-verification-since-146-rs256-via-jwks).
+
 ## Consequences (unchanged)
 
 - **Simplified testing:** services that depend on authentication are testable

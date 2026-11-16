@@ -309,7 +309,7 @@ func TestIssue618_DispatchViaInformer_ServedQueriesMatchApiserverSemantics(t *te
 	} {
 		for _, tc := range q618Served {
 			t.Run(branch.name+"/"+tc.name, func(t *testing.T) {
-				raw, served := dispatchViaInformer(branch.ctx(), buildCall(http.MethodGet, tc.path))
+				raw, served, _, _ := dispatchViaInformer(branch.ctx(), buildCall(http.MethodGet, tc.path))
 				if !served {
 					t.Fatalf("%s: a query the informer can reproduce exactly must be served; got served=false", tc.path)
 				}
@@ -330,7 +330,7 @@ func TestIssue618_DispatchViaInformer_UnsupportedQueriesFallThrough(t *testing.T
 				if ctxName == "raw" {
 					ctx = cache.WithApistageContentResolve(ctx)
 				}
-				if raw, served := dispatchViaInformer(ctx, buildCall(http.MethodGet, tc.path)); served {
+				if raw, served, _, _ := dispatchViaInformer(ctx, buildCall(http.MethodGet, tc.path)); served {
 					t.Fatalf("RED #618 %s: must fall through to the apiserver with its query intact; the informer "+
 						"served %d bytes (items %v) — the param was silently dropped", tc.path, len(raw), namesInEnvelopeBytes(t, raw))
 				}
@@ -349,7 +349,7 @@ func TestIssue618_ApistageContentServe_ServedQueriesMatch(t *testing.T) {
 	// queries mapping to one cell make the HIT pass serve the wrong set.
 	for pass := 0; pass < 2; pass++ {
 		for _, tc := range q618Served {
-			v, served, ok, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, tc.path), false)
+			v, served, ok, _, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, tc.path), false)
 			if !ok || !served {
 				t.Fatalf("pass %d %s: content layer must serve an exact selector; ok=%v served=%v", pass, tc.path, ok, served)
 			}
@@ -367,13 +367,13 @@ func TestIssue618_ApistageContentServe_UnsupportedQueriesNeverTouchACell(t *test
 	// Warm the unselected cells first: a fall-through query must not be served
 	// from them either.
 	for _, p := range []string{q618ClusterPath, q618NSPath("team-a")} {
-		if _, _, ok, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, p), false); !ok {
+		if _, _, ok, _, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, p), false); !ok {
 			t.Fatalf("precondition: warm %s", p)
 		}
 	}
 	before := store.Stats().StoreTotal
 	for _, tc := range q618Fallthrough {
-		v, served, ok, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, tc.path), false)
+		v, served, ok, _, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, tc.path), false)
 		if ok {
 			t.Fatalf("RED #618 %s: the content layer claimed this call (served=%v, items %v); it must return "+
 				"ok=false so the apiserver answers with the query intact", tc.path, served, namesIn(v))
@@ -660,7 +660,7 @@ func TestIssue618_InternalDispatch_HandsSelectorsToTheLiveList(t *testing.T) {
 			mu.Lock()
 			seen = nil
 			mu.Unlock()
-			_, ok, err := dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, tc.path))
+			_, ok, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), buildCall(http.MethodGet, tc.path))
 			if err != nil || !ok {
 				t.Fatalf("%s: served=%v err=%v", tc.path, ok, err)
 			}
@@ -682,7 +682,7 @@ func TestIssue618_InternalDispatch_HandsSelectorsToTheLiveList(t *testing.T) {
 			mu.Lock()
 			seen = nil
 			mu.Unlock()
-			_, ok, err := dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, tc.path))
+			_, ok, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), buildCall(http.MethodGet, tc.path))
 			mu.Lock()
 			defer mu.Unlock()
 			if ok || err != nil || len(seen) != 0 {
@@ -719,7 +719,7 @@ func TestIssue618_InternalDispatch_InformerBranchFiltersSelectors(t *testing.T) 
 			mu.Lock()
 			live = 0
 			mu.Unlock()
-			raw, ok, err := dispatchViaInternalRESTConfig(ctx, buildCall(http.MethodGet, tc.path))
+			raw, ok, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), buildCall(http.MethodGet, tc.path))
 			if err != nil || !ok {
 				t.Fatalf("%s: served=%v err=%v", tc.path, ok, err)
 			}

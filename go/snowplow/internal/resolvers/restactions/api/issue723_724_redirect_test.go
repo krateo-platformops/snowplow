@@ -186,7 +186,7 @@ func TestIssue724_R2_DispatchDoesNotServeARedirect(t *testing.T) {
 		resetInternalClientCacheForTest()
 		rig := newRedirectRig(t, code, true)
 		ctx := cache.WithInternalRESTConfig(context.Background(), impersonatingRC(rig.apiserver.URL))
-		raw, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+		raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 			RequestInfo: httpcall.RequestInfo{Path: "/api/v1/namespaces/n/configmaps/x", Verb: ptr.To(http.MethodGet)},
 		})
 		if len(rig.otherHits.all()) != 0 {

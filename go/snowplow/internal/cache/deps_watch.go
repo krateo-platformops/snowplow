@@ -68,6 +68,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientcache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -103,6 +104,11 @@ type depWatchCounters struct {
 	// with the 1.12.5 operator procedure (the H1 signature).
 	workerPanics atomic.Uint64
 
+	// submitDroppedShutdown — submits that reached a shut-down queue: the
+	// event is dropped (an Add after ShutDown is a no-op). #854: a lost
+	// event, so the incremental list cells unanchor.
+	submitDroppedShutdown atomic.Uint64
+
 	// probe outcomes — what the worker derived the action from.
 	probeExists          atomic.Uint64
 	probeAbsent          atomic.Uint64
@@ -129,8 +135,13 @@ type depWatch struct {
 	// first submitDepEvent; readers use q() and nil-check.
 	queue atomic.Pointer[depQueue]
 
-	// watcher is the ResourceWatcher the worker probes. Bound at handler
-	// construction (rw.depEventHandlers); production has exactly one.
+	// watcher is the ResourceWatcher the worker probes; production has
+	// exactly one. Bound by NewResourceWatcher as its LAST step, once the
+	// watcher is fully built, and by every submit (submitDepEventMask). Never
+	// by handler construction (depEventHandler): the constructor builds its
+	// dep handlers mid-construction, so binding there published a half-built
+	// watcher whose maps the worker then read while the constructor wrote
+	// them (#1016).
 	watcher atomic.Pointer[ResourceWatcher]
 
 	startOnce sync.Once
@@ -138,6 +149,127 @@ type depWatch struct {
 
 	// nilSyncWarned ensures the O14 nil-syncCh WARN fires at most once.
 	nilSyncWarned atomic.Bool
+
+	// #603 PR-2 SHADOW — the per-coordinate transition masks (deps_list_interest.go),
+	// OR-ed by the handlers BEFORE the coordinate is enqueued and swapped out by
+	// the worker. The queue coalesces a coordinate's submits; the mask must not:
+	// an A→B→A flip still sets the bit. Bounded like the queue (one entry per
+	// pending coordinate).
+	maskMu sync.Mutex
+	masks  map[depEventKey]*eventMask
+
+	// #854 — the coordinates whose event is still on its way to the hook:
+	// queued (submitted or rate-limit-requeued, not yet picked up) and
+	// processing (picked up, hook not yet returned). Guarded by maskMu. The
+	// incremental list cell's comparator skips them (in flight, not diverged).
+	queued     map[depEventKey]struct{}
+	processing map[depEventKey]struct{}
+}
+
+// depWorkerTakenHookForTest runs in the dep worker right after takeMask, before
+// the probe and the dep hook. TEST-ONLY (nil in production): #854 F5b stalls
+// the worker there to prove the comparator treats such a key as in flight.
+var depWorkerTakenHookForTest atomic.Pointer[func(gvr schema.GroupVersionResource, namespace, name string)]
+
+// SetDepWorkerTakenHookForTest installs (nil clears) the hook. TEST-ONLY.
+func SetDepWorkerTakenHookForTest(fn func(gvr schema.GroupVersionResource, namespace, name string)) (restore func()) {
+	var p *func(gvr schema.GroupVersionResource, namespace, name string)
+	if fn != nil {
+		p = &fn
+	}
+	prev := depWorkerTakenHookForTest.Swap(p)
+	return func() { depWorkerTakenHookForTest.Store(prev) }
+}
+
+// BumpDepWatchLostEventForTest moves one of the three lost-event counters
+// ("panic", "nil_sync", "dropped_shutdown"). TEST-ONLY.
+func BumpDepWatchLostEventForTest(kind string) {
+	w := depWatchSingleton()
+	switch kind {
+	case "panic":
+		w.counters.workerPanics.Add(1)
+	case "nil_sync":
+		w.counters.addNilSyncCh.Add(1)
+	case "dropped_shutdown":
+		w.counters.submitDroppedShutdown.Add(1)
+	}
+}
+
+func (w *depWatch) markQueued(k depEventKey) {
+	w.maskMu.Lock()
+	if w.queued == nil {
+		w.queued = map[depEventKey]struct{}{}
+	}
+	w.queued[k] = struct{}{}
+	w.maskMu.Unlock()
+}
+
+func (w *depWatch) beginProcessing(k depEventKey) {
+	w.maskMu.Lock()
+	delete(w.queued, k)
+	if w.processing == nil {
+		w.processing = map[depEventKey]struct{}{}
+	}
+	w.processing[k] = struct{}{}
+	w.maskMu.Unlock()
+}
+
+func (w *depWatch) endProcessing(k depEventKey) {
+	w.maskMu.Lock()
+	delete(w.processing, k)
+	w.maskMu.Unlock()
+}
+
+// mergeMask ORs m into k's pending mask.
+func (w *depWatch) mergeMask(k depEventKey, m *eventMask) {
+	if m == nil {
+		return
+	}
+	w.maskMu.Lock()
+	if w.masks == nil {
+		w.masks = map[depEventKey]*eventMask{}
+	}
+	if cur, ok := w.masks[k]; ok {
+		cur.merge(m)
+	} else {
+		cp := *m
+		cp.changed = nil
+		cp.merge(&eventMask{gen: m.gen, changed: m.changed})
+		w.masks[k] = &cp
+	}
+	w.maskMu.Unlock()
+}
+
+// takeMask removes and returns k's pending mask (nil when none).
+func (w *depWatch) takeMask(k depEventKey) *eventMask {
+	w.maskMu.Lock()
+	m := w.masks[k]
+	delete(w.masks, k)
+	w.maskMu.Unlock()
+	return m
+}
+
+// narrowUpdateMask / narrowMembershipMask / narrowUnknownMask are the
+// handler-side mask builders; nil while the shadow is off.
+func narrowUpdateMask(gvr schema.GroupVersionResource, oldObj, newObj interface{}) *eventMask {
+	if !listNarrowShadowOn() {
+		return nil
+	}
+	return Deps().updateMask(gvr, oldObj, newObj)
+}
+
+func narrowMembershipMask(gvr schema.GroupVersionResource) *eventMask {
+	if !listNarrowShadowOn() {
+		return nil
+	}
+	return Deps().membershipMask(gvr)
+}
+
+func narrowUnknownMask() *eventMask {
+	if !listNarrowShadowOn() {
+		return nil
+	}
+	return unknownMask()
 }
 
 var (
@@ -218,6 +350,7 @@ const maxDepWorkerRespawns = 5
 // FIRST so it runs LAST, so the re-spawn's Add(1) lands while the counter is
 // still ≥1 (no zero-transition race against stopWorker's Wait).
 func (w *depWatch) runDepEventWorker(respawns int) {
+	workclass.ClearGoroutine() // #871: process-lifetime; never charged to the unit that started it
 	defer w.workerWG.Done()
 	defer func() {
 		rec := recover()
@@ -226,6 +359,7 @@ func (w *depWatch) runDepEventWorker(respawns int) {
 		}
 		w.counters.workerPanics.Add(1)
 		if respawns >= maxDepWorkerRespawns {
+			// log-ctx-waiver: worker: the dep-event worker goroutine
 			slog.Error("deps.delete_worker.panic",
 				slog.String("subsystem", "cache"),
 				slog.Any("panic", rec),
@@ -237,6 +371,7 @@ func (w *depWatch) runDepEventWorker(respawns int) {
 			)
 			return
 		}
+		// log-ctx-waiver: worker: the dep-event worker goroutine
 		slog.Error("deps.delete_worker.panic",
 			slog.String("subsystem", "cache"),
 			slog.Any("panic", rec),
@@ -267,6 +402,8 @@ func (w *depWatch) runDepEventWorker(respawns int) {
 // WARN, not ERROR: the chart ships LOG_LEVEL=warn, and this line is the one
 // an operator greps for after a missed invalidation.
 func (w *depWatch) handleDepEvent(k depEventKey) {
+	w.beginProcessing(k)
+	defer w.endProcessing(k)
 	defer func() {
 		rec := recover()
 		if rec == nil {
@@ -274,6 +411,7 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 		}
 		w.counters.workerPanics.Add(1)
 		w.q().Forget(k)
+		// log-ctx-waiver: worker: the dep-event worker: a dequeued informer event
 		slog.Warn("deps.delete_worker.panic",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", k.gvr.String()),
@@ -286,6 +424,12 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 		)
 	}()
 
+	// #603 PR-2 — this processing consumes every transition merged so far; one
+	// merged after this point re-adds the coordinate with its own mask.
+	mask := w.takeMask(k)
+	if h := depWorkerTakenHookForTest.Load(); h != nil {
+		(*h)(k.gvr, k.namespace, k.name) // TEST-ONLY: after takeMask, before the hook (#854 F5b)
+	}
 	state := w.watcher.Load().probeObjectState(k.gvr, k.namespace, k.name)
 	switch state {
 	case objExists:
@@ -298,11 +442,14 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 		// refresher's re-fetch takes the decision against the apiserver.
 		w.counters.probeUnknown.Add(1)
 		if w.q().NumRequeues(k) < maxRefreshRequeues {
+			w.mergeMask(k, mask) // the requeued processing still owns these transitions
+			w.markQueued(k)
 			w.q().AddRateLimited(k)
 			return
 		}
 		w.counters.probeUnknownDegraded.Add(1)
 		w.q().Forget(k)
+		// log-ctx-waiver: worker: the dep-event worker: a dequeued informer event
 		slog.Warn("deps.probe_unknown_degraded",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", k.gvr.String()),
@@ -316,17 +463,25 @@ func (w *depWatch) handleDepEvent(k depEventKey) {
 				"leaves the cell resident and KNOWN-STALE (#547): served, counted on known_stale_served_total "+
 				"and revalidated on the next read"),
 		)
-		Deps().OnObjectEvent(k.gvr, k.namespace, k.name, objUnknownDegraded)
+		Deps().onObjectEventMasked(k.gvr, k.namespace, k.name, objUnknownDegraded, mask)
 		return
 	}
 	w.q().Forget(k)
-	Deps().OnObjectEvent(k.gvr, k.namespace, k.name, state)
+	Deps().onObjectEventMasked(k.gvr, k.namespace, k.name, state, mask)
 }
 
 // submitDepEvent binds the watcher, starts the worker on first use and
 // enqueues the coordinate. Never blocks, never drops: the typed workqueue is
 // unbounded and deduplicates pending keys.
 func (w *depWatch) submitDepEvent(rw *ResourceWatcher, k depEventKey, source string) {
+	// #603 PR-2 — a submit that carries no transition (reconcile, relist bridge)
+	// decides nothing: its mask is unknown, so every narrowed mark is kept.
+	w.submitDepEventMask(rw, k, source, narrowUnknownMask())
+}
+
+// submitDepEventMask is submitDepEvent carrying the transition mask the
+// handler computed (#603 PR-2 SHADOW). The mask is merged BEFORE the Add.
+func (w *depWatch) submitDepEventMask(rw *ResourceWatcher, k depEventKey, source string, mask *eventMask) {
 	w.watcher.Store(rw)
 	w.startWorker()
 	w.counters.eventsSubmitted.Add(1)
@@ -342,6 +497,13 @@ func (w *depWatch) submitDepEvent(rw *ResourceWatcher, k depEventKey, source str
 		// In production startWorker above always builds the queue.
 		return
 	}
+	if q.ShuttingDown() {
+		// #854 — an Add onto a shut-down queue is dropped: a lost event.
+		w.counters.submitDroppedShutdown.Add(1)
+		return
+	}
+	w.mergeMask(k, mask)
+	w.markQueued(k)
 	q.Add(k)
 }
 
@@ -409,7 +571,7 @@ var depAddDeliveryHookForTest atomic.Pointer[func(gvr schema.GroupVersionResourc
 // initial LIST after syncCh has closed; the syncCh gate then reads a replayed
 // ADD as live, which stamps the freshness clock and dirty-marks dependents
 // of an object that did not change, at boot and on every relist. The flag is
-// set per notification by client-go (DeltaFIFO's "not yet synced" at pop
+// set per notification by client-go (the FIFO's "not yet synced" at pop
 // time, and true for the replay a handler added to a running informer
 // receives), so it is exact whatever the delivery lag. A relist through
 // RemoveResourceType + EnsureResourceType builds a fresh informer whose LIST
@@ -433,23 +595,44 @@ var depAddDeliveryHookForTest atomic.Pointer[func(gvr schema.GroupVersionResourc
 // gates. A plain-func caller (depEventHandlers) carries no flag and keeps
 // the syncCh gate, including O14's nil-syncCh fail-safe drop.
 type depEventHandler struct {
-	funcs clientcache.ResourceEventHandlerFuncs
-	add   func(obj interface{}, isInInitialList, fromInformer bool)
+	gvr    schema.GroupVersionResource
+	funcs  clientcache.ResourceEventHandlerFuncs
+	add    func(obj interface{}, isInInitialList, fromInformer bool, source string)
+	update func(oldObj, newObj interface{}, source string)
+	del    func(obj interface{}, source string)
 }
 
+// #854 / #870 — the incremental list cells' comparator reads each key's last
+// delivery from the live instance's dep-handler `seen` record, which the
+// adapter (store_instance.go) updates AFTER this handler has submitted the
+// event. So the comparator sees each key either undelivered (its indexer write
+// is still in the client-go listener buffer, or this handler is still
+// running), queued / processing in the dep worker, or pending in the cell — in
+// flight in all three — and only otherwise as settled.
 func (h depEventHandler) OnAdd(obj interface{}, isInInitialList bool) {
-	h.add(obj, isInInitialList, true)
+	h.add(obj, isInInitialList, true, dmSourceWatch)
 }
-func (h depEventHandler) OnUpdate(oldObj, newObj interface{}) { h.funcs.OnUpdate(oldObj, newObj) }
-func (h depEventHandler) OnDelete(obj interface{})            { h.funcs.OnDelete(obj) }
+func (h depEventHandler) OnUpdate(oldObj, newObj interface{}) {
+	h.update(oldObj, newObj, dmSourceWatch)
+}
+func (h depEventHandler) OnDelete(obj interface{}) {
+	h.del(obj, dmSourceWatch)
+}
+
+// #870 — a swap delivery (design v5 §2.7) is an ordinary live event for the
+// dep handler, attributed to submission source store_swap.
+func (h depEventHandler) onSwapAdd(obj any) { h.add(obj, false, true, dmSourceStoreSwap) }
+func (h depEventHandler) onSwapUpdate(oldObj, newObj any) {
+	h.update(oldObj, newObj, dmSourceStoreSwap)
+}
+func (h depEventHandler) onSwapDelete(obj any) { h.del(obj, dmSourceStoreSwap) }
 
 func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depEventHandler {
-	w := depWatchSingleton()
-	w.watcher.Store(rw)
+	w := depWatchSingleton() // #1016: captured, not bound — see depWatch.watcher
 	// Ship 0.30.233 — pre-compute the CRD-meta-GVR predicate once per
 	// handler-set construction, NOT per-event.
 	crdSideEffect := IsCRDGVR(gvr)
-	add := func(obj interface{}, isInInitialList, fromInformer bool) {
+	add := func(obj interface{}, isInInitialList, fromInformer bool, source string) {
 		if h := depAddDeliveryHookForTest.Load(); h != nil {
 			defer (*h)(gvr)()
 		}
@@ -482,40 +665,48 @@ func (rw *ResourceWatcher) depEventHandler(gvr schema.GroupVersionResource) depE
 		ns, name := metaNSName(obj)
 		w.counters.addPropagated.Add(1)
 		rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-		w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch)
+		// #603 PR-2 — an ADD is a membership change.
+		w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, source, narrowMembershipMask(gvr))
 		// Ship 0.30.233 — CRD-ADD discovery side-effect, off the informer
 		// processor goroutine. See crd_discovery_side_effect.go.
 		if crdSideEffect {
 			crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleAdd)
 		}
 	}
-	return depEventHandler{add: add, funcs: clientcache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) { add(obj, false, false) },
-		UpdateFunc: func(_, newObj interface{}) {
-			ns, name := metaNSName(newObj)
-			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch)
-			// Ship L / 0.30.246 — CRD UPDATE lifecycle hook.
-			if crdSideEffect {
-				crdDiscoverySingleton().submitCRDLifecycleEvent(newObj, crdLifecycleUpdate)
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			// DeletedFinalStateUnknown wraps the last-known object when the
-			// watcher missed the explicit DELETE. Unwrap so we still get the
-			// (ns, name) tuple AND the underlying CRD spec for the CRD-DELETE
-			// teardown branch below.
-			if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
-				obj = tomb.Obj
-			}
-			ns, name := metaNSName(obj)
-			rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
-			w.submitDepEvent(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, dmSourceWatch)
-			// Ship L / 0.30.246 — CRD DELETE lifecycle hook (triggerCRDDelete).
-			if crdSideEffect {
-				crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleDelete)
-			}
-		},
+	update := func(oldObj, newObj interface{}, source string) {
+		ns, name := metaNSName(newObj)
+		rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
+		// #603 PR-2 SHADOW — the ONLY place the pre-image exists: compare it
+		// with the new object on every live interest of the GVR, per
+		// transition, before the queue coalesces it (read-only on both).
+		w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, source,
+			narrowUpdateMask(gvr, oldObj, newObj))
+		// Ship L / 0.30.246 — CRD UPDATE lifecycle hook.
+		if crdSideEffect {
+			crdDiscoverySingleton().submitCRDLifecycleEvent(newObj, crdLifecycleUpdate)
+		}
+	}
+	del := func(obj interface{}, source string) {
+		// DeletedFinalStateUnknown wraps the last-known object when the
+		// watcher missed the explicit DELETE. Unwrap so we still get the
+		// (ns, name) tuple AND the underlying CRD spec for the CRD-DELETE
+		// teardown branch below.
+		if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
+			obj = tomb.Obj
+		}
+		ns, name := metaNSName(obj)
+		rw.noteInformerEvent(gvr) // 1.12.5 #187 — freshness clock
+		// #603 PR-2 — a DELETE (or a tombstone) is a membership change.
+		w.submitDepEventMask(rw, depEventKey{gvr: gvr, namespace: ns, name: name}, source, narrowMembershipMask(gvr))
+		// Ship L / 0.30.246 — CRD DELETE lifecycle hook (triggerCRDDelete).
+		if crdSideEffect {
+			crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleDelete)
+		}
+	}
+	return depEventHandler{gvr: gvr, add: add, update: update, del: del, funcs: clientcache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { add(obj, false, false, dmSourceWatch) },
+		UpdateFunc: func(oldObj, newObj interface{}) { update(oldObj, newObj, dmSourceWatch) },
+		DeleteFunc: func(obj interface{}) { del(obj, dmSourceWatch) },
 	}}
 }
 
@@ -578,6 +769,7 @@ func (rw *ResourceWatcher) probeObjectState(gvr schema.GroupVersionResource, nam
 func (w *depWatch) noteNilSyncCh(gvr schema.GroupVersionResource, hint string) {
 	w.counters.addNilSyncCh.Add(1)
 	if w.nilSyncWarned.CompareAndSwap(false, true) {
+		// log-ctx-waiver: informer-event: an informer ADD handler
 		slog.Warn("deps.add_nil_syncch",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),

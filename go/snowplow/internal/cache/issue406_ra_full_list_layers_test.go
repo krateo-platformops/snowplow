@@ -58,7 +58,7 @@ func (r *layerRig) commitRA(body string) {
 	r.t.Helper()
 	in := r.raIn
 	ctx := WithL1KeyContext(context.Background(), r.raKey)
-	if !r.c.PutIfGen(ctx, r.raKey, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in}, r.c.CaptureGen(r.raKey)) {
+	if !r.c.putIfGen(ctx, r.raKey, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in}, r.c.CaptureGen(r.raKey)) {
 		r.t.Fatalf("raKey PutIfGen refused")
 	}
 }
@@ -89,7 +89,7 @@ func widgetEntry(w string) *ResolvedEntry {
 
 func (r *layerRig) putWidget(ctx context.Context, w string) {
 	r.t.Helper()
-	if !r.c.PutIfGen(ctx, w, widgetEntry(w), r.c.CaptureGen(w)) {
+	if !r.c.putIfGen(ctx, w, widgetEntry(w), r.c.CaptureGen(w)) {
 		r.t.Fatalf("widget PutIfGen refused")
 	}
 }
@@ -102,6 +102,8 @@ func (r *layerRig) remarks(k string) int {
 
 // Versions move on a real change only: an exact-bytes re-Put keeps the version.
 func TestIssue406_Layers_VersionMovesOnlyOnByteChange(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["a"]}`)
 	v1 := r.version()
@@ -123,6 +125,8 @@ func TestIssue406_Layers_VersionMovesOnlyOnByteChange(t *testing.T) {
 
 // A resident widget is remarked once per raKey change, never for an identical re-Put.
 func TestIssue406_Layers_RemarkOnlyOnChangedContent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["a"]}`)
 	const w = "w-resident"
@@ -148,6 +152,8 @@ func TestIssue406_Layers_RemarkOnlyOnChangedContent(t *testing.T) {
 // In flight: the widget sliced v1, raKey changed before the widget's Put. The Put
 // (gen-guarded, or the boot seed's PutThenRemark) remarks it.
 func TestIssue406_Layers_InFlightWidgetRemarkedByOwnPut(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	for _, plain := range []bool{false, true} {
 		r := newLayerRig(t)
 		r.commitRA(`{"items":["old"]}`)
@@ -156,7 +162,7 @@ func TestIssue406_Layers_InFlightWidgetRemarkedByOwnPut(t *testing.T) {
 		r.slice(ctx)
 		r.commitRA(`{"items":["new"]}`)
 		if plain {
-			r.c.PutThenRemark(ctx, w, widgetEntry(w))
+			r.c.putThenRemark(ctx, w, widgetEntry(w))
 		} else {
 			r.putWidget(ctx, w)
 		}
@@ -168,6 +174,8 @@ func TestIssue406_Layers_InFlightWidgetRemarkedByOwnPut(t *testing.T) {
 
 // P1 — raKey removed while the widget is in flight: the Put remarks it.
 func TestIssue406_Layers_P1_RAKeyAbsentAtWidgetPut(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["old"]}`)
 	const w = "w-p1"
@@ -182,6 +190,8 @@ func TestIssue406_Layers_P1_RAKeyAbsentAtWidgetPut(t *testing.T) {
 
 // P2 — two changes while in flight: no strike counting, one remark at the Put.
 func TestIssue406_Layers_P2_TwoChangesInFlight(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["1"]}`)
 	const w = "w-p2"
@@ -197,6 +207,8 @@ func TestIssue406_Layers_P2_TwoChangesInFlight(t *testing.T) {
 
 // P3 — the older of two concurrent resolves Puts last: judged by ITS slice.
 func TestIssue406_Layers_P3_OlderResolvePutsLast(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["old"]}`)
 	const w = "w-p3"
@@ -225,6 +237,8 @@ func TestIssue406_Layers_P3_OlderResolvePutsLast(t *testing.T) {
 // or a nested resolve, with a raKey commit in between). The Put is judged against the
 // OLDEST noted version: the body embeds that stale slice.
 func TestIssue406_Layers_C1_OneResolveSlicesTwoVersions(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["old"]}`)
 	const w = "w-c1"
@@ -244,6 +258,8 @@ func TestIssue406_Layers_C1_OneResolveSlicesTwoVersions(t *testing.T) {
 // that lands between the compare and the lock voids it, and the Put takes a NEW
 // version rather than inheriting one whose content was superseded.
 func TestIssue406_Layers_C2_OffLockCompare_ConcurrentCommitVoidsIdentical(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["a"]}`)
 	vA := r.version()
@@ -278,6 +294,8 @@ func TestIssue406_Layers_C2_OffLockCompare_ConcurrentCommitVoidsIdentical(t *tes
 // C2 under -race: concurrent identical re-Puts, changed Puts and customer Gets of one
 // raKey. The off-lock compare reads only immutable stored entries.
 func TestIssue406_Layers_C2_ConcurrentRePutsAndGets_Race(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["a"]}`)
 	var wg sync.WaitGroup
@@ -291,7 +309,7 @@ func TestIssue406_Layers_C2_ConcurrentRePutsAndGets_Race(t *testing.T) {
 				if (i+g)%7 == 0 {
 					body = `{"items":["b"]}`
 				}
-				r.c.Put(r.raKey, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in})
+				r.c.put(r.raKey, &ResolvedEntry{RawJSON: []byte(body), Inputs: &in})
 				if e, ok := r.c.Get(r.raKey); ok && e.contentVersion == 0 {
 					t.Errorf("a stored RAFullList entry must carry a version")
 				}
@@ -302,6 +320,8 @@ func TestIssue406_Layers_C2_ConcurrentRePutsAndGets_Race(t *testing.T) {
 }
 
 func TestIssue406_Layers_CommitBetweenGetAndNote(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["old"]}`)
 	const w = "w-race"
@@ -318,6 +338,8 @@ func TestIssue406_Layers_CommitBetweenGetAndNote(t *testing.T) {
 // A widget whose body came from a fresh resolve (Forget, then a Put with no slice) is
 // not remarked by the raKey commit that precedes its Put.
 func TestIssue406_Layers_ForgetBeforeFreshResolve(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["a"]}`)
 	const w = "w-fresh"
@@ -339,6 +361,8 @@ func TestIssue406_Layers_ForgetBeforeFreshResolve(t *testing.T) {
 // replaces the body, so it DROPS the cell's recorded sources: the cell leaves the
 // layered remark path, and a later raKey change does not remark it.
 func TestIssue406_Layers_UnknownProvenancePutDropsSources(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["a"]}`)
 	const w = "w-external"
@@ -348,7 +372,7 @@ func TestIssue406_Layers_UnknownProvenancePutDropsSources(t *testing.T) {
 	if _, cons := r.c.RAFullListLayerStatsForTest(); cons != 1 {
 		t.Fatalf("setup: want 1 edge, got %d", cons)
 	}
-	r.c.Put(w, widgetEntry(w)) // provenance unknown
+	r.c.put(w, widgetEntry(w)) // provenance unknown
 	if recs, cons := r.c.RAFullListLayerStatsForTest(); recs != 0 || cons != 0 {
 		t.Fatalf("#406 C3 RED: a ctx-less Put must drop the recorded sources, got %d / %d", recs, cons)
 	}
@@ -360,6 +384,8 @@ func TestIssue406_Layers_UnknownProvenancePutDropsSources(t *testing.T) {
 
 // Bounded by resident widgets.
 func TestIssue406_Layers_IndexBoundedByResidentWidgets(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	r := newLayerRig(t)
 	r.commitRA(`{"items":["a"]}`)
 	const w = "w-bound"
@@ -383,7 +409,7 @@ func TestIssue406_Layers_IndexBoundedByResidentWidgets(t *testing.T) {
 	const ghost = "w-ghost"
 	gctx := WithL1KeyContext(context.Background(), ghost)
 	r.slice(gctx)
-	if r.c.PutIfGen(gctx, ghost, widgetEntry(ghost), 12345) {
+	if r.c.putIfGen(gctx, ghost, widgetEntry(ghost), 12345) {
 		t.Fatalf("setup: the PutIfGen with a wrong generation must be refused")
 	}
 	if recs, cons := r.c.RAFullListLayerStatsForTest(); recs != 0 || cons != 0 {

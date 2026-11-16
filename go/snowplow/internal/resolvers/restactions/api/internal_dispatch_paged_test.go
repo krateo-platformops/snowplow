@@ -250,7 +250,7 @@ func TestInternalRESTConfigDispatch_PagedList_FullWalk(t *testing.T) {
 	ctx = withSlogLogger(ctx, logger)
 
 	start := time.Now()
-	raw, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{
 			Path: "/apis/composition.krateo.io/v1-2-2/githubscaffoldingwithcompositionpages",
 		},
@@ -454,7 +454,7 @@ func TestInternalRESTConfigDispatch_PagedList_ContextCancelDuringWalk(t *testing
 		return cancelLandedCh
 	}
 
-	_, _, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+	_, _, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{
 			Path: "/apis/composition.krateo.io/v1-2-2/githubscaffoldingwithcompositionpages",
 		},

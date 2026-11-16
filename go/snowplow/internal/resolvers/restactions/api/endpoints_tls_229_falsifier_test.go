@@ -299,11 +299,12 @@ func TestIssue229_Arm6_CertAuthEndpointUnchanged(t *testing.T) {
 		Insecure:                 false,
 	}
 
-	// Guard the routing decision itself: this endpoint must NOT take the
-	// owned branch.
-	if endpointNeedsOwnedCAClient(&ep) {
-		t.Fatalf("ARM6 FAIL: a cert-auth endpoint was routed to the owned client; " +
-			"the live <user>-clientconfig population must keep using plumbing verbatim")
+	// Guard the routing decision itself. #1088: the live <user>-clientconfig
+	// population now takes the owned client-go branch (one kept client per
+	// identity); this arm pins that it still dials with its client cert, its
+	// CA, and no Authorization header.
+	if !endpointOwnedShape(&ep) {
+		t.Fatalf("ARM6 FAIL: a cert-auth endpoint with a CA must take the owned client-go branch (#1088)")
 	}
 
 	st, jsonBytes, err := drive(t, ep, http.MethodGet, "")
@@ -323,10 +324,10 @@ func TestIssue229_Arm6_CertAuthEndpointUnchanged(t *testing.T) {
 
 // --- ARM 7: the ROUTING PREDICATE, exhaustively. ---------------------
 //
-// endpointNeedsOwnedCAClient decides which endpoints change behaviour at
-// all. Pinning it directly is what bounds the blast radius of this fix:
-// exactly one shape is rerouted and every other shape still reaches
-// plumbing untouched.
+// endpointOwnedShape (was endpointNeedsOwnedCAClient) decides which endpoints
+// take the owned client-go branch. #1088 widened it from the one #229 shape to
+// every shape client-go reproduces exactly; pinning it directly is what bounds
+// the blast radius: every exclusion is listed here.
 func TestIssue229_Arm7_RoutingPredicate(t *testing.T) {
 	const ca = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
 	cases := []struct {
@@ -335,10 +336,15 @@ func TestIssue229_Arm7_RoutingPredicate(t *testing.T) {
 		want bool
 	}{
 		{"nil endpoint", nil, false},
-		{"no CA at all", &endpoints.Endpoint{ServerURL: "https://x", Token: "t"}, false},
+		{"no CA at all", &endpoints.Endpoint{ServerURL: "https://x", Token: "t"}, true},
 		{"token-auth WITH a CA (the defect)", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", CertificateAuthorityData: ca}, true},
-		{"cert-auth with a CA (live population)", &endpoints.Endpoint{ServerURL: "https://x", CertificateAuthorityData: ca, ClientCertificateData: "c", ClientKeyData: "k"}, false},
-		{"insecure explicitly requested", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", CertificateAuthorityData: ca, Insecure: true}, false},
+		{"cert-auth with a CA (live population, #1088)", &endpoints.Endpoint{ServerURL: "https://x", CertificateAuthorityData: ca, ClientCertificateData: "c", ClientKeyData: "k"}, true},
+		{"cert-auth with NO CA (plumbing verifies against an empty pool)", &endpoints.Endpoint{ServerURL: "https://x", ClientCertificateData: "c", ClientKeyData: "k"}, false},
+		{"cert-auth + insecure (plumbing ignores Insecure on cert auth)", &endpoints.Endpoint{ServerURL: "https://x", CertificateAuthorityData: ca, ClientCertificateData: "c", ClientKeyData: "k", Insecure: true}, false},
+		// #1112 D4: owned like any other; its wire dump is credhttp.WireDump,
+		// installed on either branch, never plumbing's.
+		{"Debug (snowplow's metadata-only wire dump)", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", Debug: true}, true},
+		{"insecure explicitly requested (skip-verify, as plumbing)", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", CertificateAuthorityData: ca, Insecure: true}, true},
 		{"basic-auth with a CA", &endpoints.Endpoint{ServerURL: "https://x", Username: "u", Password: "p", CertificateAuthorityData: ca}, true},
 		// The EMPTY-USERNAME exclusion. plumbing calls this basic auth (it keys
 		// off Password) and sends Basic base64(":password"); client-go keys off
@@ -353,6 +359,10 @@ func TestIssue229_Arm7_RoutingPredicate(t *testing.T) {
 		// too. Same principle as the row above: the owned branch owns only what
 		// it can reproduce exactly.
 		{"AWS auth with a CA", &endpoints.Endpoint{ServerURL: "https://x", CertificateAuthorityData: ca, AwsAccessKey: "AKIA", AwsSecretKey: "s", AwsRegion: "eu-west-1", AwsService: "execute-api"}, false},
+		// #1135 — plumbing v1.22+ reads AwsService in HasAwsAuth, so three of the
+		// four SigV4 inputs are no AWS auth at all: the shape is owned and sends
+		// its bearer token, where plumbing used to refuse the pair outright.
+		{"AWS fields with no service, beside a bearer token", &endpoints.Endpoint{ServerURL: "https://x", Token: "t", AwsAccessKey: "AKIA", AwsSecretKey: "s", AwsRegion: "eu-west-1"}, true},
 		// THE LIVE POPULATION GUARD. Field-for-field the shape sa_client.go:126
 		// builds, which is what every non-GET no-endpointRef api-step uses. The
 		// owned branch now carries TWO exclusions beyond its original predicate,
@@ -388,8 +398,8 @@ func TestIssue229_Arm7_RoutingPredicate(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := endpointNeedsOwnedCAClient(tc.ep); got != tc.want {
-				t.Fatalf("ARM7 FAIL: endpointNeedsOwnedCAClient = %v, want %v", got, tc.want)
+			if got := endpointOwnedShape(tc.ep); got != tc.want {
+				t.Fatalf("ARM7 FAIL: endpointOwnedShape = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -442,13 +452,21 @@ func TestIssue229_Arm8_CAShapeDetection(t *testing.T) {
 // than asserting on the routing predicate alone.
 func selfSignedClientPair(t *testing.T) (certPEM, keyPEM []byte) {
 	t.Helper()
+	return selfSignedClientPairFor(t, "snowplow-test-client")
+}
+
+// selfSignedClientPairFor is selfSignedClientPair issued to cn, as authn issues
+// a user's session certificate to the username (#1382: a credential Secret is
+// its user's when its certificate's CommonName is the username).
+func selfSignedClientPairFor(t *testing.T, cn string) (certPEM, keyPEM []byte) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "snowplow-test-client"},
+		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,

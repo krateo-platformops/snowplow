@@ -121,14 +121,14 @@ func TestC113_3_EndpointMiss_NeitherSinkBumps_DeclineGateCannotCatch(t *testing.
 
 	// The REAL GTTL-1 gate: with BOTH sinks at 0, it does NOT decline → the
 	// truncated body WOULD be Put. This is the poisoning the seed-skip prevents.
-	if declineSeedPutOnError(ctx, "restactions", "krateo/hub-spoke-ra", "key/hub-spoke", stageSink, extSink, nil) {
+	if declineSeedPutOnError(ctx, "restactions", "krateo/hub-spoke-ra", "key/hub-spoke", cache.PutGateVerdict(cache.PutGateSinks{Stage: stageSink, Forbidden: &cache.PerIdentityForbiddenSink{}, External: extSink}, "restactions"), stageSink, extSink) {
 		t.Fatal("C-113-3 §4 nuance BROKEN: declineSeedPutOnError declined with BOTH sinks at 0 — if the gate DID catch the templated-endpointRef miss, the seed-skip would be redundant; the whole point is that it does NOT, so the skip is load-bearing")
 	}
 
 	// Control (discriminator): the gate DOES decline once a sink is bumped — proving
 	// the gate's verdict is real, just blind to the endpoint-miss class above.
 	stageSink.Bump("someStage", "an actual swallowed stage error")
-	if !declineSeedPutOnError(ctx, "restactions", "krateo/hub-spoke-ra", "key/hub-spoke", stageSink, extSink, nil) {
+	if !declineSeedPutOnError(ctx, "restactions", "krateo/hub-spoke-ra", "key/hub-spoke", cache.PutGateVerdict(cache.PutGateSinks{Stage: stageSink, Forbidden: &cache.PerIdentityForbiddenSink{}, External: extSink}, "restactions"), stageSink, extSink) {
 		t.Fatal("control: a bumped stage sink MUST decline")
 	}
 }

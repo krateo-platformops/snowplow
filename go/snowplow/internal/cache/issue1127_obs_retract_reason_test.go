@@ -95,7 +95,7 @@ func TestIssue1127Obs_ConfirmRetracted_ReasonIsWiredAtTheCRDDeleteSite(t *testin
 			"happened", confirmRetractCRDDeleted, by)
 	}
 	for _, wrong := range []string{
-		confirmRetractSchemaRelist, confirmRetractStaleVersionPruned,
+		confirmRetractStaleVersionPruned,
 		confirmRetractDiscoveryRefresh, confirmRetractScopedConfirm,
 		confirmRetractWalkConfirm, confirmRetractUnspecified,
 	} {

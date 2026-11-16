@@ -192,12 +192,12 @@ func issue624KindCompare(ctx context.Context, rw *ResourceWatcher, dyn dynamic.I
 		want[issue624KindKey(api.Items[i].GetNamespace(), api.Items[i].GetName())] = m
 	}
 
-	items, ok := rw.ListObjectsServable(gvr, ns)
+	items, ok := rw.ListObjectsServable(context.Background(), gvr, ns)
 	if !ok {
 		fail("decoded LIST served=false")
 		return errs, nil
 	}
-	raws, ok := rw.ListRawServable(gvr, ns)
+	raws, ok := rw.ListRawServable(context.Background(), gvr, ns)
 	if !ok {
 		fail("raw LIST served=false")
 		return errs, nil
@@ -267,7 +267,7 @@ func issue624KindCompare(ctx context.Context, rw *ResourceWatcher, dyn dynamic.I
 			fail("%s canon apiserver GET: %v", k, err)
 			continue
 		}
-		got, hit := rw.GetObject(gvr, it.GetNamespace(), it.GetName())
+		got, hit := rw.GetObject(context.Background(), gvr, it.GetNamespace(), it.GetName())
 		if !hit || got == nil {
 			fail("%s GET hit=false", k)
 			continue

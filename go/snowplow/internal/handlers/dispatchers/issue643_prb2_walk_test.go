@@ -36,7 +36,6 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -132,7 +131,7 @@ func b2StubSeeds(t *testing.T) {
 	t.Helper()
 	pw, pr := seedOneWidgetFn, seedOneRestactionFn
 	seedOneWidgetFn = func(context.Context, navWidgetEntry, string, seedScopeMode) error { return nil }
-	seedOneRestactionFn = func(context.Context, redact.Label, templatesv1.ObjectReference, string, seedScopeMode) error {
+	seedOneRestactionFn = func(context.Context, templatesv1.ObjectReference, string, seedScopeMode) error {
 		return nil
 	}
 	t.Cleanup(func() { seedOneWidgetFn, seedOneRestactionFn = pw, pr })

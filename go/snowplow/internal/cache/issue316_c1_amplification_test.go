@@ -186,7 +186,7 @@ func c1Populate(t *testing.T, c *ResolvedCacheStore, n int, ttl, maxAge time.Dur
 		if state == c1WarmSeed {
 			e.SeededAtBoot = true
 		}
-		c.Put(key, e)
+		c.put(key, e)
 		Deps().Record(context.Background(), key, gvr, ns, name)
 		if state == c1WarmGet || state == c1WarmPastMaxAge {
 			c.Get(key)
@@ -273,7 +273,7 @@ func c1RegisterRealisticRefresh(c *ResolvedCacheStore, meter *c1PickupMeter, siz
 		// ReplaceIfGen. Deliberate + faithful here — the controlled burst has no
 		// raced DELETE, so plain Put ≡ ReplaceIfGen outcome; the harness models
 		// refresh LATENCY/WORK (the amplification question), not the gen-guard.
-		c.Put(k, &ResolvedEntry{RawJSON: c1Body(sizeOf(k)), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: c1Body(sizeOf(k)), Inputs: &used})
 		if meter != nil {
 			meter.observe(k)
 		}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/krateo-platformops/plumbing/jqutil"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
@@ -49,10 +50,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) (res []EvalResult, err er
 		s := expression
 		if exp, ok := jqutil.MaybeQuery(expression); ok {
 
+			jq := slowcall.Start(ctx, slowcall.PhaseJQ) // #1054
 			s, err = jqutil.Eval(ctx, jqutil.EvalOptions{
 				Query: exp, Data: opts.DataSource, Unquote: false,
 				ModuleLoader: jqsupport.ModuleLoader(),
 			})
+			jq.End()
 			if err != nil {
 				// #638: logged by the widget resolver — no value preview.
 				return res, jqsupport.SanitizeError(err)

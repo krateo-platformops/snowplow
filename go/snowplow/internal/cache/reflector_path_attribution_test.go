@@ -647,33 +647,6 @@ func TestReflectorPath_TeardownIsNotUndoneByALateRequest(t *testing.T) {
 	}
 }
 
-// TestParseResourcePath_DoesNotAllocate is RW-2. The wrapper sits on the
-// SHARED rest.Config, so every fallthrough GET-by-name on the serve path pays
-// this scan. The earlier strings.Split allocated a []string before discovering
-// the path was not a collection — on the single most common shape.
-//
-// Asserted as zero allocations rather than as a benchmark number, because the
-// claim in the code ("counts and delegates — one atomic add and a
-// non-allocating path scan") is a claim about allocation, not about speed.
-func TestParseResourcePath_DoesNotAllocate(t *testing.T) {
-	paths := []string{
-		"/apis/widgets.templates.krateo.io/v1beta1/namespaces/krateo-system/pageheaders/portal-builder-page-header",
-		"/apis/widgets.templates.krateo.io/v1beta1/pageheaders",
-		"/api/v1/namespaces/krateo-system/configmaps",
-		"/api/v1/namespaces/krateo-system",
-		"/version",
-	}
-	if n := testing.AllocsPerRun(200, func() {
-		for _, p := range paths {
-			_, _, _ = parseResourcePath(p)
-		}
-	}); n != 0 {
-		t.Fatalf("parseResourcePath allocates %.1f time(s) per run over %d paths, want 0 — the "+
-			"hot path here is a named GET falling through to the apiserver, and it must pay "+
-			"no garbage for an instrument it is not the subject of", n, len(paths))
-	}
-}
-
 // TestReflectorPath_CountsOnlyCollectionGets is the correction that keeps the
 // family from being two measurements added together. The wrapper sits on the
 // SHARED rest.Config, which also backs discovery and every hot-path

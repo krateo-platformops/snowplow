@@ -27,6 +27,8 @@ import (
 )
 
 func TestPhase1WalkContent_S323_PostReadyz_ResolveRacingDelete_RefusedNotResurrected(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("WIDGET_CONTENT_L1_ENABLED", "true")
@@ -71,7 +73,7 @@ func TestPhase1WalkContent_S323_PostReadyz_ResolveRacingDelete_RefusedNotResurre
 		// so the tail populateWidgetContentL1 PutIfGen refuses.
 		wcKey := cache.L1KeyFromContext(ctx)
 		wcKeyV.Store(wcKey)
-		store.Put(wcKey, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
+		store.PutResolved(fixtureStoreVerdict, wcKey, &cache.ResolvedEntry{RawJSON: []byte(`{"racer":true}`)})
 		store.DeleteForTest(wcKey)
 		// NON-RBAC-sensitive page envelope so the tail Put site is reached;
 		// continue=false halts the loop after this page.
@@ -84,11 +86,9 @@ func TestPhase1WalkContent_S323_PostReadyz_ResolveRacingDelete_RefusedNotResurre
 		newPhase1Walker(nil, "krateo-system"),
 		newUnstructuredWidget(ns, name),
 		gvr,
-		fakePage1Driven(), // page1Res — apiRef+template + wants continue
-		1,                 // depth
-		5,                 // perPage (resolution default)
-		-1,                // keyPerPage (root tuple)
-		-1,                // keyPage (root tuple)
+		fakePage1Driven(),          // page1Res — apiRef+template + wants continue
+		1,                          // depth
+		newPrewarmPagination(5, 1), // #966: the first page's one pagination
 		"krateo-system",
 	)
 

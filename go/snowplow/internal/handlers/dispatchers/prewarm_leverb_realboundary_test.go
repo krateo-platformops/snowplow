@@ -102,7 +102,7 @@ func (l *walkCountingLister) lister(_ context.Context) ([]navigationRoot, error)
 			Group: engineSeedWidgetGVR.Group, Version: engineSeedWidgetGVR.Version, Kind: "Table",
 		})
 		// REAL harvest primitive (first-write-wins) into the shared accumulator.
-		l.navHarv.harvestNavWidget(w, engineSeedWidgetGVR, -1, 1, -1, -1)
+		l.navHarv.harvestNavWidget(w, engineSeedWidgetGVR, unpaginatedPrewarm)
 	}
 	l.walked = append(l.walked, names)
 	// Return NO roots → the cluster-bound per-root w.walk loop is a no-op.

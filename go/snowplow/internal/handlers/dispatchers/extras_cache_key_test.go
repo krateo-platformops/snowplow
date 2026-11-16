@@ -138,6 +138,8 @@ func TestExtras_WidgetContentKey_EmptyEqualsNil(t *testing.T) {
 // extras-A's key MUST hit (so caching still works). This exercises the real
 // cache handle Put/Get, not just key equality.
 func TestExtras_WidgetContentCell_NoCrossCollision(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	enableWidgetContentL1(t)
 	ctx := context.Background()
 	const (
@@ -154,7 +156,7 @@ func TestExtras_WidgetContentCell_NoCrossCollision(t *testing.T) {
 	}
 
 	bodyA := []byte(`{"status":{"widgetData":{"tenant":"acme"}}}`)
-	handle.Put(keyA, &cache.ResolvedEntry{RawJSON: bodyA})
+	putFixture(handle, keyA, &cache.ResolvedEntry{RawJSON: bodyA})
 
 	// Request B (different extras) must NOT hit A's cell.
 	if _, hit := handle.Get(keyB); hit {

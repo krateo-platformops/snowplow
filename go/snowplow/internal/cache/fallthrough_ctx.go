@@ -29,6 +29,8 @@ package cache
 
 import (
 	"context"
+
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 )
 
 // fallthroughScopeCtxKey is the context-value key for the request-
@@ -78,10 +80,18 @@ type FallthroughScopeData struct {
 // call-write-patch, call-write-delete, list, plurals, nested-call,
 // resolver-inner-call). The middleware constructor enforces the
 // bounded set.
+//
+// #988 — THE SCOPE IS THE RESOLVE MARKER. Every resolve origin scopes its
+// context here (the /call middleware, the boot prewarm walk and seed, the
+// refresher), so this is also where the context is marked for the wire-level
+// resolve collection-LIST counter (credhttp.MarkResolve,
+// snowplow_resolve_collection_lists). A new scope starts with no fall-through
+// reason; RecordApiserverFallthrough stamps one.
 func WithFallthroughScope(ctx context.Context, path string) context.Context {
 	if Disabled() {
 		return ctx
 	}
+	ctx = credhttp.MarkResolve(ctx)
 	return context.WithValue(ctx, fallthroughScopeCtxKey{}, &FallthroughScopeData{
 		Active: true,
 		Path:   path,

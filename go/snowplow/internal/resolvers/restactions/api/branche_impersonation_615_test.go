@@ -11,8 +11,10 @@ package api
 //	                                   config an IP literal, one server — the
 //	                                   production shape — and it impersonates.
 //	FailClosed_Writes                  POST/PUT/PATCH/DELETE of a non-review
-//	                                   resource → 0 dials.
-//	AccessReview_AsTheCohort           SSAR / SAR POST → dialed as the cohort.
+//	                                   resource → 0 dials (refused by #903's
+//	                                   background-write rule, before branch E).
+//	AccessReview_NotSentInBackground   #903: an SSAR / SAR POST is a write too →
+//	                                   0 dials (it was dialed as the cohort).
 //	AccessReview_PathTricks_FailClosed a "review" path with dot segments or
 //	                                   %-encoding, or a PUT on a review → 0 dials.
 //	Redirect_*                         F1: a 302 / 307 from the apiserver to
@@ -203,22 +205,33 @@ func TestIssue615_FailClosed_Writes(t *testing.T) {
 				t.Fatalf("#615 RED: a background refresh performed %s %s (Impersonate-User=%q) — a write is never "+
 					"performed as the cohort", r.method, r.path, r.impUser)
 			}
-			assertRefused615(t, dict, s, "never performs a "+verb)
+			assertBackgroundWriteRefused615(t, dict, s, verb)
 		})
 	}
 }
 
-func TestIssue615_AccessReview_AsTheCohort(t *testing.T) {
+// assertBackgroundWriteRefused615 — the #903 refusal (dispatchOneCall, before
+// branch E) recorded as a stage error, so the refresher's Put declines.
+func assertBackgroundWriteRefused615(t *testing.T, dict map[string]any, s sinks681, verb string) {
+	t.Helper()
+	got := jsonOf(t, dict["s615Err"])
+	if s.stage.Count() != 1 || !strings.Contains(got, "background work never writes") || !strings.Contains(got, "verb "+verb) {
+		t.Fatalf("want the #903 refusal recorded as a stage error for %s; stage sink=%d errorKey=%s", verb, s.stage.Count(), got)
+	}
+}
+
+// #903 supersedes #615's access-review carve-out: background work never
+// writes, and creating an access review is a POST.
+func TestIssue615_AccessReview_NotSentInBackground(t *testing.T) {
 	for _, res := range []string{"selfsubjectaccessreviews", "subjectaccessreviews"} {
 		t.Run(res, func(t *testing.T) {
 			srv := newServer615(t)
-			_, s := resolve615(t, srv.srv.URL, impRC615(srv.srv.URL),
+			dict, s := resolve615(t, srv.srv.URL, impRC615(srv.srv.URL),
 				stage615(http.MethodPost, "/apis/authorization.k8s.io/v1/"+res))
-			reqs := srv.requests()
-			if len(reqs) != 1 {
-				t.Fatalf("the access review must be dialed exactly once, got %d (stage errors %d)", len(reqs), s.stage.Count())
+			if reqs := srv.requests(); len(reqs) != 0 {
+				t.Fatalf("#903 RED: a background refresh created an access review (%d request(s))", len(reqs))
 			}
-			assertCohort615(t, reqs[0])
+			assertBackgroundWriteRefused615(t, dict, s, http.MethodPost)
 		})
 	}
 }
@@ -388,9 +401,11 @@ func TestIssue615_BranchEDecide(t *testing.T) {
 	}{
 		{"no marker", cache.WithInternalRESTConfig(context.Background(), imp), call(ep, "GET", "/api/v1/pods"), branchEUnmarked},
 		{"GET, DNS endpoint vs IP config (F2)", marked(imp), call(ep, "GET", "/api/v1/namespaces/n/pods/p/status"), branchEImpersonate},
-		{"SAR POST", marked(imp), call(ep, "POST", "/apis/authorization.k8s.io/v1/subjectaccessreviews"), branchEImpersonate},
-		{"SSRR POST", marked(imp), call(ep, "POST", "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews"), branchEImpersonate},
-		{"LSAR POST", marked(imp), call(ep, "POST", "/apis/authorization.k8s.io/v1/namespaces/n/localsubjectaccessreviews"), branchEImpersonate},
+		// #903 — the access-review POST carve-out is gone: a background
+		// refresh never writes, an access review included.
+		{"SAR POST", marked(imp), call(ep, "POST", "/apis/authorization.k8s.io/v1/subjectaccessreviews"), branchEFailClosed},
+		{"SSRR POST", marked(imp), call(ep, "POST", "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews"), branchEFailClosed},
+		{"LSAR POST", marked(imp), call(ep, "POST", "/apis/authorization.k8s.io/v1/namespaces/n/localsubjectaccessreviews"), branchEFailClosed},
 		{"plain rc", marked(plain), call(ep, "GET", "/api/v1/pods"), branchEFailClosed},
 		{"no rc", cache.WithImpersonatedDial(context.Background()), call(ep, "GET", "/api/v1/pods"), branchEFailClosed},
 		{"not the internal endpoint", marked(imp), call("https://evil.example", "GET", "/api/v1/pods"), branchEFailClosed},

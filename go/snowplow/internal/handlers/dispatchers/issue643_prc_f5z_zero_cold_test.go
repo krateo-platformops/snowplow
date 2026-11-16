@@ -36,6 +36,7 @@ func h643F5zCut(t *testing.T, env *h643Env, j int) map[string]passDoneRecord {
 	t.Helper()
 	budgets := map[prewarmScopeKind]time.Duration{}
 	h643Budget(t, budgets)
+	h643VirtualBudget(t)
 	env.pass(prewarmScope{kind: scopeKindBoot})
 	var units int
 	prevW := seedOneWidgetFn
@@ -43,8 +44,7 @@ func h643F5zCut(t *testing.T, env *h643Env, j int) map[string]passDoneRecord {
 		if mode == seedModeGVRDiscovered {
 			units++
 			if units == j+1 {
-				<-ctx.Done()
-				return ctx.Err()
+				return h643HoldUntilBudget(ctx)
 			}
 		}
 		return prevW(ctx, e, authnNS, mode)
@@ -144,7 +144,7 @@ func h643F5zABC(t *testing.T) (h643F5zResult, map[string]string) {
 
 	cache.ResolvedCache().DeleteForTest(w0[0]) // (a)
 	old := h643Entry(w0[1])                    // (c): a different writer's Put
-	cache.ResolvedCache().Put(w0[1], &cache.ResolvedEntry{RawJSON: append([]byte(nil), old.RawJSON...), Inputs: old.Inputs})
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, w0[1], &cache.ResolvedEntry{RawJSON: append([]byte(nil), old.RawJSON...), Inputs: old.Inputs})
 	h643Dirty(t, env, "int-w1", w1, cache.InputsMovedSincePut) // (b)
 
 	before := map[string]*cache.ResolvedEntry{}

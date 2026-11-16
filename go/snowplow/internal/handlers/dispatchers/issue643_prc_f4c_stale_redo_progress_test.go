@@ -23,6 +23,7 @@ func TestIssue643_F4c_RedoOfStaleRecordsIsProgress(t *testing.T) {
 	env := h643Setup(t, h643Opts{cohorts: h643K, internal: h643N})
 	budgets := map[prewarmScopeKind]time.Duration{}
 	h643Budget(t, budgets)
+	h643VirtualBudget(t)
 	env.pass(prewarmScope{kind: scopeKindBoot})
 	budgets[scopeKindGVRDiscovered] = 2 * time.Second
 
@@ -33,8 +34,7 @@ func TestIssue643_F4c_RedoOfStaleRecordsIsProgress(t *testing.T) {
 		if mode == seedModeGVRDiscovered {
 			calls++
 			if calls == blockAt {
-				<-ctx.Done()
-				return ctx.Err()
+				return h643HoldUntilBudget(ctx)
 			}
 		}
 		return prevW(ctx, e, authnNS, mode)

@@ -146,7 +146,7 @@ func drive2ERestaction(t *testing.T, cohort context.Context, name string, dGated
 		}
 		return nil
 	}
-	if err := seedOneRestaction(cohort, "cohort-2e", seed2ERef(name), h1NS, seedModeBoot); err != nil {
+	if err := seedOneRestaction(cohort, seed2ERef(name), h1NS, seedModeBoot); err != nil {
 		t.Fatalf("seedOneRestaction(%s): %v", name, err)
 	}
 	return seen
@@ -156,16 +156,15 @@ func seed2EWidgetEntry() navWidgetEntry {
 	return navWidgetEntry{
 		W:          h1WidgetUnstructured(map[string]any{"apiRef": map[string]any{"name": a1RAName2, "namespace": h1NS}}),
 		GVR:        h1WidgetGVR,
-		PerPage:    -1,
-		Page:       -1,
-		KeyPerPage: -1,
-		KeyPage:    -1,
+		Pagination: unpaginatedPrewarm,
 	}
 }
 
 // ───────────────────────── F-2E-LOADBEARING ─────────────────────────
 
 func TestF2E_LoadBearing_RealSeedInstallsAndChecksAllowMoves(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	a1BuildTwoTenantWatcher(t)
 	rbac.ResetRequesterProfileMemoForTest()
 	t.Cleanup(func() { rbac.SetShadowParityEnabled(false) })
@@ -197,6 +196,8 @@ func TestF2E_LoadBearing_RealSeedInstallsAndChecksAllowMoves(t *testing.T) {
 // ───────────────────────── F-2E-IDENTITY (anti-leak linchpin) ─────────────────────────
 
 func TestF2E_Identity_CohortDeniedClassifiesDeniedNotSA(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	a1BuildTwoTenantWatcher(t)
 	rbac.SetShadowParityEnabled(true)
 	t.Cleanup(func() { rbac.SetShadowParityEnabled(false) })
@@ -233,7 +234,7 @@ func TestF2E_Identity_CohortDeniedClassifiesDeniedNotSA(t *testing.T) {
 	// #424: the seed resolves the cohort as an AUTHENTICATED identity — its
 	// effective groups are the cohort groups plus system:authenticated
 	// (rbac.WithAuthenticatedGroup), never anything of the SA's.
-	want := rbac.WithAuthenticatedGroup([]string{a1Group})
+	want := rbac.WithAuthenticatedGroup(denied, []string{a1Group})
 	if len(sc.identity.Groups) != len(want) || sc.identity.Groups[0] != want[0] || sc.identity.Groups[1] != want[1] {
 		t.Fatalf("F-2E-IDENTITY: sc.identity.Groups=%v, want the cohort's effective groups %v", sc.identity.Groups, want)
 	}
@@ -242,6 +243,8 @@ func TestF2E_Identity_CohortDeniedClassifiesDeniedNotSA(t *testing.T) {
 // ───────────────────────── F-2E-CALIBRATION (4 buckets + sum) ─────────────────────────
 
 func TestF2E_Calibration_FourBucketsAndSumEqualsInstalls(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	a1BuildTwoTenantWatcher(t)
 	rbac.SetShadowParityEnabled(true)
 	t.Cleanup(func() { rbac.SetShadowParityEnabled(false) })

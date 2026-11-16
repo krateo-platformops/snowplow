@@ -45,7 +45,6 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
@@ -101,7 +100,7 @@ func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewar
 			return rePrewarmLearnedClasses(ctx, deps)
 		default:
 			// Ship 2 future scope (scopeKindWidgetCR) lands here when unwired.
-			slog.Warn("prewarm.engine.unknown_scope",
+			slog.WarnContext(ctx, "prewarm.engine.unknown_scope",
 				slog.String("subsystem", "cache"),
 				slog.String("scope", s.key()),
 			)
@@ -230,7 +229,7 @@ func rePrewarmGVRDiscovered(ctx context.Context, deps rePrewarmDeps) error {
 	)
 	err := rePrewarmGVRDiscoveredSeed(ctx, deps)
 	if err != nil {
-		slog.Warn("prewarm.engine.gvr_discovered.incomplete",
+		slog.WarnContext(ctx, "prewarm.engine.gvr_discovered.incomplete",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
 		)
@@ -279,6 +278,20 @@ func rePrewarmKeepwarm(ctx context.Context, deps rePrewarmDeps) error {
 // mode).
 func rePrewarmGVRDiscoveredSeed(ctx context.Context, deps rePrewarmDeps) error {
 	return rePrewarmBootScoped(ctx, deps, seedModeGVRDiscovered)
+}
+
+// prewarmPassIndexStep is what a prewarm pass (boot, keep-warm sweep, GVR
+// discovery) does to the BindingsByGVR index: it sets the navigated set to the
+// GVRs registered now, and the index re-derives its per-GVR buckets (prewarm
+// targeting) from the bindings it holds. It does NOT touch the index's
+// membership, which the RBAC event hooks alone write: a pass can neither drop a
+// binding the event path recorded nor bring back one it removed (#1458; until
+// then every pass emptied the index and refilled it from the published RBAC
+// snapshot, which is published later than the events are handled). Returns the
+// navigated GVR count and the number of bindings the index holds.
+func prewarmPassIndexStep(rw *cache.ResourceWatcher) (navigated, bindings int) {
+	gvrs := rw.RegisteredGVRs()
+	return len(gvrs), cache.SetNavigatedGVRs(gvrs)
 }
 
 // bootShouldWalk is the #135 F4b Lever B reuse predicate — the SINGLE source of
@@ -389,7 +402,7 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 		var listErr error
 		roots, listErr = deps.lister(rctx)
 		if listErr != nil {
-			log.Warn("prewarm.engine.boot.roots_list_failed",
+			log.WarnContext(ctx, "prewarm.engine.boot.roots_list_failed",
 				slog.String("subsystem", "cache"),
 				slog.Any("err", listErr),
 				slog.String("effect", "boot re-walk has no roots; first /call per cohort falls back to per-user resolve"),
@@ -464,11 +477,10 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 			withApiRefHarvester(deps.harvester),
 			withNavWidgetHarvester(deps.navHarv),
 		)
-		// Same walk() entrypoint + same root tuple as resolveNavigationRoot
-		// (page 1, perPage prewarmPageLimit(), key tuple (-1,-1)) — the
-		// Change A page-number fix is preserved.
-		if err := w.walk(rctx, root.Root, root.GVR, 0, 1, prewarmPageLimit(), -1, -1); err != nil {
-			log.Warn("prewarm.engine.boot.root_rewalk_failed",
+		// The SAME root entry as resolveNavigationRoot (#966 review F2:
+		// walkRoot owns the root's pagination for both walks).
+		if err := w.walkRoot(rctx, root.Root, root.GVR); err != nil {
+			log.WarnContext(ctx, "prewarm.engine.boot.root_rewalk_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("root", rootKey(root.Root)),
 				slog.Any("err", err),
@@ -509,16 +521,13 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 	// seed reads RegisteredGVRs().
 	settleRegisteredSet(ctx, deps.rw)
 
-	// ── (3) BUILD the BindingsByGVR index over the navigated GVRs. Ship 1
-	// builds it here on the engine path, AFTER the re-walk discovered the
-	// navigated GVRs. The build is ONCE (Gate-2); steady-state maintenance
-	// is the delta hooks (bindings_by_gvr_delta.go).
-	navigated := deps.rw.RegisteredGVRs()
-	enrolled := cache.BuildBindingsByGVRIndex(navigated)
+	// ── (3) Give the BindingsByGVR index its navigated set: the GVRs registered
+	// now, after the re-walk discovered them (prewarmPassIndexStep).
+	navigated, bindings := prewarmPassIndexStep(deps.rw)
 	log.Info("prewarm.engine.boot.index_built",
 		slog.String("subsystem", "cache"),
-		slog.Int("navigated_gvrs", len(navigated)),
-		slog.Int("bindings_enrolled", enrolled),
+		slog.Int("navigated_gvrs", navigated),
+		slog.Int("bindings_enrolled", bindings),
 	)
 
 	// ── (4) SEED per cohort with PER-TARGET-GVR scoping.
@@ -676,9 +685,11 @@ func seedScopeYielding(ctx context.Context,
 	// function's scope — nothing references it once seedScopeYielding returns
 	// (C-F4-5 teardown: the next pass builds a fresh one). Keyed by the full
 	// RBAC identity so it is per-cohort correct (C-F4-4). Inert under
-	// Disabled(): WithSeedResolveMemo returns ctx unchanged (C-F4-9). copyFn =
-	// plumbing/maps.DeepCopyJSON (JSON-native round-trip on every hit, C-F4-3).
-	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	// Disabled(): WithSeedResolveMemo returns ctx unchanged (C-F4-9). It stores
+	// encoded bodies and decodes one per hit (#883 F4, C-F4-3), and the dep
+	// tracker drops its entries as their deps move for as long as the pass runs.
+	memo := cache.NewSeedResolveMemo()
+	defer cache.TrackDepMoves(memo)()
 	ctx = cache.WithSeedResolveMemo(ctx, memo)
 	defer func() {
 		h, m := memo.Stats()
@@ -732,7 +743,7 @@ func seedScopeYielding(ctx context.Context,
 		passBudgetMS = time.Until(dl).Milliseconds()
 	}
 	emitSeedAbort := func(phase string, cause error) {
-		log.Warn("prewarm.seed.abort",
+		log.WarnContext(ctx, "prewarm.seed.abort",
 			slog.String("subsystem", "cache"),
 			slog.String("phase", phase),
 			slog.Any("cause", cause),
@@ -768,14 +779,13 @@ func seedScopeYielding(ctx context.Context,
 	// back-compat grand total pipBindingSetSeedFailuresTotal is bumped for
 	// parity (= rbac_deny + operational).
 	failedSet := map[string]struct{}{}
-	classifyEngineSeedErr := func(kind, label string, target redact.Label, err error) {
+	classifyEngineSeedErr := func(kind, label string, err error) {
 		pipBindingSetSeedFailuresTotal.Add(1)
 		if classifySeedErr(err) == seedFailRBACDeny {
 			pipSeedRBACDenyTotal.Add(1)
 			slog.Info("prewarm.engine.seed.expected_deny",
 				slog.String("subsystem", "cache"),
 				slog.String("kind", kind),
-				slog.String("target", target.String()),
 				slog.String(kind, label),
 				slog.String("err", redact.Err(err)),
 			)
@@ -788,10 +798,9 @@ func seedScopeYielding(ctx context.Context,
 		// tail owns the re-enqueue (finalizeBootReEnqueue).
 		pipSeedOperationalFailTotal.Add(1)
 		failedSet[kind+"/"+label] = struct{}{}
-		slog.Warn("prewarm.engine.seed.operational_failure",
+		slog.WarnContext(ctx, "prewarm.engine.seed.operational_failure",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", kind),
-			slog.String("target", target.String()),
 			slog.String(kind, label),
 			slog.String("err", redact.Err(err)),
 			slog.String("effect", "operational seed failure (NOT an RBAC deny); recorded into the boot "+
@@ -846,7 +855,7 @@ func seedScopeYielding(ctx context.Context,
 			// up. WARN so the operator still sees the deterministic failer (the
 			// per-target operational_failure Warn also fired every pass) — this
 			// stops the re-walk AMPLIFICATION, not the visibility (design §5 reco).
-			log.Warn("prewarm.engine.boot.converged_with_skips",
+			log.WarnContext(ctx, "prewarm.engine.boot.converged_with_skips",
 				slog.String("subsystem", "cache"),
 				slog.Any("given_up_targets", givenUp),
 				slog.Int("passes", passes),
@@ -1065,7 +1074,6 @@ func seedScopeYielding(ctx context.Context,
 	// metric stays data-derived CollapsedBindings.
 	type rankedIdentity struct {
 		key       string
-		label     redact.Label // #453: the only form of the identity that is logged
 		widgetMax int
 		allMax    int
 	}
@@ -1074,7 +1082,6 @@ func seedScopeYielding(ctx context.Context,
 		k := identityKey(c)
 		ri := rankOf[k] // zero value {key:"", 0, 0} for a first observation
 		ri.key = k
-		ri.label = cohortLogLabel(c)
 		if c.CollapsedBindings > ri.allMax {
 			ri.allMax = c.CollapsedBindings
 		}
@@ -1121,7 +1128,6 @@ func seedScopeYielding(ctx context.Context,
 			log.Info("prewarm.engine.seed.rank",
 				slog.String("subsystem", "cache"),
 				slog.Int("rank", r),
-				slog.String("identity", ranked[r].label.String()),
 				slog.Int("widget_max", ranked[r].widgetMax),
 				slog.Int("all_max", ranked[r].allMax),
 			)
@@ -1184,7 +1190,7 @@ func seedScopeYielding(ctx context.Context,
 			// removed during the resolve). ONE inline re-seed in the SAME mode
 			// (so PutIfGen again, fresh capture). NOT via failedSet →
 			// finalizeBootReEnqueue: that redrives a BOOT (plain-Put) scope.
-			err = reseedAfterTerminalPutRefusal("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c),
+			err = reseedAfterTerminalPutRefusal("widget", e.W.GetNamespace()+"/"+e.W.GetName(),
 				func() error { return seedOneTarget(c, true, do) })
 		}
 		// #397: the FINAL error of this unit, after the #394 one-shot re-seed. A
@@ -1198,7 +1204,7 @@ func seedScopeYielding(ctx context.Context,
 			return true
 		}
 		if err != nil {
-			classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
+			classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), err)
 		}
 		targetsProcessed++
 		passStats.unitDone() // #643 PR-A — resolved or skipped, the unit is done
@@ -1212,13 +1218,13 @@ func seedScopeYielding(ctx context.Context,
 		}
 		engineYieldCheckpoint(ctx)
 		do := func(cohortCtx context.Context) error {
-			return seedOneRestactionFn(cohortCtx, cohortLogLabel(c), ref, authnNS, mode)
+			return seedOneRestactionFn(cohortCtx, ref, authnNS, mode)
 		}
 		err := seedOneTarget(c, false, do)
 		if errors.Is(err, errSeedTerminalPutRefused) && ctx.Err() == nil {
 			// #394 — one-shot same-mode re-seed of the refused unit; see
 			// seedWidgetTarget. Never routed through failedSet.
-			err = reseedAfterTerminalPutRefusal("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c),
+			err = reseedAfterTerminalPutRefusal("restaction", ref.Namespace+"/"+ref.Name,
 				func() error { return seedOneTarget(c, false, do) })
 		}
 		if err != nil && ctx.Err() != nil {
@@ -1226,7 +1232,7 @@ func seedScopeYielding(ctx context.Context,
 			return true
 		}
 		if err != nil {
-			classifyEngineSeedErr("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c), err)
+			classifyEngineSeedErr("restaction", ref.Namespace+"/"+ref.Name, err)
 		}
 		targetsProcessed++
 		passStats.unitDone() // #643 PR-A — resolved or skipped, the unit is done
@@ -1248,28 +1254,41 @@ func seedScopeYielding(ctx context.Context,
 	for _, rs := range restactionSeeds {
 		baseRAUnits += len(rs.targets)
 	}
+	// onLearnedNavUnit, when set, observes each learned nav unit processed (the
+	// pre-latch phase's readiness accounting, #841).
+	var onLearnedNavUnit func()
+	// Each learned unit's class key is computed ONCE here, not once per class
+	// that asks for its units: walking every seed's learned list per admitted
+	// class recomputed LearnedClassKey O(classes × units) times, 2.4% of all
+	// CPU and 9.1% of allocated objects on run 23. The index holds exactly the
+	// units, in exactly the order, that walk visited (learnedUnitsByClass).
+	// widgetSeeds / restactionSeeds are final here: sorted above, never
+	// written below.
+	learnedWidgets := make([][]seedTarget, len(widgetSeeds))
+	for i := range widgetSeeds {
+		learnedWidgets[i] = widgetSeeds[i].learned
+	}
+	learnedRAs := make([][]seedTarget, len(restactionSeeds))
+	for i := range restactionSeeds {
+		learnedRAs[i] = restactionSeeds[i].learned
+	}
+	learnedWidgetUnits := learnedUnitsByClass(learnedWidgets)
+	learnedRAUnits := learnedUnitsByClass(learnedRAs)
 	seedLearnedWidgetsFor := func(k string) bool {
-		for _, ws := range widgetSeeds {
-			for _, c := range ws.learned {
-				if learnedKey(c) != k {
-					continue
-				}
-				if seedWidgetTarget(ws.e, c) {
-					return true
-				}
+		for _, u := range learnedWidgetUnits[k] {
+			if seedWidgetTarget(widgetSeeds[u.seed].e, u.c) {
+				return true
+			}
+			if onLearnedNavUnit != nil {
+				onLearnedNavUnit()
 			}
 		}
 		return false
 	}
 	seedLearnedRAsFor := func(k string) bool {
-		for _, rs := range restactionSeeds {
-			for _, c := range rs.learned {
-				if learnedKey(c) != k {
-					continue
-				}
-				if seedRestactionTarget(rs.ref, c) {
-					return true
-				}
+		for _, u := range learnedRAUnits[k] {
+			if seedRestactionTarget(restactionSeeds[u.seed].ref, u.c) {
+				return true
 			}
 		}
 		return false
@@ -1428,7 +1447,7 @@ func seedScopeYielding(ctx context.Context,
 			}
 			log.Info("prewarm.keepwarm.cohort_summary",
 				slog.String("subsystem", "cache"),
-				slog.String("identity", ranked[ri].label.String()),
+				slog.Int("rank", ri),
 				slog.Int("widget_max", ranked[ri].widgetMax),
 				slog.Int64("reseeds", reseeds),
 				slog.Int64("age_skips", int64(ageSkips)),
@@ -1475,11 +1494,14 @@ func seedScopeYielding(ctx context.Context,
 		cohortRankIndex[ranked[r].key] = r
 	}
 	type seedUnit struct {
-		navOrder  int
-		rankIndex int
-		wsNSName  string
-		e         navWidgetEntry
-		target    seedTarget
+		// population — #841: the known requesters this unit's identity serves
+		// (seedTarget.Population). The flat order's primary key.
+		population int
+		navOrder   int
+		rankIndex  int
+		wsNSName   string
+		e          navWidgetEntry
+		target     seedTarget
 		// external — #594 cost class, carried from the widgetSeed so the flat
 		// unit order can key on it. THIS is the list the boot seed executes:
 		// it is rebuilt from widgetSeeds and RE-SORTED below, so a cost-class
@@ -1499,22 +1521,31 @@ func seedScopeYielding(ctx context.Context,
 				ri = len(ranked)
 			}
 			flat = append(flat, seedUnit{
-				navOrder:  ws.e.NavOrder,
-				rankIndex: ri,
-				wsNSName:  nsName,
-				e:         ws.e,
-				target:    c,
-				external:  ws.external,
+				population: c.Population,
+				navOrder:   ws.e.NavOrder,
+				rankIndex:  ri,
+				wsNSName:   nsName,
+				e:          ws.e,
+				target:     c,
+				external:   ws.external,
 			})
 		}
 	}
 	sort.SliceStable(flat, func(i, j int) bool {
-		// (0) #594 COST CLASS ASC — internal-backed units first, external-backed
-		// last. The pass below is cut by pipGlobalTimeout mid-list, so this key
-		// decides WHAT A CUT LOSES: units whose cell has no dep edges, can never
-		// publish and carries the bounded external TTL, instead of an arbitrary
-		// suffix of the walk. Ordering only; the set is unchanged, and the
-		// first-nav latch counts the same units in either order.
+		// (0) #841 POPULATION DESC — the class serving the most known requesters
+		// first, so a cut by the readiness backstop drops the least-populated
+		// classes. The same key orders the learned classes (newLearnedPlan) and
+		// the merge of the two below: the order is by who a class serves, never
+		// by where its identity came from.
+		if flat[i].population != flat[j].population {
+			return flat[i].population > flat[j].population
+		}
+		// (0′) #594 COST CLASS ASC within a population — internal-backed units
+		// first, external-backed last. The pass below is cut by pipGlobalTimeout
+		// mid-list, so this key decides WHAT A CUT LOSES: units whose cell has no
+		// dep edges, can never publish and carries the bounded external TTL,
+		// instead of an arbitrary suffix of the walk. Ordering only; the set is
+		// unchanged, and the first-nav latch counts the same units in either order.
 		if flat[i].external != flat[j].external {
 			return !flat[i].external
 		}
@@ -1550,51 +1581,124 @@ func seedScopeYielding(ctx context.Context,
 		}
 		bootNavProgressState.arm(navUnitsTotal, len(navCohorts), navExternal)
 	}
-	if navWidgetRemaining == 0 {
+	if navWidgetRemaining == 0 && len(lp.wUnits) == 0 {
 		// Provably-empty: no nav-widget units at all (all-tail topology, or the
 		// walk reached no widget). There is nothing to warm on the nav-widget
 		// path → fire so the latch never hangs to the PHASE1_TIMEOUT backstop.
+		// #841: a pass with learned nav units is NOT empty even when no
+		// representative is kept — the latch waits for the merged phase below
+		// (before #841 it fired here, ahead of every learned class).
 		fireFirstNav("zero-nav-widgets", 0, 0)
 	}
 
-	// Seed the flat list in NavOrder order. SAME primitive (seedWidgetTarget),
-	// SAME abort/yield semantics (return ctx.Err() on abort). Fire the latch the
-	// instant the LAST nav-widget unit is PROCESSED (remaining==0) — before the
-	// RA content tail runs, so readyz does not wait on the RA whale-fanout.
-	// PROCESSED, NOT SUCCEEDED (C2 liveness, unchanged): a per-target failure is
-	// classified+swallowed inside seedWidgetTarget, so the count still decrements
-	// — a permanently-failing widget must not hang /readyz to the backstop.
-	for i := range flat {
-		if seedWidgetTarget(flat[i].e, flat[i].target) {
-			if trackNav {
-				bootNavProgressState.cut()
-			}
-			return ctx.Err()
-		}
-		if trackNav {
-			bootNavProgressState.unitProcessed(lastWidgetSeedErr)
-		}
-		navWidgetRemaining--
+	// ── #841: ONE nav phase, ordered by POPULATION. ──
+	// The kept representatives' nav units (flat, above) and the admitted learned
+	// classes (#262) are merged by the population each serves: at every step the
+	// next base unit or the next learned class, whichever serves more known
+	// requesters (a tie goes to the base unit — it is in the latch's mandatory
+	// set). A learned class seeds its nav widgets whole, in NavOrder.
+	//
+	// THE LATCH waits for every nav widget × every identity seeded here: all of
+	// flat (PROCESSED, NOT SUCCEEDED — C2 liveness, unchanged: a per-target
+	// failure is classified+swallowed inside seedWidgetTarget, so a permanently-
+	// failing widget cannot hang /readyz) plus each learned class taken before it,
+	// whose units join the readiness accounting as it is taken. A latch released
+	// by the readiness BACKSTOP is a failed boot, so a learned class is taken only
+	// while its nav cost AND the base units still to come fit the time left
+	// (#442's per-class re-check, now also reserving the mandatory base units);
+	// once one does not fit, the remaining learned classes seed after the latch.
+	//
+	// THE PROBE: the admission is decided lazily, when a learned class's turn
+	// first comes (until then the merge compares against the top class by
+	// population, which no decision is needed to know), so it reads the costs and
+	// the store the base units before it measured. If no unit cost has been
+	// measured then, it admits the top class alone as the measuring probe (seeded
+	// without a cost check — that is the measurement); the decision is re-taken
+	// as soon as a cost is measured.
+	var (
+		navDecision  learnedDecision
+		decided      bool
+		backstopLeft time.Duration
+		hasBackstop  bool
+		li           int  // next index into navDecision.preLatch
+		learnedDone  bool // no further learned class before the latch
+	)
+	decideNav := func() {
+		backstopLeft, hasBackstop = latch.backstopRemaining()
+		navDecision = lp.decide(baseWidgetUnits, baseRAUnits, backstopLeft, hasBackstop)
+		decided, li = true, 0
 	}
-	// #262: the admitted learned classes' nav widgets, newest class first, whose
-	// nav units fit the time left before the readiness BACKSTOP seed BEFORE the
-	// latch fires (a learned user's first navigation is warm when the pod turns
-	// Ready). A latch released by the backstop is a failed boot, never worth one
-	// learned class: the admission is taken here (after the base nav units, so
-	// t_widget is measured) AND the time left is re-checked before EACH class
-	// (#442), so a slow tail moves the rest to after the latch. No learned class →
-	// the latch fires at the same instant as before.
-	backstopLeft, hasBackstop := latch.backstopRemaining()
-	navDecision := lp.decide(baseWidgetUnits, baseRAUnits, backstopLeft, hasBackstop)
 	seededPre := map[string]struct{}{}
 	var preOrder []string
-	for _, k := range navDecision.preLatch {
-		if hasBackstop {
-			tW, _, _, _, _ := seedUnitCosts()
-			if left, ok := latch.backstopRemaining(); !ok || left < lp.navCost(k, tW) {
-				break // #442: the rest seed after the latch
+	learnedNavUnits := 0
+	if trackNav {
+		onLearnedNavUnit = func() { bootNavProgressState.unitProcessed(lastWidgetSeedErr) }
+	}
+	// topLearned: the most-populated class with nav units, the merge's learned
+	// candidate before the admission is decided.
+	topLearned, haveTop := "", false
+	if len(lp.wUnits) > 0 {
+		for _, k := range newLearnedPlan(lp.wUnits, lp.rUnits, lp.pop, 0, 0).order {
+			if lp.wUnits[k] > 0 {
+				topLearned, haveTop = k, true
+				break
 			}
 		}
+	}
+	nextLearned := func() (string, bool) {
+		if learnedDone || !haveTop {
+			return "", false
+		}
+		if !decided {
+			return topLearned, true
+		}
+		for ; li < len(navDecision.preLatch); li++ {
+			if _, done := seededPre[navDecision.preLatch[li]]; !done {
+				return navDecision.preLatch[li], true
+			}
+		}
+		return "", false
+	}
+	bi := 0
+	for {
+		k, haveLearned := nextLearned()
+		if !haveLearned && bi >= len(flat) {
+			break
+		}
+		if !haveLearned || (bi < len(flat) && lp.pop[k] <= flat[bi].population) {
+			if seedWidgetTarget(flat[bi].e, flat[bi].target) {
+				if trackNav {
+					bootNavProgressState.cut()
+				}
+				return ctx.Err()
+			}
+			if trackNav {
+				bootNavProgressState.unitProcessed(lastWidgetSeedErr)
+			}
+			navWidgetRemaining--
+			bi++
+			continue
+		}
+		if !decided {
+			decideNav() // the first learned turn: decide on what was measured so far
+			continue
+		}
+		tW, _, _, _, measured := seedUnitCosts()
+		if navDecision.probe && measured {
+			decideNav() // a cost is known now: decide on it, not on the probe
+			continue
+		}
+		if hasBackstop && !navDecision.probe {
+			need := lp.navCost(k, tW) + time.Duration(len(flat)-bi)*tW
+			if left, ok := latch.backstopRemaining(); !ok || left < need {
+				learnedDone = true // #442: the rest seed after the latch
+				continue
+			}
+		}
+		if trackNav {
+			bootNavProgressState.addUnits(lp.wUnits[k])
+		}
+		learnedNavUnits += lp.wUnits[k]
 		if seedLearnedWidgetsFor(k) {
 			if trackNav {
 				bootNavProgressState.cut()
@@ -1603,10 +1707,18 @@ func seedScopeYielding(ctx context.Context,
 		}
 		seededPre[k] = struct{}{}
 		preOrder = append(preOrder, k)
+		if navDecision.probe {
+			decideNav()
+		}
 	}
+	onLearnedNavUnit = nil
 	noteLearnedPhase("prelatch", preOrder)
-	if navUnitsTotal > 0 && navWidgetRemaining == 0 {
-		fireFirstNav("segment-complete", distinctNavWidgets, navUnitsTotal)
+	if navWidgetRemaining == 0 && navUnitsTotal+learnedNavUnits > 0 {
+		fireFirstNav("segment-complete", distinctNavWidgets, navUnitsTotal+learnedNavUnits)
+	} else if navWidgetRemaining == 0 {
+		// Learned nav units existed but the bound admitted none before the
+		// latch: nothing on the nav path to wait for.
+		fireFirstNav("zero-nav-widgets", 0, 0)
 	}
 
 	// RA tail — RAs carry no NavOrder (they are the background content layer, not

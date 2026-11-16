@@ -64,7 +64,7 @@ func TestIssue229_Arm10_DelegationParityForNonOwnedShapes(t *testing.T) {
 	cases := []struct {
 		name string
 		ep   func(serverURL string) *endpoints.Endpoint
-		// ownedPredicate is what endpointNeedsOwnedCAClient must return for this
+		// ownedPredicate is what endpointOwnedShape must return for this
 		// shape. There are TWO delegation sites, reached differently: a shape the
 		// PREDICATE rejects delegates at endpoints_tls.go:84, while an OWNED shape
 		// whose CA is in an unrecognised encoding delegates deeper, at :95, after
@@ -79,7 +79,7 @@ func TestIssue229_Arm10_DelegationParityForNonOwnedShapes(t *testing.T) {
 			ep: func(u string) *endpoints.Endpoint {
 				return &endpoints.Endpoint{ServerURL: u, Token: saTestToken}
 			},
-			ownedPredicate: false,
+			ownedPredicate: true, // #1088: owned, system roots as plumbing
 		},
 		{
 			name: "cert-auth with a CA (the live clientconfig population)",
@@ -92,7 +92,10 @@ func TestIssue229_Arm10_DelegationParityForNonOwnedShapes(t *testing.T) {
 					ClientKeyData:            string(keyPEM),
 				}
 			},
-			ownedPredicate: false,
+			// #1088: owned shape; this fixture's cert data is raw PEM, which
+			// plumbing cannot base64-decode, so the owned branch delegates it
+			// (endpointTLSConfig) and both fail with plumbing's error.
+			ownedPredicate: true,
 		},
 		{
 			name: "insecure with a CA",
@@ -104,7 +107,7 @@ func TestIssue229_Arm10_DelegationParityForNonOwnedShapes(t *testing.T) {
 					Insecure:                 true,
 				}
 			},
-			ownedPredicate: false,
+			ownedPredicate: true, // #1088: owned, skip-verify as plumbing
 		},
 		{
 			name: "AWS auth with a CA (SigV4 unexported in plumbing)",
@@ -158,8 +161,8 @@ func TestIssue229_Arm10_DelegationParityForNonOwnedShapes(t *testing.T) {
 			// A case that drifted into the other branch would still satisfy the
 			// parity assertions below while no longer testing the site it was
 			// written for.
-			if got := endpointNeedsOwnedCAClient(tc.ep(srv.URL)); got != tc.ownedPredicate {
-				t.Fatalf("ARM10 FAIL [%s]: endpointNeedsOwnedCAClient = %v, want %v. Either the "+
+			if got := endpointOwnedShape(tc.ep(srv.URL)); got != tc.ownedPredicate {
+				t.Fatalf("ARM10 FAIL [%s]: endpointOwnedShape = %v, want %v. Either the "+
 					"routing predicate changed or this case is miscategorised — reconcile with "+
 					"ARM 7 before touching the assertions below", tc.name, got, tc.ownedPredicate)
 			}

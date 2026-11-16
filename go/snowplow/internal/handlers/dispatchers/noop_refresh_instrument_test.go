@@ -54,10 +54,12 @@ func drive(t *testing.T, inputs cache.ResolvedKeyInputs, produces []byte) {
 // ARM-1 — THE WIRING ARM. A refresher rebuild that reproduces the stored bytes
 // is counted as identical. RED without the call site in resolve_populate.go.
 func TestNoopInstrument_ARM1_IdenticalRebuildIsCountedAtTheRealCallSite(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	c := instrumentCacheOn(t)
 	inputs := instrumentInputs("arm1")
 	body := []byte(`{"items":[{"a":1}]}`)
-	c.Put(cache.ComputeKey(inputs), &cache.ResolvedEntry{RawJSON: body, Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, cache.ComputeKey(inputs), &cache.ResolvedEntry{RawJSON: body, Inputs: &inputs})
 
 	i0, ch0, _ := RefreshRebuildStats()
 	drive(t, inputs, body)
@@ -76,9 +78,11 @@ func TestNoopInstrument_ARM1_IdenticalRebuildIsCountedAtTheRealCallSite(t *testi
 
 // ARM-2 — a rebuild producing different bytes is counted as changed.
 func TestNoopInstrument_ARM2_ChangedRebuildIsCounted(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	c := instrumentCacheOn(t)
 	inputs := instrumentInputs("arm2")
-	c.Put(cache.ComputeKey(inputs), &cache.ResolvedEntry{
+	c.PutResolved(fixtureStoreVerdict, cache.ComputeKey(inputs), &cache.ResolvedEntry{
 		RawJSON: []byte(`{"items":[{"a":1}]}`), Inputs: &inputs})
 
 	i0, ch0, _ := RefreshRebuildStats()
@@ -149,6 +153,8 @@ func TestNoopInstrument_ARM4_ClassifierBoundaries(t *testing.T) {
 // decision to be explicit -- because an instrument that alters what it measures
 // cannot be used to decide #604.
 func TestNoopInstrument_ARM5_ObservationDoesNotSkipTheStore(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	c := instrumentCacheOn(t)
 	inputs := instrumentInputs("arm5")
 	key := cache.ComputeKey(inputs)
@@ -156,7 +162,7 @@ func TestNoopInstrument_ARM5_ObservationDoesNotSkipTheStore(t *testing.T) {
 
 	// A prior entry that is byte-identical to what the rebuild will produce,
 	// but distinguishable by a field the comparison does not look at.
-	c.Put(key, &cache.ResolvedEntry{RawJSON: body, Inputs: &inputs, Pinned: true})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: body, Inputs: &inputs, Pinned: true})
 
 	drive(t, inputs, body)
 

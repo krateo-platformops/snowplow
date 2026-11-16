@@ -33,6 +33,8 @@ import (
 )
 
 func TestIssue1126_C3_FU4b_ChunkedWalkReportsBatchesAndBoundedHolds(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store, rw := fu4Store(t)
 
 	wantBatches := (fu4Entries + reconcileFullBatch - 1) / reconcileFullBatch
@@ -118,7 +120,7 @@ func TestIssue1126_C3_FU2b_ReportCarriesSkippedNoEdge(t *testing.T) {
 	rw, dyn := realWatcher(t, gvr)
 	createObj(t, rw, dyn, gvr, "demo-system", "flex-z", "z")
 	// Put WITHOUT Record: no edge at all (the dropped_cap shape without the cap).
-	store.Put("L1_flex-z", &ResolvedEntry{RawJSON: []byte(`{"k":"z"}`), Inputs: widgetInputs(gvr, "demo-system", "flex-z")})
+	store.put("L1_flex-z", &ResolvedEntry{RawJSON: []byte(`{"k":"z"}`), Inputs: widgetInputs(gvr, "demo-system", "flex-z")})
 	fu2Strand(t, rw, dyn, gvr, store, []string{"flex-z"}, []string{"L1_flex-z"})
 
 	rep := reconcileOnce(store, rw, 512)
@@ -146,12 +148,14 @@ func fu4Store(t *testing.T) (*ResolvedCacheStore, *ResourceWatcher) {
 	unwatched := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "buttons"}
 	for i := 0; i < fu4Entries; i++ {
 		name := fmt.Sprintf("button-%d", i)
-		store.Put("L1_"+name, &ResolvedEntry{RawJSON: []byte(`{"i":1}`), Inputs: widgetInputs(unwatched, "demo-system", name)})
+		store.put("L1_"+name, &ResolvedEntry{RawJSON: []byte(`{"i":1}`), Inputs: widgetInputs(unwatched, "demo-system", name)})
 	}
 	return store, rw
 }
 
 func TestIssue1126_C3_FU4_FullWalkHoldsLockPerBatchNotAcrossResidency(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store, rw := fu4Store(t)
 	if _, alive := store.Get("L1_button-0"); !alive {
 		t.Fatalf("premise: entry not resident")
@@ -199,6 +203,8 @@ func TestIssue1126_C3_FU4_FullWalkHoldsLockPerBatchNotAcrossResidency(t *testing
 }
 
 func TestIssue1126_C3_FU4_ConcurrentGetNeverBlockedForTheWholeWalk(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	store, rw := fu4Store(t)
 	if _, alive := store.Get("L1_button-0"); !alive {
 		t.Fatalf("premise: entry not resident")

@@ -29,7 +29,7 @@ func TestCohortSeedContext_InheritsSeedResolveMemo(t *testing.T) {
 
 	// Mirror seedScopeYielding's install (top of the function).
 	base := cache.WithSeedResolveMemo(xcontext.BuildContext(t.Context()),
-		cache.NewSeedResolveMemo(nil))
+		cache.NewSeedResolveMemo())
 	if cache.SeedResolveMemoFromContext(base) == nil {
 		t.Fatal("premise broken: base ctx should carry the memo the pass installs")
 	}

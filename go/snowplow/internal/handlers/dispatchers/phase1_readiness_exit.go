@@ -337,6 +337,17 @@ func (p *bootNavProgress) arm(total, cohorts, external int) {
 	p.aborted = 0
 }
 
+// addUnits (#841) extends the armed pass by n nav units: the units of a learned
+// class the pass seeds before the latch, decided as the class is taken.
+func (p *bootNavProgress) addUnits(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.total += n
+	if n > 0 {
+		p.cohorts++
+	}
+}
+
 // unitProcessed counts one processed nav unit; err is the unit's seed error (nil
 // on success). Classification reuses classifySeedErr (the same verdict the
 // expected_deny / operational_failure log lines carry).
@@ -567,6 +578,7 @@ func recordPhase1ReadinessExitWith(classify func() (outcome, cause string), elap
 		case phase1ExitSeedReturned:
 			effect = "readiness released after a seed fn returned without the engine latch"
 		}
+		// log-ctx-waiver: boot: the end of phase 1, which precedes readiness
 		slog.Default().Log(context.Background(), level, "prewarm.phase1.readiness_exit",
 			slog.String("subsystem", "cache"),
 			slog.String("outcome", rec.Outcome),

@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -46,16 +45,21 @@ func List() http.HandlerFunc {
 
 		ep, err := xcontext.UserConfig(req.Context())
 		if err != nil {
-			log.Error("unable to get user endpoint", slog.Any("err", err))
+			log.ErrorContext(req.Context(), "unable to get user endpoint", slog.Any("err", err))
 			response.Unauthorized(wri, err)
 			return
 		}
 
 		log.Debug("user config succesfully loaded", endpointLogAttr(&ep)) // #453: never the struct
 
-		rc, err := credhttp.NewClientConfig(req.Context(), ep)
+		// #1334 — cache.ClientConfigFor, not credhttp.NewClientConfig: for a
+		// caller whose only credential is an impersonating config (the public
+		// identity) that config, so the apiserver decides as that identity. A
+		// live authenticated request carries none and gets its clientconfig,
+		// exactly as before.
+		rc, err := cache.ClientConfigFor(req.Context(), ep)
 		if err != nil {
-			log.Error("unable to create user client config", slog.Any("err", err))
+			log.ErrorContext(req.Context(), "unable to create user client config", slog.Any("err", err))
 			response.InternalError(wri, err)
 			return
 		}
@@ -64,17 +68,26 @@ func List() http.HandlerFunc {
 		// client + Discover + per-GVR ListObjects; the cache-gate
 		// stub at dynamic/list.go:19-33 today falls through to
 		// apiserver. Record BEFORE client build (AC-D.3 ordering).
-		cache.RecordApiserverFallthrough(req.Context(), cache.ReasonClientBuild, "")
-		cli, err := dynamic.NewClient(rc)
+		// #988 — the per-GVR LISTs below are sent with the returned ctx, so
+		// they are labelled with this reason on snowplow_resolve_collection_lists.
+		lctx := cache.RecordApiserverFallthrough(req.Context(), cache.ReasonClientBuild, "")
+		// #1115 — this request's client: its discovery runs on client-go's own
+		// context.TODO(), so the page budget is bound to the client.
+		cli, err := dynamic.NewClient(credhttp.BindRequestBudget(req.Context(), rc))
 		if err != nil {
-			log.Error("cannot create dynamic client", slog.Any("err", err))
+			log.ErrorContext(lctx, "cannot create dynamic client", slog.Any("err", err))
 			response.InternalError(wri, err)
 			return
 		}
 
 		log.Debug("performing discovery", slog.String("category", cat))
-		res, err := cli.Discover(context.Background(), cat)
+		// #1115 — the request's ctx: the discovery reads carry its page budget.
+		res, err := cli.Discover(req.Context(), cat)
 		if err != nil {
+			if credhttp.WriteBudgetError(wri, err) {
+				log.WarnContext(lctx, "discovery ended by the page budget", slog.String("category", cat))
+				return
+			}
 			// #517 — A PARTIAL DISCOVERY IS DEGRADED, NOT FATAL. One stale
 			// aggregated APIService must not break /list for every category:
 			// Discover hands back the healthy groups' resources next to a
@@ -84,14 +97,14 @@ func List() http.HandlerFunc {
 			// whole point of discriminating.
 			pd, partial := dynamic.AsPartialDiscovery(err)
 			if !partial {
-				log.Error("discovery failed", slog.Any("err", err))
+				log.ErrorContext(lctx, "discovery failed", slog.Any("err", err))
 				response.InternalError(wri, err)
 				return
 			}
 			// WARN, because some group/versions genuinely failed: the names are
 			// the actionable datum (they identify the stale APIService), and the
 			// response below is a SHORTER list than the cluster really has.
-			log.Warn("discovery is DEGRADED: serving the healthy API groups only",
+			log.WarnContext(lctx, "discovery is DEGRADED: serving the healthy API groups only",
 				slog.String("category", cat),
 				slog.Any("failedGroups", pd.FailedGroupVersions()),
 				slog.String("cause", pd.Error()))
@@ -106,10 +119,15 @@ func List() http.HandlerFunc {
 				GVR:       gvr,
 			}
 
-			obj, err := dynamic.ListObjects(req.Context(), cli, opts)
+			obj, err := dynamic.ListObjects(lctx, cli, opts)
 			if err != nil {
-				log.Error("cannot list resources",
+				log.ErrorContext(lctx, "cannot list resources",
 					slog.String("gvr", gvr.String()), slog.Any("err", err))
+				// #1115 — the page budget ran out: a clear 504, never a list
+				// silently missing the GVRs it could not read.
+				if credhttp.WriteBudgetError(wri, err) {
+					return
+				}
 				if apierrors.IsForbidden(err) {
 					response.Forbidden(wri, err)
 					return

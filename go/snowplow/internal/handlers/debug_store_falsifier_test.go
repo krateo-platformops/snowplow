@@ -156,7 +156,7 @@ func seedStoreArm(t *testing.T, storeRV string) {
 		t.Fatalf("ResolvedCache() nil — RESOLVED_CACHE_ENABLED not honoured")
 	}
 	cache.Deps().SetStore(store)
-	store.Put(storeArmL1Key, &cache.ResolvedEntry{
+	store.PutResolved(fixtureStoreVerdict, storeArmL1Key, &cache.ResolvedEntry{
 		RawJSON: []byte(storeArmL1Body),
 		Inputs: &cache.ResolvedKeyInputs{
 			CacheEntryClass: cache.CacheEntryClassWidgetContent,

@@ -54,6 +54,8 @@ func TestRangeMetadata_StructurallyCannotLeakContent(t *testing.T) {
 // populated entry's body never reaches the emitted metadata, and the
 // metadata coordinates are correct.
 func TestRangeMetadata_BehaviorallyEmitsNoBody(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 
 	const sentinel = "SECRET-DO-NOT-LEAK-7f3a9"
@@ -77,7 +79,7 @@ func TestRangeMetadata_BehaviorallyEmitsNoBody(t *testing.T) {
 			Extras:          map[string]any{"compositionId": sentinel},
 		},
 	}
-	c.Put("opaque-key-1", entry)
+	c.put("opaque-key-1", entry)
 
 	var got []ResolvedEntryMeta
 	c.RangeMetadata(func(m ResolvedEntryMeta) bool {
@@ -125,13 +127,15 @@ func TestRangeMetadata_BehaviorallyEmitsNoBody(t *testing.T) {
 // to spot a stale entry (the R1 verification signal: after a composition
 // update the entry's age resets).
 func TestRangeMetadata_AgeAndTTL(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	old := &ResolvedEntry{
 		RawJSON:   []byte(`{}`),
 		CreatedAt: time.Now().Add(-10 * time.Minute),
 		Inputs:    &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage, Version: "v1", Resource: "configmaps"},
 	}
-	c.Put("k-old", old)
+	c.put("k-old", old)
 
 	var m ResolvedEntryMeta
 	c.RangeMetadata(func(x ResolvedEntryMeta) bool { m = x; return false })

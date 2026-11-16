@@ -223,16 +223,23 @@ func (g *contentFillGate) expansionLocked(gvr string) float64 {
 // calibrateLocked folds one measured expansion sample. Caller holds g.mu.
 func (g *contentFillGate) calibrateLocked(gvr string, sample float64) {
 	if sample <= 0 {
+		contentFillCalibrationSamples[calibIgnored].Add(1) // #787
 		return
 	}
 	sample = min(max(sample, 1), contentFillExpansionMax)
 	cur, measured := g.expansion[gvr]
 	switch {
-	case !measured, sample >= cur:
-		// The first measurement replaces the seed; a larger one is taken at once.
+	case !measured:
+		// The first measurement replaces the seed.
 		g.expansion[gvr] = sample
+		contentFillCalibrationSamples[calibSeeded].Add(1)
+	case sample >= cur:
+		// A larger one is taken at once.
+		g.expansion[gvr] = sample
+		contentFillCalibrationSamples[calibRaised].Add(1)
 	default:
 		g.expansion[gvr] = cur + contentFillExpansionDecay*(sample-cur)
+		contentFillCalibrationSamples[calibDecayed].Add(1)
 	}
 }
 
@@ -240,8 +247,10 @@ func (g *contentFillGate) calibrateLocked(gvr string, sample float64) {
 // dispatch. resident is the key's current cell (nil when absent); partition is
 // the informer partition's item count (ok=false when unknown).
 func predictContentFillRaw(gvr string, resident *cache.ResolvedEntry, partitionItems int, partitionOK bool) int64 {
-	if resident != nil && len(resident.RawJSON) > 0 {
-		return int64(len(resident.RawJSON))
+	// #854 — RawLen: an incremental list cell stores no RawJSON; its exact
+	// envelope length is maintained without building it.
+	if n := resident.RawLen(); n > 0 {
+		return int64(n)
 	}
 	g := theContentFillGate()
 	g.mu.Lock()
@@ -497,6 +506,24 @@ func contentFillCalibrationSnapshot() (expansion, predictRatio map[string]float6
 }
 
 // --- test seams ---------------------------------------------------------------
+
+// CalibrateContentFillExpansionForTest folds one expansion sample for gvr,
+// exactly as a released fill does. Cross-package test seam (#787: the metrics
+// package's OTLP export arm); production MUST NOT use it.
+func CalibrateContentFillExpansionForTest(gvr string, sample float64) {
+	g := theContentFillGate()
+	g.mu.Lock()
+	g.calibrateLocked(gvr, sample)
+	g.mu.Unlock()
+}
+
+// ResetContentFillGateForTest drops the gate and its calibration, and zeroes
+// the content-fill stats. Cross-package test seam (#787); production MUST NOT
+// use it.
+func ResetContentFillGateForTest() {
+	resetContentFillGateForTest()
+	ResetContentFillStatsForTest()
+}
 
 // resetContentFillGateForTest drops the gate and its calibration. Test-only.
 func resetContentFillGateForTest() {

@@ -125,7 +125,8 @@ func s436BuildWatcher(t *testing.T) (*dynamicfake.FakeDynamicClient, *cache.Reso
 	cache.RebuildRBACSnapshotForTest(rw)
 	prev := cache.Global()
 	cache.SetGlobal(rw)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1WidgetGVR, h1RAGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1WidgetGVR, h1RAGVR})
+	knowEveryRepresentative(t, h1WidgetGVR, h1RAGVR) // #841: a known requester per representative
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	t.Cleanup(func() {
 		rw.Stop()
@@ -144,7 +145,7 @@ func TestS436_SysAuthBindingChange_ReseedsEveryCohort(t *testing.T) {
 
 	navHarv := newNavWidgetHarvester()
 	e := reseedWidgetEntry()
-	navHarv.harvestNavWidget(e.W, e.GVR, e.PerPage, e.Page, e.KeyPerPage, e.KeyPage)
+	navHarv.harvestNavWidget(e.W, e.GVR, e.Pagination)
 	deps := rePrewarmDeps{harvester: newContentPrewarmHarvester(), navHarv: navHarv, authnNS: h1NS}
 
 	// THE CHANGE: a binding whose subject is system:authenticated.

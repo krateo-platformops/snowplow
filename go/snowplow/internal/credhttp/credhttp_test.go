@@ -151,6 +151,18 @@ func TestIssue723_724_EveryConstructorRefusesRedirects(t *testing.T) {
 			}
 			return c.Get().Namespace("n").Resource("configmaps").Name("x").Do(ctx).Error()
 		},
+		// #920: plumbing's FromSecret builds its own REST client; credhttp
+		// hands it a hardened copy, so the redirect is refused there too.
+		"FromSecret": func(rc *rest.Config) error {
+			_, err := FromSecret(ctx, rc, "x", "n")
+			return err
+		},
+		// #1382: GetSecret reads the requester's credential Secret whole, over
+		// the same hardened client.
+		"GetSecret": func(rc *rest.Config) error {
+			_, err := GetSecret(ctx, rc, "x", "n")
+			return err
+		},
 		"HTTPClientFor": func(rc *rest.Config) error {
 			c, err := HTTPClientFor(rc)
 			if err != nil {

@@ -11,8 +11,12 @@
 //
 // WHY THAT MIGHT BE THE BULK OF THE ROTATION. The informers run resyncPeriod=0
 // (watcher.go), so there is no periodic resync — but a watch RE-ESTABLISHMENT
-// produces a DeltaFIFO Replace, whose Sync deltas the shared informer dispatches
-// as OnUpdate with old and new being the SAME object. One relist therefore
+// that relists produces a Replace (one atomic ReplacedAll at client-go v0.36.5,
+// controller.go processReplacedAllInfo), which the shared informer dispatches
+// as OnUpdate for every key it still holds, old and new at the SAME
+// resourceVersion. With resyncPeriod=0 every listener stays a syncing one
+// (shared_informer.go:1058; shouldResync never runs), so those same-RV updates
+// reach snowplow's handlers. One relist therefore
 // delivers one no-op UPDATE per binding. Against a few hundred bindings and
 // genuine binding creations running at tens per day, relist fan-out is the
 // candidate explanation for a rotation rate three orders of magnitude above the

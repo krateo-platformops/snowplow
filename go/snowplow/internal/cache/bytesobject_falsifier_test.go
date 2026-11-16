@@ -23,6 +23,7 @@
 package cache
 
 import (
+	"context"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -127,7 +128,7 @@ func TestFalsifier_AllFiveCastSites_NoSilentDrop(t *testing.T) {
 	t.Run("GetObject", func(t *testing.T) {
 		got := 0
 		for _, name := range names {
-			uns, ok := rw.GetObject(gvr, ns, name)
+			uns, ok := rw.GetObject(context.Background(), gvr, ns, name)
 			if !ok || uns == nil {
 				t.Errorf("GetObject(%s) silently dropped the bytesObject", name)
 				continue
@@ -157,7 +158,7 @@ func TestFalsifier_AllFiveCastSites_NoSilentDrop(t *testing.T) {
 
 	// --- cast site 2/5 (shared): ListObjectsServable -> listFromIndexer ---
 	t.Run("ListObjectsServable", func(t *testing.T) {
-		out, served := rw.ListObjectsServable(gvr, ns)
+		out, served := rw.ListObjectsServable(context.Background(), gvr, ns)
 		if !served {
 			t.Fatal("ListObjectsServable not served — informer not vouched")
 		}
@@ -247,7 +248,7 @@ func TestFalsifier_CastSites_MixedStore(t *testing.T) {
 	if out := rw.ListTypedObjects(gvr, ns); len(out) != total {
 		t.Fatalf("ListTypedObjects mixed store: %d/%d", len(out), total)
 	}
-	if out, served := rw.ListObjectsServable(gvr, ns); !served || len(out) != total {
+	if out, served := rw.ListObjectsServable(context.Background(), gvr, ns); !served || len(out) != total {
 		t.Fatalf("ListObjectsServable mixed store: served=%v len=%d/%d", served, len(out), total)
 	}
 }

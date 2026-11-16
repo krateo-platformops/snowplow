@@ -199,7 +199,8 @@ var closedAttributeKeys = map[string]struct{}{
 	"state": {}, "stat": {}, "check": {}, "version": {}, "health": {},
 	"policy": {}, "family": {},
 	// #239 dirty-mark attribution — both bounded enums: cause is the ~7
-	// object/type causes, source is {watch, relist_bridge, reconcile}.
+	// object/type causes, source is {watch, store_swap, reconcile} (#870
+	// replaced relist_bridge with store_swap).
 	"cause": {}, "source": {},
 	// #408 moved-remark carrier — a 2-value enum {boot, guarded}.
 	"carrier": {},
@@ -208,6 +209,10 @@ var closedAttributeKeys = map[string]struct{}{
 	// pinned to their producers by metrics_448_security_otlp_test.go and
 	// dispatchers' identity_class_drift_closed_sets_test.go.
 	"site": {}, "bound": {},
+	// #847 — the egress connection counters: egress and protocol are the closed
+	// credhttp.Egresses and ConnProtocols, pinned by credhttp's
+	// TestConnections847_LabelSetIsClosed.
+	"egress": {}, "protocol": {},
 	// #643 background-pass detectors: kind is the closed prewarm scope-kind
 	// enum {boot, gvr-discovered, keepwarm, rbac-shift, learned-class}, pinned
 	// by metrics_643_prewarm_pass_otlp_test.go; origin is {background, request}
@@ -222,6 +227,31 @@ var closedAttributeKeys = map[string]struct{}{
 	// cache.KnownStaleRevalidationSlots set {background, demand}, pinned by
 	// issue740_known_stale_rerun_otlp_test.go.
 	"slot": {},
+	// #870 — close on the push-ledger instruments
+	// (snowplow_store_swap_ledger_closes_total, _detect_to_push_ms,
+	// _install_to_push_ms): the closed cache.StoreSwapCloses set {pushed,
+	// pushed_on_arm, pushed_resync, known_stale, evicted, live_event}, pinned
+	// with reason/outcome by store_swap_otlp_870_test.go
+	// (TestStoreSwap870_LabelValuesAreClosedSets).
+	"close": {},
+	// #1070 — tier and content on the refresh-cycle instruments
+	// (snowplow_refresh_cycle_put_total, _wait_ms, _duration_ms,
+	// snowplow_refresh_broadcaster_put_to_frame_ms): tier is the closed
+	// cache.RefreshCycleTiers set {viewed, normal, cluster_list, direct},
+	// content the closed cache.RefreshPutContents set {identical, changed};
+	// pinned by refresh_cycle_otlp_1070_test.go
+	// (TestRefreshCycle1070_LabelValuesAreClosedSets).
+	"tier": {}, "content": {},
+	// #1062 — layer on the stale-push instruments (snowplow_stale_to_push_ms,
+	// _stale_unreplaced_total, _stale_serves_total, _stale_serves_open,
+	// _stale_serve_closes_total): the closed cache.StaleLayers set {apistage,
+	// l1}, with close from cache.StalePushCloses {pushed, dropped, identical}; pinned by
+	// stale_push_1062_otlp_test.go.
+	"layer": {},
+	// #1265 — handler and class_warm on snowplow_customer_serves_total (with
+	// outcome; cause on _cold_total): handler is {restactions, widgets},
+	// class_warm {none} until P3; pinned by customer_serves_otlp_1265_test.go.
+	"handler": {}, "class_warm": {},
 }
 
 // neverAnAttribute lists the three expvar keys whose VALUES carry

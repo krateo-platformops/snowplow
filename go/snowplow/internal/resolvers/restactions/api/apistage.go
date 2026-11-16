@@ -39,6 +39,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/pprof"
+	"sync/atomic"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -46,6 +47,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -101,13 +103,16 @@ func contentKeyInputsQ(gvr schema.GroupVersionResource, namespace, name, query s
 // gating the stored raw envelope yields byte-identical narrowing to a
 // fresh inline-gated dispatch (AC-F1.2).
 //
-// Returns (gatedEnvelope, served):
-//   - served==false — fail-closed: no identity on ctx, or a GET denied.
-//     The caller treats this exactly as dispatchViaInformer's
-//     served=false — fall through to the apiserver branch, whose
-//     per-user token narrows correctly.
-//   - served==true  — gatedEnvelope is the RBAC-narrowed bytes to feed
-//     the stage's ResponseHandler.
+// Returns (gatedEnvelope, err):
+//   - err == nil — gatedEnvelope is the RBAC-narrowed envelope to feed the
+//     stage's ResponseHandler.
+//   - err is a *regateDeniedError — a LIST the requester may not make
+//     (#961): the caller records it as a per-identity Forbidden, the answer
+//     the apiserver gives the same request.
+//   - err == errGateFallthrough — fail-closed: no identity on ctx, a GET
+//     denied, an evaluator error. The caller treats this exactly
+//     as dispatchViaInformer's served=false — fall through to the apiserver
+//     branch, whose per-user token narrows correctly.
 func gateContentEnvelope(
 	ctx context.Context,
 	call interface {
@@ -116,8 +121,8 @@ func gateContentEnvelope(
 	},
 	raw []byte,
 	uafActive bool,
-) (any, bool) {
-	gvr, _, name, parseOK := cache.ParseAPIServerPathToDep(call.GetPath())
+) (any, error) {
+	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.GetPath())
 	if !parseOK {
 		// Not an apiserver GVR path — the content layer never produced
 		// this; pass the bytes through un-gated (defensive — the caller
@@ -126,9 +131,9 @@ func gateContentEnvelope(
 		// P-CORE-2).
 		var v any
 		if err := json.Unmarshal(raw, &v); err != nil {
-			return nil, false
+			return nil, errGateFallthrough
 		}
-		return v, true
+		return v, nil
 	}
 	// SECURITY (#58, UAF-AWARE — symmetric with the pre-parsed-LIST branch):
 	// a UAF step is served UN-narrowed here; the per-user narrowing is the
@@ -140,16 +145,21 @@ func gateContentEnvelope(
 	if uafActive {
 		var v any
 		if err := json.Unmarshal(raw, &v); err != nil {
-			return nil, false
+			return nil, errGateFallthrough
 		}
-		return v, true
+		return v, nil
 	}
 	if name == "" {
 		// LIST envelope: {apiVersion, kind, items:[...]}.
-		return gateListEnvelope(ctx, gvr, raw)
+		_, rawQuery, _ := splitPathQuery(call.GetPath())
+		return gateListEnvelope(ctx, gvr, ns, rawQuery, raw)
 	}
 	// GET-by-name: raw is a single object.
-	return gateGetEnvelope(ctx, gvr, raw)
+	v, ok := gateGetEnvelope(ctx, gvr, raw)
+	if !ok {
+		return nil, errGateFallthrough
+	}
+	return v, nil
 }
 
 // parsedListEnvelope is the Ship 0.30.121 R3 pre-parsed form of a LIST
@@ -163,13 +173,28 @@ type parsedListEnvelope struct {
 	kind       string
 }
 
+// parseListEnvelopeHookForTest observes every envelope parse. TEST-ONLY (nil
+// in production, one atomic load per parse): the #882 herd arm counts parses
+// through a seam it owns, never through snowplow's own fill metrics.
+var parseListEnvelopeHookForTest atomic.Pointer[func(schema.GroupVersionResource)]
+
 // parseListEnvelope decodes a raw LIST envelope ONCE — Ship 0.30.121 R3.
 // Called at the content-entry Put site so the parsed items can be stored
 // on the ResolvedEntry; the content-gate then runs filterListByRBAC over
 // the stored items and skips re-unmarshalling on every hit. Returns ok=false
 // on a malformed envelope (the caller stores RawJSON only — the gate then
 // falls back to the unmarshal path, byte-identical to pre-0.30.121).
+// parseListEnvelopeTimed is parseListEnvelope timed as the request's parse
+// phase (#1054).
+func parseListEnvelopeTimed(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) (parsedListEnvelope, bool) {
+	defer slowcall.Start(ctx, slowcall.PhaseParse).End()
+	return parseListEnvelope(gvr, raw)
+}
+
 func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListEnvelope, bool) {
+	if h := parseListEnvelopeHookForTest.Load(); h != nil {
+		(*h)(gvr) // TEST-ONLY: the #882 herd arm's own parse seam
+	}
 	var envelope struct {
 		APIVersion string           `json:"apiVersion"`
 		Kind       string           `json:"kind"`
@@ -215,6 +240,37 @@ func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListE
 // snowplow has always stripped it before serving. Pre-Ship-2a the strip
 // happened per-serve on a private deep copy (removeManagedFields(dict));
 // Ship 2a moves it to load-time so the shared items are stripped once.
+// decodeListItem decodes ONE list item exactly as parseListEnvelope decodes an
+// element of the envelope: encoding/json into map[string]any (every number a
+// float64), then stripManagedFields. #854: the incremental list cell decodes a
+// changed object with this function, so its items are the full path's items.
+func decodeListItem(raw []byte) (*unstructured.Unstructured, error) {
+	var it map[string]any
+	if err := json.Unmarshal(raw, &it); err != nil {
+		return nil, err
+	}
+	stripManagedFields(it)
+	return &unstructured.Unstructured{Object: it}, nil
+}
+
+// listCellFuncs hands the incremental list cell the full fill's own functions
+// for this stage: the per-item decoder, the query predicate and the envelope
+// writer over the dispatch's apiVersion and list kind (#854).
+func listCellFuncs(gvr schema.GroupVersionResource, q listQuery) cache.ListCellFuncs {
+	apiVersion := gvr.Version
+	if gvr.Group != "" {
+		apiVersion = gvr.Group + "/" + gvr.Version
+	}
+	listKind := listKindForResource(gvr.Resource)
+	return cache.ListCellFuncs{
+		Decode: decodeListItem,
+		Match:  q.matchRaw,
+		Marshal: func(raws [][]byte) ([]byte, error) {
+			return marshalAsListRaw(apiVersion, listKind, raws)
+		},
+	}
+}
+
 func stripManagedFields(obj map[string]any) {
 	if obj == nil {
 		return
@@ -238,14 +294,18 @@ func stripManagedFields(obj map[string]any) {
 // envelope map is built exactly as marshalAsList builds it
 // (apiVersion/kind/items), so the eventual served body is byte-identical
 // (AC-128.4) — only the decode timing moves.
-func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, parsed parsedListEnvelope) (any, bool) {
-	kept, identityOK := filterListByRBAC(ctx, gvr, parsed.items)
-	if !identityOK {
-		// FAIL-CLOSED: no identity — same contract as the inline gate's
-		// served=false (caller falls through to the apiserver).
-		return nil, false
+//
+// namespace is the LIST's own namespace ("" = cluster-wide) and rawQuery its
+// own query string (#1049: a metadata.name field selector carries a Name). A
+// non-nil error is filterListByRBAC's: a *regateDeniedError (the requester may
+// not make this LIST, #961) or errGateFallthrough (not decided here — the
+// caller falls through to the apiserver).
+func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, namespace, rawQuery string, parsed parsedListEnvelope) (any, error) {
+	kept, err := filterListByRBAC(ctx, gvr, namespace, rawQuery, parsed.items)
+	if err != nil {
+		return nil, err
 	}
-	return listEnvelopeValue(parsed.apiVersion, parsed.kind, kept), true
+	return listEnvelopeValue(parsed.apiVersion, parsed.kind, kept), nil
 }
 
 // listEnvelopeValue assembles the apiserver-shaped LIST envelope as a
@@ -301,13 +361,13 @@ func listEnvelopeValue(apiVersion, listKind string, items []*unstructured.Unstru
 // envelope, or a refresh path that stored RawJSON only). The hot path
 // (a content-Get-hit on an entry with Items) goes through gateListItems
 // and never reaches here. Output is byte-identical between the two.
-func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) (any, bool) {
-	parsed, ok := parseListEnvelope(gvr, raw)
+func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, namespace, rawQuery string, raw []byte) (any, error) {
+	parsed, ok := parseListEnvelopeTimed(ctx, gvr, raw)
 	if !ok {
 		// A malformed stored envelope cannot be vouched for — fail closed.
-		return nil, false
+		return nil, errGateFallthrough
 	}
-	return gateListItems(ctx, gvr, parsed)
+	return gateListItems(ctx, gvr, namespace, rawQuery, parsed)
 }
 
 // gateGetEnvelope runs filterGetByRBAC on a single-object envelope.
@@ -454,11 +514,16 @@ func (c callPathVerb) GetVerb() string {
 // namespace-source differ), so applying raw RBAC to a UAF step would wrongly
 // strip the UAF-intended scope (the Diego/arch UAF verdict).
 //
-// #710 PR-2a — err is non-nil only when the call's content fill could not be
+// #710 PR-2a — err is non-nil when the call's content fill could not be
 // admitted under the memory ceiling before its deadline
 // (ErrContentFillAdmissionTimeout, D1): the caller records a stage error. It
 // must NOT fall through to another dispatch branch, which would rebuild the
 // whole list the gate refused.
+//
+// #961 — err is also non-nil (a *regateDeniedError, isRegateDenied) when the
+// serve-time gate finds the requester may not make this LIST at all: the caller
+// records it as the per-identity Forbidden the apiserver answers the same
+// request with, exactly as it records the apiserver's own 403.
 //
 // A JOINER of a flight that was never admitted, whose own ctx is still alive,
 // does not inherit that failure — someone else's deadline produced it. It makes
@@ -469,17 +534,24 @@ func apistageContentServe(
 	store *cache.ResolvedCacheStore,
 	call httpcall.RequestOptions,
 	uafActive bool,
-) (value any, served bool, ok bool, err error) {
-	value, served, ok, err = apistageContentServeAttempt(ctx, store, call, uafActive, true)
-	if errors.Is(err, errInheritedAdmissionTimeout) {
-		value, served, ok, err = apistageContentServeAttempt(ctx, store, call, uafActive, false)
+) (value any, served bool, ok bool, fallCtx context.Context, err error) {
+	value, served, ok, fallCtx, err = apistageContentServeAttempt(ctx, store, call, uafActive, true)
+	if errors.Is(err, errInheritedAdmissionTimeout) || errors.Is(err, errJoinedMovedFlight) {
+		value, served, ok, fallCtx, err = apistageContentServeAttempt(ctx, store, call, uafActive, false)
 	}
-	return value, served, ok, err
+	return value, served, ok, fallCtx, err
 }
 
 // errInheritedAdmissionTimeout is a joiner's signal to retry (never returned
 // from apistageContentServe).
 var errInheritedAdmissionTimeout = errors.New("apistage content fill: joined flight was not admitted")
+
+// errJoinedMovedFlight (#882 F2) is the signal of a joiner whose list moved
+// after the flight began and whose flight ended without an incremental cell to
+// bring up to its own seq: the flight's body may predate an edit it must see,
+// so it makes one more attempt under the epoch rule (never returned from
+// apistageContentServe).
+var errJoinedMovedFlight = errors.New("apistage content fill: joined a moved list and the flight anchored no cell")
 
 // apistageContentServeAttempt is one attempt of apistageContentServe.
 // mayRetry lets a joiner of a never-admitted flight ask for a second attempt.
@@ -489,7 +561,7 @@ func apistageContentServeAttempt(
 	call httpcall.RequestOptions,
 	uafActive bool,
 	mayRetry bool,
-) (value any, served bool, ok bool, err error) {
+) (value any, served bool, ok bool, fallCtx context.Context, err error) {
 	log := xcontext.Logger(ctx)
 
 	// Ship 0.30.193 Checkpoint 3 — per-call apistageContentServe
@@ -516,12 +588,12 @@ func apistageContentServeAttempt(
 	// Content-keyed entries describe apiserver GET/LIST calls only — the
 	// same shape dispatchViaInformer can serve. A write verb or a
 	// non-apiserver path is not a content unit.
-	if ptr.Deref(call.Verb, http.MethodGet) != http.MethodGet {
-		return nil, false, false, nil
+	if !isPlainGet(call.Verb) { // #1011: the one read-optimisation verb predicate
+		return nil, false, false, ctx, nil
 	}
 	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path)
 	if !parseOK {
-		return nil, false, false, nil
+		return nil, false, false, ctx, nil
 	}
 	isList := name == ""
 	// #618 — classify the query BEFORE any cell is read or written. A query
@@ -532,8 +604,7 @@ func apistageContentServeAttempt(
 	query := planListQuery(call.Path, isList, ns != "")
 	if !query.applicable {
 		recordListQuery(query)
-		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerListQuery, gvr.String())
-		return nil, false, false, nil
+		return nil, false, false, cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerListQuery, gvr.String()), nil
 	}
 	contentKey := cache.ComputeKey(contentKeyInputsQ(gvr, ns, name, query.canon))
 
@@ -574,11 +645,19 @@ func apistageContentServeAttempt(
 	// GVR that marked or remarked the key before this dequeue), not equality with a
 	// single last-write GVR.
 	_, refresherDriven := cache.RefreshTriggerGVRFromContext(ctx)
-	forceContentMiss := refresherDriven && cache.RefreshTriggerHas(ctx, gvr)
 	// #710 PR-2b — a debt's refill always re-dispatches (it exists because the
 	// cell is known-stale).
-	if contentDebtRefillFromContext(ctx) {
-		forceContentMiss = true
+	forceContentMiss := contentDebtRefillFromContext(ctx)
+	// #765 option A — the content stamp. A refresher re-resolve whose trigger set
+	// holds this cell's GVR no longer discards the cell unconditionally: it re-fills
+	// only when the cell's read may be OLDER than a trigger it consumed
+	// (cache.ContentStampCovers against cache.RefreshTriggerAsOf), and otherwise
+	// reuses it. N dependents refreshed after one change share one re-fill. The R1
+	// shield's guarantee — a refreshed cell is never built from a snapshot older
+	// than the change that triggered it — is exactly the stamp check.
+	var stamp contentStampGate
+	if !forceContentMiss && refresherDriven && cache.RefreshTriggerHas(ctx, gvr) {
+		stamp = contentStampGate{on: true, need: cache.RefreshTriggerAsOf(ctx), viewed: cache.ViewedRefreshFromContext(ctx)}
 	}
 	// #376 — the content cell is stamped ONLY by a true customer serve. On
 	// forceContentMiss the entry is discarded + re-dispatched fresh anyway → skip the
@@ -619,14 +698,39 @@ func apistageContentServeAttempt(
 	// servable; the informer's re-fire refreshes the cell.
 	// #710 — which case sent this reader into the fill (apistage_fill_metrics.go).
 	fillReason := contentFillAbsent
+	// #854 — an incremental list cell (cache.ListCell): the generation this
+	// reader is served, taken through Snapshot(need) so its stamp and its data
+	// are one value. need is the refresh's trigger seq for a refresher, the
+	// current dep-event seq for every other reader (#854 C5: a customer is never
+	// served a generation older than what a fill now would read). A cell that
+	// unanchors on this read is not served: the reader takes the full fill,
+	// which re-anchors it.
+	var inc cache.ListView
+	var incOK bool
+	acceptInc := func(e *cache.ResolvedEntry, need uint64) bool {
+		lc := e.ListCell()
+		if lc == nil {
+			return true
+		}
+		v, ok := lc.Snapshot(need)
+		if !ok {
+			fillReason = contentFillReanchor
+			return false
+		}
+		inc, incOK = v, true
+		return true
+	}
 	readContent := func(k string) (*cache.ResolvedEntry, bool) {
+		// #1054 — the request's content_read phase: the store lock, an
+		// incremental cell's snapshot drain, the stale-debt registry.
+		defer slowcall.Start(ctx, slowcall.PhaseContentRead).End()
 		// #710 PR-2b (D2, owner ruling "show then replace") — an ARMABLE customer
 		// read of a KNOWN-STALE cell is served the cell at once and opens (or
 		// joins) its debt: an immediate refill at top priority, then a push to
 		// this customer's cell (apistage_stale_debt.go). Decided, read and
 		// registered in one critical section. Any other reader falls through to
 		// #547's read-through below.
-		if sink, ok := staleServeEligible(ctx); ok && !forceContentMiss {
+		if sink, ok := staleServeEligible(ctx); ok && !forceContentMiss && !stamp.on {
 			if e, served := serveStaleWithDebt(ctx, sink, store, k, call, gvr.String(), cache.DepKey{GVR: gvr, Namespace: ns, Name: name}); served {
 				return e, true
 			}
@@ -638,16 +742,55 @@ func apistageContentServeAttempt(
 		case cache.KnownStaleReadThrough(k):
 			fillReason = contentFillKnownStale
 			return nil, false
+		case stamp.on:
+			// #765 — a refresher read is never a customer serve: no warmth stamp
+			// (#376/#552). Through cache.ServeCellIf (the #643 served-cell
+			// path): the cell is served — and noted — only if its content stamp
+			// covers the refresh's triggers.
+			e, hit, served := cache.ServeCellIf(ctx, store, k, func(e *cache.ResolvedEntry) bool {
+				if e.ListCell() != nil {
+					// #854 — the generation's own stamp: Snapshot(stamp.need)
+					// returns a generation complete as of at least stamp.need (it
+					// drains pending when the published one is older), so the
+					// stamp covers the refresh's triggers by construction. Not
+					// ContentStampCovers: its asOf==0 "unknown" rule is about a
+					// fill's read start, and a generation built before any dep
+					// event is legitimately complete as of seq 0.
+					return acceptInc(e, stamp.need) && inc.AsOf() >= stamp.need
+				}
+				return cache.ContentStampCovers(gvr, ns, name, e.ContentAsOf, stamp.need)
+			}, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
+			if !hit {
+				return nil, false
+			}
+			if !served {
+				if fillReason != contentFillReanchor {
+					fillReason = contentFillRefreshForced
+				}
+				return nil, false
+			}
+			noteContentRefreshReused(gvr.String())
+			return e, true
 		case cache.BackgroundResolveFromContext(ctx) || cache.Inert(ctx):
 			// #443 (e) — an inert (dry-run) resolve reads the cell as input
 			// but must not stamp it warm either.
 			// #643 — through ServeCell: the served cell (and the dep it stands
-			// for) is noted on the resolve's sink.
-			return cache.ServeCell(ctx, store, k, false, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
+			// for) is noted on the resolve's sink. #854 — ServeCellAccept, so an
+			// incremental cell that unanchors on this read is not noted.
+			e, hit, served := cache.ServeCellAccept(ctx, store, k, false, func(e *cache.ResolvedEntry) bool {
+				return acceptInc(e, cache.DepGenEpochNow())
+			}, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
+			return e, hit && served
 		default:
-			return cache.ServeCell(ctx, store, k, true, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
+			e, hit, served := cache.ServeCellAccept(ctx, store, k, true, func(e *cache.ResolvedEntry) bool {
+				return acceptInc(e, cache.DepGenEpochNow())
+			}, cache.DepKey{GVR: gvr, Namespace: ns, Name: name})
+			return e, hit && served
 		}
 	}
+	// #882 F2 — a fill of this call would anchor an incremental cell: a LIST,
+	// not a dry run, anchoring available on a servable GVR.
+	anchorable := isList && !cache.Inert(ctx) && cache.ListCellAnchorable(gvr)
 	if entry, hit := readContent(contentKey); hit && entry != nil {
 		hitObserved = true // Ship 0.30.193 C3 — observed cache hit.
 		// #618 — a HIT serves this call's selector from its own cell; the MISS
@@ -655,6 +798,14 @@ func apistageContentServeAttempt(
 		recordListQuery(query)
 		envelope = entry.RawJSON
 		entryRef = entry
+		if lc := entry.ListCell(); lc != nil && !incOK {
+			// #854 — the #710 stale-serve path read the entry without a
+			// Snapshot: take one now (a cell that unanchored meanwhile serves
+			// its last generation, as a stale serve serves its last fill).
+			if v, ok := lc.Snapshot(cache.DepGenEpochNow()); ok {
+				inc, incOK = v, true
+			}
+		}
 		// R3: a LIST entry stored with pre-parsed Items — gate directly
 		// over them, no re-unmarshal. An entry without Items (legacy /
 		// refresh-stored / malformed-at-Put) falls back to the RawJSON
@@ -666,9 +817,19 @@ func apistageContentServeAttempt(
 		// therefore happens at most once per refresh generation and ONLY for
 		// cells somebody actually reads — where the pre-#578 Put-time parse
 		// ran for every rebuild of every cell, read or not.
-		if isList {
+		if isList && incOK {
+			// #854 — an incremental cell: this generation's shared items; the
+			// envelope is built only for an empty list (the unparsed fallback
+			// below needs bytes).
+			if items := inc.Items(); len(items) > 0 {
+				parsed = parsedListEnvelope{items: items, apiVersion: inc.APIVersion(), kind: inc.Kind()}
+				haveParsed = true
+			} else {
+				envelope = inc.Raw()
+			}
+		} else if isList {
 			if items, av, k, ok := entry.EnsureItems(func(raw []byte) ([]*unstructured.Unstructured, string, string, bool) {
-				p, pOK := parseListEnvelope(gvr, raw)
+				p, pOK := parseListEnvelopeTimed(ctx, gvr, raw)
 				return p.items, p.apiVersion, p.kind, pOK
 			}); ok && len(items) > 0 {
 				parsed = parsedListEnvelope{
@@ -737,28 +898,67 @@ func apistageContentServeAttempt(
 			slog.Bool("preparsed", haveParsed),
 			slog.String("key_hash", contentKey),
 		)
-	} else if flight, fillCtx, lead := enterContentFlight(ctx, contentKey, gvr, ns, name, fillReason); !lead {
+	} else if flight, fillCtx, lead, movedJoin := enterContentFlight(ctx, contentKey, gvr, ns, name, fillReason, stamp,
+		anchorable, anchorable && mayRetry); !lead {
 		// MISS, JOINER (#710 PR-1, apistage_fill_flight.go) — an in-flight fill of
 		// this key started after this reader's coordinate last moved, so its body is
 		// as fresh as this reader's own fill would be. Serve the flight's envelope
 		// and shared parsed items through this reader's own gate below, exactly as a
 		// content HIT serves entry.Items.
+		//
+		// #882 F2 — or the flight anchors an incremental LIST cell and this reader
+		// may snapshot-join (anchorable, on its first attempt): then it joined
+		// whatever its list did, and is served the cell brought up to its own seq.
 		res, ok := flight.wait(ctx)
 		if res.err != nil {
 			// #710 PR-2a (D1) — the flight was never admitted. Its leader's
 			// deadline, not this reader's: while this reader's own request is
 			// alive it tries once more (apistageContentServe); else it errors.
 			if mayRetry && ctx.Err() == nil {
-				return nil, false, false, errInheritedAdmissionTimeout
+				return nil, false, false, ctx, errInheritedAdmissionTimeout
 			}
-			return nil, false, true, res.err
+			return nil, false, true, ctx, res.err
 		}
 		if !ok {
 			// The flight was not servable (its leader fell through too), or this
-			// reader's own ctx ended while it waited.
-			return nil, false, false, nil
+			// reader's own ctx ended while it waited. #988 — it falls through on
+			// the leader's decision, which the leader counted: carry its reason.
+			return nil, false, false, cache.WithFallthroughReason(ctx, res.fallReason), nil
 		}
-		envelope, parsed, haveParsed = res.envelope, res.parsed, res.haveParsed
+		// #882 F2 — the flight's incremental cell, brought up to THIS reader's
+		// own seq (its content sink's entry seq, taken before it joined): every
+		// edit up to that seq is in the generation it is served, whatever the
+		// flight's own read saw. Snapshot drains only the edits since the
+		// flight's last generation.
+		servedAsOf := flight.startSeq
+		fromCell := false
+		if res.cell != nil && isList {
+			need, _ := cache.DepGenStartSeqFromContext(fillCtx)
+			snap := slowcall.Start(ctx, slowcall.PhaseContentRead) // #1054: the cell's drain to need
+			v, vok := res.cell.Snapshot(need)
+			snap.End()
+			if vok {
+				if items := v.Items(); len(items) > 0 {
+					parsed = parsedListEnvelope{items: items, apiVersion: v.APIVersion(), kind: v.Kind()}
+					haveParsed = true
+				} else {
+					envelope = v.Raw()
+				}
+				servedAsOf, fromCell = v.AsOf(), true
+			}
+		}
+		if !fromCell {
+			if movedJoin {
+				// Joined a list that moved after the flight began, and there is no
+				// cell to bring up to this reader's seq: the flight's body may miss
+				// an edit this reader must see. One more attempt (epoch rule).
+				if mayRetry && ctx.Err() == nil {
+					return nil, false, false, ctx, errJoinedMovedFlight
+				}
+				return nil, false, false, ctx, nil
+			}
+			envelope, parsed, haveParsed = res.envelope, res.parsed, res.haveParsed
+		}
 		if res.stored {
 			// The dep edge the leader Recorded on its accepted Put, on THIS reader's
 			// resolve sink, so its own cell's Put-check sees the coordinate (#375).
@@ -769,12 +969,16 @@ func apistageContentServeAttempt(
 			}
 			entryRef = res.entry
 		}
-		noteFillOutcome(ctx, res.stored, flight.startSeq)
+		noteFillOutcome(ctx, res.stored, servedAsOf)
 	} else {
 		// MISS, LEADER — dispatch UN-GATED so the stored envelope is identity-free.
 		// #710 PR-1 — every exit publishes the flight's outcome to its joiners (a
 		// zero result = not servable); the success path publishes the result right
 		// after the Put, before this reader's own gate.
+		// #1054 — the lead marker: this request's record names the flight it
+		// leads by the same key digest a joiner's wait names, so the records join.
+		lead := slowcall.StartLead(ctx, "content_flight", contentKey, gvr.String())
+		defer lead.End()
 		defer flight.complete(contentFlightResult{})
 		// #710 PR-1 — the fill runs DETACHED from this reader's cancellation, bounded
 		// by the server write deadline: a leader whose request goes away cannot fail
@@ -793,6 +997,7 @@ func apistageContentServeAttempt(
 		// propagate to the outer resolve's sink.
 		// Block-scoped shadow: the child sink covers exactly this MISS branch's read → Put
 		// → Record; the gate below keeps the caller's ctx.
+		callerCtx := ctx // #988: the ctx this reader falls through with
 		ctx := fillCtx
 		// #710 — count the fill and hold its envelope bytes in flight until
 		// this serve returns; the dispatch and the parse run under pprof
@@ -807,11 +1012,14 @@ func apistageContentServeAttempt(
 		// item, …), bounded by the detached fill ctx (the write deadline), while
 		// the fills in flight would exceed the shared ceiling. Joiners pay nothing.
 		gate := theContentFillGate()
-		if aerr := gate.admit(ctx, flight.ticket, gvr.String(), predictFillRaw(store, contentKey, gvr, ns, isList)); aerr != nil {
+		adm := slowcall.Start(ctx, slowcall.PhaseFillAdmission) // #1054
+		aerr := gate.admit(ctx, flight.ticket, gvr.String(), predictFillRaw(store, contentKey, gvr, ns, isList))
+		adm.End()
+		if aerr != nil {
 			// D1 — never admitted before the deadline: this reader and every
 			// joiner error. Nothing is dispatched, stored or served stale.
 			flight.complete(contentFlightResult{err: aerr})
-			return nil, false, true, aerr
+			return nil, false, true, callerCtx, aerr
 		}
 		admitted := true
 		defer func() {
@@ -819,26 +1027,54 @@ func apistageContentServeAttempt(
 				gate.release(flight.ticket, false) // an early exit: nothing decoded
 			}
 		}()
+		// #882 F2 — a LIST fill's incremental cell starts watching its GVR BEFORE
+		// the dispatch lists the informer, so every edit during the fill is
+		// recorded in its pending (an edit the anchor then takes from the
+		// listing, never an abort). nil when no cell can anchor here; abandoned
+		// on every exit that does not anchor it.
+		var listFill *cache.ListCellFill
+		if isList && !cache.Inert(ctx) {
+			listFill = cache.BeginListCell(contentKey, gvr, ns, listCellFuncs(gvr, query))
+			defer listFill.Abandon()
+		}
 		var dispatched []byte
 		var dispatchedOK bool
+		var dispatchCtx context.Context
 		pprof.Do(ctx, fillLabels, func(ctx context.Context) {
-			dispatched, dispatchedOK = dispatchViaInformerFn(
+			dispatched, dispatchedOK, dispatchCtx = dispatchViaInformerFn(
 				cache.WithApistageContentResolve(ctx), call)
 		})
 		if !dispatchedOK {
 			// Not pivot-servable — the content layer cannot serve it.
 			fill.notServable()
-			return nil, false, false, nil
+			// #988 — the gate's reason (counted by dispatchViaInformer) goes
+			// with this reader's fall-through and its joiners'. Only the
+			// reason crosses: the fill ctx carries the un-gated content marker
+			// and a deadline cancelled on return, neither of which the
+			// apiserver dispatch may inherit.
+			reason := cache.FallthroughReasonOf(dispatchCtx)
+			flight.complete(contentFlightResult{fallReason: reason})
+			return nil, false, false, cache.WithFallthroughReason(callerCtx, reason), nil
 		}
 		fill.dispatched(dispatched)
 		// The exact size is known: the held weight becomes exact, in place.
 		gate.reconcile(flight.ticket, int64(len(dispatched)))
 		envelope = dispatched
+		// #765 — the content stamp: this cell is fresh as of the flight's entry
+		// seq, captured (WithContentDepGenSink) before the data read above. A
+		// snapshot stored while the informer is not servable may be degraded
+		// (R1 Layer 2): it stays unstamped (0), so a refresher always re-fills it.
+		servable := cache.Global().IsServable(gvr)
+		var contentAsOf uint64
+		if servable {
+			contentAsOf = flight.startSeq
+		}
 		// uaf-scope-waiver: PRE-refilter substrate, same reasoning as cluster_list.go — the raw per-K8s-call envelope, identity-free by key, narrowed only downstream on the way to the requester. Never holds refilter output.
 		// scope-waiver:TTLOverride: apistage identity-free content substrate — sets its OWN data-plane CATALOG_UNSERVABLE TTLOverride CONDITIONALLY on newEntry below (not a keyed literal element); NOT the UAF-cap class (no BindingUID / no per-user refilter output) — uaf_shortttl.go R-d-4 SITE MAP.
 		newEntry := &cache.ResolvedEntry{
-			RawJSON: dispatched,
-			Inputs:  ptrTo(contentKeyInputsQ(gvr, ns, name, query.canon)),
+			RawJSON:     dispatched,
+			Inputs:      ptrTo(contentKeyInputsQ(gvr, ns, name, query.canon)),
+			ContentAsOf: contentAsOf,
 		}
 		// R1 Layer 2 (#36): bounded-staleness backstop. If this content
 		// entry is being stored while its GVR informer is NOT servable
@@ -849,9 +1085,10 @@ func apistageContentServeAttempt(
 		// even if a dirty-mark / refresh-ordering gap is missed. Uniform
 		// over every GVR (no path/resource special-case — feedback_no_special_cases);
 		// disabled (TTLOverride stays 0 → standard TTL) when the env is unset.
-		if ttl := cache.CatalogUnservableTTL(); ttl > 0 && !cache.Global().IsServable(gvr) {
+		if ttl := cache.CatalogUnservableTTL(); ttl > 0 && !servable {
 			newEntry.TTLOverride = ttl
 		}
+		var anchoredCell *cache.ListCell
 		// R3: parse the LIST envelope ONCE and attach the items to the
 		// entry, so every future content-Get-hit gates without a
 		// re-unmarshal. A malformed envelope (parseOK=false) stores
@@ -860,7 +1097,7 @@ func apistageContentServeAttempt(
 			var p parsedListEnvelope
 			var parseOK bool
 			pprof.Do(ctx, fillLabels, func(context.Context) {
-				p, parseOK = parseListEnvelope(gvr, dispatched)
+				p, parseOK = parseListEnvelopeTimed(ctx, gvr, dispatched)
 			})
 			if parseOK {
 				fill.parsed(len(p.items))
@@ -870,6 +1107,21 @@ func apistageContentServeAttempt(
 				newEntry.ItemsKind = p.kind
 				parsed = p
 				haveParsed = true
+				// #854 — anchor an incremental cell on this fill: from here on
+				// every informer event on the GVR is applied to the stored list
+				// instead of re-filling it. Only for a servable GVR (the cell
+				// trusts its informer). #882 F2 — an edit during the fill is a
+				// pending key the anchor takes from the informer, never an
+				// abort; Anchor returns nil only when the envelope cannot be
+				// proven to be this informer's, and the entry then stays a plain
+				// fill. A dry run (cache.Inert) persists nothing: no listFill.
+				if servable {
+					if cell := listFill.Anchor(dispatched, p.items, p.apiVersion, p.kind); cell != nil {
+						cell.AttachStore(store)
+						anchoredCell = cell
+						newEntry = cache.NewListCellEntry(cell, newEntry.Inputs)
+					}
+				}
 			}
 		}
 		// #189 — generation-guarded write: refuse (do not resurrect a pre-delete
@@ -877,7 +1129,11 @@ func apistageContentServeAttempt(
 		// the resolve. A cold fill (key absent, gen 0) still inserts. On refusal
 		// the current request STILL serves `dispatched` below (envelope / parsed
 		// are already set); only the CACHE fill + its dep-record are skipped.
-		if store.PutIfGen(ctx, contentKey, newEntry, contentGen0) {
+		accepted := store.PutContentIfGen(ctx, contentKey, newEntry, contentGen0)
+		if !accepted && anchoredCell != nil {
+			anchoredCell.Close() // #854 — no entry was stored for it
+		}
+		if accepted {
 			// Ship 0.30.212 — wire informer-event invalidation for this content
 			// entry. Without a dep edge an informer ADD/UPDATE/DELETE on the
 			// underlying objects can never dirty-mark this cell, leaving it
@@ -926,6 +1182,10 @@ func apistageContentServeAttempt(
 			// #740 R1 — ANY accepted fill at or after a debt's mark retires it.
 			retireStaleDebtOnFill(contentKey, flight.startSeq)
 		}
+		var flightCell *cache.ListCell
+		if entryRef != nil && anchoredCell != nil {
+			flightCell = anchoredCell // #882 F2 — joiners bring it up to their own seq
+		}
 		flight.complete(contentFlightResult{
 			ok:         true,
 			envelope:   envelope,
@@ -933,6 +1193,7 @@ func apistageContentServeAttempt(
 			haveParsed: haveParsed,
 			stored:     entryRef != nil,
 			entry:      entryRef,
+			cell:       flightCell,
 		})
 	}
 
@@ -942,7 +1203,7 @@ func apistageContentServeAttempt(
 		// Prewarm: no requester — populate the content entry only, do not
 		// gate or feed dict[id]. served=false tells the caller not to use
 		// the bytes (the prewarm resolve discards dict).
-		return nil, false, true, nil
+		return nil, false, true, ctx, nil
 	}
 	// R3: a LIST with pre-parsed items gates unmarshal-free; everything
 	// else (GET-by-name, or a LIST whose envelope failed to pre-parse)
@@ -979,21 +1240,31 @@ func apistageContentServeAttempt(
 	//     DIVERGENT UAF) is the proof this branch is required.
 	_ = entryRef
 	var gated any
-	var gateOK bool
+	var gateErr error
 	if haveParsed {
 		if uafActive {
-			gated, gateOK = serveParsedListEnvelope(parsed)
+			var ok bool
+			if gated, ok = serveParsedListEnvelope(parsed); !ok {
+				gateErr = errGateFallthrough
+			}
 		} else {
-			gated, gateOK = gateListItems(ctx, gvr, parsed)
+			_, rawQuery, _ := splitPathQuery(call.Path)
+			gated, gateErr = gateListItems(ctx, gvr, ns, rawQuery, parsed)
 		}
 	} else {
-		gated, gateOK = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope, uafActive)
+		gated, gateErr = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope, uafActive)
 	}
-	if !gateOK {
+	if isRegateDenied(gateErr) {
+		// #961 — the requester may not make this LIST: the per-identity
+		// Forbidden the apiserver would answer, recorded by the caller. Not a
+		// fall-through: the apiserver would only say the same.
+		return nil, false, true, ctx, gateErr
+	}
+	if gateErr != nil {
 		// Fail-closed — no identity / GET denied. Fall through to apiserver.
-		return nil, false, true, nil
+		return nil, false, true, ctx, nil
 	}
-	return gated, true, true, nil
+	return gated, true, true, ctx, nil
 }
 
 // serveParsedListEnvelope returns the cell's pre-parsed list items as
@@ -1061,7 +1332,8 @@ func RefreshContentEntry(ctx context.Context, inputs cache.ResolvedKeyInputs) ([
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	raw, served := dispatchViaInformer(cache.WithApistageContentResolve(ctx), call)
+	// informer-only: a refresh of a content cell sends nothing to the apiserver.
+	raw, served, _ := dispatchContentViaInformer(ctx, call)
 	if !served {
 		// Not pivot-servable (pre-sync informer, metadata-only GVR, …).
 		// 1.12.6 C4 (§6.2 row 9): TYPED, not (nil, nil). The (nil, nil)

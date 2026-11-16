@@ -66,7 +66,7 @@ func TestIssue216_F6b_OnlyTheAbsentVerdictFires(t *testing.T) {
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	Deps().SetStore(store)
 	const key = "L1_f6b-flex"
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &ResolvedKeyInputs{
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &ResolvedKeyInputs{
 		CacheEntryClass: "widgets", Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource,
 		Namespace: ns, Name: name,
 	}})

@@ -15,6 +15,34 @@ machine-readable surface is
 [`helm/snowplow/values.schema.json`](../helm/snowplow/values.schema.json) — every value
 below is typed and validated there; this page explains, it does not re-enumerate.
 
+## Supported authorization configuration
+
+**Requirement: with `env.CACHE_ENABLED: "true"` (the default), Kubernetes RBAC must be the
+only authorizer in the apiserver chain that can deny a read.**
+
+How Kubernetes decides: the apiserver runs a chain of authorizers (`--authorization-mode`
+or an `AuthorizationConfiguration`, e.g. Node, RBAC, Webhook). The first authorizer that
+returns *allow* or *deny* ends the chain. RBAC itself never denies: it either allows (the
+first matching rule from any binding of the user or one of the user's groups) or has no
+opinion.
+
+How snowplow decides: with the cache on, every "may this user see it" decision is an
+in-memory evaluation of RBAC. It covers the request gate, the per-item list filters,
+user-aware filtering and the cache keys; see
+[go/snowplow/docs/architecture/rbac-uaf.md](../go/snowplow/docs/architecture/rbac-uaf.md).
+Many reads use snowplow's own service account and are narrowed per user afterwards. Cached
+answers are shared by users with the same RBAC bindings. Other authorizers are therefore
+never consulted for those reads.
+
+| Cluster setup | Supported with the cache on? | Effect |
+|---|---|---|
+| RBAC only | Yes | snowplow matches the apiserver. |
+| RBAC plus authorizers that only **grant** (e.g. Google IAM on GKE, evaluated after RBAC) | Yes | Users see at most what RBAC allows. Access granted only by the other authorizer is not shown. |
+| An authorizer that can **deny**, ordered **before** RBAC (e.g. a deny-capable webhook) | **No** | snowplow would serve data that authorizer denies. Run with `env.CACHE_ENABLED: "false"`: every access decision is then checked by the apiserver for that user (a SelfSubjectAccessReview through the full chain). |
+
+Writes and direct `/call` passthrough reads always use the user's own credential, so the
+apiserver applies its full chain to them in every mode. Tracking issue: #835.
+
 ## The env contract
 
 The container takes **no direct `env:` array**. Every value that reaches the process
@@ -63,8 +91,8 @@ A `checksum/configmap` pod annotation rolls the Deployment when the ConfigMap ch
 | Env var | Default | Effect |
 |---|---|---|
 | `CACHE_ENABLED` | `"true"` | The single master cache gate. `false` = transparent fallback to the direct apiserver — same data, same RBAC, slower ([ADR 0004](../go/snowplow/docs/adr/0004-cache-is-provisional-and-removable.md)). |
-| `GOMEMLIMIT` | `7GiB` | **Must stay strictly below the container memory limit** (default 8Gi) so Go GC back-pressures before Linux OOM-kills. Move it with `resources.limits.memory`. |
-| `GOGC` | `"50"` | Tighter heap for ~1% CPU. |
+| `GOMEMLIMIT` | unset | Unset, snowplow sets the Go soft memory limit to **7/8 of the container's cgroup memory limit** at startup (cgroup v2 `memory.max` or v1 `memory.limit_in_bytes`): 7 GiB under the default 8Gi, and it follows `resources.limits.memory` by itself. The 1/8 left over covers memory outside the heap goal (run 23 measured ~1 GiB of it in an 8 GiB container). With no cgroup limit, or one it cannot read (logged at WARN), no soft limit is set. Set `GOMEMLIMIT` only to override; it then **must stay strictly below the container memory limit**, or Linux OOM-kills the pod before the GC back-pressures. The override is never second-guessed, but snowplow still reads the container limit, publishes it beside the effective one on `/debug/vars` (`snowplow_go_runtime`), and logs a WARN at boot when the override is at or above it. |
+| `GOGC` | unset (runtime default 100) | Set only to override. The chart used to set `"50"`; paired run 23 (50K compositions × 1000 users, 4 cores) measured GC at ~40% of CPU under it, GC assist 28% of customer-path CPU. |
 | `LOG_LEVEL` | `"warn"` (chart) / `info` (binary) | The single verbosity knob (`--log-level`, #163): `debug`, `info`, `warn` or `error`, case-insensitive; an unrecognised value falls back to `info` so a typo never silences logs. |
 | `DEBUG` | unset (binary default `"false"`) | **Deprecated** — `main.go` labels `--debug` / `DEBUG` a thin alias for `--log-level=debug`. The chart dropped it in #163; set `LOG_LEVEL` instead. |
 | `PRETTY_LOG` | `"false"` | `false` = single-line JSON logs (the pretty handler is a measured CPU/I/O drag in prod). |
@@ -73,11 +101,11 @@ A `checksum/configmap` pod annotation rolls the Deployment when the ConfigMap ch
 | `PHASE1_SYNC_QUIESCENCE_SECONDS` | `"10"` | Registered-set stability window before the sync barrier returns. |
 | `CATALOG_UNSERVABLE_TTL_SECONDS` | `"300"` | Short TTL for entries cached while their informer wasn't servable (self-correcting safety net); `0` disables. |
 | `UAF_RESOLVED_TTL_SECONDS` | `"300"` | Staleness bound for **restactions-class** entries whose RESTAction declares a `userAccessFilter` stage (#118 (d)); `0` disables. It bounds staleness over *time*, not identity, so it is not a mitigation for a cross-tenant key collision, and it does not stamp the widgets or widgetContent classes. Inert **only while** the A-1 mitigation declines every `userAccessFilter`-bearing cache write; without it this value is live and cuts those cells from 3600s to 300s (a 12x refill rate for the class, boot seed included), so set it to `"0"` for a release that ships without the mitigation. Load-bearing again in 1.13.0 when those writes return under the v7 key. |
-| `RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS` | `"86400"` | **1.12.6.** Bounded L1 entry **lifetime**, measured from the first `Put` under a key (`BornAt`) and not reset by refresh re-Puts — unlike the 3600 s TTL, which every `Put` resets. Past it the entry is evicted on `Get` (`evict_max_age_total`) and re-resolved from scratch: the backstop for a wrong refresh that the event pipeline would otherwise re-serve forever. `"0"` disables. |
+| `RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS` | `"86400"` | **1.12.6.** Bounded L1 entry **lifetime**, measured from the first `Put` under a key (`BornAt`) and not reset by refresh re-Puts — unlike the 3600 s TTL, which every `Put` resets. Past it the entry is evicted on `Get` (`evict_max_age_total`) and re-resolved from scratch: the backstop for a wrong refresh that the event pipeline would otherwise re-serve forever. `"0"` disables. **Exception (#882):** an apistage LIST content cell in incremental mode is subject to neither this bound nor the store TTL; its from-scratch check is the incremental cell's comparator pass, and it leaves only through its own unanchor signals or byte pressure. |
 | `OTEL_ENABLED` | `"true"` | **1.12.4.** Master switch for OpenTelemetry export to ClickStack (traces + metrics over OTLP/HTTP). `"false"` restores a byte-identical pre-1.12.4 process. Per-signal overrides `OTEL_TRACING_ENABLED` / `OTEL_METRICS_ENABLED` / `OTEL_LOGS_ENABLED` default to the master. Metrics-on is **not free**: the HTTP middleware records three synchronous, unsampled histograms per request (`http.server.request.duration` among them — the first server-side `/call` latency distribution snowplow exports); `OTEL_METRICS_ENABLED: "false"` is the rollback. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `"http://$(HOST_IP):4318"` | The **node-local OTel collector daemonset agent** (hostPort 4318) — the only OTLP ingest on the platform. `$(HOST_IP)` is expanded by the Deployment (downward API), not by the ConfigMap. The collector *deployment* Service also publishes 4317/4318 but has no OTLP receiver: do not point here. |
-| `OTEL_TRACES_SAMPLER` | `"traceidratio"` | Sampler **family**. Root-deciding on purpose: snowplow sits behind the agent gateway, whose tracing policy samples 100% and propagates `sampled=1`, so `parentbased_traceidratio` would span 100% of customer `/call`. Trade: 5% complete end-to-end traces + 95% gateway-only traces, partial **by design**. |
-| `OTEL_TRACES_SAMPLER_ARG` | `"0.05"` | Ratio for the sampler above. The SDK default with no sampler is **100%** — always set together with `OTEL_ENABLED`. Tune only after a Phase-6 measurement at 50K. |
+| `OTEL_TRACES_SAMPLER` | `"parentbased_always_on"` | **#1013** (Diego's ruling 2026-10-30). The platform API SLIs (availability, p95) are **counts** over snowplow's `Server` spans, so every request's span is kept: a root span (no `traceparent`) is always sampled and a span with a parent follows the parent's `sampled` flag. Behind the agent gateway (samples 100%, propagates `sampled=1`) that is 100% of requests. Once the gateway samples at its edge (installer#402), a request it drops arrives with `sampled=0` and gets **no** snowplow span; the remedies are in `internal/tracing/tracing.go` (SAMPLING). Installer override: `componentValues.snowplow.env.OTEL_TRACES_SAMPLER`. Replaces the 1.12.4 default `traceidratio` 0.05. |
+| `OTEL_TRACES_SAMPLER_ARG` | unset | Ratio read only by the ratio samplers (`traceidratio`, `parentbased_traceidratio`). `parentbased_always_on` takes none. Setting `OTEL_TRACES_SAMPLER` back to a ratio sampler **without** this gives 100% (the SDK default ratio is 1.0). |
 | `OTEL_LOGS_ENABLED` | `"false"` | OTLP log export (audit events). Explicitly off: the collector agent's logs pipeline accepts filelog only, so an OTLP log export has no consumer. Logs stay stdout → filelog; since 1.12.4 every `*Context` record carries a top-level `trace_id` (the OTel id — distinct from the pre-existing `traceId` shortid). |
 | `URL_AUTHN` / `URL_SELF` | authn / snowplow in-cluster service URLs | The prewarm-seed loopback-auth pair: exchange the projected SA token at authn, append the JWT only on exact-`URL_SELF` loopback calls. |
 | `SERVICEACCOUNT_TOKEN_PATH` | `/var/run/secrets/krateo.io/serviceaccount/token` | Where the projected (audience=`authn`) token is mounted. |

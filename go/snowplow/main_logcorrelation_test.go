@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/krateo-platformops/snowplow/internal/tracing"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -110,7 +111,7 @@ func TestF6_NoSpanRecordIsByteIdentical(t *testing.T) {
 	var got bytes.Buffer
 	// Same options through the decorator: ReplaceAttr is part of the
 	// base handler, so build it the same way and wrap it.
-	log := slog.New(newTraceCorrelationHandler(slog.NewJSONHandler(&got, opts)))
+	log := slog.New(tracing.NewTraceCorrelationHandler(slog.NewJSONHandler(&got, opts)))
 	log.Info("plain.event", slog.Int("n", 1))                              // no ctx
 	log.InfoContext(context.Background(), "plain.event", slog.Int("n", 1)) // ctx, no span
 

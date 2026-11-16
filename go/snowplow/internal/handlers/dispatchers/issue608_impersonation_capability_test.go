@@ -317,7 +317,7 @@ func i608Cell(t *testing.T, store *cache.ResolvedCacheStore, c i608Cohort, ra st
 		RBACSubGen:             cls.RBACSubGen,
 	}
 	key := cache.ComputeKey(in)
-	store.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"prior"}`), Inputs: &in})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":"prior"}`), Inputs: &in})
 	return key, in
 }
 

@@ -1,6 +1,7 @@
 package redact
 
 import (
+	"log/slog"
 	"net/url"
 	"strings"
 )
@@ -133,3 +134,41 @@ func URL(raw string) string {
 	}
 	return out
 }
+
+// pathOrigin is the placeholder origin Path renders a reference on. .invalid
+// is reserved (RFC 2606): it names no host.
+const pathOrigin = "https://path.redact.invalid"
+
+// Path renders an origin-relative request reference (a stage's rendered path,
+// "/api/v1/namespaces/x/pods?labelSelector=...") so it may reach a log line,
+// by URL's rules: every query value is replaced, the fragment is dropped, and
+// nothing returned holds an "@" (#1138). URL alone cannot render one: a
+// reference with no authority is refused as URLUnparseable, so a logged path
+// would lose its shape (the diagnostic) along with its values. Path renders it
+// on a fixed placeholder origin, through URL itself so the two cannot drift,
+// and returns the reference part. Anything that is not origin-relative (no
+// leading "/", or a "//" that names an authority) is URL's to render.
+func Path(raw string) string {
+	if !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") {
+		return URL(raw)
+	}
+	rest, ok := strings.CutPrefix(URL(pathOrigin+raw), pathOrigin)
+	if !ok || !strings.HasPrefix(rest, "/") {
+		return URLUnparseable
+	}
+	return rest
+}
+
+// PathAttr is the log attribute key=Path(raw), rendered only when a record
+// that carries it is emitted (#1481): a stage path is logged at DEBUG on every
+// dial, and a disabled level then costs no parse. A stage path is the
+// RESTAction's own text after templating, so its query can carry a credential
+// (an `?apikey=`), and no log line may hold the value.
+func PathAttr(key, raw string) slog.Attr {
+	return slog.Any(key, pathValue(raw))
+}
+
+// pathValue defers Path to the handler that emits the record.
+type pathValue string
+
+func (p pathValue) LogValue() slog.Value { return slog.StringValue(Path(string(p))) }

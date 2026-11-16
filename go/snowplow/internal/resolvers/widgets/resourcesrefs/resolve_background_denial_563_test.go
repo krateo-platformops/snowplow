@@ -21,7 +21,8 @@
 // Plus the attribution the counter owes: the three background producers must land
 // in THREE DISTINCT cells (a {background, serve} map passes every log-level arm
 // above and still cannot tell the refresher from the seed), and the surviving
-// serve WARN must name the requester as a redact label.
+// serve WARN must not name the requester, in clear or as a label (#1192: its
+// traceId reaches the audit record, which does).
 //
 // Hermetic, same harness shape as #214's: the real resolveOne over a builtin GVR
 // (configmaps → cache.KindForGVR builtin arm, no discovery hop), denied through
@@ -207,20 +208,14 @@ func TestIssue563_RefDenialIsLoggedAndCountedByItsDriver(t *testing.T) {
 					"cannot be read as zero", d.wantOrigin)
 			}
 
-			// (3) IDENTITY on the surviving WARN — redact label, never clear.
+			// (3) NO IDENTITY on the surviving WARN (#1192).
 			if d.wantLevel == slog.LevelWarn {
-				got, ok := rec.attrs["user"]
-				if !ok {
-					t.Errorf("#563: the serve-path WARN carries no user attr (%v) — "+
-						"a real access problem that does not name the requester is unactionable",
-						rec.attrs)
-				}
-				if want := redact.User(denial563User); got != want {
-					t.Errorf("#563: serve WARN user=%q, want the redact label %q", got, want)
+				if got, ok := rec.attrs["user"]; ok {
+					t.Errorf("#1192: the serve-path WARN carries a user attr (%q)", got)
 				}
 				for k, v := range rec.attrs {
-					if strings.Contains(v, denial563User) {
-						t.Errorf("#453: attr %q carries the username in clear (%q)", k, v)
+					if strings.Contains(v, denial563User) || strings.Contains(v, redact.User(denial563User)) {
+						t.Errorf("#1192: attr %q carries the requester (%q)", k, v)
 					}
 				}
 			} else if got := rec.attrs["origin"]; got != d.wantOrigin {

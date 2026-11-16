@@ -238,7 +238,7 @@ func StartSecretsInformer(ctx context.Context, rc *rest.Config, namespace string
 		// Informer already started — pre-Start install must succeed;
 		// log and proceed (we'll still publish on the bounded sync
 		// wait below).
-		slog.Warn("cache.secrets.informer.add_event_handler_failed",
+		slog.WarnContext(ctx, "cache.secrets.informer.add_event_handler_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
 		)
@@ -278,7 +278,7 @@ func StartSecretsInformer(ctx context.Context, rc *rest.Config, namespace string
 	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer syncCancel()
 	if ok := clientcache.WaitForCacheSync(syncCtx.Done(), inf.HasSynced); !ok {
-		slog.Warn("cache.secrets.informer.initial_sync_timeout",
+		slog.WarnContext(ctx, "cache.secrets.informer.initial_sync_timeout",
 			slog.String("subsystem", "cache"),
 			slog.String("namespace", namespace),
 			slog.String("hint", "Secrets cache will become servable when HasSynced flips; "+
@@ -337,6 +337,7 @@ func installSecretsWatchErrorHandler(inf clientcache.SharedIndexInformer) {
 		// caller guarantees against (installed pre-Start). Log a
 		// WARN so the regression is visible without failing the
 		// boot.
+		// log-ctx-waiver: boot: wired once, before the Secrets informer starts
 		slog.Warn("cache.secrets.watch.set_error_handler_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
@@ -359,6 +360,7 @@ func secretsWatchErrorHandler() func(*clientcache.Reflector, error) {
 			// Already broken — suppress duplicate WARN.
 			return
 		}
+		// log-ctx-waiver: informer-event: a watch error on the reflector goroutine
 		slog.Warn("cache.secrets.watch.broken",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
@@ -399,6 +401,7 @@ func AssertSecretsInformerWired() {
 				"Secrets cache is NOT wired (every /call falls back to apiserver FromSecret)")
 		}
 		secretsAssertionViolationsTotal.Add(1)
+		// log-ctx-waiver: boot: main checks the wiring once before serving
 		slog.Error("cache.secrets.informer.assertion_violation",
 			slog.String("subsystem", "cache"),
 			slog.String("check", "secrets_informer_wired"),
@@ -414,6 +417,7 @@ func AssertSecretsInformerWired() {
 				"or returned an error")
 		}
 		secretsAssertionViolationsTotal.Add(1)
+		// log-ctx-waiver: boot: main checks the wiring once before serving
 		slog.Error("cache.secrets.informer.assertion_violation",
 			slog.String("subsystem", "cache"),
 			slog.String("check", "secrets_informer_wired"),

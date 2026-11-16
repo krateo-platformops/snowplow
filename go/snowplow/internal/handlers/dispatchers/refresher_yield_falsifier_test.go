@@ -90,6 +90,8 @@ func TestFA98_1_HookWiring(t *testing.T) {
 // refresher handler enqueued WHILE a customer is in-flight does NOT
 // run until the counter drops.
 func TestFA98_2_YieldEngagesEndToEnd(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetDepsForTest()
@@ -110,7 +112,7 @@ func TestFA98_2_YieldEngagesEndToEnd(t *testing.T) {
 	c := cache.ResolvedCache()
 	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-cafe"}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	var handlerRan atomic.Int32
 	cache.RegisterRefreshFunc("widgets", func(_ context.Context, _ string, _ cache.ResolvedKeyInputs) error {

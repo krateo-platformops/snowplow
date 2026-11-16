@@ -36,7 +36,6 @@
 package cache
 
 import (
-	"bytes"
 	"context"
 	"sync"
 	"sync/atomic"
@@ -130,13 +129,20 @@ func (c *ResolvedCacheStore) raLayerEqualPrior(key string, entry *ResolvedEntry)
 	if !isRAFullListEntry(entry) {
 		return nil
 	}
-	c.mu.Lock()
-	prior := c.raLayerResidentEntryLocked(key)
-	c.mu.Unlock()
+	return c.raLayerEqualOf(entry, c.sameBytesPrior(key, entry))
+}
+
+// raLayerEqualOf is raLayerEqualPrior given the byte compare's result: same is
+// the resident prior whose bytes equal entry's, or nil (sameBytesPrior). The
+// refresher terminal Put (#1070) compares once for its put_total count and
+// hands the result here.
+func (c *ResolvedCacheStore) raLayerEqualOf(entry, same *ResolvedEntry) *ResolvedEntry {
+	if !isRAFullListEntry(entry) {
+		return nil
+	}
 	var eq *ResolvedEntry
-	if prior != nil && isRAFullListEntry(prior) && prior.contentVersion != 0 &&
-		bytes.Equal(prior.RawJSON, entry.RawJSON) {
-		eq = prior
+	if same != nil && isRAFullListEntry(same) && same.contentVersion != 0 {
+		eq = same
 	}
 	if fn := raLayerAfterCompareHook.Load(); fn != nil {
 		(*fn)()
@@ -237,6 +243,25 @@ func (c *ResolvedCacheStore) raLayerForgetLocked(key string) {
 	if len(ix.byWidget) != 0 {
 		ix.dropWidgetLocked(key)
 	}
+}
+
+// raLayerConsumersLocked returns the resident widget cells whose recorded body was
+// sliced from raKey. #1255: when raKey is evicted because a later resolve proved it
+// unstorable, its body was stale, so every one of them holds a stale derived body
+// that no raKey commit will ever remark — the caller remarks them
+// (remarkLayerConsumers). A capacity or DELETE removal does not call it (the comment
+// on raLayerForgetLocked holds for those). Callers hold c.mu.
+func (c *ResolvedCacheStore) raLayerConsumersLocked(raKey string) []string {
+	ix := &c.layers
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	var out []string
+	for w := range ix.byRA[raKey] {
+		if _, resident := c.index[w]; resident {
+			out = append(out, w)
+		}
+	}
+	return out
 }
 
 // NoteRAFullListSlice notes, on ctx's dep-gen sink (and its ancestors, whose bodies

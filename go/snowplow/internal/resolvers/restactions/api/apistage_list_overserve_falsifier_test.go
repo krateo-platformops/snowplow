@@ -81,7 +81,7 @@ func seedNamespacesCell(t *testing.T, nss ...string) {
 		}})
 	}
 	key := cache.ComputeKey(contentKeyInputs(nsGVR, "", ""))
-	store.Put(key, &cache.ResolvedEntry{
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{
 		RawJSON:         []byte(`{"apiVersion":"v1","kind":"NamespaceList","items":[]}`),
 		Inputs:          ptrTo(contentKeyInputs(nsGVR, "", "")),
 		Items:           items,
@@ -168,7 +168,7 @@ func TestFalsifier58_UAF_EndToEnd_NarrowsToUAFScope(t *testing.T) {
 	call := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
 		Path: "/api/v1/namespaces", Verb: ptr.To(http.MethodGet),
 	}}
-	v, served, ok, _ := apistageContentServe(ctx, store, call, true /*uafActive*/)
+	v, served, ok, _, _ := apistageContentServe(ctx, store, call, true /*uafActive*/)
 	if !ok || !served {
 		t.Fatalf("UAF serve: expected served=true (full set passes through); ok=%v served=%v", ok, served)
 	}
@@ -223,7 +223,7 @@ func seedOverserveCell(t *testing.T) {
 		}})
 	}
 	key := cache.ComputeKey(contentKeyInputs(f1WidgetsGVR, "", ""))
-	store.Put(key, &cache.ResolvedEntry{
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{
 		RawJSON:         []byte(`{"apiVersion":"widgets.krateo.io/v1","kind":"WidgetList","items":[]}`),
 		Inputs:          ptrTo(contentKeyInputs(f1WidgetsGVR, "", "")),
 		Items:           items,
@@ -239,7 +239,7 @@ func servedWidgetNamespaces(t *testing.T, user jwtutil.UserInfo) (nss []string, 
 	call := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
 		Path: "/apis/widgets.krateo.io/v1/widgets", Verb: ptr.To(http.MethodGet),
 	}}
-	v, servedOK, ok, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
+	v, servedOK, ok, _, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
 	if !ok {
 		t.Fatalf("apistageContentServe ok=false")
 	}
@@ -267,15 +267,11 @@ func TestFalsifier58_NoUAF_NarrowTenantGetsOnlyOwnNamespaces(t *testing.T) {
 	_ = newF1Watcher(t)
 	seedOverserveCell(t)
 
-	narrowNss, served := servedWidgetNamespaces(t, jwtutil.UserInfo{Username: f1NarrowUser})
-	if !served {
-		t.Fatalf("narrow tenant: expected a served (gated) LIST")
-	}
-	want := append([]string{}, f1NarrowNamespaces...)
-	sort.Strings(want)
-	if !equalStrs(narrowNss, want) {
-		t.Fatalf("#58 SECURITY (no-UAF): narrow tenant received %v, want ONLY %v — over-serve "+
-			"(serveParsedListEnvelope skipped serve-time filterListByRBAC).", narrowNss, want)
+	// #961 (match Kubernetes): the narrow tenant holds namespace grants only, so
+	// its CLUSTER-WIDE LIST is refused — nothing of the SA-maximal cell is served.
+	if narrowNss, served := servedWidgetNamespaces(t, jwtutil.UserInfo{Username: f1NarrowUser}); served {
+		t.Fatalf("#58 SECURITY (no-UAF): a namespace-only tenant was served %v on a cluster-wide LIST — "+
+			"over-serve (want the per-identity Forbidden)", narrowNss)
 	}
 
 	broadNss, servedB := servedWidgetNamespaces(t, jwtutil.UserInfo{Username: f1BroadUser})
@@ -307,13 +303,13 @@ func TestFalsifier58_GetByName_StaysGated(t *testing.T) {
 	// NARROW user is NOT granted).
 	raw := []byte(`{"apiVersion":"widgets.krateo.io/v1","kind":"Widget","metadata":{"namespace":"team-c","name":"w-team-c"}}`)
 	key := cache.ComputeKey(contentKeyInputs(f1WidgetsGVR, "team-c", "w-team-c"))
-	store.Put(key, &cache.ResolvedEntry{RawJSON: raw, Inputs: ptrTo(contentKeyInputs(f1WidgetsGVR, "team-c", "w-team-c"))})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: raw, Inputs: ptrTo(contentKeyInputs(f1WidgetsGVR, "team-c", "w-team-c"))})
 
 	ctx := xcontext.BuildContext(context.Background(), xcontext.WithUserInfo(jwtutil.UserInfo{Username: f1NarrowUser}))
 	call := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
 		Path: "/apis/widgets.krateo.io/v1/namespaces/team-c/widgets/w-team-c", Verb: ptr.To(http.MethodGet),
 	}}
-	_, served, ok, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
+	_, served, ok, _, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
 	if !ok {
 		t.Fatalf("GET serve: ok=false")
 	}
@@ -358,7 +354,7 @@ func TestFalsifier58_UAF_GetByName_PassesThroughForRefilter(t *testing.T) {
 	store := cache.ResolvedCache()
 	raw := []byte(`{"apiVersion":"widgets.krateo.io/v1","kind":"Widget","metadata":{"namespace":"bench-ns-01","name":"w-1"}}`)
 	key := cache.ComputeKey(contentKeyInputs(f1WidgetsGVR, "bench-ns-01", "w-1"))
-	store.Put(key, &cache.ResolvedEntry{RawJSON: raw, Inputs: ptrTo(contentKeyInputs(f1WidgetsGVR, "bench-ns-01", "w-1"))})
+	store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: raw, Inputs: ptrTo(contentKeyInputs(f1WidgetsGVR, "bench-ns-01", "w-1"))})
 
 	ctx := ctxWithUser("cyberjoker", "devs")
 	call := httpcall.RequestOptions{RequestInfo: httpcall.RequestInfo{
@@ -368,7 +364,7 @@ func TestFalsifier58_UAF_GetByName_PassesThroughForRefilter(t *testing.T) {
 	// uafActive=true → the GET extension must PASS THROUGH (served=true, object
 	// returned), NOT fail-closed via filterGetByRBAC. The refilter narrows
 	// downstream by the UAF rule (out of this serve's scope).
-	v, served, ok, _ := apistageContentServe(ctx, store, call, true /*uafActive*/)
+	v, served, ok, _, _ := apistageContentServe(ctx, store, call, true /*uafActive*/)
 	if !ok || !served {
 		t.Fatalf("#58 UAF-GET extension: a UAF GET-by-name must PASS THROUGH (served=true) for the "+
 			"downstream refilter; got ok=%v served=%v. Without the gateContentEnvelope UAF branch, "+
@@ -382,7 +378,7 @@ func TestFalsifier58_UAF_GetByName_PassesThroughForRefilter(t *testing.T) {
 
 	// CONTRAST (no-UAF): the SAME GET, uafActive=false, must FAIL CLOSED (the
 	// user lacks raw get) — the GET extension only loosens the UAF path.
-	_, servedNoUAF, okNoUAF, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
+	_, servedNoUAF, okNoUAF, _, _ := apistageContentServe(ctx, store, call, false /*no-UAF*/)
 	if !okNoUAF {
 		t.Fatalf("no-UAF GET serve: ok=false")
 	}

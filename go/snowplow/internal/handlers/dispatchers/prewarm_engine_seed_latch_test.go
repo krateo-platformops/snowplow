@@ -54,7 +54,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
-	"github.com/krateo-platformops/snowplow/internal/redact"
 )
 
 // engineLatchTestMu serializes the tests in this file: they share the
@@ -251,8 +250,8 @@ func TestSeedScopeYielding_OneOperationalFailure_EnqueuesExactlyOnce(t *testing.
 	if lvl, _ := rec["level"].(string); lvl != "WARN" {
 		t.Errorf("operational_failure level = %q; want WARN", lvl)
 	}
-	if tgt, _ := rec["target"].(string); tgt != redact.User("user-0") { // #453: the cohort label, never the username
-		t.Errorf("operational_failure target(cohort-label) field = %q; want %q", tgt, redact.User("user-0"))
+	if _, on := rec["target"]; on { // #1192: no cohort on a log line, in clear or as a label
+		t.Errorf("operational_failure carries a cohort target: %v", rec)
 	}
 	// No expected_deny event for a pure-operational run.
 	if d := findLogRecord(t, res.logText, "prewarm.engine.seed.expected_deny"); d != nil {
@@ -330,12 +329,11 @@ func TestSeedScopeYielding_RBACDeny_NoEnqueue_BumpsDenyCounter(t *testing.T) {
 	if lvl, _ := rec["level"].(string); lvl != "INFO" {
 		t.Errorf("expected_deny level = %q; want INFO (a genuine deny is expected, not a Warn)", lvl)
 	}
-	// classifyEngineSeedErr(kind="widget", label=ns/name, target=cohortLabel)
-	// — prewarm_engine_boot.go:353,357-363. The COHORT/identity label is
-	// logged under "target"; the RESOURCE (ns/name) is logged under the
-	// kind-named key ("widget").
-	if tgt, _ := rec["target"].(string); tgt != redact.User("user-0") { // #453: the cohort label, never the username
-		t.Errorf("expected_deny target(cohort-label) field = %q; want %q", tgt, redact.User("user-0"))
+	// classifyEngineSeedErr(kind="widget", label=ns/name): the RESOURCE
+	// (ns/name) is logged under the kind-named key ("widget"), and no cohort
+	// is logged (#1192).
+	if _, on := rec["target"]; on {
+		t.Errorf("expected_deny carries a cohort target: %v", rec)
 	}
 	if w, _ := rec["widget"].(string); w != "ns/w0" {
 		t.Errorf("expected_deny widget(resource) field = %q; want %q", w, "ns/w0")

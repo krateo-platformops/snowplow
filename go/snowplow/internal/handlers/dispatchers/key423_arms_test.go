@@ -315,7 +315,7 @@ func TestKey423_SeedKeyParity(t *testing.T) {
 
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR})
 	var rep *cache.PrewarmTarget
 	for _, tg := range cache.EnumeratePrewarmTargetsForGVR(h1RAGVR, "list") {
 		tg := tg
@@ -339,7 +339,7 @@ func TestKey423_SeedKeyParity(t *testing.T) {
 
 	// The cell the seed would Put is the cell carol's /call reads.
 	marker := []byte(`{"kind":"RESTAction","status":{"seeded":"` + psSentinel + `"}}`)
-	cache.ResolvedCache().Put(seedKey, &cache.ResolvedEntry{RawJSON: marker, Inputs: seedIn})
+	cache.ResolvedCache().PutResolved(fixtureStoreVerdict, seedKey, &cache.ResolvedEntry{RawJSON: marker, Inputs: seedIn})
 	before := counters[psCarol].Load()
 	rec := psServe(t, a, srv.URL, psUserCtx(a, psCarol))
 	if counters[psCarol].Load() != before || !bytes.Contains(rec.Body.Bytes(), marker) {
@@ -360,7 +360,7 @@ func TestKey423_RoleEditRotatesKey(t *testing.T) {
 	dyn := psBuildWatcher(t, a) // target-reader is referenced ONLY by alice's RoleBinding
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target})
 
 	aliceCtx := psUserCtx(a, psAlice)
 	// Bob is bound only to pod-reader in ns z — the edited role does not touch him.

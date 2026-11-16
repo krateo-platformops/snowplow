@@ -65,31 +65,85 @@ const (
 
 var cacheAllow443 = map[string]cacheClass443{
 	// --- side-effecting, gated inside the cache package ---------------------
-	"DepTracker.Record":                      gatedInCache443,
-	"DepTracker.RecordList":                  gatedInCache443,
-	"DepTracker.ReplayEdges":                 gatedInCache443,
-	"ResolvedCacheStore.PutIfGen":            gatedInCache443,
-	"ResolvedCacheStore.PutRAFullListIfGen":  gatedInCache443,
+	"DepTracker.Record":     gatedInCache443,
+	"DepTracker.RecordList": gatedInCache443,
+	// #603 PR-2 SHADOW: RecordListNarrowable checks Inert itself; the commit
+	// and the widen are ctx-less and run only from commitNarrow, which checks it.
+	"DepTracker.RecordListNarrowable":              gatedInCache443,
+	"DepTracker.CommitListInterest":                gatedAtCaller443,
+	"DepTracker.WidenListInterest":                 gatedAtCaller443,
+	"ListNarrowShadowOn":                           readOnly443,
+	"CommitWhyOfAnalysis":                          readOnly443,
+	"DepTracker.ReplayEdgesWithStates":             gatedInCache443, // #765 B: ReplayEdges carrying the producer's interest states
+	"DepTracker.ReleaseUnstored":                   gatedInCache443, // #890/#893: strips a non-resident key's edges at a resolve's end; returns under Inert
+	"ResolvedCacheStore.PutContentIfGen":           gatedInCache443,
+	"ResolvedCacheStore.PutRAFullListIfGenOutcome": gatedInCache443, // #1321: PutRAFullListIfGen reporting its outcome; same Inert check (putRAFullListIfGen)
+	"PutOutcome.Stored":                            readOnly443,
+	// #1321 — publishes only a STORED outcome, and an inert resolve stores nothing
+	// (#443 (a)): under the flag it is always handed PutRefused and returns.
+	"PublishPutIfSubscribed":                 unreachableInert443,
 	"ResolvedCacheStore.NoteRAFullListSlice": gatedInCache443,
-	"ResourceWatcher.EnsureResourceTypeFor":  gatedInCache443,
-	"RecordSliceabilityClassifiedCtx":        gatedInCache443,
-	"SliceabilityLookupCtx":                  gatedInCache443,
+	// #1255 — an unstorable decline evicts the older cell; both refuse an inert ctx.
+	"ResolvedCacheStore.EvictOnPermanentDecline": gatedInCache443,
+	"ResolvedCacheStore.EvictUnstorable":         gatedInCache443,
+	"ResourceWatcher.EnsureResourceTypeFor":      gatedInCache443,
+	"RecordSliceabilityClassifiedCtx":            gatedInCache443,
+	"SliceabilityLookupCtx":                      gatedInCache443,
 	// #398 decline: always returns true on a sensitive read (inert or not), so
 	// the decline is never hidden by the flag; only its counter is gated.
 	"DeclineSensitivePut": gatedInCache443,
+	// #765 — the stamp-gated refresher read: GetNoTouch (no warmth), and the
+	// served-cell note only for an accepted cell, under its own cache.Inert check.
+	"ServeCellIf": gatedInCache443,
+	// --- #854 incremental list cell -------------------------------------------
+	// Snapshot catches the cell up with the informer (drains its pending keys
+	// into a new generation): identity-free state that mirrors cluster facts,
+	// exactly what any reader of the cell must see; it serves no bytes a full
+	// fill of the same informer state would not, and Puts nothing.
+	"ListCell.Snapshot":      clusterFact443,
+	"ResolvedEntry.ListCell": readOnly443,
+	"ListCellAnchorable":     readOnly443, // #882 F2: a predicate over the watcher's servability
+	"ResolvedEntry.RawLen":   readOnly443, // #854: an arithmetic length, nothing built
+	"ListView.AsOf":          readOnly443,
+	"ListView.APIVersion":    readOnly443,
+	"ListView.Kind":          readOnly443,
+	// Items / Raw build their generation's shared slice / envelope once
+	// (a per-generation memo of cluster facts).
+	"ListView.Items": clusterFact443,
+	"ListView.Raw":   clusterFact443,
 	// --- side-effecting, gated at the (listed) caller -----------------------
 	// #643 — the resolve path's ONE L1 body read (it replaced the direct
 	// ResolvedCacheStore.Get): touch=true is the warmth-stamping Get, which each
 	// caller turns into touch=false under the flag; the served-cell note inside
 	// it is itself gated on cache.Inert (NoteServedCell).
-	"ServeCell":                gatedAtCaller443,
-	"ResolvedEntry.NoteHitter": gatedAtCaller443, // representative pool
+	"ServeCell": gatedAtCaller443,
+	// #854 — ServeCell with an accept check before the note; same gating.
+	"ServeCellAccept": gatedAtCaller443,
+	// #854 / #882 F2 — anchoring registers a cell (BeginListCell, before the
+	// fill's listing) and hands it to the store (Anchor): the caller begins one
+	// only on a non-inert fill leader, and Anchor / Abandon of a nil fill are
+	// no-ops.
+	"BeginListCell":                               gatedAtCaller443,
+	"ListCellFill.Anchor":                         gatedAtCaller443,
+	"ListCellFill.Abandon":                        gatedAtCaller443,
+	"NewListCellEntry":                            gatedAtCaller443,
+	"ListCell.AttachStore":                        gatedAtCaller443,
+	"ListCell.Close":                              gatedAtCaller443,
+	"ResolvedEntry.NoteHitter":                    gatedAtCaller443, // representative pool
 	"ResolvedCacheStore.ForgetRAFullListConsumer": gatedAtCaller443,
 	"AddNavigationDiscoveredGroup":                gatedAtCaller443,
 	"BumpExternalSkippedPut":                      gatedAtCaller443, // a Put-decline counter: no decline without a Put
 	// --- unreachable under the flag -----------------------------------------
-	"DepTracker.ReplayEdgesAsOf":          unreachableInert443, // seed-memo hit only (SeedResolveMemo is installed by seeds); delegates to the gated ReplayEdges
-	"SeedResolveMemo.StoreLayered":        unreachableInert443, // memo installed only by seeds, never on a live/inline ctx
+	"DepTracker.ReplayEdgesAsOfWithStates":   unreachableInert443, // seed-memo hit only (SeedResolveMemo is installed by seeds); delegates to the gated ReplayEdgesWithStates
+	"SeedResolveMemo.StoreLayeredWithStates": unreachableInert443, // memo installed only by seeds, never on a live/inline ctx
+	// The memo's measurement-only would-join counter: only after a memo miss,
+	// so only under a memo (seeds and the refresher), never on a live/inline ctx.
+	"SeedResolveMemo.BeginProduce": unreachableInert443, "MemoProduce.End": unreachableInert443,
+	"MemoProduce.Produced": unreachableInert443,
+	// #912 N1 — the memo's Put-gate effects capture / replay: only under a
+	// memo (seeds and the refresher), never on a live/inline ctx.
+	"WithPutGateEffectsCapture": unreachableInert443, "PutGateCapture.Effects": unreachableInert443,
+	"PutGateEffects.Replay":               unreachableInert443,
 	"RegisterClusterListKey":              unreachableInert443, // after a PutIfGen that refuses under the flag
 	"ResourceWatcher.ConfirmResourceType": unreachableInert443, // only when EnsureResourceTypeFor reported added=true (never under the flag)
 	// via the package-level discoverGroupResourcesFn seam, invoked only inside
@@ -105,6 +159,8 @@ var cacheAllow443 = map[string]cacheClass443{
 	// raFullList store Puts, so it is no longer reached from this path at all and
 	// a renamed entry would have been flagged stale — correctly.
 	"BumpUAFTouched": telemetry443, // request-scoped UAF-touched sink
+	// #787: an OTLP-collection-time truncation count (a process counter only).
+	"NoteSeriesTruncated": telemetry443,
 	// #592 — the OBSERVED limb of the raFullList UAF stamp reads the sink that
 	// BumpUAFTouched writes. Both are pure reads (nil-receiver-safe, no store,
 	// informer, dep or refresher state), strictly weaker than the bump already
@@ -142,25 +198,49 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ClientConfigFor": readOnly443, "ComputeKey": readOnly443, "DepGenEpochNow": readOnly443,
 	// #710 PR-1 — the single-flight join check (a load of the #375 bucket/floor
 	// seq) and the detached fill's deadline (a read of the store's window).
-	"ContentCoordinateMovedSince": readOnly443, "DemandRevalidationDeadline": readOnly443,
+	"ContentCoordinateMovedSince": readOnly443,
+	// #765 — the content stamp: pure seq reads/compares.
+	"ContentStampCovers": readOnly443, "RefreshTriggerAsOf": readOnly443,
+	"ViewedRefreshFromContext":   readOnly443, // #799 fix 1: a ctx read
+	"DemandRevalidationDeadline": readOnly443,
 	// #710 PR-2a — the content-fill admission gate reads the shared ceiling and
 	// live-heap sampler (runtime reads, no cache state).
 	"AdmissionCeiling": readOnly443, "AdmissionLiveHeapSample": readOnly443,
+	// #844 — the external conversion memo's byte budget: the same runtime reads.
+	// (The memo itself lives in restactions/api, not here; it stores only a pure
+	// function of the bytes an inert resolve's own live fetch returned.)
+	"ExternalFetchCacheBudget": readOnly443,
 	// The admission predictor's partition count: index keys under rw.mu read.
 	"ResourceWatcher.PartitionLen": readOnly443,
 	// #710 PR-2b — the D2 stale serve. The sink and the mark are request-scoped
-	// reads; Note/NoteServedAt write only the request's own sink, after
+	// reads; NoteIfNoWrite/NoteServedAt write only the request's own sink, after
 	// serveStaleWithDebt's cache.Inert check. Commit/Withdraw (the write point)
 	// act only on a sink that check let note a stale serve (StaleDerived is
 	// false under the flag). The debt goroutines' DebtCleared / publish /
 	// re-resolve / evict run only for a debt that check let open.
 	"StaleServeSinkFromContext": readOnly443, "StaleServeSink.L1Key": readOnly443,
 	"StaleServeSink.ServedAt": readOnly443, "KnownStaleMark": readOnly443,
-	"HasRefreshSubscriber": readOnly443, "StaleOwedStatsSnapshot": readOnly443,
+	// #1321 — the D2 replace's publish gate: the served body (a sink read), the
+	// cell's bytes (a stored entry's body, never mutated), whether the key is
+	// still owed a push (a map read). SettleStaleOwed clears an owed mark: only
+	// finishStaleReplace reaches it, on a debt serveStaleWithDebt's cache.Inert
+	// check let open (like PublishRefresh).
+	"StaleServeSink.ServedBody": readOnly443, "ResolvedEntry.Raw": readOnly443, "StaleOwed": readOnly443,
+	"SettleStaleOwed": unreachableInert443,
+	// #930 — reads the dirty-window clock (an atomic pointer load, time.Now by
+	// default) to age a known-stale mark; no state is written.
+	"DirtyWindowNow": readOnly443,
+	// #905 — BeginWrite and NoteDeclaredWrite set flags on the request's own sink, DeclaredWrite reads
+	// them: request-scoped, nothing outlives the request (an inert resolve has no
+	// sink, and the nil sink answers without state).
+	"StaleServeSink.BeginWrite": readOnly443, "StaleServeSink.DeclaredWrite": readOnly443,
+	"StaleServeSink.NoteDeclaredWrite": readOnly443,
+	"StaleServeSinkForWrite":           readOnly443,
+	"HasRefreshSubscriber":             readOnly443, "StaleOwedStatsSnapshot": readOnly443,
 	// #710 PR-2b — the customer-triggered-refresh marker: a ctx value (set by the debt
 	// lane on its own detached ctx, read by the two admission classifiers).
 	"CustomerTriggeredRefreshFromContext": readOnly443, "WithCustomerTriggeredRefresh": readOnly443,
-	"StaleServeSink.Note": unreachableInert443, "StaleServeSink.NoteServedAt": unreachableInert443,
+	"StaleServeSink.NoteIfNoWrite": unreachableInert443, "StaleServeSink.NoteServedAt": unreachableInert443,
 	"StaleServeSink.Commit": unreachableInert443, "StaleServeSink.Withdraw": unreachableInert443,
 	"StaleServeSink.DebtCleared": unreachableInert443, "ResolvedCacheStore.EvictStaleDerived": unreachableInert443,
 	"RunRefreshNow": unreachableInert443, "PublishRefresh": unreachableInert443,
@@ -173,16 +253,26 @@ var cacheAllow443 = map[string]cacheClass443{
 	// (past serveStaleWithDebt's cache.Inert check); an accepted content fill
 	// retires a debt (R1) — an inert resolve's Put is never accepted (#443 (a)).
 	"StaleRetryResume": unreachableInert443, "StaleRetryEnd": unreachableInert443,
-	// Package init wiring (the test-reset quiesce; the #710 F2 arm-time
-	// stale_to_push recorder); no resolve reaches it.
-	"RegisterStaleServeQuiesce": unreachableInert443, "SetStaleOwedArmRecorder": unreachableInert443,
+	// Package init wiring (the test-reset quiesce); no resolve reaches it.
+	"RegisterStaleServeQuiesce": unreachableInert443,
+	// #1062 — the stale-push ledger as the D2 family reads it: its clock and
+	// its apistage histogram (pure reads), and the #740 resume's clock restart
+	// (only a parked debt's resume reaches it, and an inert resolve never
+	// opens a debt: serveStaleWithDebt's Inert check).
+	"StalePushNow": readOnly443, "StaleToPushSnapshot": readOnly443, "StaleToPushHistogram.ExpvarValue": readOnly443,
+	"RestartStaleServeClock":    unreachableInert443,
 	"DepGenStartSeqFromContext": readOnly443, "DepTracker.BeginCapture": readOnly443,
 	"DepTracker.EndCapture": readOnly443, "DepTracker.EdgesUnder": readOnly443, "Deps": readOnly443,
-	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443,
+	"Disabled": readOnly443, "ExternalTouchedSink.Bump": readOnly443, "RequesterCredentialFor": readOnly443, "ExternalTouchedSink.BumpThirdParty": readOnly443, "ExternalTouchedSink.MarkDeclaredWrite": readOnly443, "ExternalTouchedSink.DeclaredWrite": readOnly443,
 	"ExternalTouchedSinkFromContext": readOnly443, "ExtractAPIServerGroupFromTemplatedPath": readOnly443,
 	"FallthroughScope": readOnly443, "FullListIsEmpty": readOnly443, "Global": readOnly443,
-	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "IdentityClass.String": readOnly443,
+	// #988 — pure ctx value read / stamp of the fall-through reason the wire
+	// counter labels a LIST with: no cache state is written.
+	"FallthroughReasonOf": readOnly443, "WithFallthroughReason": readOnly443,
+	"GoSliceFullList": readOnly443, "HashExtras": readOnly443, "SourcePagination": readOnly443, "IdentityClass.String": readOnly443,
 	"Inert": readOnly443, "InformerOnlyReadsFromContext": readOnly443, "InternalEndpointFromContext": readOnly443,
+	// #1334 — the apiserver's group rule over (username, groups): a pure function.
+	"Authenticated": readOnly443,
 	// #561 removed "WithInformerOnlyReads" from this table when it deleted
 	// #403's informer-only UAF pre-check read. #594 PUTS IT BACK, for a
 	// different read on the same path: apiref.DeclaresExternalEndpoint, the
@@ -224,6 +314,14 @@ var cacheAllow443 = map[string]cacheClass443{
 	// cannot drift out of half of it again (which is #563 itself). The stale-entry
 	// half of this census is what required removing the row.
 	"RefDenialOrigin": readOnly443,
+	// #903 — "is this a customer's own request?" for the write refusal and the
+	// self-loopback header: RefDenialOrigin plus two more ctx values (the #547
+	// demand revalidation, the background hop). Pure ctx reads.
+	"NonCustomerWriteOrigin": readOnly443,
+	// AUDIT-4 (audit#22) — "does this resolve have a requester?" for a stage's
+	// audit record (stage_audit.go stageRecorded): every non-customer origin
+	// NonCustomerWriteOrigin reads, walked in its order. Pure ctx reads.
+	"EachNonCustomerOrigin": readOnly443,
 	// #608 — the validator's transport pick reads the set-once process SA
 	// *rest.Config (an RLock + pointer read, no state written), and the stage
 	// wrap only builds an error value. Neither outlives the request.
@@ -253,7 +351,7 @@ var cacheAllow443 = map[string]cacheClass443{
 	"ResourceWatcher.ListServableEnvelopeJSONWhere": readOnly443 /* #618: ListServableEnvelopeJSON + a pure read-only predicate */, "ResourceWatcher.ServabilitySnapshotFor": readOnly443,
 	"ResourceWatcher.Snapshot": readOnly443, "ResourceWatcher.WaitForGVRSync": readOnly443,
 	"SecretsCacheNamespace": readOnly443, "SecretsCacheServable": readOnly443, "SecretsSnapshotLoad": readOnly443,
-	"SeedResolveMemo.Key": readOnly443, "SeedResolveMemo.LoadLayered": readOnly443,
+	"SeedResolveMemo.Key": readOnly443, "SeedResolveMemo.LoadLayeredWithStates": readOnly443, "DepTracker.EdgeNarrowStates": readOnly443,
 	"SeedResolveMemoFromContext": readOnly443, "ServeWatcherFromContext": readOnly443,
 	"ServiceAccountDialFromContext": readOnly443, "SliceShapeHash": readOnly443,
 	"SliceabilityShapeKnownNegative": readOnly443, "StageErrorSink.Bump": readOnly443,
@@ -263,21 +361,25 @@ var cacheAllow443 = map[string]cacheClass443{
 	// Same classification as StageErrorSink.Bump.
 	"PerIdentityForbiddenSink.BumpStage": readOnly443, "PerIdentityForbiddenSink.BumpExternal": readOnly443,
 	"PerIdentityForbiddenSinkFromContext": readOnly443,
-	"WithContentDepGenSink":               readOnly443, "WithInternalEndpoint": readOnly443,
+	// #1080: the dep worker's objAbsent probe of the process watcher — an
+	// indexer read under the watcher's read lock; it never registers a GVR.
+	"WatchedAbsent":         readOnly443,
+	"WithContentDepGenSink": readOnly443, "WithInternalEndpoint": readOnly443,
 	"WithInternalRESTConfig": readOnly443, "WithL1KeyContextFromEpoch": readOnly443,
-	"WithNestedCallDepth": readOnly443, "WithNestedResolveAncestor": readOnly443, "WithServiceAccountDial": readOnly443,
+	"WithNestedCallDepth": readOnly443, "WithNestedResolveAncestor": readOnly443, "WithServiceAccountDialValue": readOnly443,
 	// #398 (#440): a pure GVR classifier and the request-scoped sensitive-touched sink.
 	"IsSensitiveResource": readOnly443, "SensitiveTouchedSink.Bump": readOnly443,
 	"SensitiveTouchedSink.Count": readOnly443, "SensitiveTouchedSinkFromContext": readOnly443,
 	"WithSensitiveTouchedSink": readOnly443,
 	// #684 — the raFullList cell's own #681 Put gate. WithChildPutGateSinks is a
 	// ctx builder installing request-scoped sinks (their bumps forward to the
-	// enclosing request-scoped sinks only); DenialOnly / GenuineExternal /
-	// StageErrorSink.Count are pure reads of them. None touches cache, informer,
-	// dep or refresher state. (ExternalTouchedSink.Count left the resolve path:
-	// GenuineExternal now reads it inside the cache package.)
-	"WithChildPutGateSinks": readOnly443, "DenialOnly": readOnly443,
-	"GenuineExternal": readOnly443, "StageErrorSink.Count": readOnly443,
+	// enclosing request-scoped sinks only); PutGateVerdict (#912 re-review: the
+	// shared verdict, which reads DenialOnly / GenuineExternal inside the cache
+	// package) and PutVerdict.Permanent are pure reads of them. None touches
+	// cache, informer, dep or refresher state.
+	"WithChildPutGateSinks": readOnly443, "PutGateVerdict": readOnly443,
+	"PutVerdict.Permanent": readOnly443, "PutVerdict.Store": readOnly443, "PutVerdict.Reason": readOnly443,
+	"PutVerdict.DenialOnly": readOnly443,
 	// The denial-only Put counter: a process counter, reached only after a
 	// PutRAFullListIfGen that STORED (which refuses under the flag).
 	"RecordDenialOnlyPut": telemetry443,
@@ -286,11 +388,20 @@ var cacheAllow443 = map[string]cacheClass443{
 // callerAllow443: for each gatedAtCaller symbol, the "<file>:<func>" sites
 // allowed to use it. Each listed function must contain a cache.Inert check.
 var callerAllow443 = map[string][]string{
-	"ServeCell":                {"apistage.go:apistageContentServeAttempt", "apistage_stale_debt.go:serveStaleWithDebt", "ra_full_list.go:raFullListServe"},
-	"ResolvedEntry.NoteHitter": {"ra_full_list.go:raFullListServe"},
+	"ServeCell":                                   {"apistage.go:apistageContentServeAttempt", "apistage_stale_debt.go:serveStaleWithDebt", "ra_full_list.go:raFullListServe"},
+	"ServeCellAccept":                             {"apistage.go:apistageContentServeAttempt"},
+	"BeginListCell":                               {"apistage.go:apistageContentServeAttempt"},
+	"ListCellFill.Anchor":                         {"apistage.go:apistageContentServeAttempt"},
+	"ListCellFill.Abandon":                        {"apistage.go:apistageContentServeAttempt"},
+	"NewListCellEntry":                            {"apistage.go:apistageContentServeAttempt"},
+	"ListCell.AttachStore":                        {"apistage.go:apistageContentServeAttempt"},
+	"ListCell.Close":                              {"apistage.go:apistageContentServeAttempt"},
+	"ResolvedEntry.NoteHitter":                    {"ra_full_list.go:raFullListServe"},
 	"ResolvedCacheStore.ForgetRAFullListConsumer": {"ra_full_list.go:raFullListServe"},
 	"AddNavigationDiscoveredGroup":                {"resolve.go:lazyRegisterInnerCallPaths"},
-	"BumpExternalSkippedPut":                      {"ra_full_list.go:raFullListServe"},
+	"BumpExternalSkippedPut":                      {"ra_full_list.go:raFullListPermanentDecline"},
+	"DepTracker.CommitListInterest":               {"narrow.go:commitNarrow"},
+	"DepTracker.WidenListInterest":                {"narrow.go:commitNarrow"},
 }
 
 // goAllow443: every `go` statement on the resolve path, by "<file>:<func>",
@@ -302,6 +413,8 @@ var goAllow443 = map[string]bool{
 	"apistage_stale_debt.go:serveStaleWithDebt":         true,  // #710 PR-2b: starts a debt's refill only past its cache.Inert check
 	"apistage_stale_debt.go:goReplaceStaleDependent":    false, // #710 PR-2b: a committed dependent's replace + push; only past serveStaleWithDebt's Inert check
 	"apistage_stale_debt.go:ensureStaleOverdueScanner":  false, // #710 PR-2b: once-per-process overdue ticker (counters + one WARN)
+	"apistage_stale_debt.go:joinStaleDebts":             false, // #1033 review: test joins only; waits staleDebtWG and closes a channel, no cache access
+	"external_fetch_flight.go:start":                    false, // #1320: the shared external READ's request on the wire. Its ctx is pagebudget.Detach(the reader that started it) + its own cancel (the last waiter leaving ends it): every value kept, the inert flag included; an inert read carries cache.InertHeader in its headers and cache.Inert in its key, so it never shares a non-inert request. Egress only; no cache, informer, dep or refresher state
 	"informer_dispatch_metrics.go:startDispatchSummary": false, // once-per-process summary log ticker
 	"informer_serve.go:startObjectsGetSummary":          false, // once-per-process summary log ticker
 }

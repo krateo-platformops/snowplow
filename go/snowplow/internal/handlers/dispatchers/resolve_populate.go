@@ -31,9 +31,12 @@
 // load-bearing 0.30.103 SA-CA seam. When saEP/saRC are nil (no SA creds
 // — unit test / outside-cluster) the context is identity-only as before.
 //
-// Per feedback_l1_invalidation_delete_only.md: this path only ever
-// Put()s — it never evicts. A refresh that lands after the entry was
-// evicted must not resurrect it (see the post-resolve liveness re-check).
+// Per feedback_l1_invalidation_delete_only.md: this path Put()s, and evicts
+// only in the two terminal states where no refresh can ever replace the cell —
+// no in-class representative (#444) and a re-resolve whose decline proves the
+// key unstorable (#1255, evict_unstorable.go). A refresh that lands after the
+// entry was evicted must not resurrect it (see the post-resolve liveness
+// re-check).
 
 package dispatchers
 
@@ -120,6 +123,27 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	}
 
 	key := cache.ComputeKey(inputs)
+
+	// #854 — an incremental list content cell is kept current by the informer
+	// deltas themselves (cache.ListCell): a refresh of its own key need not —
+	// and must not — re-list and re-Put the whole list. Its Snapshot drains every
+	// change up to the refresh's trigger seq; the refresh then ends FRESH (the
+	// dirty window closes), with no store write: no generation move, no
+	// PublishRefresh, no dep re-record, no rebuild compare (#854 C3). A cell that
+	// unanchors here falls through to today's re-dispatch.
+	if inputs.CacheEntryClass == cache.CacheEntryClassApistage {
+		// #376 — GetNoTouch: the refresher reading its own key's prior entry is
+		// an internal read, never a customer serve.
+		if prior, ok := c.GetNoTouch(key); ok && prior != nil {
+			if lc := prior.ListCell(); lc != nil {
+				if _, ok := lc.Snapshot(cache.RefreshTriggerAsOf(ctx)); ok {
+					cache.NoteListCellRefreshSkipped()
+					cache.NoteRefreshWrite(ctx, key, true)
+					return nil
+				}
+			}
+		}
+	}
 
 	// #189 — capture the key's generation BEFORE the re-resolve. If a DELETE-
 	// eviction lands during the (possibly long) re-resolve, the tail write below
@@ -276,6 +300,40 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		opts = append(opts, xcontext.WithLogger(log))
 	}
 	rctx := xcontext.BuildContext(ctx, opts...)
+	// #574/#608 — the cohort's impersonating transport, when the apiserver
+	// will accept every principal on it (used below).
+	// An unauthenticated identity has no ServiceAccount fallback (below), so its
+	// refusal is counted as such, never as impersonation_fallback_sa.
+	authenticated := cache.Authenticated(refreshUser, refreshGroups)
+	var imp *rest.Config
+	if saRC != nil {
+		if authenticated {
+			imp = cache.PermittedImpersonatingRESTConfig(rctx, saRC, refreshUser, refreshGroups)
+		} else {
+			imp = cache.ImpersonatingRESTConfigNoFallback(rctx, saRC, refreshUser, refreshGroups)
+		}
+	}
+	// #1334 — an identity the apiserver does not treat as authenticated (the
+	// public identity: system:unauthenticated) has no credential of its own:
+	// snowplow may act for it ONLY by impersonation. So when its cell cannot be
+	// refreshed impersonated, it is not refreshed under snowplow's own
+	// ServiceAccount with the re-gate (the fallback an authenticated cohort
+	// keeps): it is evicted, and the next request resolves it fresh on its own
+	// impersonated path. Decided by the apiserver's own group rule, never by a
+	// name.
+	if imp == nil && !authenticated {
+		prior, _ := c.GetNoTouch(key)
+		evicted := c.EvictUnrefreshable(key, prior)
+		noteUnauthenticatedRefreshRefused(evicted)
+		log.Debug("resolveAndPopulateL1: an unauthenticated identity cannot be refreshed impersonated; evicting instead of refreshing under the ServiceAccount",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+			slog.String("handler", inputs.CacheEntryClass),
+			slog.Bool("evicted", evicted),
+			slog.String("effect", "the next request resolves the cell fresh, impersonated (#1334)"),
+		)
+		return nil
+	}
 	// WithInternalEndpoint / WithInternalRESTConfig make cache.ClientConfigFor
 	// (internal_client.go) return the pre-built SA *rest.Config verbatim
 	// for the objects.Get apiserver fall-through and resourcesrefs.Resolve
@@ -301,7 +359,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// RBAC snapshot generation) and a refused cohort takes the SAME re-gated
 		// SA branch below — no impersonated-dial marker, so the re-gate and the
 		// UAF refilter apply exactly as before #574.
-		if imp := cache.PermittedImpersonatingRESTConfig(rctx, saRC, refreshUser, refreshGroups); imp != nil {
+		if imp != nil {
 			rctx = cache.WithInternalRESTConfig(rctx, imp)
 			rctx = cache.WithImpersonatedDial(rctx)
 		} else {
@@ -309,8 +367,13 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		}
 	}
 	// WithL1KeyContext threads the L1 key so the resolver's inner-call
-	// recording site re-records dep edges for this refresh.
-	rctx = cache.WithL1KeyContext(rctx, key)
+	// recording site re-records dep edges for this refresh. The refresher names
+	// itself here, not only in resolveOnceProd, so its terminal write is counted
+	// under its own name when the store refuses it (#1233).
+	rctx = refresherResolveCtx(cache.WithL1KeyContext(rctx, key))
+	// #890/#893 — a re-resolve whose write leaves key non-resident (refused: the
+	// cell was evicted meanwhile) leaves no edges behind (DepTracker.ReleaseUnstored).
+	defer cache.Deps().ReleaseUnstored(rctx, key)
 
 	// #598 — collapse the duplicate RA resolves inside one dirty-mark burst.
 	// One object event dirties every cell on its coordinate and the refresher
@@ -341,13 +404,13 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// clean refresh. It obsoletes #677's known-declined mark, whose trigger was
 	// exactly that result.
 	rctx, forbiddenSink := cache.WithPerIdentityForbiddenSink(rctx)
-	// External-no-cache (proposal 2026-06-22) — defense-in-depth. The
-	// refresher only ever re-Puts already-cached keys, and external RAs never
-	// get cached in the first place (the request-path Put-gates decline them),
-	// so the refresher should never re-resolve an external RA. But install +
-	// gate the external-touched sink here too, so that IF an external RA ever
-	// reached this path it would still decline the re-Put rather than persist
-	// stale external data. Additive to the stage-error sink.
+	// External-no-cache (proposal 2026-06-22). The refresher only ever re-Puts
+	// already-cached keys, and the request-path Put-gates never cache an
+	// external result — but a cell cached BEFORE an edit made its RESTAction
+	// touch a named endpoint reaches this path with the edit's dirty mark
+	// (#1255: the 057 PageHeader after portal#384). The external-touched sink
+	// lets the verdict decline that re-Put and evict the pre-edit body.
+	// Additive to the stage-error sink.
 	rctx, extTouchedSink := cache.WithExternalTouchedSink(rctx)
 	// #398 — sensitive-resource sink: a resolve that dispatched a core
 	// v1/secrets read must not be persisted by any resolved-output Put.
@@ -359,6 +422,11 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// re-resolve runs a refilter — including a widgets-class cell, whose stored
 	// Inputs never carry HasUAF because the declaration lives on the apiRef'd RA.
 	rctx, uafTouchedSink := cache.WithUAFTouchedSink(rctx)
+	// #904, #1319 — the re-resolve's stage outcomes, kept on the entry (every
+	// class) so an L1 hit answers with the header its cold resolve would have:
+	// a RESTAction cell's, a widget cell's (its apiRef RESTAction's stages) and
+	// a RESTAction full list's (replayed to the widget it is sliced for).
+	rctx, stageOutcomes := restactionsapi.WithStageOutcomes(rctx)
 
 	encoded, err := resolveOnceFn(rctx, inputs)
 	if err != nil {
@@ -427,68 +495,108 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// #681 — a result whose ONLY stage errors are per-identity forbidden is NOT
 	// an under-served result: it is exactly what this identity's class reads.
 	// It falls through to the re-Put below.
-	if stageErrSink.Count() > 0 && !cache.DenialOnly(stageErrSink, forbiddenSink, extTouchedSink, inputs.CacheEntryClass) {
-		// #301 observability: surface the FIRST failing stage's name + err
-		// inline so a decline can be attributed without a cross-grep
-		// against the resolver's error lines (which cost two traces).
-		sampleStage, sampleErr := stageErrSink.Sample()
-		// #547 — an inner stage that fails under the background identity (a
-		// refresher-only 403, an exportJwt loopback) ends the dequeue's window
-		// KNOWN-STALE: the cell keeps serving its pre-change body, every hit on
-		// it is counted (known_stale_served_total{reason=declined}), and the
-		// next read revalidates it under the REQUESTER, whose read is the one
-		// known to work. 1.12.6 C4 suppressed the key after K consecutive
-		// declines (REFRESH_SUPPRESS_AFTER_DECLINES) and left it frozen; that
-		// knob is retired. The #191 WARN storm is bounded instead by logging at
-		// WARN once per stale generation: a decline of a cell that is ALREADY
-		// known-stale is DEBUG (the counter carries the rate).
-		suppressed := cache.NoteRefreshDecline(key, "stage_error", false)
-		_, _, alreadyKnownStale := cache.KnownStale(key)
-		declineLevel := slog.LevelWarn
-		if alreadyKnownStale {
-			declineLevel = slog.LevelDebug
-		}
-		log.Log(rctx, declineLevel, "resolveAndPopulateL1: stage error during refresh; declining to overwrite good entry",
-			slog.String("subsystem", "cache"),
-			slog.String("key_hash", key),
-			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshLogUser(refreshUser)),
-			slog.String("rep_source", repSource),
-			slog.Int64("stage_errors", stageErrSink.Count()),
-			slog.String("stage_err_stage", sampleStage),
-			slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
-			slog.Bool("suppressed", suppressed),
-			slog.String("effect", "prior entry kept and marked KNOWN-STALE: served and counted, revalidated "+
-				"on the next read under the requester, re-enqueued by the next change (#547)"),
-		)
-		cache.BumpRefresherSkippedStageError()
-		return nil
-	}
+	// The shared Put-gate verdict (cache.PutGateVerdict): the refresher's
+	// decline, its reason and whether it is permanent all come from it.
+	verdict := cache.PutGateVerdict(cache.PutGateSinks{Stage: stageErrSink, Forbidden: forbiddenSink, External: extTouchedSink}, inputs.CacheEntryClass)
 
-	// External-no-cache (proposal 2026-06-22) — defense-in-depth re-Put gate.
-	// If the re-resolve touched a genuine external endpoint, the fresh bytes
-	// have no dep edge to invalidate them; decline the re-Put (keep the prior
-	// entry; TTL is the outer net) exactly as the stage-error gate does.
-	// #681 C2 — an own-credential apiserver 403 is not a genuine external touch.
-	if cache.GenuineExternal(extTouchedSink, forbiddenSink) > 0 {
-		cache.BumpExternalSkippedPut()
-		// 1.12.6 C4 (§6.2 row 7) — structurally permanent: an external RA has
-		// no dep edge, so every dirty-mark re-resolve is pure waste. Suppress
-		// on first occurrence; the next real Put clears it.
-		cache.NoteRefreshDecline(key, "external_touched", true)
-		// Not a fault: a designed defense-in-depth decline (external data has no
-		// dep edge to invalidate it, so keep the prior entry; TTL is the outer
-		// net). Fires on every refresh of an external-touching entry — DEBUG.
-		// The BumpExternalSkippedPut counter carries the rate for operators.
-		log.Debug("resolveAndPopulateL1: re-resolve touched an external endpoint; declining to overwrite entry",
-			slog.String("subsystem", "cache"),
-			slog.String("key_hash", key),
-			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshLogUser(refreshUser)),
-			slog.String("rep_source", repSource),
-			slog.Int64("external_touches", extTouchedSink.Count()),
-			slog.String("effect", "prior entry kept; external data has no dep edge — TTL is the outer net"),
-		)
+	// Declined, whatever the reason (#912 re-review: the reason only selects
+	// the log line and the counter; the refresher's write takes the verdict too
+	// and would refuse it anyway). A permanent verdict — a declared write
+	// (#903 F1), a genuine external touch (1.12.6 C4 §6.2 row 7: no dep edge, so
+	// every dirty-mark re-resolve is waste), a stage error beside one (#903 B2)
+	// — suppresses the key on first occurrence; the next real Put clears it. A
+	// transient stage error leaves the cell KNOWN-STALE (#547).
+	if !verdict.Store() {
+		suppressed := cache.NoteRefreshDecline(key, string(verdict.Reason()), verdict.Permanent())
+		// #1255 — a PERMANENT decline proves this key can no longer be stored (an
+		// edit made the RESTAction touch a named endpoint, or declare a write): no
+		// writer will ever replace the prior body, so keeping it would serve the
+		// pre-change output until the TTL. Evict it, so the next request resolves
+		// live; the eviction clears the suppression marker with the key and is
+		// pushed to armed tabs. The epoch guard spares a body a concurrent writer
+		// stored after this resolve began, and an external-TTL cell, whose own
+		// opt-in stores exactly this resolve (cache/evict_unstorable.go). A
+		// transient decline keeps the prior entry KNOWN-STALE (#547).
+		evicted := evictOnPermanentDecline(rctx, inClassEvicter(rctx, c, &inputs), verdict, key)
+		switch verdict.Reason() {
+		case cache.PutReasonDeclaredWrite:
+			if !evicted {
+				log.Debug("resolveAndPopulateL1: the RESTAction declares a write stage; declining to re-Put",
+					slog.String("subsystem", "cache"),
+					slog.String("key_hash", key),
+					slog.String("handler", inputs.CacheEntryClass),
+					slog.String("effect", "never stored: every /call runs its write (#903 F1); suppressed until the next real Put"),
+				)
+			}
+		case cache.PutReasonExternal:
+			// External-no-cache (proposal 2026-06-22) — the fresh bytes have no dep
+			// edge to invalidate them, so they are never stored. #681 C2 — an
+			// own-credential apiserver 403 is not a genuine external touch.
+			cache.BumpExternalSkippedPut()
+			// The prior entry was evicted above unless nothing older than this
+			// resolve was resident, or it is an external-TTL cell (bounded by its own
+			// short TTL by design). Those keeps are expected — DEBUG; the
+			// BumpExternalSkippedPut counter carries the rate for operators.
+			if !evicted {
+				log.Debug("resolveAndPopulateL1: re-resolve touched an external endpoint; declining to overwrite entry",
+					slog.String("subsystem", "cache"),
+					slog.String("key_hash", key),
+					slog.String("handler", inputs.CacheEntryClass),
+					slog.String("rep_source", repSource),
+					slog.Int64("external_touches", extTouchedSink.Count()),
+					slog.String("effect", "not stored; no older entry to evict, or an external-TTL cell kept to its own bounded TTL (#1255)"),
+				)
+			}
+		case cache.PutReasonStageError:
+			// #301 observability: surface the FIRST failing stage's name + err
+			// inline so a decline can be attributed without a cross-grep
+			// against the resolver's error lines (which cost two traces).
+			sampleStage, sampleErr := stageErrSink.Sample()
+			// #547 — an inner stage that fails under the background identity (a
+			// refresher-only 403, an exportJwt loopback) ends the dequeue's window
+			// KNOWN-STALE: the cell keeps serving its pre-change body, every hit on
+			// it is counted (known_stale_served_total{reason=declined}), and the
+			// next read revalidates it under the REQUESTER, whose read is the one
+			// known to work. 1.12.6 C4 suppressed the key after K consecutive
+			// declines (REFRESH_SUPPRESS_AFTER_DECLINES) and left it frozen; that
+			// knob is retired. The #191 WARN storm is bounded instead by logging at
+			// WARN once per stale generation: a decline of a cell that is ALREADY
+			// known-stale is DEBUG (the counter carries the rate).
+			// #903 B2 — a stage error on a resolve that ALSO touched a genuine
+			// external endpoint can never be re-Put by the refresher (the external
+			// decline would refuse it anyway), so the verdict makes it structurally
+			// permanent: suppress, don't re-resolve it on every change. #1255 — and
+			// evict the prior entry (above), which nothing can ever replace; that
+			// eviction logged itself, and nothing was kept to describe here.
+			_, _, alreadyKnownStale := cache.KnownStale(key)
+			declineLevel := slog.LevelWarn
+			if alreadyKnownStale {
+				declineLevel = slog.LevelDebug
+			}
+			if !evicted {
+				log.Log(rctx, declineLevel, "resolveAndPopulateL1: stage error during refresh; declining to overwrite good entry",
+					slog.String("subsystem", "cache"),
+					slog.String("key_hash", key),
+					slog.String("handler", inputs.CacheEntryClass),
+					slog.String("rep_source", repSource),
+					slog.Int64("stage_errors", stageErrSink.Count()),
+					slog.String("stage_err_stage", sampleStage),
+					slog.String("stage_err_sample", redact.ErrorText(sampleErr)),
+					slog.Bool("suppressed", suppressed),
+					slog.String("effect", "prior entry kept and marked KNOWN-STALE: served and counted, revalidated "+
+						"on the next read under the requester, re-enqueued by the next change (#547)"),
+				)
+			}
+			cache.BumpRefresherSkippedStageError()
+		default:
+			// Any other decline: today only cache.PutReasonUnobserved, a verdict
+			// over Put-gate sinks that were not all installed on the resolve. It
+			// admits nothing (#912 delta-3 item 3); never read as another reason.
+			slog.Default().WarnContext(ctx, "resolve declined by the Put-gate verdict; declining to cache",
+				slog.String("reason", string(verdict.Reason())),
+				slog.String("effect", "body served; not persisted"),
+			)
+		}
 		return nil
 	}
 
@@ -504,8 +612,8 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// It still fires for an identity-free cell, where ONE cell is shared by every
 	// requester and a narrowed body in it is an unconditional cross-tenant leak
 	// no key change short of making the class identity-bound can fix. Same shape
-	// as the external-touched re-Put gate above: keep whatever entry exists,
-	// decline the write, TTL is the outer net.
+	// as the external-touched re-Put gate above: decline the write, and (#1255)
+	// evict an older entry, which no writer can ever replace.
 	if reason := uafDeclineReason(&inputs, uafTouchedSink); reason != "" {
 		// Count under the class the cell actually belongs to, so the widgets
 		// carrier's refresh declines do not get buried in the restactions number.
@@ -517,25 +625,32 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// 1.12.6 C4 (§6.2 row 8) — structurally permanent until 1.13.0 folds
 		// the UAF scope into the key (#180): suppress on first occurrence.
 		cache.NoteRefreshDecline(key, "uaf", true)
+		// #1255 — evict an older entry: no writer stores this key's current body.
+		if evictUnstorable(rctx, inClassEvicter(rctx, c, &inputs), key, cache.UnstorableUAF) {
+			return nil
+		}
 		// DEBUG for the same reason as the dispatch site: expected, designed, and
 		// potentially per-refresh-cycle frequent. The counter carries the rate.
 		log.Debug("resolveAndPopulateL1: re-resolve is userAccessFilter-narrowed; declining to re-Put",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", refreshLogUser(refreshUser)),
 			slog.String("rep_source", repSource),
 			slog.String("uaf_reason", reason),
 			slog.Int64("uaf_touches", uafTouchedSink.Count()),
-			slog.String("effect", "prior entry kept, not refreshed; a UAF body is per-requester-narrowed and the key does not separate co-bound users (1.12.3 A-1)"),
+			slog.String("effect", "not stored, no older entry to evict; a UAF body is per-requester-narrowed and the key does not separate co-bound users (1.12.3 A-1)"),
 		)
 		return nil
 	}
 
 	// #398 — a re-resolve that read a sensitive resource is never re-Put
-	// (structurally permanent for this cell: suppress on first occurrence).
+	// (structurally permanent for this cell: suppress on first occurrence), and
+	// (#1255) an older entry is evicted: no writer stores this key's current body.
 	if cache.DeclineSensitivePut(rctx) {
 		cache.NoteRefreshDecline(key, "sensitive_resource", true)
+		if evictUnstorable(rctx, inClassEvicter(rctx, c, &inputs), key, cache.UnstorableSensitive) {
+			return nil
+		}
 		log.Debug("resolveAndPopulateL1: re-resolve read a sensitive resource; declining to re-Put",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
@@ -582,6 +697,10 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// without needing the RESTAction CR. Returns 0 (no override) when the knob
 		// is unset or the cell is non-UAF → byte-identical to today.
 		TTLOverride: uafTTLOverrideForEntry(&inputs),
+		// #904, #1319 — the cell keeps its resolve's stage outcomes. A
+		// re-resolve whose stages all succeeded stores "" and its hit answers
+		// complete: a widget's notice clears on the refetch its frame triggers.
+		StageOutcomes: storableStageOutcomes(stageOutcomes),
 	}
 	// Ship #97 (0.30.214) — restore the R3 fast-path on refresher Puts
 	// of apistage-class LIST entries. Pre-fix the refresher Put wrote
@@ -649,9 +768,15 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	rebuildPrior, hadRebuildPrior := c.GetNoTouch(key)
 	noteRefreshRebuild(rebuildPrior, hadRebuildPrior, encoded)
 
-	stored := c.ReplaceIfGenRefresh(rctx, key, entry, gen0)
+	put := c.ReplaceResolvedIfGenRefresh(rctx, verdict, key, entry, gen0)
+	stored := put.Stored()
 	cache.NoteRefreshWrite(rctx, key, stored)
-	if stored && stageErrSink.Count() > 0 {
+	// #603 PR-2 / #765 SHADOW audit — when every mark this cell received since
+	// its last refresh was a would-avoid, classify this rebuild against the
+	// same prior the #612 compare used: identical, or changed (would_change).
+	// Observation only.
+	cache.NoteNarrowAuditWrite(rctx, key, rebuildPrior, hadRebuildPrior, encoded, stored)
+	if stored && verdict.DenialOnly() {
 		cache.RecordDenialOnlyPut(cache.DenialOnlyPutSiteRefresher) // #681
 	}
 	if !stored {
@@ -663,21 +788,27 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	}
 	// Ship 1 (live-refresh-coherence, option A) — emit the live-refresh
 	// signal STRICTLY post-commit, on the refresher path only. This line is
-	// reached ONLY after the Put returned and ONLY on a genuine L1 change:
-	// the four no-Put success-returns above (cache-off :96-99, declined
-	// :214-218, evicted-during-refresh :223-229, stage-error decline
-	// :243-260) all return before here, so the signal never fires when L1
-	// did not actually change (design §1.1 — coherent by construction).
+	// reached ONLY after the Put returned, and the signal fires ONLY on a
+	// genuine L1 change: the no-Put success-returns above (cache-off, declined,
+	// evicted-during-refresh, stage-error decline) all return before here, and
+	// #1321 — an ACCEPTED Put whose bytes equal the prior it replaced (put ==
+	// PutIdentical, the compare confirmed under the store lock) publishes
+	// nothing either: PublishRefreshed fans out only a PutChanged. Before #1321
+	// this gated on the new generation alone, so ~84% of frames on an idle 057
+	// announced bytes the subscriber already held (design §1.1 — coherent by
+	// construction). The refresh and its Put still ran; only the frame is
+	// withheld, counted snowplow_refresh_broadcaster.withheld_identical.
 	// resolveAndPopulateL1 is invoked ONLY from the refresher closure
 	// (dispatchers.go:86), never from cold dispatch or the prewarm walker, so
 	// this announces dep-change-driven re-resolves only. PublishRefresh is
 	// nil-safe and a no-op when the SSE layer is disabled or cache is off.
-	cache.PublishRefresh(key)
+	// #1070 — PublishRefreshed is PublishRefresh carrying this refresh's Put time
+	// (on rctx) so the frame it causes is timed from it (measurement only).
+	cache.PublishRefreshed(rctx, key, put)
 	log.Debug("resolveAndPopulateL1: re-resolved + stored",
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),
 		slog.String("handler", inputs.CacheEntryClass),
-		slog.String("user", refreshLogUser(refreshUser)),
 		slog.String("rep_source", repSource),
 		slog.Bool("pinned", prePinned),
 	)
@@ -772,7 +903,7 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 		// so on. The message text is unchanged ("re-fetch <res>/<name>: <msg>").
 		refetchErr := cache.WrapResolveStage(cache.ResolveStageRefetch,
 			fmt.Sprintf("re-fetch %s/%s", inputs.Resource, inputs.Name),
-			statusErrFromResponse(got.Err))
+			statusErrFromResult(got))
 		//
 		// WHAT EACH CLASS DOES WITH IT (the refresher decides, not this site):
 		//

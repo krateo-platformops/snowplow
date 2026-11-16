@@ -88,6 +88,7 @@ func AssertSeedUnitFootprint(label string, deltaBytes, budgetBytes uint64) bool 
 	}
 
 	seedUnitFootprintViolations.Add(1)
+	// log-ctx-waiver: worker: a prewarm seed unit, which no request drives
 	slog.Error("cache.seed_aggregate_footprint.violation",
 		slog.String("subsystem", "cache"),
 		slog.String("check", "seed_aggregate_footprint"),

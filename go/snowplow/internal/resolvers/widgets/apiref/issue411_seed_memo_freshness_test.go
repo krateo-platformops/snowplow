@@ -32,7 +32,6 @@ import (
 	"testing"
 	"time"
 
-	pmaps "github.com/krateo-platformops/plumbing/maps"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
@@ -95,7 +94,7 @@ func i411Setup(t *testing.T, raName string) *i411Fixture {
 	f := &i411Fixture{
 		t: t, gRA: gRA, backing: backing, raName: raName, marker: &marker,
 		base:   f6CtxWithUser(t, "admin", []string{"system:masters"}),
-		memo:   cache.NewSeedResolveMemo(pmaps.DeepCopyJSON),
+		memo:   cache.NewSeedResolveMemo(),
 		marked: map[string]bool{},
 		dyn:    dyn,
 	}
@@ -107,7 +106,7 @@ func i411Setup(t *testing.T, raName string) *i411Fixture {
 	if err != nil {
 		t.Fatalf("pre-warm resolve failed: %v", err)
 	}
-	store.PutRAFullList(f.raKey, f.raIn, fullDict)
+	store.PutRAFullList(fixtureStoreVerdict, f.raKey, f.raIn, fullDict)
 	cache.RecordSliceability(f.raKey, shape, true)
 	d.Record(context.Background(), f.raKey, gRA, ns, raName) // RA-CR self-dep
 
@@ -141,7 +140,7 @@ func (f *i411Fixture) seedResolve(key, name string) map[string]any {
 	if err != nil {
 		f.t.Fatalf("seed apiref.Resolve(%s) failed: %v", key, err)
 	}
-	store.PutIfGen(ctx, key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(f.t, body), Inputs: edge3WidgetInputs(name)}, gen)
+	store.PutResolvedIfGen(ctx, fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(f.t, body), Inputs: edge3WidgetInputs(name)}, gen)
 	return body
 }
 
@@ -205,7 +204,7 @@ func (f *i411Fixture) drain(widgets map[string]string) {
 	if err != nil {
 		f.t.Fatalf("raKey refresh resolve failed: %v", err)
 	}
-	store.PutRAFullList(f.raKey, f.raIn, fresh)
+	store.PutRAFullList(fixtureStoreVerdict, f.raKey, f.raIn, fresh)
 	for key, name := range widgets {
 		if !marked[key] {
 			continue
@@ -215,7 +214,7 @@ func (f *i411Fixture) drain(widgets map[string]string) {
 		if err != nil || !ok {
 			f.t.Fatalf("refresh re-serve of %q failed: ok=%v err=%v", key, ok, err)
 		}
-		store.Put(key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(f.t, got), Inputs: edge3WidgetInputs(name)})
+		store.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(f.t, got), Inputs: edge3WidgetInputs(name)})
 	}
 }
 
@@ -326,7 +325,7 @@ func TestIssue411_KeepwarmResidentNotOverwrittenByStaleMemo(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("prior-pass w2 serve failed: ok=%v err=%v", ok, err)
 	}
-	store.Put(w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, prior), Inputs: edge3WidgetInputs("w2")})
+	store.PutResolved(fixtureStoreVerdict, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, prior), Inputs: edge3WidgetInputs("w2")})
 
 	// Current pass: w1 produces the memo body (OLD).
 	f.seedResolve(w1Key, "w1")
@@ -400,7 +399,7 @@ func TestIssue411_TornWindowMemoHitIsRemarked(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("prior-pass w2 serve failed: ok=%v err=%v", ok, err)
 	}
-	store.Put(w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, prior), Inputs: edge3WidgetInputs("w2")})
+	store.PutResolved(fixtureStoreVerdict, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, prior), Inputs: edge3WidgetInputs("w2")})
 
 	f.seedResolve(w1Key, "w1") // current pass: memo body (OLD)
 
@@ -438,7 +437,7 @@ func TestIssue411_TornWindowMemoHitIsRemarked(t *testing.T) {
 	}
 
 	reasons := i411RemarksFor(t, w2Key)
-	if !store.PutIfGen(w2ctx, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, w2body), Inputs: edge3WidgetInputs("w2")}, gen) {
+	if !store.PutResolvedIfGen(w2ctx, fixtureStoreVerdict, w2Key, &cache.ResolvedEntry{RawJSON: edge3MustJSON(t, w2body), Inputs: edge3WidgetInputs("w2")}, gen) {
 		t.Fatalf("setup: the keepwarm PutIfGen must be accepted (a refresh does not move the gen)")
 	}
 	if got := reasons(); len(got) == 0 {
@@ -558,7 +557,7 @@ func TestIssue411_MemoDoesNotCrossRBACSubGenClass(t *testing.T) {
 	i411CrossClassArm(t, "i411-xclass-subgen-ra", func(f *i411Fixture) {
 		// Activate the sub-gen deltas (production builds this index at boot over
 		// the navigated GVRs), then edit the role's rules.
-		cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{f.gRA})
+		cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{f.gRA})
 		role := &rbacv1.ClusterRole{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
 			ObjectMeta: metav1.ObjectMeta{Name: "widgets-reader"},
@@ -573,6 +572,6 @@ func TestIssue411_MemoDoesNotCrossRBACSubGenClass(t *testing.T) {
 			t.Fatalf("update ClusterRole: %v", err)
 		}
 	}, func() string {
-		return fmt.Sprint(cache.RBACSubGenForSubject("admin", rbac.WithAuthenticatedGroup([]string{"system:masters"})))
+		return fmt.Sprint(cache.RBACSubGenForSubject("admin", rbac.WithAuthenticatedGroup("admin", []string{"system:masters"})))
 	})
 }

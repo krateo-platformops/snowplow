@@ -163,9 +163,7 @@ func CollectResourceTypesFromRestActions(ctx context.Context, dynClient dynamic.
 // downstream GVRs (e.g. compositions) without an informer at 0.30.91.
 func ParseAPIServerPathToGVR(path string) (schema.GroupVersionResource, bool) {
 	// Strip query string.
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path, _, _ = apicall.SplitURI(path) // fragment too, as the apiserver receives it (#1073 F1)
 	// Strip trailing slash.
 	path = strings.TrimRight(path, "/")
 
@@ -286,9 +284,7 @@ func ParseAPIServerPathToDep(path string) (gvr schema.GroupVersionResource, name
 // on a literal group/version/resource value.
 func ParseAPIServerDiscoveryPath(path string) (groupVersion string, ok bool) {
 	// Strip query string.
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path, _, _ = apicall.SplitURI(path) // fragment too, as the apiserver receives it (#1073 F1)
 	// Strip trailing slash.
 	path = strings.TrimRight(path, "/")
 
@@ -363,9 +359,7 @@ func ParseAPIServerDiscoveryPath(path string) (groupVersion string, ok bool) {
 // shape, never a literal resource/group value.
 func ParseAPIServerDiscoveryRoot(path string) (root string, ok bool) {
 	// Strip query string + trailing slash (so "/api/" and "/apis/?x=1" match).
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path, _, _ = apicall.SplitURI(path) // fragment too, as the apiserver receives it (#1073 F1)
 	path = strings.TrimRight(path, "/")
 
 	// Reject unresolved JQ template fragments.

@@ -40,7 +40,7 @@ func TestS398_SeedNeverPersistsSecret(t *testing.T) {
 		Reference:  templatesv1.Reference{Name: psRAName, Namespace: h1NS},
 		APIVersion: h1RAGVR.Group + "/" + h1RAGVR.Version, Resource: h1RAGVR.Resource,
 	}
-	_ = seedOneRestaction(cohort, "cohort-s398", ref, psAuthnNS, seedModeBoot)
+	_ = seedOneRestaction(cohort, ref, psAuthnNS, seedModeBoot)
 
 	c := cache.ResolvedCache()
 	for _, k := range c.KeysForTest() {

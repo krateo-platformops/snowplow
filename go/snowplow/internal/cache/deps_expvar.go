@@ -77,6 +77,11 @@ func registerDepsExpvar() {
 		expvar.Publish("snowplow_deps_dirty_mark_attribution", expvar.Func(func() any {
 			return DirtyMarkAttributionExpvar()
 		}))
+		// #603 PR-2 / #765 option B SHADOW — would_avoid / would_change and their
+		// denominators (deps_list_interest.go). Metadata only, never a body.
+		expvar.Publish("snowplow_deps_list_narrow", expvar.Func(func() any {
+			return ListNarrowExpvar()
+		}))
 	})
 }
 

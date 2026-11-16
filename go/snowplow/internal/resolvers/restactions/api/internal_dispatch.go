@@ -117,18 +117,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
-	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/redact"
+	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sdynamic "k8s.io/client-go/dynamic"
@@ -362,7 +363,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		// endpoint and fails with the x509 error. Loud so a future caller
 		// passing the wrong shape is diagnosable (mirrors resolveOne's
 		// WithInternalEndpoint wrong-type warning).
-		xcontext.Logger(ctx).Warn("dispatchViaInternalRESTConfig: internal REST config present but not a usable *rest.Config; falling through to httpcall.Do",
+		xcontext.Logger(ctx).WarnContext(ctx, "dispatchViaInternalRESTConfig: internal REST config present but not a usable *rest.Config; falling through to httpcall.Do",
 			slog.String("subsystem", "cache"),
 			slog.String("got_type", fmt.Sprintf("%T", v)),
 			slog.String("hint", "an internal driver (e.g. Phase 1) must pass *rest.Config to cache.WithInternalRESTConfig"),
@@ -370,8 +371,16 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		return nil, false, nil
 	}
 
+	// Gate 1b (#1017): the internal rest config is THIS cluster's
+	// ServiceAccount. A stage whose endpoint names another cluster
+	// (targetsOwnCluster) is never answered with it: it falls through to the
+	// dispatch on its own endpoint.
+	if !targetsOwnCluster(ctx) {
+		return nil, false, nil
+	}
+
 	// Gate 2: verb. client-go dynamic Get/List is read-only.
-	if verb := ptr.Deref(call.Verb, http.MethodGet); verb != http.MethodGet {
+	if !isPlainGet(call.Verb) { // #1011: the one read-optimisation verb predicate
 		return nil, false, nil
 	}
 
@@ -446,6 +455,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		// own authorize-before-lookup order.
 		//
 		// The LIST shape below is unchanged (its narrowing is per item).
+		preDialAuthorized := false
 		if !serveUnnarrowed {
 			if preNS, ok := preDialAuthzNamespace(gvr, namespace); ok {
 				if !authorizeGetByRBAC(ctx, gvr, preNS, name) {
@@ -457,12 +467,25 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 					return nil, false, newRegateForbidden(gvr, namespace, name)
 				}
 				recordPreDial(preDialAllowed)
+				preDialAuthorized = true
 			} else {
 				recordPreDial(preDialScopeFallback)
 			}
 		}
-		obj, getErr := nri.Get(ctx, name, metav1.GetOptions{})
+		// #1054 — one apiserver GET: its attempts (client-go retries a 429),
+		// statuses and retry sleeps ride dctx to slowcall.Transport.
+		dctx, dial := slowcall.StartDial(ctx, slowcall.BranchInternalRESTConfig, "get", gvr.String())
+		obj, getErr := nri.Get(dctx, name, metav1.GetOptions{})
+		dial.EndErr(ctx, getErr)
 		if getErr != nil {
+			// #1080 N2 — a NotFound AFTER this identity's `get` was authorized
+			// is this identity's answer (the apiserver's own authorize-before-
+			// lookup order). Without the pre-dial step (an un-narrowed serve, a
+			// scope fallback) the SA's NotFound says nothing about the identity:
+			// it stays a plain error.
+			if preDialAuthorized && apierrors.IsNotFound(getErr) {
+				return nil, false, newAuthorizedNotFound(getErr)
+			}
 			return nil, false, getErr
 		}
 		// Per-user RBAC re-gate on the GET-by-name (defensive authorization).
@@ -520,11 +543,11 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 	// an operator see that a caller supplied a null where a name was expected,
 	// instead of the failure only surfacing as a confusing downstream jq error.
 	if pathHasNullPathSegment(call.Path) {
-		xcontext.Logger(ctx).Warn("internal_dispatch.list.unintended_collapse: api-step path resolved to a cluster LIST because a name/namespace path segment was null — check the caller's extras",
+		xcontext.Logger(ctx).WarnContext(ctx, "internal_dispatch.list.unintended_collapse: api-step path resolved to a cluster LIST because a name/namespace path segment was null — check the caller's extras",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", namespace),
-			slog.String("resolved_path", call.Path),
+			redact.PathAttr("resolved_path", call.Path),
 			slog.String("note", "Task #118 — a jq-templated name/namespace segment folded to empty (string+null); the intended by-name GET became a cluster-wide LIST"),
 		)
 	}
@@ -610,9 +633,13 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		// Bounded per-GVR sync-wait (returns immediately when already synced —
 		// the common boot case), then the SAME four-conjunct IsServable gate
 		// ListObjectsServable enforces. Both must hold to serve from cache.
+		waitStart := time.Now()
+		syncWait := slowcall.StartWait(ctx, slowcall.PhaseInformerSyncWait, "informer_sync", "", gvr.String()) // #1054
 		synced := rw.WaitForGVRSync(ctx, gvr, internalDispatchServeSyncWait)
+		syncWait.EndRelease(syncWaitRelease(ctx, synced))
+		recordServeSyncWait(time.Since(waitStart)) // #796
 		if synced && rw.IsServable(gvr) {
-			if served, ok := rw.ListServableEnvelopeJSONWhere(gvr, namespace, keep); ok {
+			if served, ok := rw.ListServableEnvelopeJSONWhere(ctx, gvr, namespace, keep); ok {
 				recordListQuery(query) // applied in process (no-op without a query)
 				xcontext.Logger(ctx).Info("internal_dispatch.list.informer_served",
 					slog.String("subsystem", "cache"),
@@ -630,6 +657,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		// we fall through to the live paged LIST. Diagnostic only (Task #130 F1);
 		// the dispatch flow below is byte-identical whether or not this fires.
 		snap := rw.ServabilitySnapshotFor(gvr)
+		recordServeMiss(serveMissReason(snap)) // #796 — the shipped surface
 		xcontext.Logger(ctx).Info("internal_dispatch.list.serve_miss",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -637,6 +665,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 			slog.Bool("hasSynced", snap.HasSynced),
 			slog.Bool("watchHealthy", snap.WatchHealthy),
 			slog.Bool("typeConfirmed", snap.TypeConfirmed),
+			slog.Bool("listRefused", snap.ListRefused),
 		)
 		// Fall through to the live paged LIST below (never worse).
 	}
@@ -658,7 +687,9 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 			return nil, false, ctx.Err()
 		default:
 		}
-		page, pageErr := nri.List(ctx, opts)
+		dctx, dial := slowcall.StartDial(ctx, slowcall.BranchInternalRESTConfig, "list", gvr.String()) // #1054: one LIST page
+		page, pageErr := nri.List(dctx, opts)
+		dial.EndErr(ctx, pageErr)
 		if pageErr != nil {
 			return nil, false, pageErr
 		}
@@ -758,9 +789,11 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 	// Per-user RBAC re-gate on the LIST (defensive authorization). See the
 	// GET branch above: branch C reads under the SA client, so an un-narrowed
 	// LIST would serve every namespace's items to a denied per-user caller.
-	// DEFAULT POSTURE on a full deny: a served-EMPTY `items` list, byte-
-	// consistent with the informer path (filterListByRBAC returns an empty
-	// subset, not a fall-through). The informer-serve early return above is
+	// A caller who may `list` on NO scope the request covers gets the typed
+	// re-gate Forbidden (#961) — the apiserver's own answer for that caller,
+	// and the informer path's: filterListByRBAC decides it from the RBAC rules,
+	// never from how many items survive. An allowed LIST keeps the caller's
+	// items (possibly none). The informer-serve early return above is
 	// unreachable for a per-user request (it is gated on a serve-watcher,
 	// which is itself clause (a) of serveUnnarrowed), so this is the single
 	// narrowing site for a live-LIST branch-C serve.
@@ -775,11 +808,17 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		for i := range resultList.Items {
 			items[i] = &resultList.Items[i]
 		}
-		filtered, servedOK := filterListByRBAC(ctx, gvr, items)
-		if !servedOK {
-			// filterListByRBAC's no-identity contract (fall-through, not
-			// serve). Unreachable here — clause (c) already exempts a
-			// no-identity ctx before we narrow — but honour it defensively.
+		// #1049: the requester's own request, query included.
+		_, rawQuery, _ := splitPathQuery(call.Path)
+		filtered, gateErr := filterListByRBAC(ctx, gvr, namespace, rawQuery, items)
+		if isRegateDenied(gateErr) {
+			return nil, false, gateErr
+		}
+		if gateErr != nil {
+			// filterListByRBAC's not-decided contract (fall-through, not
+			// serve): no identity — unreachable here, clause (c) already
+			// exempts a no-identity ctx before we narrow — or an evaluator
+			// error.
 			return nil, false, nil
 		}
 		narrowed := make([]unstructured.Unstructured, len(filtered))
@@ -842,9 +881,7 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 // branch; here it is only consulted on the LIST branch, so it fires precisely
 // on the null→cluster-LIST case task #118 targets.
 func pathHasNullPathSegment(path string) bool {
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path, _, _ = splitPathQuery(path) // fragment and query dropped (#1073 F1)
 	if path == "" {
 		return false
 	}
@@ -856,4 +893,17 @@ func pathHasNullPathSegment(path string) bool {
 	// (typically the namespace) folded to empty. TrimPrefix the leading '/'
 	// so the mandatory leading separator is not mistaken for an empty segment.
 	return strings.Contains(strings.TrimPrefix(path, "/"), "//")
+}
+
+// syncWaitRelease is why a bounded informer sync wait ended (#1054): the
+// informer synced (completed), the caller's ctx ended, or the bound ran out
+// first (timeout).
+func syncWaitRelease(ctx context.Context, synced bool) slowcall.Release {
+	if synced {
+		return slowcall.ReleaseCompleted
+	}
+	if err := ctx.Err(); err != nil {
+		return slowcall.CauseOf(err)
+	}
+	return slowcall.ReleaseTimeout
 }

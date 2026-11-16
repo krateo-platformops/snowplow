@@ -291,7 +291,7 @@ func TestServe1a_InformerServed_WholeDesignGreen(t *testing.T) {
 	ctx = cache.WithServeWatcher(ctx, rw)
 	ctx = withSlogLogger(ctx, logger)
 
-	raw, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: serve1aListPath},
 	})
 	if err != nil {
@@ -350,7 +350,7 @@ func TestServe1a_C1_NeverWorse_FallsThroughToLiveList(t *testing.T) {
 	ctx = withSlogLogger(ctx, logger)
 
 	start := time.Now()
-	raw, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: serve1aListPath},
 	})
 	elapsed := time.Since(start)
@@ -423,7 +423,7 @@ func TestServe1a_ByteParity_InformerVsLiveList(t *testing.T) {
 		TLSClientConfig: rest.TLSClientConfig{CAData: caPEM},
 	}
 	liveCtx := cache.WithInternalRESTConfig(context.Background(), rc)
-	liveRaw, liveServed, err := dispatchViaInternalRESTConfig(liveCtx, httpcall.RequestOptions{
+	liveRaw, liveServed, err := dispatchViaInternalRESTConfig(ownClusterCtx(liveCtx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: serve1aListPath},
 	})
 	if err != nil || !liveServed {
@@ -435,7 +435,7 @@ func TestServe1a_ByteParity_InformerVsLiveList(t *testing.T) {
 	rw := newServe1aWatcher(t, true, items...)
 	infCtx := cache.WithInternalRESTConfig(context.Background(), rc)
 	infCtx = cache.WithServeWatcher(infCtx, rw)
-	infRaw, infServed, err := dispatchViaInternalRESTConfig(infCtx, httpcall.RequestOptions{
+	infRaw, infServed, err := dispatchViaInternalRESTConfig(ownClusterCtx(infCtx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: serve1aListPath},
 	})
 	if err != nil || !infServed {
@@ -686,7 +686,7 @@ func TestServe1a_NoServeWatcher_ByteIdenticalToPre1a(t *testing.T) {
 	ctx := cache.WithInternalRESTConfig(context.Background(), rc)
 	ctx = withSlogLogger(ctx, logger)
 
-	_, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+	_, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: serve1aListPath},
 	})
 	if err != nil || !served {
@@ -743,7 +743,7 @@ func TestServe1a_CustomerPath_Gate1EarlyReturn_NoInformerServe(t *testing.T) {
 	// CUSTOMER-SHAPED ctx: NO WithInternalRESTConfig (the per-user /call path).
 	ctx := withSlogLogger(context.Background(), logger)
 
-	raw, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+	raw, served, err := dispatchViaInternalRESTConfig(ownClusterCtx(ctx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: serve1aListPath},
 	})
 	// Gate 1 early-return: (nil,false,nil).
@@ -815,7 +815,7 @@ func serve1aLiveAndInformerRaw(t *testing.T, n int, items []*unstructured.Unstru
 	liveCtx := cache.WithInternalRESTConfig(context.Background(), rc)
 	var liveServed bool
 	var err error
-	liveRaw, liveServed, err = dispatchViaInternalRESTConfig(liveCtx, httpcall.RequestOptions{
+	liveRaw, liveServed, err = dispatchViaInternalRESTConfig(ownClusterCtx(liveCtx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: serve1aListPath},
 	})
 	if err != nil || !liveServed {
@@ -825,7 +825,7 @@ func serve1aLiveAndInformerRaw(t *testing.T, n int, items []*unstructured.Unstru
 	infCtx := cache.WithInternalRESTConfig(context.Background(), rc)
 	infCtx = cache.WithServeWatcher(infCtx, rw)
 	var infServed bool
-	infRaw, infServed, err = dispatchViaInternalRESTConfig(infCtx, httpcall.RequestOptions{
+	infRaw, infServed, err = dispatchViaInternalRESTConfig(ownClusterCtx(infCtx), httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{Path: serve1aListPath},
 	})
 	if err != nil || !infServed {

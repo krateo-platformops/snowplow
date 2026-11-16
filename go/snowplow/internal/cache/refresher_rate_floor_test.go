@@ -58,7 +58,7 @@ const agedBackoff = 30 * time.Second
 // every test floor so the FIRST dequeue re-resolves immediately, setting
 // up the "1 immediate + N floored" shape deterministically.
 func putAgedEntry(c *ResolvedCacheStore, key string, in *ResolvedKeyInputs) {
-	c.Put(key, &ResolvedEntry{
+	c.put(key, &ResolvedEntry{
 		RawJSON:   []byte(`{}`),
 		Inputs:    in,
 		CreatedAt: time.Now().Add(-agedBackoff),
@@ -75,6 +75,8 @@ func putAgedEntry(c *ResolvedCacheStore, key string, in *ResolvedKeyInputs) {
 // deferred = 2, regardless of N. Contrast the RED form below (floor=0 →
 // N resolves).
 func TestRefresher_RateFloorCollapsesNMarksToOne(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	// The env knob is seconds-granular; use 1s and a sub-second burst window
@@ -94,7 +96,7 @@ func TestRefresher_RateFloorCollapsesNMarksToOne(t *testing.T) {
 	// exactly as a real RefreshFunc does. After the immediate resolve the
 	// entry is young, so the burst marks floor.
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used})
 		calls.Add(1)
 		return nil
 	})
@@ -155,6 +157,8 @@ func TestRefresher_RateFloorCollapsesNMarksToOne(t *testing.T) {
 // the behavior the floor collapses (Test 1 GREEN). It also doubles as the
 // floor=0-identity falsifier (Test 4).
 func TestRefresher_RateFloorZero_NMarksProduceNResolves(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "0") // kill switch — identity to pre-#321
@@ -163,11 +167,11 @@ func TestRefresher_RateFloorZero_NMarksProduceNResolves(t *testing.T) {
 	c := ResolvedCache()
 	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "redzero"}
 	key := ComputeKey(in)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 
 	var calls atomic.Int32
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used})
 		calls.Add(1)
 		return nil
 	})
@@ -204,6 +208,8 @@ func TestRefresher_RateFloorZero_NMarksProduceNResolves(t *testing.T) {
 // assert NO resolve before floor expiry and EXACTLY one at/after. Proves
 // the final mark is neither dropped nor resolved early.
 func TestRefresher_RateFloorDeferredFinalMarkResolvesAtExpiry(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "1") // 1s floor
@@ -218,7 +224,7 @@ func TestRefresher_RateFloorDeferredFinalMarkResolvesAtExpiry(t *testing.T) {
 	var calls atomic.Int32
 	var lastResolveAt atomic.Int64 // unix-nanos of the most recent resolve
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used})
 		lastResolveAt.Store(time.Now().UnixNano())
 		calls.Add(1)
 		return nil
@@ -315,6 +321,8 @@ func TestRefresher_RateFloorDeleteBypass(t *testing.T) {
 // full real chain: Deps().OnDelete → dirty-mark via the refresh hook →
 // refresher queue → floor → deferred re-resolve.
 func TestRefresher_RateFloorDeleteListDepReResolvesWithinFloor(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "1") // 1s floor
@@ -336,7 +344,7 @@ func TestRefresher_RateFloorDeleteListDepReResolvesWithinFloor(t *testing.T) {
 	// behaviour. Put it fresh instead so the DELETE-triggered re-resolve is
 	// floored (entry younger than floor): that is the C3 scenario (LIST-dep
 	// refresh after DELETE is floor-delayed ≤ floor).
-	c.Put(listKey, &ResolvedEntry{RawJSON: []byte(`{"rows":["row-1"]}`), Inputs: listIn})
+	c.put(listKey, &ResolvedEntry{RawJSON: []byte(`{"rows":["row-1"]}`), Inputs: listIn})
 	Deps().RecordList(context.Background(), listKey, gvr, "ns") // LIST-dep edge on the deleted row's ns
 
 	var resolves atomic.Int32
@@ -344,7 +352,7 @@ func TestRefresher_RateFloorDeleteListDepReResolvesWithinFloor(t *testing.T) {
 	// inputsFor sets CacheEntryClass="restactions"; register that kind.
 	RegisterRefreshFunc("restactions", func(_ context.Context, k string, used ResolvedKeyInputs) error {
 		// Re-resolve drops the deleted row from the LIST envelope.
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{"rows":[]}`), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{"rows":[]}`), Inputs: &used})
 		resolveAt.Store(time.Now().UnixNano())
 		resolves.Add(1)
 		return nil
@@ -404,6 +412,8 @@ func TestRefresher_RateFloorDeleteListDepReResolvesWithinFloor(t *testing.T) {
 // storm keeps re-marking. Asserts: no data race, every key eventually
 // re-resolves at least once, bounded (no runaway).
 func TestRefresher_RateFloorConcurrentMarkerStormRaceFree(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 4, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "1") // 1s floor — many marks land inside it
@@ -426,7 +436,7 @@ func TestRefresher_RateFloorConcurrentMarkerStormRaceFree(t *testing.T) {
 		idxOf[k] = i
 	}
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used})
 		resolved[idxOf[k]].Add(1)
 		return nil
 	})
@@ -485,6 +495,8 @@ func TestRefresher_RateFloorConcurrentMarkerStormRaceFree(t *testing.T) {
 // entry is FLOORED (deferred, not resolved) under that default, then
 // resolves losslessly at expiry.
 func TestRefresher_RateFloorDefaultIsTwoSecondsAndFloors(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envRefresherRateFloorSeconds, "")
@@ -499,11 +511,11 @@ func TestRefresher_RateFloorDefaultIsTwoSecondsAndFloors(t *testing.T) {
 	key := ComputeKey(in)
 	// FRESH entry (Put stamps CreatedAt=now) → younger than the 2s default
 	// → the first mark must FLOOR, not resolve.
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 
 	var calls atomic.Int32
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
-		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used})
+		c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used})
 		calls.Add(1)
 		return nil
 	})

@@ -42,6 +42,7 @@
 package cache
 
 import (
+	"context"
 	"log/slog"
 	"sync/atomic"
 
@@ -79,7 +80,7 @@ func ResetServeRequiresServableViolationsForTest() {
 func (rw *ResourceWatcher) AssertServeRequiresServableForTest(gvr schema.GroupVersionResource, servePath string) bool {
 	rw.mu.RLock()
 	defer rw.mu.RUnlock()
-	return rw.assertServeRequiresServableLocked(gvr, servePath)
+	return rw.assertServeRequiresServableLocked(context.Background(), gvr, servePath)
 }
 
 // assertServeRequiresServableLocked asserts the serve(gvr)⇒servable
@@ -100,7 +101,7 @@ func (rw *ResourceWatcher) AssertServeRequiresServableForTest(gvr schema.GroupVe
 // servePath is a short, closed-enum label of the serve site for the log
 // (e.g. "GetObject", "GetTypedObject", "ListObjectsServable") — never
 // per-GVR/per-name, so no special-casing (feedback_no_special_cases).
-func (rw *ResourceWatcher) assertServeRequiresServableLocked(gvr schema.GroupVersionResource, servePath string) bool {
+func (rw *ResourceWatcher) assertServeRequiresServableLocked(ctx context.Context, gvr schema.GroupVersionResource, servePath string) bool {
 	if _, ok := rw.servableLocked(gvr); ok {
 		return true // invariant holds — the common path.
 	}
@@ -113,7 +114,7 @@ func (rw *ResourceWatcher) assertServeRequiresServableLocked(gvr schema.GroupVer
 	}
 
 	serveRequiresServableViolations.Add(1)
-	slog.Error("cache.serve_requires_servable.violation",
+	slog.ErrorContext(ctx, "cache.serve_requires_servable.violation",
 		slog.String("subsystem", "cache"),
 		slog.String("check", "serve_requires_servable"),
 		slog.String("gvr", gvr.String()),

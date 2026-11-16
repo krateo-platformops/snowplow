@@ -67,6 +67,8 @@ var (
 // AddRateLimited / burn the retry budget); the prior good entry stays
 // and TTL is the outer net.
 func TestRefresher_StageErrorDoesNotOverwriteGoodEntry(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()
@@ -85,7 +87,7 @@ func TestRefresher_StageErrorDoesNotOverwriteGoodEntry(t *testing.T) {
 		RepresentativeGroups:   []string{"devs"},
 	}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: stageErrGoodEntry, Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: stageErrGoodEntry, Inputs: &inputs})
 
 	// Emulate the poisoned re-resolve: touch the stage-error sink that
 	// resolveAndPopulateL1 installed on ctx (this is exactly what the api
@@ -132,6 +134,8 @@ func TestRefresher_StageErrorDoesNotOverwriteGoodEntry(t *testing.T) {
 // user who legitimately has zero compositions. The empty result MUST be
 // stored: the gate must not false-positive on a legit empty.
 func TestRefresher_LegitimateEmptyIsStored(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()
@@ -146,7 +150,7 @@ func TestRefresher_LegitimateEmptyIsStored(t *testing.T) {
 		RepresentativeUsername: "loner",
 	}
 	key := cache.ComputeKey(inputs)
-	c.Put(key, &cache.ResolvedEntry{RawJSON: stageErrGoodEntry, Inputs: &inputs})
+	c.PutResolved(fixtureStoreVerdict, key, &cache.ResolvedEntry{RawJSON: stageErrGoodEntry, Inputs: &inputs})
 
 	// Empty result, NO sink touch — a legitimate "0 compositions" outcome.
 	restore := setResolveOnceForTest(func(_ context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {

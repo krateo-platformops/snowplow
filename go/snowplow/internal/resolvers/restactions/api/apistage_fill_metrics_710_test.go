@@ -104,6 +104,11 @@ func newFill710Watcher(t *testing.T, n int) dynamic.Interface {
 	waitOwnRBACPublish(t, rw)
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
+	// #854 — the #710 / #765 A / #799 arms built on this harness pin the PLAIN
+	// fill path (every fill re-lists and re-parses), which still serves every
+	// cell that is not, or no longer, incremental. They run with anchoring off;
+	// the incremental cell's own arms (list_cell_854_*_test.go) turn it back on.
+	t.Cleanup(cache.SetListCellAnchoringForTest(false))
 	return dyn
 }
 
@@ -134,7 +139,7 @@ func fill710SpyDispatch(t *testing.T, gate <-chan struct{}, arrived *atomic.Int6
 	var lastLen atomic.Int64
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
-	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
+	dispatchViaInformerFn = func(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool, context.Context) {
 		if onCall != nil {
 			onCall(ctx)
 		}
@@ -144,9 +149,9 @@ func fill710SpyDispatch(t *testing.T, gate <-chan struct{}, arrived *atomic.Int6
 		if gate != nil {
 			<-gate
 		}
-		raw, ok := orig(ctx, call)
+		raw, ok, fctx := orig(ctx, call)
 		lastLen.Store(int64(len(raw)))
-		return raw, ok
+		return raw, ok, fctx
 	}
 	return &lastLen
 }
@@ -163,7 +168,7 @@ func fill710MakeKnownStale(t *testing.T, dyn dynamic.Interface, store *cache.Res
 	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
 	cache.ResetRefresherForTest()
 
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatalf("PRECONDITION: the cold LIST read was not served (ok=%v served=%v)", ok, served)
 	}
 	key := fill710ListKey()
@@ -208,7 +213,7 @@ func TestContentFill710_AbsentFillCountsBytesAndItemsAndAHitMovesNothing(t *test
 	fill710Reset(t)
 	envLen := fill710SpyDispatch(t, nil, nil, nil)
 
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatalf("cold read not served (ok=%v served=%v)", ok, served)
 	}
 	s := ContentFillStatsSnapshot()
@@ -248,7 +253,7 @@ func TestContentFill710_AbsentFillCountsBytesAndItemsAndAHitMovesNothing(t *test
 	}
 
 	// A second read is a content HIT: no fill.
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatalf("second read not served")
 	}
 	if s2 := ContentFillStatsSnapshot(); s2.Total["absent"] != 1 || s2.ByGVR[r1FsaGVR.String()].Fills != 1 {
@@ -257,15 +262,18 @@ func TestContentFill710_AbsentFillCountsBytesAndItemsAndAHitMovesNothing(t *test
 }
 
 func TestContentFill710_RefreshForcedReason(t *testing.T) {
-	newFill710Watcher(t, 3)
+	dyn := newFill710Watcher(t, 3)
 	store := cache.ResolvedCache()
-	if _, served, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
+	if _, served, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok || !served {
 		t.Fatalf("cold read not served")
 	}
+	// #765 — a refresh re-fills a resident cell only when a change landed after
+	// the cell's read (the content stamp): make the trigger a real change.
+	stamp765Change(t, dyn, r1FreshManaged)
 	fill710Reset(t)
 
 	ctx := cache.WithRefreshTriggerGVR(cache.WithBackgroundResolve(r1Ctx()), r1FsaGVR)
-	if _, _, ok, _ := apistageContentServe(ctx, store, fill710ListCall(), false); !ok {
+	if _, _, ok, _, _ := apistageContentServe(ctx, store, fill710ListCall(), false); !ok {
 		t.Fatalf("refresh re-resolve not content-servable")
 	}
 	s := ContentFillStatsSnapshot()
@@ -284,9 +292,9 @@ func TestContentFill710_NotServableCountsNoBytes(t *testing.T) {
 	fill710Reset(t)
 	orig := dispatchViaInformerFn
 	t.Cleanup(func() { dispatchViaInformerFn = orig })
-	dispatchViaInformerFn = func(context.Context, httpcall.RequestOptions) ([]byte, bool) { return nil, false }
+	dispatchViaInformerFn = func(ctx context.Context, _ httpcall.RequestOptions) ([]byte, bool, context.Context) { return nil, false, ctx }
 
-	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); ok {
+	if _, _, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); ok {
 		t.Fatalf("a not-servable dispatch must return ok=false")
 	}
 	s := ContentFillStatsSnapshot()
@@ -358,7 +366,7 @@ func TestContentFill710_LogLineIsRateLimitedAndCarriesNoIdentityOrObjectName(t *
 	}}
 	ctx := withContentFillOwner(r1Ctx(), "ra-ns", "ra-name", "stage-a")
 	for _, call := range []httpcall.RequestOptions{fill710ListCall(), getCall} {
-		if _, _, ok, _ := apistageContentServe(ctx, store, call, false); !ok {
+		if _, _, ok, _, _ := apistageContentServe(ctx, store, call, false); !ok {
 			t.Fatalf("read of %s not content-servable", call.Path)
 		}
 	}
@@ -407,7 +415,7 @@ func TestContentFill710_LogLineIsRateLimitedAndCarriesNoIdentityOrObjectName(t *
 			Path: "/apis/composition.krateo.io/v1/namespaces/" + r1Ns + "/fullstackapps/" + obj,
 			Verb: ptr.To(http.MethodGet),
 		}}
-		if _, _, ok, _ := apistageContentServe(ctx, store, c, false); !ok {
+		if _, _, ok, _, _ := apistageContentServe(ctx, store, c, false); !ok {
 			t.Fatalf("read of %s not content-servable", c.Path)
 		}
 	}
@@ -437,7 +445,7 @@ func TestContentFill710_ExpvarKeysReadTheLiveCounters(t *testing.T) {
 	store := cache.ResolvedCache()
 	fill710Reset(t)
 	RegisterContentFillExpvarForTest()
-	if _, _, ok, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok {
+	if _, _, ok, _, _ := apistageContentServe(r1Ctx(), store, fill710ListCall(), false); !ok {
 		t.Fatalf("cold read not content-servable")
 	}
 	s := ContentFillStatsSnapshot()

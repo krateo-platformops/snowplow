@@ -264,6 +264,34 @@ only when that cell was not otherwise re-resolved in 24 h. `"0"` disables. Arms:
 `resolved_max_entry_age_test.go` (G1 is RED on 1.12.5: a key re-Put every 400 ms under a 1 s
 bound is still evicted).
 
+**The incremental LIST content cell is under neither bound (#882 F1, owner ruling).** An
+apistage LIST content cell anchored in incremental mode (`internal/cache/list_cell.go`, #854)
+changes its body by applying informer deltas, never by a `Put`, so its `CreatedAt` and `BornAt`
+say nothing about its freshness. While it is anchored, neither the store TTL nor the max entry
+age applies to it (`itemExpiredLocked`; the read-independent reaper skips it too): it leaves
+only through its own unanchor signals — a servability-epoch move, a lost-event signal, a
+type-level event, a comparator divergence, a refused or replaced `Put`, a `DELETE` — or byte /
+entry-count pressure (LRU). For this cell the from-scratch comparator pass (read-driven, run by
+the refresher) **replaces** the 24 h max-age rebuild above and the #378 re-mint that keeps it
+off a customer path: there is no timer. Before #882 the 3600 s TTL removed a correct 50K list
+cell an hour after it was built while edits flowed, and every reader then re-filled it (the
+run-15 OOM). Once a cell unanchors it is a plain entry again and both bounds apply from its
+original clocks. Arm: `list_cell_882_test.go` F1a (1 s TTL and max age, 5 s of events: still
+served, zero new dispatches, body equal to a full fill).
+
+**One fill per incremental list, whatever the edit rate (#882 F2).** A LIST fill that can
+anchor registers its cell *before* it lists the informer (`cache.BeginListCell`), so every edit
+during the fill is recorded in the cell's pending set. The anchor (`ListCellFill.Anchor`) pairs
+the envelope with a second, decode-free listing key by key: a key whose bytes differ because an
+edit landed during the fill — pending, or still on its way to the dep hook — is taken from the
+informer (decoded once) instead of aborting the anchor; pending is drained before the cell is
+first published. The fill flight (`apistage_fill_flight.go`) admits every LIST reader to such a
+flight even when its list moved since the flight began, and serves it the cell brought up to its
+own sequence (`Snapshot(entry seq)`). GET-by-name and lists that cannot anchor keep the #710
+epoch join rule. Arms: `apistage_fill_herd_710_integration_test.go` (32 readers, one edit per
+ms: one dispatch, one parse, every body holds every edit up to its reader's entry) and
+`list_cell_882_test.go` F2c (edits during the fill: `anchor_raced` stays 0).
+
 ---
 
 ## 4. The dispatcher seam (`handlers/dispatchers/`)
@@ -280,15 +308,51 @@ here is load-bearing:
    `BindingUID`; the #95 guard). On hit, `writeResolvedJSON(entry.RawJSON)` and return.
 4. On miss: attach `WithL1KeyContext(ctx, cacheKey)` so the resolver records dep edges against
    this key as it reads L3; attach a `StageErrorSink` and an `ExternalTouchedSink`; resolve;
-   encode once; serve; then **Put only when every gate passes**:
-   - `stageErrSink.Count() == 0` — a partial-with-errors body is served (200) but never
-     persisted, so transient item failures self-heal on the next resolve;
-   - `extTouchedSink.Count() == 0` — a resolve that reached a genuine external endpoint
-     (`httpFetchAllowingNonJSON`, ADR 0006) has **no dep edge to invalidate it**, so the Put is
-     declined and every `/call` re-fetches live (`external_touched_sink.go`). *Exception:* a
-     widget annotated `krateo.io/external-cache-ttl-seconds: <n>` opts into a bounded-staleness
-     Put with `TTLOverride = min(n, 120s)` (`external_ttl.go`) — general opt-in, no hardcoded
-     widget names;
+   encode once; serve; then **Put only when every gate passes**. The sink-derived gates are
+   ONE verdict, `cache.PutGateVerdict` (`put_verdict.go`). The TYPE and the COMPILER enforce it:
+   every exported `ResolvedEntry` write takes the verdict and stores nothing unless it allows the
+   Put (`put_gated.go`; `PutRAFullList(IfGen)` too); the ungated store methods are unexported, so
+   no other package can reach one; the one exported write without a verdict, `PutContentIfGen`,
+   writes only a GET-only content cell (an `apistage` entry under the key its own inputs compute).
+   Mark sites read `Permanent()`, and a verdict cannot be forged (only `PutGateVerdict` makes one;
+   the zero value admits nothing). A verdict over sinks that were not ALL installed (an empty
+   `PutGateSinks{}`, a field left out) is `unobserved`: it admits nothing and is not permanent.
+   The decline reason only picks the log line and the counter.
+   `scripts/check_resolved_entry_put_sites.sh` fails a write reached around the verdict through
+   any receiver in the dispatchers or apiref packages, and, inside the cache package, an ungated
+   store call outside a function that takes the verdict and returns on `!v.Store()` first. Its
+   closed set, first match wins:
+   - **declared write** (permanent, `declared_write`) — a RESTAction that declares a write-verb
+     stage is never stored, whether or not this resolve sent it (#903 F1): every `/call` runs it,
+     and the background marks it and stops re-resolving it. It is its own input, never counted
+     as an external touch;
+   - **stage error** (`stage_error`; permanent only beside a genuine external touch) — a
+     partial-with-errors body is served (200) but never persisted, so transient item failures
+     self-heal on the next resolve. A body whose every stage error is a per-identity forbidden
+     (#681 `DenialOnly`) is stored;
+   - **external touch** (permanent, `external_touched`) — a resolve that reached a genuine
+     external endpoint (`httpFetchAllowingNonJSON`, ADR 0006) has **no dep edge to invalidate
+     it**, so the Put is declined and every `/call` re-fetches live (`external_touched_sink.go`).
+     *Exception:* a widget annotated `krateo.io/external-cache-ttl-seconds: <n>` opts into a
+     bounded-staleness Put with `TTLOverride = min(n, 120s)` (`external_ttl.go`) — general
+     opt-in, no hardcoded widget names; it applies to this reason ALONE, never to a declared
+     write or a stage error (#915), and only when every touch carried nothing of the requester
+     (#1221): a named endpoint's own credential, with no requester bearer. A stage dialled as
+     the requester, `exportJwt` and the self-loopback all stay declined, even beside a
+     third-party stage.
+
+   A seed / refresher `SeedResolveMemo` hit (`apiref.Resolve`) replays the producing resolve's
+   Put-gate inputs (`put_gate_effects.go`) onto the hitter's sinks, so a memo-served body gets
+   exactly the verdict its producer got (#912 N1).
+
+   The `raFullList` layer (`apiref/ra_full_list.go`) never runs a RESTAction a second time in
+   one `/call` once that run declared a write (#942). Whether it did is known only after the run:
+   the RESTAction's own write stage AND a write in any RESTAction it resolves in-process
+   (`resolve:true`) set the same runtime declared-write mark, which no check of the widget
+   RESTAction's own spec can see. So first sight runs the page-keyed resolve FIRST and takes a
+   permanent decline before the unpaginated one, serving the page it holds; every fall-back to
+   `apiref.Resolve`'s page-keyed resolve after a run goes through one helper that refuses a run
+   which declared a write (the `/call` gets an error rather than a second write);
    - `serveFromCacheEligible(inputs)` — never write the shared empty-`BindingUID` row from the
      dispatch path;
    - the **F6 undeclared-extras quarantine** — request extras must all be declared in the
@@ -442,21 +506,14 @@ handler run) and builds a **fresh** informer. A fresh informer has an empty `kno
 object that vanished before the new LIST. An object deleted inside that window therefore leaves
 its self entry stranded with no future informer trigger.
 
-`OnResourceTypeSchemaRelisted` dirty-marks every dependent entry from the **forward dep index**,
-not from the indexer, so it covers entries whose objects are absent. But it ran **once**, at the
-start of the window: an entry dirty-marked at that instant re-resolves successfully while its
-object still exists, and is then stranded when the delete lands a moment later. That is the
-#187 burst shape — relist at ~09:21, deletes 09:21–09:24.
-
-Since 1.12.5 the relist **re-fires the same dirty-mark after the new informer has synced**,
-in the goroutine that already waits on the sync channel. Every stranded entry is then handed to
-the self-404 eviction above. The pre-sync fire is kept as well; both run. Counted as
-`relist_dirtymark_postsync_total` under `snowplow_deps`.
-
-This is containment, not the precise form: it evicts by re-resolving and observing a 404, so it
-costs the requeue budget and depends on the refresh path being healthy. Since 1.12.6 C2 the
-relist delta bridge re-derives the missing DELETEs from the indexer (`relist_bridge.go`), and
-the C3 **sampled reconcile audit** (`deps_reconcile.go`) is the safety net under the whole
+Before #870 a CRD schema relist tore the informer down and registered a fresh one, so a delete
+landing inside that window produced no DELETE; 1.12.5 contained it with a post-sync dirty-mark
+re-fire and 1.12.6 C2 with a relist delta bridge. **#870 (1.12.60) removed the window itself:** a
+schema change (and a store repair) builds the replacement beside the live informer and swaps it in
+(`store_swap.go`). The live copy keeps watching, so a delete during the build is delivered by it;
+and the swap delivers every key whose bytes changed against what the handlers last acted on —
+including a delete the live copy missed — as an ordinary per-key event. The re-fire, the bridge and
+their counters are deleted. the C3 **sampled reconcile audit** (`deps_reconcile.go`) is the safety net under the whole
 pipeline: every `DEPS_RECONCILE_PERIOD_SECONDS` (30) it probes `DEPS_RECONCILE_SAMPLE` (512)
 resident entries against the indexer and hands ABSENT ones to the dep-event worker.
 
@@ -481,13 +538,21 @@ refresher ends in exactly one of three states, all counted:
 | **known-stale** (#547) | the refresh ended without an accepted re-Put: a decline (stage error, empty full, external / UAF / sensitive gate), a drop after `maxRefreshRequeues` (403, 500, timeout, parse failure, an apistage content call that is not servable), a suppressed skip | `dirty_ended_unfresh_{declined,dropped}`; served: `known_stale_served_total{reason}` |
 
 **Known-stale.** The cell stays resident and its dirty stamp (`dirty_window.go`) is NOT erased: it
-is converted to `{t0, stale: reason, seq}` and stays until an accepted write closes it or the cell
-leaves the store. ANY accepted write whose resolve began at or after the window's latest mark
-closes it — the refresher, a demand revalidation, a substrate read-through refill, a seed or
-keep-warm re-Put, the external-TTL widget Put (an external widget whose RESTAction also reads
-Kubernetes carries the inner-call dep edge, so it is marked too) (`closeKnownStaleOnPut`: the resolve's #375 `startSeq` against the stamp's
-`seq`) — unless a refresh is in flight, whose dequeue settles it. A Put whose resolve began
-before the mark carries the pre-change body and closes nothing. Before #547 the stamp was deleted there,
+is converted to `{t0, stale: reason, seq}` and stays until an accepted write ends it or the cell
+leaves the store. Known-stale means "the last refresh FAILED", not "the data moved since" (#884,
+owner ruling F5). ANY accepted write ends it — the refresher (also when #375 remarks it), a demand
+revalidation, a substrate read-through refill, a seed or keep-warm re-Put, the external-TTL widget
+Put (an external widget whose RESTAction also reads Kubernetes carries the inner-call dep edge, so
+it is marked too) (`endKnownStaleOnPut`, inside the write's critical section; a write with no #375
+sink proves nothing and ends nothing). What happens to the WINDOW depends on the resolve's #375
+`startSeq` against the stamp's `seq`: at or after the latest mark, the window closes (a dirty→fresh
+sample); before it (a newer edit landed during the resolve), the window stays an ORDINARY open one
+from the same t0 — served stale, counted on `stale_served_total`, never on
+`known_stale_served_total` — and is handed to the refresher, which replaces it (#710
+stale-then-replace). If that replacement fails, the cell is known-stale again. An in-flight
+refresh's window is settled by its own dequeue. Before #884 a newer mark kept the cell
+known-stale through the write: at ≥ 10 edits/s every resolve of a hot cell overlaps a mark, so the
+state never ended and every customer read started a full re-resolve (bench run 15). Before #547 the stamp was deleted there,
 so the cell looked exactly like a fresh one — every reload was a hit on a body the system knew
 was stale, nothing re-validated it short of a later event or the TTL, and `stale_served_total`
 went blind at the moment the user started seeing stale data (#547 trace). The serve path
@@ -500,13 +565,14 @@ went blind at the moment the user started seeing stale data (#547 trace). The se
   (key, t0): the handler re-runs its own cold path on a detached copy of the request, under the
   requester's identity and own credential (the read known to work), bounded by the server's write
   deadline, never blocking the response (`dispatchers/demand_revalidate.go`). Its accepted
-  write closes the window and publishes over SSE. If it fails, the body keeps being served and
+  write ends the known-stale state, settles the revalidation (no #740 rerun, #884) and publishes
+  over SSE. If it fails, the body keeps being served and
   counted and the next read or change retries — never an eviction (owner ruling, #547). A key
   suppressed for a structurally-permanent reason (external, UAF, unsupported, sensitive) starts
   NO demand revalidation — its cold path declines the Put by the same gate — and the skip is
   counted (`known_stale_revalidation_skipped_total`, team ruling);
   a read that finds a revalidation slot (background or demand) already held is ABSORBED into that
-  attempt and earns it ONE rerun if it settles still known-stale — the slot stays claimed across the
+  attempt and earns it ONE rerun if it settles still known-stale with no accepted write — the slot stays claimed across the
   rerun, so a read during it arms one more; without an absorbed read the slot is released
   (`known_stale_revalidation_rerun_total{slot}`, #740);
 - the **shared, identity-free widget shell** (widgetContent) is a SERVED body too: it is served
@@ -637,7 +703,8 @@ and the SPA's recovery are OPEN rows owned by the chart review checklist and fro
 | Terminal refresh semantics (known-stale, suppression) | `internal/cache/refresher_terminal.go`, `dirty_window.go`, `known_stale.go`; `internal/handlers/dispatchers/demand_revalidate.go` | `NoteRefreshDecline`, `RefreshTerminalStatsSnapshot`, `KnownStale`, `KnownStaleReadThrough`, `BeginDemandRevalidation`; consulted in `refresher.go` `processNext` and the `Get` funnel |
 | Tag-derived stats families (1.12.6 C7) | `internal/cache/stats_by_tag.go`, `internal/cache/stats_families.go` | `StatSpec`, `StatFamily`, `TaggedStatFamilies`; `stat`/`kind`/`desc` tags on `CRDDiscoveryStats`, `RefreshBroadcasterStats`, `refresherStats`, `RefreshTerminalStats` drive expvar, the OTLP mirror (`internal/metrics/metrics.go` `newDerivedFamilies`) and the parity arms |
 | Invalidation | `internal/cache/deps.go`, `deps_watch.go` | `Record`, `RecordList`, `OnObjectEvent` (state-derived; `OnAdd`/`OnUpdate`/`OnDelete` are shims), `isSelfRepresentation`; bridge: `depEventHandlers` → `submitDepEvent` → `probeObjectState` |
-| External Put-gate | `internal/cache/external_touched_sink.go` | `WithExternalTouchedSink` |
+| Put-gate verdict | `internal/cache/put_verdict.go`, `put_gated.go`, `put_gate_effects.go` | `PutGateVerdict`, `PutVerdict.WithExternalTTL`, the verdict-gated `PutResolved*` / `ReplaceResolvedIfGenRefresh` writes, `PutGateSinksFromContext`, `WithPutGateEffectsCapture`, `PutGateEffects.Replay` |
+| External Put-gate | `internal/cache/external_touched_sink.go` | `WithExternalTouchedSink`, `MarkDeclaredWrite` |
 | L3 informer | `internal/cache/watcher.go` | `NewResourceWatcher`, `GetObject`, `ListObjects`, `depEventHandlers` |
 | Servability tripwire | `internal/cache/serve_assert.go` | `serve_requires_servable` |
 | Dispatcher seam — keys | `internal/handlers/dispatchers/helpers.go` | `dispatchCacheLookupKey`, `dispatchWidgetContentKey`, `serveFromCacheEligible`, `filterDeclaredKeyExtras` |

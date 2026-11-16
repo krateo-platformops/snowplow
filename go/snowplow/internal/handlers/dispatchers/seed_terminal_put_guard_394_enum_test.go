@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 )
@@ -234,6 +235,10 @@ type s394RecordingHandle struct {
 }
 
 func (h *s394RecordingHandle) Get(string) (*cache.ResolvedEntry, bool) { return nil, false }
+func (h *s394RecordingHandle) GetReportingMiss(string) (*cache.ResolvedEntry, cache.LookupMiss) {
+	return nil, cache.LookupAbsent
+}
+func (h *s394RecordingHandle) Now() time.Time { return time.Now() }
 func (h *s394RecordingHandle) GetNoTouch(string) (*cache.ResolvedEntry, bool) {
 	return nil, false
 }
@@ -250,6 +255,45 @@ func (h *s394RecordingHandle) PutIfGen(_ context.Context, _ string, _ *cache.Res
 	h.lastCapturedGenInPut = g
 	return g == h.gen
 }
+
+// #912 re-review — the verdict-gated writes; like the store, they refuse a
+// declining verdict.
+func (h *s394RecordingHandle) PutResolved(v cache.PutVerdict, k string, e *cache.ResolvedEntry) bool {
+	if !v.Store() {
+		return false
+	}
+	h.Put(k, e)
+	return true
+}
+func (h *s394RecordingHandle) PutResolvedIfGen(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry, g uint64) bool {
+	return v.Store() && h.PutIfGen(ctx, k, e, g)
+}
+func (h *s394RecordingHandle) PutResolvedIfGenOutcome(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry, g uint64) cache.PutOutcome {
+	if h.PutResolvedIfGen(ctx, v, k, e, g) {
+		return cache.PutChanged
+	}
+	return cache.PutRefused
+}
+func (h *s394RecordingHandle) PutResolvedThenRemark(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry) cache.PutOutcome {
+	if !v.Store() {
+		return cache.PutRefused
+	}
+	h.PutThenRemark(ctx, k, e)
+	return cache.PutChanged
+}
+func (h *s394RecordingHandle) PutResolvedEndingKnownStale(ctx context.Context, v cache.PutVerdict, k string, e *cache.ResolvedEntry) cache.PutOutcome {
+	if !v.Store() {
+		return cache.PutRefused
+	}
+	h.PutEndingKnownStale(ctx, k, e)
+	return cache.PutChanged
+}
+
+// #1255 — the unstorable-eviction surface; this handle holds no cell to evict.
+func (h *s394RecordingHandle) EvictOnPermanentDecline(context.Context, cache.PutVerdict, string) bool {
+	return false
+}
+func (h *s394RecordingHandle) EvictUnstorable(context.Context, string, string) bool { return false }
 
 func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) {
 	// guardedByMode is the classification table. A new seedScopeMode constant
@@ -285,7 +329,7 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 		if g.guarded != c.guarded {
 			t.Errorf("#394: seedTerminalGuardFor(%s) = {guarded:%v}, want {guarded:%v}", name, g.guarded, c.guarded)
 		}
-		if !seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, g) {
+		if !seedTerminalPut(context.Background(), h, fixtureStoreVerdict, "k", &cache.ResolvedEntry{}, g) {
 			t.Errorf("#394: %s: an unmoved generation must be accepted", name)
 		}
 		if c.guarded {
@@ -294,7 +338,7 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 					"puts=%d putIfGens=%d gen=%d", name, h.puts, h.putIfGens, h.lastCapturedGenInPut)
 			}
 			h.gen = 8 // a removal moved the generation
-			if seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, g) {
+			if seedTerminalPut(context.Background(), h, fixtureStoreVerdict, "k", &cache.ResolvedEntry{}, g) {
 				t.Errorf("#394: %s: a moved generation must be REFUSED", name)
 			}
 		} else if h.puts != 0 || h.putIfGens != 0 || h.putThenRemarks != 1 {
@@ -317,7 +361,7 @@ func TestS394_EverySeedModeIsClassified_PostReadyzModesAreGuarded(t *testing.T) 
 	pre := seedTerminalGuardFor(seedModeBoot, h, "k")
 	cache.MarkPhase1Done()
 	h.gen = 8 // a removal during the resolve, after the capture
-	if seedTerminalPut(context.Background(), h, "k", &cache.ResolvedEntry{}, pre) {
+	if seedTerminalPut(context.Background(), h, fixtureStoreVerdict, "k", &cache.ResolvedEntry{}, pre) {
 		t.Errorf("#408: a boot Put that crossed the /readyz flip must be gen-guarded and REFUSE a moved generation")
 	}
 	if h.putIfGens != 1 || h.lastCapturedGenInPut != 7 || h.puts != 0 || h.putThenRemarks != 0 {

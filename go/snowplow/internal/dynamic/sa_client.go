@@ -168,8 +168,9 @@ func ServiceAccountRESTConfig() (*rest.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dynamic.sa: rest.InClusterConfig: %w", err)
 	}
-	rc.QPS = -1 // disable client-side rate limiter (server-side P&F is authoritative); see client-go rest/config.go:117-122
-	rc.Burst = 0
+	// No client-side rate limit is set here: credhttp.InClusterConfig already
+	// removed it (#920), as it does for every config snowplow builds, so
+	// server-side Priority & Fairness is authoritative.
 	saRestConfigInstance = rc
 	return rc, nil
 }
@@ -234,4 +235,17 @@ func SetServiceAccountTokenPathForTest(path string) func() {
 		saTokenPath = orig
 		resetSAEndpointForTest()
 	}
+}
+
+// SetServiceAccountRESTConfigForTest makes ServiceAccountRESTConfig return rc,
+// so a cross-package test can stand a hermetic apiserver in for the in-cluster
+// one (rest.InClusterConfig reads fixed /var/run/secrets paths a test cannot
+// plant). Returns a restore that clears the singleton again. Exported
+// test-support ONLY, like SetServiceAccountTokenPathForTest; production never
+// calls it.
+func SetServiceAccountRESTConfigForTest(rc *rest.Config) func() {
+	saRestConfigMu.Lock()
+	saRestConfigInstance = rc
+	saRestConfigMu.Unlock()
+	return resetSARestConfigForTest
 }

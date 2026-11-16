@@ -1,0 +1,13 @@
+status: 200
+Content-Type: "text/csv; charset=utf-8"
+Content-Disposition: "attachment; filename=\"golden.csv\""
+X-Export-Truncated: ""
+X-Content-Type-Options: ""
+X-From-Call: ""
+call[0]: apiVersion=templates.krateo.io%2Fv1&name=demo&namespace=ns&page=1&perPage=500&resource=restactions
+body:
+health,labels.app.kubernetes.io/name,meta,multi,name,note,ready,tags,text,usage.cpu,usage.mem
+OK,web,{},,alpha,,true,"[""a"",""b""]",,2,1.5
+"Critical, degraded",,,"line one
+line ""two""",'=1+1,,false,[],Grüße — Ελληνικά — Кириллица — 東京,7,
+'-x,,,,'@SUM(A1),,true,,,0.25,

@@ -267,7 +267,7 @@ func TestF1_PostStartupCRD_UnconfirmedUntilDiscovered(t *testing.T) {
 	if rw.IsServable(s4TestGVR) {
 		t.Fatalf("S4: unconfirmed resource type must NOT be servable (IsServable)")
 	}
-	if _, servable := rw.ListObjectsServable(s4TestGVR, ""); servable {
+	if _, servable := rw.ListObjectsServable(context.Background(), s4TestGVR, ""); servable {
 		t.Fatalf("S4: unconfirmed resource type must NOT be servable (ListObjectsServable)")
 	}
 
@@ -279,7 +279,7 @@ func TestF1_PostStartupCRD_UnconfirmedUntilDiscovered(t *testing.T) {
 	if !rw.IsServable(s4TestGVR) {
 		t.Fatalf("S4 fix: confirmed + synced GVR must be servable after discovery refresh")
 	}
-	items, servable := rw.ListObjectsServable(s4TestGVR, "")
+	items, servable := rw.ListObjectsServable(context.Background(), s4TestGVR, "")
 	if !servable {
 		t.Fatalf("S4 fix: confirmed + synced GVR must be servable (ListObjectsServable)")
 	}
@@ -325,7 +325,7 @@ func TestF2_WatchDisconnected_FallsThroughThenRecovers(t *testing.T) {
 	if rw.IsServable(servableTestGVR) {
 		t.Fatalf("F2: GVR with broken WATCH must NOT be servable (IsServable)")
 	}
-	if _, servable := rw.ListObjectsServable(servableTestGVR, ""); servable {
+	if _, servable := rw.ListObjectsServable(context.Background(), servableTestGVR, ""); servable {
 		t.Fatalf("F2: GVR with broken WATCH must NOT be servable (ListObjectsServable)")
 	}
 

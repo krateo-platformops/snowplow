@@ -70,13 +70,15 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 // --- AC-C1 — dirty-mark -> re-resolved exactly once -------------------------
 
 func TestRefresher_HandlerInvokedOnEnqueue(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-0abc"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"x":1}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"x":1}`), Inputs: &inputs})
 
 	var called atomic.Int32
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, in ResolvedKeyInputs) error {
@@ -115,13 +117,15 @@ func TestRefresher_HandlerInvokedOnEnqueue(t *testing.T) {
 // already queued is not re-queued; a key being processed and re-Added
 // is processed at most once more.
 func TestRefresher_RapidMarksCoalesce(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "coalesce"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	// Gate the single worker so all M marks land while the key sits
 	// queued — the workqueue must coalesce them to ONE processing.
@@ -159,6 +163,8 @@ func TestRefresher_RapidMarksCoalesce(t *testing.T) {
 // --- AC-C3 — error -> bounded exponential-backoff retry ---------------------
 
 func TestRefresher_ErrorRetriesThenForgets(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	// Tight backoff so the test is fast.
@@ -169,7 +175,7 @@ func TestRefresher_ErrorRetriesThenForgets(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "retry"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	var attempts atomic.Int32
 	const failFirst = 3
@@ -216,6 +222,8 @@ func TestRefresher_ErrorRetriesThenForgets(t *testing.T) {
 // drop-point eviction and its REFRESH_DROP_EVICT_MAX_PER_MINUTE breaker are
 // retired) — TestRefreshTerminal_F5a pins the known-stale stamp.
 func TestRefresher_PoisonPillDroppedAfterCap(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	// Tight backoff so the cap is reached fast.
@@ -226,7 +234,7 @@ func TestRefresher_PoisonPillDroppedAfterCap(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "poison"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	var attempts atomic.Int32
 	RegisterRefreshFunc("widgets", func(context.Context, string, ResolvedKeyInputs) error {
@@ -289,7 +297,7 @@ func TestRefresher_TransientUnderCapStillSucceeds(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "transient"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	var attempts atomic.Int32
 	// Fail maxRefreshRequeues-1 times (strictly under the cap), then OK.
@@ -318,6 +326,8 @@ func TestRefresher_TransientUnderCapStillSucceeds(t *testing.T) {
 
 // AC-C3 — a failing refresh must NOT evict the entry.
 func TestRefresher_HandlerErrorDoesNotEvict(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	t.Setenv(envRefresherBaseDelayMS, "10")
@@ -327,7 +337,7 @@ func TestRefresher_HandlerErrorDoesNotEvict(t *testing.T) {
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "noevict"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	RegisterRefreshFunc("widgets", func(context.Context, string, ResolvedKeyInputs) error {
 		return errors.New("permanent failure")
@@ -349,13 +359,15 @@ func TestRefresher_HandlerErrorDoesNotEvict(t *testing.T) {
 // --- AC-C5 — legacy nil-Inputs entry skips, no panic ------------------------
 
 func TestRefresher_NilInputsEntrySkips(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 
 	c := ResolvedCache()
 	// Synthesise a key + a legacy entry with nil Inputs under it.
 	key := ComputeKey(ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "legacy"})
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: nil})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: nil})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -371,13 +383,15 @@ func TestRefresher_NilInputsEntrySkips(t *testing.T) {
 }
 
 func TestRefresher_NoHandlerForKind(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "unregistered"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -419,6 +433,8 @@ func TestRefresher_CleanShutdownOnCancel(t *testing.T) {
 // --- Concurrency ------------------------------------------------------------
 
 func TestRefresher_ConcurrentEnqueueRaceFree(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 4, 0)
 	defer cleanup()
 
@@ -437,7 +453,7 @@ func TestRefresher_ConcurrentEnqueueRaceFree(t *testing.T) {
 	for i := 0; i < N; i++ {
 		inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "n" + itoa(i)}
 		key := ComputeKey(inputs)
-		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+		c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 		wg.Add(1)
 		go func(k string) {
 			defer wg.Done()
@@ -460,13 +476,15 @@ func TestRefresher_ConcurrentEnqueueRaceFree(t *testing.T) {
 // OnUpdate dirty-mark -> refresher -> RefreshFunc that writes NEW bytes
 // -> Get returns the new content.
 func TestRefresher_OnUpdateRefreshesContent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "content"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: &inputs})
 
 	gvr := gvrCompositions()
 	Deps().Record(context.Background(), key, gvr, "ns", "n")
@@ -474,7 +492,7 @@ func TestRefresher_OnUpdateRefreshesContent(t *testing.T) {
 	fresh := []byte(`{"v":"fresh"}`)
 	RegisterRefreshFunc("widgets", func(_ context.Context, k string, _ ResolvedKeyInputs) error {
 		// A real RefreshFunc re-resolves and Put()s; emulate that here.
-		c.Put(k, &ResolvedEntry{RawJSON: fresh, Inputs: &inputs})
+		c.put(k, &ResolvedEntry{RawJSON: fresh, Inputs: &inputs})
 		return nil
 	})
 
@@ -570,13 +588,15 @@ func TestRefresher_CacheDisabledNeverStarts(t *testing.T) {
 // --- Dep tracker -> refresher hook wiring -----------------------------------
 
 func TestRefresher_DepTrackerOnUpdateEnqueues(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
 
 	c := ResolvedCache()
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets"}
 	key := ComputeKey(inputs)
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
 	gvr := gvrCompositions()
 	Deps().Record(context.Background(), key, gvr, "ns", "n")

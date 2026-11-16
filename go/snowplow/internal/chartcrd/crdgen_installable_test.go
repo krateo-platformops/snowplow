@@ -13,7 +13,7 @@ import (
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	schemacel "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
 	celmodel "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel/model"
-	"k8s.io/apimachinery/pkg/util/validation/field"
+	apiservervalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	celconfig "k8s.io/apiserver/pkg/apis/cel"
 	"k8s.io/apiserver/pkg/cel/environment"
 )
@@ -50,22 +50,21 @@ func TestIssue657_CrdgenCompilesChartSchema(t *testing.T) {
 }
 
 // TestIssue657_UnboundedSchemaIsRefusedForCost is the negative control. With
-// every maxItems/maxLength stripped (the 1.12.45 shape), crdgen must refuse the
-// schema and name BOTH item rules as over budget. That proves the positive arm
-// exercised the cost check and did not merely skip it.
+// every maxItems/maxLength stripped and the item rule crdgen emitted before
+// plumbing#81 put back (the 1.12.45 shape), crdgen must refuse the schema for
+// cost. That proves the positive arm exercised the cost check and did not
+// merely skip it.
 func TestIssue657_UnboundedSchemaIsRefusedForCost(t *testing.T) {
-	_, err := generate(t, stripBounds(t, readFile(t, chartSchemaPath)))
+	_, err := generate(t, stripBounds(t, withCostlyItemRule(t, readFile(t, chartSchemaPath))))
 	if err == nil {
-		t.Fatal("crdgen accepted the chart schema with every bound stripped. Either crdgen stopped emitting the " +
-			"impersonate* CEL rules (then the CRD no longer enforces them, see TestIssue657_GeneratedCRDCarriesTheRules) " +
-			"or the cost estimator changed. Either way the positive arm no longer proves anything")
+		t.Fatal("crdgen accepted an unbounded CEL rule known to be over budget: crdgen stopped running the cost " +
+			"estimator, or the estimator changed. Either way the positive arm no longer proves anything")
 	}
 	// The refusal must be the cost check and nothing else. The `in [...]` rule
-	// crdgen emits for impersonateServiceAccounts' `not: {enum}` is the one that
-	// breaks the budget unbounded (1.363149x). The explicit impersonateGroups rule
-	// (`!=` and startsWith against constants) stays under it even unbounded, and
-	// TestIssue657_RuleCostMargin pins its cost.
-	if !strings.Contains(err.Error(), "properties[impersonateServiceAccounts].items.x-kubernetes-validations") ||
+	// is the one that breaks the budget unbounded (1.363149x). The explicit
+	// impersonateGroups rule (`!=` and startsWith against constants) stays under
+	// it even unbounded, and TestIssue657_RuleCostMargin pins its cost.
+	if !strings.Contains(err.Error(), "properties["+nativeNotField+"].items.x-kubernetes-validations") ||
 		!strings.Contains(err.Error(), costOverBudget) {
 		t.Errorf("unbounded schema: no %q error on impersonateServiceAccounts; got:\n%v", costOverBudget, err)
 	}
@@ -76,17 +75,19 @@ func TestIssue657_UnboundedSchemaIsRefusedForCost(t *testing.T) {
 	}
 }
 
-// TestIssue657_GeneratedCRDCarriesTheRules: the CRD keeps the bounds and one
-// CEL rule on each item node. crdgen drops a `not` it cannot translate, and
-// only logs a warning. #640's `not: {anyOf: [enum, pattern]}` was dropped
-// that way, so the CRD stopped rejecting system:masters. That is why
-// impersonateGroups carries an explicit x-kubernetes-validations rule.
+// TestIssue657_GeneratedCRDCarriesTheRules: the CRD keeps the bounds and each
+// item node's constraint. crdgen drops a `not` it cannot translate, and only
+// warns. #640's `not: {anyOf: [enum, pattern]}` was dropped that way, so the CRD
+// stopped rejecting system:masters. That is why impersonateGroups carries an
+// explicit x-kubernetes-validations rule, and must keep it: nothing else
+// enforces that constraint. impersonateServiceAccounts' `not: {enum}` is
+// translated, natively since plumbing#81 (#1135), and must stay.
 func TestIssue657_GeneratedCRDCarriesTheRules(t *testing.T) {
 	crd, err := generate(t, readFile(t, chartSchemaPath))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range celItemFields {
+	for _, f := range constrainedItemFields {
 		arr := rbacField(t, crd, f)
 		if arr.MaxItems == nil {
 			t.Errorf("spec.rbac.%s has no maxItems in the CRD: its item rule is costed as unbounded (#657)", f)
@@ -98,16 +99,30 @@ func TestIssue657_GeneratedCRDCarriesTheRules(t *testing.T) {
 		if it.MaxLength == nil {
 			t.Errorf("spec.rbac.%s.items has no maxLength in the CRD", f)
 		}
-		if len(it.XValidations) == 0 {
-			t.Errorf("spec.rbac.%s.items carries NO CEL rule: crdgen dropped the schema's `not`, so the CRD admits the values helm refuses", f)
+		switch f {
+		case ruleOnlyField:
+			if len(it.XValidations) == 0 {
+				t.Errorf("spec.rbac.%s.items carries NO CEL rule: crdgen drops this schema's `not`, so the CRD admits the values helm refuses", f)
+			}
+		case nativeNotField:
+			if it.Not == nil || len(it.Not.Enum) != 1 || string(it.Not.Enum[0].Raw) != `"*"` {
+				t.Errorf("spec.rbac.%s.items carries no native `not: {enum: [*]}` (got %+v): the CRD admits the value helm refuses", f, it.Not)
+			}
+			if len(it.XValidations) != 0 {
+				t.Errorf("spec.rbac.%s.items carries a CEL rule again (%v): a rule here is costed against the budget, which plumbing#81 ended", f, it.XValidations)
+			}
+		default:
+			t.Errorf("spec.rbac.%s: no expected constraint declared for this field", f)
 		}
 	}
 }
 
-// TestIssue657_CRDRuleRejectsPrivilegedNames runs the generated CRD's CEL rules
-// through the apiserver's own validator, over whole spec objects. The rules
-// must reject what the helm schema rejects and admit ordinary names. The
-// kind-backed twin does the same with real CRs against a v1.36.4 apiserver.
+// TestIssue657_CRDRuleRejectsPrivilegedNames runs the generated CRD's constraints
+// through the apiserver's own validators, over whole spec objects: the schema
+// validator (a native `not`) and the CEL validator (the x-kubernetes-validations
+// rules), as admission does. They must reject what the helm schema rejects, at
+// the item, and admit ordinary names. The kind-backed twin does the same with
+// real CRs against a v1.36.4 apiserver.
 func TestIssue657_CRDRuleRejectsPrivilegedNames(t *testing.T) {
 	crd, err := generate(t, readFile(t, chartSchemaPath))
 	if err != nil {
@@ -122,9 +137,13 @@ func TestIssue657_CRDRuleRejectsPrivilegedNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	validator := schemacel.NewValidator(structural, true, 1_000_000)
+	cel := schemacel.NewValidator(structural, true, 1_000_000)
+	schemaValidator, _, err := apiservervalidation.NewSchemaValidator(&internal)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	celErrs := func(field_ string, names ...string) string {
+	admissionErrs := func(field_ string, names ...string) string {
 		list := make([]any, len(names))
 		for i, n := range names {
 			list[i] = n
@@ -135,7 +154,9 @@ func TestIssue657_CRDRuleRejectsPrivilegedNames(t *testing.T) {
 			"metadata":   map[string]any{"name": "x", "namespace": "default"},
 			"spec":       map[string]any{"rbac": map[string]any{field_: list}},
 		}
-		errs, _ := validator.Validate(context.Background(), field.NewPath(""), structural, obj, nil, 10_000_000)
+		errs := apiservervalidation.ValidateCustomResource(nil, obj, schemaValidator)
+		celErrs, _ := cel.Validate(context.Background(), nil, structural, obj, nil, 10_000_000)
+		errs = append(errs, celErrs...)
 		if len(errs) == 0 {
 			return ""
 		}
@@ -144,16 +165,21 @@ func TestIssue657_CRDRuleRejectsPrivilegedNames(t *testing.T) {
 
 	for _, c := range rejectCases {
 		t.Run("reject/"+c.field+"/"+c.name, func(t *testing.T) {
-			// After an allowed name: the rule must apply per item.
-			if got := celErrs(c.field, "devs", c.name); got == "" {
-				t.Fatalf("the CRD's CEL admits spec.rbac.%s=[devs, %s]", c.field, c.name)
+			// After an allowed name: the constraint must apply per item.
+			got := admissionErrs(c.field, "devs", c.name)
+			if got == "" {
+				t.Fatalf("the CRD admits spec.rbac.%s=[devs, %s]", c.field, c.name)
+			}
+			// Refused by the item's constraint, not by something incidental.
+			if !strings.Contains(got, "spec.rbac."+c.field+"[1]") {
+				t.Fatalf("spec.rbac.%s=[devs, %s] refused, but not at the item: %s", c.field, c.name, got)
 			}
 		})
 	}
 	for _, c := range acceptCases {
 		t.Run("accept/"+c.field, func(t *testing.T) {
-			if got := celErrs(c.field, c.names...); got != "" {
-				t.Fatalf("the CRD's CEL rejects spec.rbac.%s=%v: %s", c.field, c.names, got)
+			if got := admissionErrs(c.field, c.names...); got != "" {
+				t.Fatalf("the CRD rejects spec.rbac.%s=%v: %s", c.field, c.names, got)
 			}
 		})
 	}
@@ -171,7 +197,7 @@ func TestIssue657_RuleCostMargin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range celItemFields {
+	for _, f := range constrainedItemFields {
 		arr := rbacField(t, crd, f)
 		if arr.MaxItems == nil {
 			t.Errorf("spec.rbac.%s has no maxItems: its item rules run an unbounded number of times", f)

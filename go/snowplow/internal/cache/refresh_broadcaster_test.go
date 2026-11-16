@@ -491,6 +491,8 @@ func TestRefreshBroadcaster_SlowConsumerNeverStalls(t *testing.T) {
 //     after draining, whose re-read is the fresh body (F-DROP's cache twin,
 //     TestRefresh484_FDrop_FullSinkChangeReachesClient, runs it K×M).
 func TestRefreshBroadcaster_DroppedTerminalSignalDegrades(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	withRefreshLayer(t)
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "3600")
 
@@ -506,13 +508,13 @@ func TestRefreshBroadcaster_DroppedTerminalSignalDegrades(t *testing.T) {
 	defer unsub()
 
 	// Saturate the sink with signals for the stale value.
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"phase":"v1"}`), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(`{"phase":"v1"}`), Inputs: &in})
 	for i := 0; i < refreshSubChanCap; i++ {
 		PublishRefresh(key)
 	}
 	// The refresher commits the FRESH value, then the TERMINAL signal.
 	const fresh = `{"phase":"v2-FRESH"}`
-	c.Put(key, &ResolvedEntry{RawJSON: []byte(fresh), Inputs: &in})
+	c.put(key, &ResolvedEntry{RawJSON: []byte(fresh), Inputs: &in})
 	PublishRefresh(key)
 	st := RefreshBroadcasterStatsSnapshot()
 	if st.Deferred == 0 {

@@ -198,6 +198,8 @@ func coverGetPods(name string) AccessDomain {
 // ───────────────────────── F-D6(a) — fires on the right returns ─────────────────────────
 
 func TestFD6a_HookFiresOnMemoPermitWalkPermitAndDeny(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	shadowWatcher(t)
 	d := coverGetPods("p1")
 	opts := rbac.EvaluateOptions{Verb: "get", Group: "", Resource: "pods", Namespace: "default", Name: "p1"}
@@ -318,6 +320,8 @@ func TestFD6a_HookDoesNotFire_CacheOff(t *testing.T) {
 // ───────────────────────── F-verdict (RED-first) ─────────────────────────
 
 func TestFVerdict_MismatchFiresOnDivergentR(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	shadowWatcher(t)
 	d := coverGetPods("p1")
 	opts := rbac.EvaluateOptions{Verb: "get", Group: "", Resource: "pods", Namespace: "default", Name: "p1"}
@@ -349,6 +353,8 @@ func TestFVerdict_MismatchFiresOnDivergentR(t *testing.T) {
 // ───────────────────────── F-coverage (RED-first) incl ${._getpath} ─────────────────────────
 
 func TestFCoverage_MissFiresOnGetpathExternalDomain(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	shadowWatcher(t)
 	opts := rbac.EvaluateOptions{Verb: "get", Group: "", Resource: "pods", Namespace: "default", Name: "p1"}
 
@@ -384,6 +390,8 @@ func TestFCoverage_MissFiresOnGetpathExternalDomain(t *testing.T) {
 // ───────────────────────── F-proj (name-ambiguous leak) ─────────────────────────
 
 func TestFProj_AgentsGetUAFCellIsNotShareableAndLeakStaysZero(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	shadowWatcher(t)
 
 	// The live agents get-UAF cell: one UAF stanza {get, kagent.dev, agents}.
@@ -433,6 +441,8 @@ func TestFProj_AgentsGetUAFCellIsNotShareableAndLeakStaysZero(t *testing.T) {
 // ───────────────────────── F-panic (both carriers + ctx collision) ─────────────────────────
 
 func TestFPanic_HookBodyPanicIsRecoveredAndVerdictUnchanged(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	shadowWatcher(t)
 	d := coverGetPods("p1")
 	o := rbac.EvaluateOptions{Username: "alice", Groups: []string{spGroup}, Verb: "get", Group: "", Resource: "pods", Namespace: "default", Name: "p1"}
@@ -501,6 +511,8 @@ func TestFPanic_CtxTypeCollisionCommaOksCleanly(t *testing.T) {
 // ───────────────────────── F-2mutant (two-mutant control) ─────────────────────────
 
 func TestF2Mutant_TwoDefectsFireTwoCountersIndependently(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	shadowWatcher(t)
 	covered := coverGetPods("p1")
 	// The ${._getpath} external domain (no class).
@@ -544,6 +556,8 @@ func TestF2Mutant_TwoDefectsFireTwoCountersIndependently(t *testing.T) {
 // ───────────────────────── F-H5 (independent denominator) ─────────────────────────
 
 func TestFH5_ChecksTotalEqualsIndependentEvaluateRBACCount(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	shadowWatcher(t)
 	d := coverGetPods("") // name-free exact get pods (covers any name at (get,core,pods))
 	// A served-only hermetic window: every EvaluateRBAC call below carries a
@@ -651,6 +665,8 @@ func TestFSeed_SeedPathHasNoShadowCtxSoHookNoOps(t *testing.T) {
 // `allowed` is the genuine verdict, and asserts each check lands on the correct
 // branch. A permit → allow only; a deny → deny only.
 func TestFSplit_AttributionByBranch(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	shadowWatcher(t)
 	d := coverGetPods("p1") // covers get/core/pods; no coverage miss on either arm.
 	opts := rbac.EvaluateOptions{Verb: "get", Group: "", Resource: "pods", Namespace: "default", Name: "p1"}
@@ -699,6 +715,8 @@ func TestFSplit_AttributionByBranch(t *testing.T) {
 // including one that trips anomaly counters — the two split counters partition
 // checks_total exactly. allow + deny == checks_total, unconditionally.
 func TestFSplit_SumInvariant(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	cache.CompleteRBACSnapshotForTest(t)
 	shadowWatcher(t)
 	pods := coverGetPods("p1")
 	opts := rbac.EvaluateOptions{Verb: "get", Group: "", Resource: "pods", Namespace: "default", Name: "p1"}

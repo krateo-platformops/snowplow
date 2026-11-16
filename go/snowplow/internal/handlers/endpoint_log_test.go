@@ -43,7 +43,10 @@ func TestS453_EndpointLogAttrRendersNoCredential(t *testing.T) {
 				t.Errorf("%s handler: %q reached the line: %s", name, s, out)
 			}
 		}
-		for _, want := range []string{"https://api.example:6443", "cert", redact.User(ep.Username)} {
+		if strings.Contains(out, ep.Username) || strings.Contains(out, redact.User(ep.Username)) || strings.Contains(out, `"user"`) {
+			t.Errorf("%s handler: #1192: the projection carries the endpoint's user: %s", name, out)
+		}
+		for _, want := range []string{"https://api.example:6443", "cert"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("NON-VACUITY %s handler: the projection must carry %q: %s", name, want, out)
 			}

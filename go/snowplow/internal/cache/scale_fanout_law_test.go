@@ -65,7 +65,7 @@ func scalePopulation(t testing.TB, compositions, cohorts, widgetsPer int, listDe
 		for k := 0; k < cohorts; k++ {
 			for w := 0; w < widgetsPer; w++ {
 				l1 := fmt.Sprintf("L1|c%06d|k%03d|w%02d", c, k, w)
-				store.Put(l1, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, "ns", comp)})
+				store.put(l1, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: inputsFor(gvr, "ns", comp)})
 				// Deterministic interleave rather than rand: the share must be
 				// exact and the run reproducible.
 				if float64(w) < float64(widgetsPer)*listDepShare {
@@ -83,6 +83,8 @@ func scalePopulation(t testing.TB, compositions, cohorts, widgetsPer int, listDe
 // TestScaleLaw_FanOutGrowsWithPopulation measures dirty-marks-per-event as the
 // composition count grows with everything else held fixed.
 func TestScaleLaw_FanOutGrowsWithPopulation(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	const (
 		cohorts    = 2
 		widgetsPer = 10  // ~9.4/composition on 057

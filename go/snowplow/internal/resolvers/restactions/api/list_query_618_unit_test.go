@@ -167,7 +167,7 @@ func TestIssue618_ContentKey_SelectorAndUnselectedNeverShare(t *testing.T) {
 	sel := q618ClusterPath + "?labelSelector=env%3Dprod"
 	selSpelt := q618ClusterPath + "?labelSelector=env=prod"
 	for _, p := range []string{q618ClusterPath, sel, selSpelt} {
-		if _, served, ok, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, p), false); !ok || !served {
+		if _, served, ok, _, _ := apistageContentServe(q618Ctx(), store, buildCall(http.MethodGet, p), false); !ok || !served {
 			t.Fatalf("serve %s", p)
 		}
 	}
@@ -181,10 +181,12 @@ func TestIssue618_ContentKey_SelectorAndUnselectedNeverShare(t *testing.T) {
 	if !ok1 || !ok2 {
 		t.Fatalf("want both cells resident: unselected=%v selector=%v", ok1, ok2)
 	}
-	if got := namesInEnvelopeBytes(t, unEntry.RawJSON); !eqNames(got, names(all3, "w1", "w2", "w3")) {
+	// #854 — Raw(): an incremental list cell stores no RawJSON; its envelope is
+	// built on demand from the same bytes.
+	if got := namesInEnvelopeBytes(t, unEntry.Raw()); !eqNames(got, names(all3, "w1", "w2", "w3")) {
 		t.Fatalf("unselected cell holds %v", got)
 	}
-	if got := namesInEnvelopeBytes(t, selEntry.RawJSON); !eqNames(got, names(all3, "w1")) {
+	if got := namesInEnvelopeBytes(t, selEntry.Raw()); !eqNames(got, names(all3, "w1")) {
 		t.Fatalf("selector cell holds %v", got)
 	}
 	if selEntry.Inputs == nil || selEntry.Inputs.Query != "labelSelector=env%3Dprod" {
@@ -256,16 +258,21 @@ func TestIssue618_EveryServeSiteClassifiesTheQuery(t *testing.T) {
 	notServing := map[string]string{
 		"callWantsWireDump":                  "wire-dump verbosity decision only",
 		"k8sListGVR":                         "E6 normalisation flag only (#674): is the response a list envelope, of which GVR; serves and keys nothing",
-		"dispatchOneCall":                    "sensitive-resource check only (cache.IsSensitiveResource); no serve",
+		"dispatchOneCall":                    "sensitive-resource check (cache.IsSensitiveResource), and #1124: the resource the stage's items are objects of, for the userAccessFilter refilter's per-object check; no serve",
+		"applyUserAccessFilter":              "#1124: the resource the stage's items are objects of, for the userAccessFilter refilter's per-object check; serves and keys nothing",
 		"runStage":                           "dep-edge record — a selector LIST depends on the same (gvr, ns) list edge (over-approximation is safe)",
 		"gateContentEnvelope":                "gates an envelope apistageContentServe already classified and keyed",
 		"maybeResolveInProcess":              "GET-by-name of a RESTAction/Widget only; a query on a GET falls through earlier (query_on_get)",
 		"inspectInClusterStage":              "inspect/RBAC preflight: derives the RBAC verb from the path shape, serves nothing",
 		"validInterpolatedPath":              "#293 malformed-dial guard: path-shape check, serves nothing",
+		"collapsedPath":                      "#288/#1112 collapse refusal (every dial): path-shape check, serves nothing",
 		"extractClusterListGVRFromStagePath": "GVR shape half of extractClusterListTargetFromStage, which classifies",
 		"classifyOwnDialForbidden":           "#681: classifies an apiserver 403 and builds its identity-free error text from (gvr, ns, name); serves and keys nothing",
+		"definiteNotFoundMessage":            "#1080: classifies a named GET's NotFound (a LIST never qualifies) and builds its identity-free error text from (gvr, name); serves and keys nothing",
 		"stageMessage":                       "#709 (+#729 redirect variant): formats a failed stage's error text from (code, gvr, ns, name) only — never a key, never a served data body; TestIssue709_CanonicalStageMessage_CarriesNoQuery pins that no query reaches it",
-		"isAccessReviewPath":                 "#615: classifies a POST path as an access-review create (group, resource, no name) to decide a branch-E dial's identity (impersonate or fail closed); a query makes it false; serves and keys nothing",
+		"noteNarrowServed":                   "#603 PR-2 shadow: maps a served call back to the list edge the edge-3 record keyed on (gvr, ns) — the same query-free key runStage records; serves and keys nothing",
+		"stageAuditEvent":                    "AUDIT-4 (installer#410): labels the audit record of a write-verb stage with the (gvr, ns, name) it addressed, after the dial; the query is stripped first and no path is recorded; serves and keys nothing",
+		"stageTarget":                        "AUDIT-4 (installer#410, audit#22): the audit record's target of a write stage, dialled or refused: the (gvr, ns, name) its path addresses, the query read only for dryRun; serves and keys nothing",
 	}
 	fset := token.NewFileSet()
 	files, err := filepath.Glob("*.go")

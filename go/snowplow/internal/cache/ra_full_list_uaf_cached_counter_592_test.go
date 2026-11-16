@@ -22,6 +22,8 @@ import (
 )
 
 func TestS592_RAFullListUAFCachedCounter_CountsStoredNotAttempted(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	ResetUAFPutDeclineCountersForTest()
 	t.Cleanup(ResetUAFPutDeclineCountersForTest)
 
@@ -31,7 +33,7 @@ func TestS592_RAFullListUAFCachedCounter_CountsStoredNotAttempted(t *testing.T) 
 	plainIn := ResolvedKeyInputs{CacheEntryClass: CacheEntryClassRAFullList}
 
 	// ACCEPTED + HasUAF → counts.
-	if !c.PutRAFullListIfGen(context.Background(), "rk-uaf", uafIn, full, c.CaptureGen("rk-uaf")) {
+	if !c.PutRAFullListIfGen(context.Background(), fixtureStoreVerdict, "rk-uaf", uafIn, full, c.CaptureGen("rk-uaf")) {
 		t.Fatalf("setup: a cold-fill PutRAFullListIfGen must be accepted")
 	}
 	if n := RAFullListUAFCached(); n != 1 {
@@ -41,7 +43,7 @@ func TestS592_RAFullListUAFCachedCounter_CountsStoredNotAttempted(t *testing.T) 
 	// ACCEPTED + non-UAF → does not count. (Pins that the counter measures the
 	// UAF population and not raFullList writes in general — without this the
 	// acceptance number silently becomes "all 4a traffic".)
-	if !c.PutRAFullListIfGen(context.Background(), "rk-plain", plainIn, full, c.CaptureGen("rk-plain")) {
+	if !c.PutRAFullListIfGen(context.Background(), fixtureStoreVerdict, "rk-plain", plainIn, full, c.CaptureGen("rk-plain")) {
 		t.Fatalf("setup: a cold-fill non-UAF PutRAFullListIfGen must be accepted")
 	}
 	if n := RAFullListUAFCached(); n != 1 {
@@ -51,7 +53,7 @@ func TestS592_RAFullListUAFCachedCounter_CountsStoredNotAttempted(t *testing.T) 
 	// REFUSED (generation moved by a real DELETE-evict) + HasUAF → must NOT count.
 	gen0 := c.CaptureGen("rk-uaf")
 	c.DeleteForTest("rk-uaf") // real deleteForDep — tombstones + bumps the gen
-	if c.PutRAFullListIfGen(context.Background(), "rk-uaf", uafIn, full, gen0) {
+	if c.PutRAFullListIfGen(context.Background(), fixtureStoreVerdict, "rk-uaf", uafIn, full, gen0) {
 		t.Fatalf("setup: a write carrying the pre-DELETE generation must be REFUSED — without the refusal this arm " +
 			"cannot observe the property it exists for")
 	}
@@ -67,6 +69,8 @@ func TestS592_RAFullListUAFCachedCounter_CountsStoredNotAttempted(t *testing.T) 
 // asserts the same thing end to end; this one fails without the harness, so a
 // future refactor of raFullListServe cannot take the cap down with it silently.
 func TestS592_RAFullListUAFCap_AppliesToStoredEntry(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	// A non-zero knob, so "capped" is distinguishable from "knob off".
 	t.Setenv("UAF_RESOLVED_TTL_SECONDS", "300")
 	ResetUAFPutDeclineCountersForTest()
@@ -75,7 +79,7 @@ func TestS592_RAFullListUAFCap_AppliesToStoredEntry(t *testing.T) {
 	c := newResolvedCache(10, 1<<20, time.Hour)
 	full := map[string]any{"apiVersion": "v1", "kind": "List", "items": []any{}}
 
-	if !c.PutRAFullListIfGen(context.Background(), "rk-uaf", ResolvedKeyInputs{
+	if !c.PutRAFullListIfGen(context.Background(), fixtureStoreVerdict, "rk-uaf", ResolvedKeyInputs{
 		CacheEntryClass: CacheEntryClassRAFullList, HasUAF: true,
 	}, full, c.CaptureGen("rk-uaf")) {
 		t.Fatalf("setup: cold-fill must be accepted")
@@ -93,7 +97,7 @@ func TestS592_RAFullListUAFCap_AppliesToStoredEntry(t *testing.T) {
 	// The twin primitive must agree — PutRAFullList is test-only today, but a
 	// divergence between the two would be invisible until something promoted it.
 	c2 := newResolvedCache(10, 1<<20, time.Hour)
-	c2.PutRAFullList("rk-uaf2", ResolvedKeyInputs{
+	c2.PutRAFullList(fixtureStoreVerdict, "rk-uaf2", ResolvedKeyInputs{
 		CacheEntryClass: CacheEntryClassRAFullList, HasUAF: true,
 	}, full)
 	e2, ok := c2.Get("rk-uaf2")
@@ -106,7 +110,7 @@ func TestS592_RAFullListUAFCap_AppliesToStoredEntry(t *testing.T) {
 	}
 
 	// And a non-UAF cell is untouched by any of it.
-	if !c.PutRAFullListIfGen(context.Background(), "rk-plain", ResolvedKeyInputs{
+	if !c.PutRAFullListIfGen(context.Background(), fixtureStoreVerdict, "rk-plain", ResolvedKeyInputs{
 		CacheEntryClass: CacheEntryClassRAFullList,
 	}, full, c.CaptureGen("rk-plain")) {
 		t.Fatalf("setup: non-UAF cold-fill must be accepted")

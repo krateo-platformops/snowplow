@@ -43,13 +43,15 @@ func evictionHarness(t *testing.T, maxEntries int, ttl time.Duration) (*DepTrack
 // putSelf stores a self-representation entry for (gvr, ns, name) under key
 // and records its self dep edge — the shape a DELETE of that object evicts.
 func putSelf(store *ResolvedCacheStore, d *DepTracker, key string, gvr schema.GroupVersionResource, ns, name string) {
-	store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: widgetInputs(gvr, ns, name)})
+	store.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":1}`), Inputs: widgetInputs(gvr, ns, name)})
 	d.Record(context.Background(), key, gvr, ns, name)
 }
 
 // --- S1c — no subscriber: eviction publishes nothing --------------------------
 
 func TestRefreshEviction_S1c_NoSubscriber_PublishesNothing(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	d, store := evictionHarness(t, 100, time.Hour)
 	gvr := gvrFlexes()
 	const key = "L1_s1c"
@@ -85,6 +87,8 @@ func TestRefreshEviction_S1c_NoSubscriber_PublishesNothing(t *testing.T) {
 // --- S1d — TTL and LRU evictions stay silent ----------------------------------
 
 func TestRefreshEviction_S1d_TTLAndLRU_Silent(t *testing.T) {
+	// #1233: this test writes the store under a complete snapshot.
+	CompleteRBACSnapshotForTest(t)
 	gvr := gvrFlexes()
 
 	t.Run("ttl", func(t *testing.T) {
@@ -175,7 +179,7 @@ func TestRefreshEviction_S1d_TTLAndLRU_Silent(t *testing.T) {
 		const ns, name = "krateo-system", "outage-widget"
 		inputs := widgetInputs(gvr, ns, name)
 		key := ComputeKey(*inputs)
-		store.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: inputs})
+		store.put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: inputs})
 		t.Cleanup(func() { store.DeleteForTest(key) })
 		Deps().Record(context.Background(), key, gvr, ns, name)
 

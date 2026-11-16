@@ -92,7 +92,7 @@ func TestPrewarmDedup_ARM_DISTINCT_OneTargetPerIdentity(t *testing.T) {
 	crs = append(crs, saCR)
 
 	PublishRBACSnapshotForTest(buildSnap(crbs, crs))
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{g})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{g})
 
 	targets := EnumeratePrewarmTargetsForGVR(g, "list")
 	// #130 F3 (Diego directive 2026-07-11): the SA-only binding (installer) is now
@@ -132,7 +132,7 @@ func TestPrewarmDedup_ARM_COLLAPSE_SameIdentityToOne(t *testing.T) {
 		crs = append(crs, cr)
 	}
 	PublishRBACSnapshotForTest(buildSnap(crbs, crs))
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{g})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{g})
 
 	targets := EnumeratePrewarmTargetsForGVR(g, "list")
 	if len(targets) != 1 {
@@ -193,7 +193,7 @@ func TestPrewarmDedup_D5e_SameSubjectDifferentBindingNS_CollapsesToOne(t *testin
 		map[string]*rbacv1.Role{"ns-a/devs-a-role": roleA, "ns-b/devs-b-role": roleB},
 	)
 	PublishRBACSnapshotForTest(snap)
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{g})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{g})
 
 	targets := EnumeratePrewarmTargetsForGVR(g, "list")
 	if len(targets) != 1 {

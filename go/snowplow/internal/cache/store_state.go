@@ -37,7 +37,7 @@
 //
 //  3. NO APISERVER CONTACT. There is no client field on this type and no client
 //     reachable from this file. Reading the apiserver as the snowplow
-//     ServiceAccount would tell any valid-JWT holder the existence and
+//     ServiceAccount would tell any debug-surface caller the existence and
 //     resourceVersion of objects their own RBAC forbids — a cross-identity read
 //     of exactly the class the standing debug-surface rule exists to prevent.
 //     The operator does that half themselves, under their own RBAC, with
