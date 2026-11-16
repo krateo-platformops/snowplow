@@ -134,8 +134,19 @@ if [[ -n "$SNOWPLOW_ENV_DIR" ]]; then ENV_AGREE_WAIT_S="${ENV_AGREE_WAIT_S_SET:-
 # reading and its comparison with the declaration, the cluster's operations record, one final block
 # that prints all of it, then the teardown. No data, no drivers, no verdict. It creates a cluster,
 # so it needs BENCH_606_GO like any run.
+# BENCH_606_REHEARSAL=bootwindow (runs 26j/27: the Go runtime read got no byte for 30 s, 6-11 s after the
+# rebooted pod's Ready): ONE cluster, the real install, the data step's compositions and the reboot, with
+# the boot606 probe (load606 BootProbe) running on the loadgen node from before the reboot to
+# BOOT_WINDOW_S past the new pod's Ready: every BOOT_EVERY_S, concurrently, /readyz (anonymous),
+# /debug/pprof/goroutine?debug=1 and /debug/vars (the debug reader) and the boot root (the preflight
+# user), each timed to its connect and its first byte, a goroutine dump saved whenever one passes
+# BOOT_STALL_S without a byte; then the digest gate, ONE report block (bench/bootwindow.py) and the
+# teardown. No drivers, no verdict. Its run budget is the full run's (the measure's terms exceed the
+# probe's start, window and copy many times over).
 REHEARSAL="${BENCH_606_REHEARSAL:-}"
-case "$REHEARSAL" in ""|env) ;; *) echo "refusing: BENCH_606_REHEARSAL must be 'env' or unset, got '${REHEARSAL}'" >&2; exit 2 ;; esac
+case "$REHEARSAL" in ""|env|bootwindow) ;; *) echo "refusing: BENCH_606_REHEARSAL must be 'env', 'bootwindow' or unset, got '${REHEARSAL}'" >&2; exit 2 ;; esac
+read -r BOOT_EVERY_S BOOT_WINDOW_S BOOT_STALL_S HTTP_TIMEOUT_S < <(python3 -c 'from bench import load606 as l
+print(f"{l.BOOT_EVERY_S:g} {l.BOOT_WINDOW_S:g} {l.BOOT_STALL_S:g} {l.HTTP_TIMEOUT_S:g}")')
 if [[ -n "$FRONTEND_TAG" || -n "$EXPECTED_FRONTEND_DIGEST" ]]; then
   if [[ -z "$FRONTEND_TAG" || -z "$EXPECTED_FRONTEND_DIGEST" ]]; then
     echo "refusing: FRONTEND_TAG and EXPECTED_FRONTEND_DIGEST are set together or not at all (FRONTEND_TAG='${FRONTEND_TAG}', EXPECTED_FRONTEND_DIGEST='${EXPECTED_FRONTEND_DIGEST}')" >&2
@@ -1096,13 +1107,16 @@ s_portal_routes() {
 go_runtime_reading() {
   local out="$OUT/go-runtime.jsonl" job=runtime606 deadline ok="" failed=""
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: python3 -m bench.load606_job --go-runtime-only > $OUT/go-runtime-job.yaml; kapply it (Job bench-loadgen/${job}: the debug reader reads /debug/vars snowplow_go_runtime) -> $out"
+    log "DRY: python3 -m bench.load606_job --go-runtime-only --go-runtime-deadline <now + ${GO_RUNTIME_S}s> > $OUT/go-runtime-job.yaml; kapply it (Job bench-loadgen/${job}: the debug reader reads /debug/vars snowplow_go_runtime; a read with no answer is tried again within ${GO_RUNTIME_S}s, a refusal ends it) -> $out"
     return 0
   fi
+  # ONE deadline for the step and the Job (GO_RUNTIME_S, its share of the run budget): the Job tries a
+  # read with no answer again while a whole attempt still fits before it (load606 read_answered), and
+  # this wait ends there; an attempt the wait outruns is in the Job's log all the same
+  deadline=$(( $(date +%s) + GO_RUNTIME_S ))
   python3 -m bench.load606_job --go-runtime-only --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" \
-      --password "$PW" > "$OUT/go-runtime-job.yaml"
+      --password "$PW" --go-runtime-deadline "$deadline" > "$OUT/go-runtime-job.yaml"
   kapply "$OUT/go-runtime-job.yaml" >/dev/null || { log "the ${job} Job was not created: $(kerr_line)"; return 0; }
-  deadline=$(( $(date +%s) + PREFLIGHT_TIMEOUT_S ))
   while (( $(date +%s) < deadline )); do
     ok="$("${K[@]}" -n bench-loadgen get job "$job" -o 'jsonpath={.status.succeeded}' 2>/dev/null || true)"
     failed="$("${K[@]}" -n bench-loadgen get job "$job" -o 'jsonpath={.status.failed}' 2>/dev/null || true)"
@@ -1112,8 +1126,10 @@ go_runtime_reading() {
   done
   "${K[@]}" --request-timeout=60s -n bench-loadgen logs "job/$job" > "$out" 2>/dev/null || true
   if [[ -z "$ok" || "$ok" == "0" ]] && [[ -z "$failed" || "$failed" == "0" ]]; then
-    log "the ${job} Job did not finish within ${PREFLIGHT_TIMEOUT_S}s: $(job_pod_why "$job")"
+    log "the ${job} Job did not finish within ${GO_RUNTIME_S}s: $(job_pod_why "$job")"
   fi
+  # the read's own finding: a boot-window stall is said here, whatever the reading ended with
+  log "$(python3 -m bench.snowplow_env read-said --effective "$out" 2>&1)"
 }
 # snowplow_env_gate: before any load, the running snowplow container must have every declared key as
 # declared (the reading tracing_reading just took: the container's env and the ConfigMaps it reads,
@@ -1179,6 +1195,92 @@ s_rehearsal() {
   fi
   python3 -m bench.snowplow_env rehearsal-report --out-dir "$OUT" 2>&1 | while IFS= read -r ln; do log "$ln"; done
   return "$gate"
+}
+# ─── BENCH_606_REHEARSAL=bootwindow: the boot606 probe around the reboot ────
+# its hard end, from its own start: the wait for it to probe, the reboot's bound, the window
+BOOT_BOUND_S=$(( PREFLIGHT_TIMEOUT_S + ROLLOUT_TIMEOUT_S + ${BOOT_WINDOW_S%.*} ))
+# past the window's end: the probes in flight end within their bound, then a dump in flight within its own
+BOOT_FINISH_S=$(( 2 * ${HTTP_TIMEOUT_S%.*} + ${PREFLIGHT_POLL_S%.*} + 1 ))
+boot_pod() { incluster_pod boot606; }
+boot_exec() {
+  local pod
+  pod="$(boot_pod)"
+  if [[ -z "$pod" ]]; then echo "error: no live boot606 pod" > "$KERR"; return 1; fi
+  bounded 60 "${K[@]}" --request-timeout=60s -n bench-loadgen exec "$pod" -c probe -- "$@"
+}
+# s_bootwindow_start: the probe runs BEFORE the reboot (the new pod's first seconds are what it is for):
+# applied, then waited for until its first records exist (bounded by PREFLIGHT_TIMEOUT_S, like a Job's start)
+s_bootwindow_start() {
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.load606_job --boot-probe-only --boot-bound-s ${BOOT_BOUND_S} > $OUT/boot-probe-job.yaml; kapply it (Job bench-loadgen/boot606 on the loadgen node: every ${BOOT_EVERY_S}s, concurrently, /readyz anonymous, /debug/pprof/goroutine?debug=1 and /debug/vars as the debug reader, the boot root ${PORTAL_INIT} as the preflight user; a goroutine dump saved whenever a probe passes ${BOOT_STALL_S}s without a byte); wait until it probes"
+    return 0
+  fi
+  python3 -m bench.load606_job --boot-probe-only --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" \
+      --password "$PW" --init "$PORTAL_INIT" --boot-bound-s "$BOOT_BOUND_S" --linger-s "$COLLECT_CAP_S" \
+      > "$OUT/boot-probe-job.yaml"
+  kapply "$OUT/boot-probe-job.yaml" >/dev/null || { record_failure "bootwindow FAILED: the boot606 Job was not created" || true; return 1; }
+  : > "$OUT/.boot-started"
+  local deadline=$(( $(date +%s) + PREFLIGHT_TIMEOUT_S ))
+  until boot_exec grep -q boot_probe_start /out/probes.jsonl >/dev/null 2>&1; do
+    if (( $(date +%s) >= deadline )); then
+      record_failure "bootwindow FAILED: boot606 did not start probing within ${PREFLIGHT_TIMEOUT_S}s: $(job_pod_why boot606)" || true
+      return 1
+    fi
+    sleep "$PREFLIGHT_POLL_S"
+  done
+  log "boot606: probing every ${BOOT_EVERY_S}s from the loadgen node (before the reboot)"
+}
+# boot_collect: the probe's /out (its records and its goroutine dumps) into $OUT/bootwindow, then its Job
+# deleted. Once (the teardown calls it for a run it cut short).
+boot_collect() {
+  [[ -f "$OUT/.boot-started" && ! -f "$OUT/.boot-collected" ]] || return 0
+  local pod
+  pod="$(boot_pod)"
+  mkdir -p "$OUT/bootwindow"
+  if [[ -n "$pod" ]]; then
+    bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen \
+        cp -c probe "$pod:/out" "$OUT/bootwindow" >/dev/null 2>"$KERR" \
+      || log "could not copy boot606's /out ($(kerr_line)): its records may be missing"
+  else
+    log "boot606: no pod to copy from: its records are missing"
+  fi
+  : > "$OUT/.boot-collected"
+  bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen delete job/boot606 \
+      --ignore-not-found --wait=false >/dev/null 2>"$KERR" || log "WARNING: boot606's Job could not be deleted ($(kerr_line)); the cluster's deletion is the backstop"
+}
+# s_bootwindow: after the reboot. The new pod's Ready (its own condition, as the API server stamps it)
+# goes to the probe, which ends BOOT_WINDOW_S past it; its files come in; the observer's samples
+# (top_boot: the pod's CPU) too; then the report. Fails when the window was not covered.
+s_bootwindow() {
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: snowplow pod record (boot) -> the new pod's Ready; boot606: echo <Ready> > /out/ready; wait for /out/done (Ready + ${BOOT_WINDOW_S}s + ${BOOT_FINISH_S}s); kubectl cp boot606:/out $OUT/bootwindow; observe606 collected (top_boot); python3 -m bench.bootwindow report --out-dir $OUT --declared '$SNOWPLOW_ENV' --out $OUT/bootwindow.json"
+    return 0
+  fi
+  snowplow_pod_record boot
+  local ready rc=0
+  ready="$(python3 -c 'import json, sys; r = json.loads(open(sys.argv[1]).readline()); print(r["ready_at"] if r.get("ready_at") else "")' "$OUT/pod-boot.jsonl" 2>/dev/null || true)"
+  if [[ ! "$ready" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    record_failure "bootwindow FAILED: the new snowplow pod's Ready time could not be read (pod-boot.jsonl)" || true
+    boot_collect
+    return 1
+  fi
+  boot_exec sh -c "echo ${ready} > /out/ready.part && mv /out/ready.part /out/ready" >/dev/null 2>"$KERR" \
+    || log "WARNING: boot606 could not be given the Ready time ($(kerr_line)): it probes to its own bound (${BOOT_BOUND_S}s)"
+  local deadline=$(( ${ready%.*} + ${BOOT_WINDOW_S%.*} + BOOT_FINISH_S ))
+  log "boot606: the new pod was Ready at $(python3 -c 'import sys, time; print(time.strftime("%H:%M:%S", time.gmtime(float(sys.argv[1]))))' "$ready")Z; probing to Ready+${BOOT_WINDOW_S}s"
+  until boot_exec test -f /out/done >/dev/null 2>&1; do
+    if (( $(date +%s) >= deadline )); then
+      log "boot606 did not end within Ready + ${BOOT_WINDOW_S}s + ${BOOT_FINISH_S}s: copying its records as they are"
+      break
+    fi
+    sleep "$PREFLIGHT_POLL_S"
+  done
+  boot_collect
+  collect_observer
+  python3 -m bench.bootwindow report --out-dir "$OUT" --declared "$SNOWPLOW_ENV" --out "$OUT/bootwindow.json" \
+      > "$OUT/bootwindow-report.txt" 2>&1 || rc=$?
+  while IFS= read -r ln; do log "$ln"; done < "$OUT/bootwindow-report.txt"
+  return "$rc"
 }
 # s_registry: BEFORE any cluster exists, the pull token must resolve every
 # repo-override chart the installer turns on, and every private-image
@@ -2727,6 +2829,7 @@ collect_observer() {
 incluster_teardown() {
   if [[ "$DRY" == "1" ]]; then log "DRY: in-cluster teardown: data606 and observe606 collected if not yet, then deleted with their ServiceAccounts and RBAC"; return 0; fi
   data606_finish || true
+  boot_collect || true
   collect_observer
   [[ -f "$OUT/.data606-applied" ]] && incluster_delete data606
   [[ -f "$OUT/.observer-started" ]] && incluster_delete observe606
@@ -3243,6 +3346,14 @@ if [[ "$REHEARSAL" == "env" ]]; then
 fi
 step preflight s_preflight
 step data      s_data
+if [[ "$REHEARSAL" == "bootwindow" ]]; then
+  step bootwindow-start s_bootwindow_start
+  step reboot    s_reboot
+  step bootwindow s_bootwindow
+  step digest    s_digest
+  log "rehearsal complete: $OUT (bootwindow: no drivers ran; the teardown deletes the cluster)"
+  exit 0
+fi
 if [[ "$LOAD_DRIVER" == "k6" ]]; then step classes s_classes; fi
 step reboot    s_reboot
 step digest    s_digest

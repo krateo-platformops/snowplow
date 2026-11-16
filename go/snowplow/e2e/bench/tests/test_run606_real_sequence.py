@@ -346,6 +346,13 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         uf = os.path.join(STATE, "users")
         if who not in (open(uf).read().split() if os.path.exists(uf) else []) and not fail:
             fail = "login"
+        # load606 go-runtime requires --deadline (the step's own): without it argparse exits 2, no line
+        if cmd and not re.search(r"--deadline [0-9]+", cmd):
+            if "get" in a:
+                print("1" if any(x.endswith("{.status.failed}") for x in a) else "")
+            elif "logs" in a:
+                print("load606.py go-runtime: error: the following arguments are required: --deadline")
+            sys.exit(0)
         # snowplow #1365 (every image after 1.12.70): /debug/vars is a NON-RESOURCE request, allowed only
         # by a ClusterRoleBinding of the user (or one of its groups) to a ClusterRole whose rule has
         # nonResourceURLs matching the path and verb get, as upstream RuleAllows decides (exact, "*", or a
@@ -371,7 +378,7 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                 fail = "vars403"
         if "get" in a:
             done = fail != "pending"
-            bad = fail in ("login", "vars401", "vars403", "nokey")
+            bad = fail in ("login", "vars401", "vars403", "nokey", "noanswer")
             if any(x.endswith("{.status.succeeded}") for x in a):
                 print("1" if done and not bad else "")
             elif any(x.endswith("{.status.failed}") for x in a):
@@ -384,13 +391,41 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             eff = {"gogc": int(env.get("GOGC", 100)), "memory_limit_bytes": 7516192768,
                    "memory_limit_source": "cgroup_v2", "cgroup_memory_limit_bytes": 8589934592}
             eff.update(json.loads(os.environ.get("FAKE_GO_RUNTIME") or "{}"))
+            # the Job's lines as load606 go-runtime prints them (read_answered): one per attempt, then the
+            # record with its read. FAKE_GO_RUNTIME_FAIL=stall: one attempt with no answer (connected, no
+            # byte in 30 s), then 200; noanswer: no attempt answered within the step's budget
+            no = {"status": 0, "elapsed_ms": 30001.0, "connect_ms": 0.9, "first_byte_ms": None,
+                  "error_class": "TimeoutError", "error": "TimeoutError: timed out", "stalled_at": "first_byte"}
+            t = 1794812706.0
+            tries = ([dict(no, n=1, t=t, t_end=t + 30.0)] if fail in ("stall", "noanswer") else [])
+            if fail == "noanswer":
+                tries += [dict(no, n=k, t=t + 35.0 * (k - 1), t_end=t + 35.0 * (k - 1) + 30.0) for k in range(2, 9)]
+            elif fail != "pending":
+                tries.append({"status": 401 if fail == "vars401" else 403 if fail == "vars403" else 200,
+                              "elapsed_ms": 12.0, "connect_ms": 0.8, "first_byte_ms": 11.0,
+                              "n": len(tries) + 1, "t": t + 35.0 * len(tries), "t_end": t + 35.0 * len(tries) + 0.012})
+            if fail == "login":
+                tries = []
+            for x in tries:
+                print(json.dumps(dict(x, kind="go_runtime_attempt")))
+            nos = [x for x in tries if not x["status"]]
+            ans = next((x for x in tries if x["status"]), None)
+            secs = round(ans["t_end"] - tries[0]["t"], 1) if ans else None
+            read = {"attempts": len(tries), "no_answer": len(nos), "answered": ans["status"] if ans else None,
+                    "seconds_to_answer": secs, "budget_s": 300.0, "timeout_s": 30.0, "poll_s": 5.0,
+                    "stall": {"no_answer_attempts": len(nos), "seconds_to_answer": secs,
+                              "answered": ans["status"] if ans else None, "first": nos[0], "last": nos[-1]}
+                    if nos else None}
             why = {"login": "the login failed (HTTPError)", "vars401": "/debug/vars answered 401",
                    "vars403": "/debug/vars answered 403",
+                   "noanswer": "/debug/vars: no answer to 8 attempt(s) over 275.0 s (each bounded at 30 s, 5 s "
+                               "apart, within the step's budget of 300.0 s); the last: TimeoutError after "
+                               "30001.0 ms: connected, no byte of an answer (connected in 0.9 ms)",
                    "nokey": "/debug/vars holds no snowplow_go_runtime: this snowplow image does not publish "
                             "the settings its Go runtime runs with"}.get(fail)
             if fail != "pending":
                 print(json.dumps({"kind": "go_runtime", "ok": why is None, "effective": None if why else eff,
-                                  "why": why}))
+                                  "why": why, **({} if fail == "login" else {"read": read})}))
             sys.exit(0)
         sys.exit(0)
     # #1471 review (g): the live chain of the portal's grant, as the installer leaves it: the Installer CR (with

@@ -37,6 +37,7 @@ import base64
 import calendar
 import concurrent.futures
 import gzip
+import http.client
 import itertools
 import json
 import math
@@ -44,6 +45,7 @@ import os
 import random
 import re
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -130,6 +132,27 @@ class Response:
     # X-Snowplow-Stage-Outcomes, verbatim (see parse_stage_outcomes); None
     # when the response did not carry it
     stage_outcomes: str | None = None
+    # where the time went (HttpClient's timed connection): ms from the request's start to its TCP
+    # connect, and to the answer's first byte; None = that point was never reached. error_class: the
+    # failure's own class when no HTTP answer came (status 0): TimeoutError, ConnectionRefusedError,
+    # RemoteDisconnected, ... ("" otherwise)
+    connect_ms: float | None = None
+    first_byte_ms: float | None = None
+    error_class: str = ""
+
+    def attempt(self) -> dict:
+        """This request as one recorded attempt: status, elapsed_ms, connect_ms, first_byte_ms, and,
+        when no HTTP answer came, error_class, error and `stalled_at`, the phase it never got past
+        (connect: no TCP connection; first_byte: connected, no byte of an answer; body: the answer
+        began and did not complete). Never the body."""
+        rec = {"status": self.status, "elapsed_ms": round(self.ms, 1),
+               "connect_ms": None if self.connect_ms is None else round(self.connect_ms, 1),
+               "first_byte_ms": None if self.first_byte_ms is None else round(self.first_byte_ms, 1)}
+        if self.status == 0:
+            rec.update(error_class=self.error_class, error=self.error[:200],
+                       stalled_at=("connect" if self.connect_ms is None else
+                                   "first_byte" if self.first_byte_ms is None else "body"))
+        return rec
 
 
 REFRESH_HEADER_KEY = "X-Snowplow-Refresh-Key"
@@ -181,30 +204,98 @@ def _refresh_headers(headers) -> tuple | None:
 HTTP_TIMEOUT_S = 30.0
 
 
+# The timed connection: every HttpClient request says WHERE its time went (runs 26j/27's boot window:
+# "/debug/vars answered 0" could not tell a connection that never opened from a server that never
+# sent a byte). The connection opened for a request times its TCP connect and the first byte of the
+# answer (a 1-byte MSG_PEEK before http.client parses it; on TLS, whose records cannot be peeked, the
+# parsed status line) into the timing dict of the request that opened it (_TIMING.t, set by
+# HttpClient.get on the request's own thread), while the request runs: a watcher on another thread
+# can see a request that is connected and still has no byte.
+_TIMING = threading.local()
+
+
+class _TimedConnection:
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self._timing = getattr(_TIMING, "t", None)
+        if self._timing is None:
+            self._timing = {"t0": time.perf_counter()}
+
+    def _ms(self) -> float:
+        return (time.perf_counter() - self._timing["t0"]) * 1000
+
+    def connect(self):
+        super().connect()
+        self._timing["connect_ms"] = self._ms()
+
+    def getresponse(self):
+        if self.sock is not None and not isinstance(self.sock, ssl.SSLSocket):
+            if self.sock.recv(1, socket.MSG_PEEK):    # b"": the peer closed without a byte (http.client says so)
+                self._timing["first_byte_ms"] = self._ms()
+        r = super().getresponse()
+        self._timing.setdefault("first_byte_ms", self._ms())
+        return r
+
+
+class _TimedHTTPConnection(_TimedConnection, http.client.HTTPConnection):
+    pass
+
+
+class _TimedHTTPSConnection(_TimedConnection, http.client.HTTPSConnection):
+    pass
+
+
+class _TimedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_TimedHTTPConnection, req)
+
+
+class _TimedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_TimedHTTPSConnection, req, context=self._context)
+
+
+def error_class(e: BaseException) -> str:
+    """The class of a failure that left no HTTP answer: urllib's URLError by its cause (a refused or
+    timed-out connect, a name that does not resolve), any other exception by itself."""
+    if isinstance(e, urllib.error.URLError) and isinstance(e.reason, BaseException):
+        return type(e.reason).__name__
+    return type(e).__name__
+
+
 class HttpClient:
     def __init__(self, base_url: str, timeout: float = HTTP_TIMEOUT_S):
         self.base = base_url.rstrip("/")
         self.timeout = timeout
+        self._opener = urllib.request.build_opener(_TimedHTTPHandler, _TimedHTTPSHandler)
 
-    def get(self, path: str, token: str | None) -> Response:
+    def get(self, path: str, token: str | None, timing: dict | None = None) -> Response:
+        """One GET, bounded by the client's timeout. `timing` (optional): the dict this request fills
+        while it runs (t0, then connect_ms, first_byte_ms), for a caller watching from another thread."""
         headers = {"Accept-Encoding": "gzip"}
         if token:
             headers["Authorization"] = "Bearer " + token
         req = urllib.request.Request(self.base + path, headers=headers)
         t0 = time.perf_counter()
+        tm = timing if timing is not None else {}
+        tm["t0"] = t0
+        _TIMING.t = tm
+
+        def done(status, body, error="", cls="", **kw):
+            return Response(status, body, (time.perf_counter() - t0) * 1000, error,
+                            connect_ms=tm.get("connect_ms"), first_byte_ms=tm.get("first_byte_ms"),
+                            error_class=cls, **kw)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            with self._opener.open(req, timeout=self.timeout) as r:
                 raw = r.read()
-                return Response(r.status, _decode(raw, r.headers),
-                                (time.perf_counter() - t0) * 1000,
-                                refresh=_refresh_headers(r.headers),
-                                stage_outcomes=r.headers.get(STAGE_OUTCOMES_HEADER))
+                return done(r.status, _decode(raw, r.headers), refresh=_refresh_headers(r.headers),
+                            stage_outcomes=r.headers.get(STAGE_OUTCOMES_HEADER))
         except urllib.error.HTTPError as e:
-            return Response(e.code, b"", (time.perf_counter() - t0) * 1000,
-                            f"http {e.code}")
+            return done(e.code, b"", f"http {e.code}")
         except Exception as e:  # noqa: BLE001 — every failure is a sample
-            return Response(0, b"", (time.perf_counter() - t0) * 1000,
-                            f"{type(e).__name__}: {e}")
+            return done(0, b"", f"{type(e).__name__}: {e}", error_class(e))
+        finally:
+            _TIMING.t = None
 
 
 # ─── /refreshes viewers (#764) ──────────────────────────────────────────────
@@ -5045,18 +5136,308 @@ def go_runtime_record(status: int | None, body, why: str | None = None) -> dict:
     return rec
 
 
+# ─── a read that must be ANSWERED, inside a step's budget (runs 26j/27) ──────
+#
+# Runs 26j and 27 (2026-11-16, all three arms of each, 1.12.70/71/72): the Go runtime read landed
+# 6-11 s after the rebooted pod's Ready, ~2.5 min before snowplow's boot converged, got no byte for
+# HTTP_TIMEOUT_S and failed the arm on "/debug/vars answered 0", the record keeping neither the error
+# nor where the time went. The rule is the start gate's (wait_for_customer_load): a real HTTP answer
+# that is not 200 (401, 403, 5xx) is a refusal and ends the read at once; NO answer (status 0: no
+# connection, or no byte within the bound) is tried again, every READ_POLL_S, each attempt keeping
+# HTTP_TIMEOUT_S, while a whole attempt still fits before the step's deadline. Every attempt is
+# recorded (Response.attempt), and a read answered only after attempts with no answer says so
+# (read_summary "stall": how many, and the seconds from the first attempt to the answer): retrying
+# never hides the stall.
+READ_POLL_S = 5.0          # wait_for_customer_load's poll_s: the start gate's pace for the same endpoint
+
+
+def read_answered(client: HttpClient, path: str, token: str | None, *, deadline: float,
+                  poll_s: float = READ_POLL_S, clock: Callable[[], float] = time.time,
+                  sleep: Callable[[float], None] = time.sleep,
+                  on_attempt: Callable[[dict], None] | None = None) -> tuple["Response | None", list[dict]]:
+    """GET `path` until it is ANSWERED (any HTTP status), within `deadline` (epoch s): (the answer, or
+    None when no attempt got one; every attempt, each Response.attempt with n and t, its start).
+    An attempt starts only while its whole bound (client.timeout) fits before the deadline."""
+    attempts: list[dict] = []
+    while clock() + client.timeout <= deadline:
+        t = clock()
+        r = client.get(path, token)
+        att = dict(r.attempt(), n=len(attempts) + 1, t=round(t, 3), t_end=round(clock(), 3))
+        attempts.append(att)
+        if on_attempt is not None:
+            on_attempt(att)
+        if r.status != 0:
+            return r, attempts
+        if clock() + poll_s + client.timeout > deadline:
+            break
+        sleep(poll_s)
+    return None, attempts
+
+
+def attempt_text(a: dict | None) -> str:
+    """One recorded attempt, as a line says it (no body, no identity: there is none in it)."""
+    if not isinstance(a, dict):
+        return "no attempt"
+    if a.get("status"):
+        return f"HTTP {a['status']} after {a.get('elapsed_ms')} ms"
+    where = {"connect": "no TCP connection", "first_byte": "connected, no byte of an answer",
+             "body": "the answer began and did not complete"}.get(a.get("stalled_at"), "no answer")
+    conn = "" if a.get("connect_ms") is None else f" (connected in {a['connect_ms']} ms)"
+    return f"{a.get('error_class') or 'no answer'} after {a.get('elapsed_ms')} ms: {where}{conn}"
+
+
+def read_summary(attempts: list[dict], *, deadline: float, t_start: float, timeout_s: float,
+                 poll_s: float = READ_POLL_S) -> dict:
+    """What a read_answered read did, as its record keeps it: attempts, no_answer (how many had no
+    HTTP answer), answered (the answer's status, None when none came), seconds_to_answer (first
+    attempt's start to the answer's end), budget_s (what was left of the step's budget at t_start),
+    and `stall`: None when the first attempt was answered, else {no_answer_attempts,
+    seconds_to_answer (None: no answer), answered, first, last} (first and last no-answer attempts)."""
+    no = [a for a in attempts if not a.get("status")]
+    ans = next((a for a in attempts if a.get("status")), None)
+    secs = round(ans["t_end"] - attempts[0]["t"], 1) if ans is not None else None
+    out = {"attempts": len(attempts), "no_answer": len(no), "answered": ans["status"] if ans else None,
+           "seconds_to_answer": secs, "budget_s": round(deadline - t_start, 1),
+           "timeout_s": timeout_s, "poll_s": poll_s, "stall": None}
+    if no:
+        out["stall"] = {"no_answer_attempts": len(no), "seconds_to_answer": secs,
+                        "answered": out["answered"], "first": no[0], "last": no[-1]}
+    if not attempts:
+        out["why"] = (f"the step's budget left {out['budget_s']} s at the read's start: not one attempt "
+                      f"({timeout_s:g} s) fits")
+    elif ans is None:
+        out["why"] = (f"no answer to {len(no)} attempt(s) over {round(no[-1]['t_end'] - no[0]['t'], 1)} s "
+                      f"(each bounded at {timeout_s:g} s, {poll_s:g} s apart, within the step's budget of "
+                      f"{out['budget_s']} s); the last: {attempt_text(no[-1])}")
+    return out
+
+
+def go_runtime_read(client: HttpClient, token: str, *, deadline: float, poll_s: float = READ_POLL_S,
+                    clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
+                    sink: Callable[[dict], None] = lambda r: None) -> dict:
+    """The go_runtime record of /debug/vars read by the start gate's rule (read_answered), each attempt
+    streamed to `sink` as a go_runtime_attempt line as it ends, the read's summary in rec["read"]."""
+    t0 = clock()
+    r, attempts = read_answered(client, "/debug/vars", token, deadline=deadline, poll_s=poll_s, clock=clock,
+                                sleep=sleep, on_attempt=lambda a: sink(dict(a, kind="go_runtime_attempt")))
+    read = read_summary(attempts, deadline=deadline, t_start=t0, timeout_s=client.timeout, poll_s=poll_s)
+    rec = (go_runtime_record(None, None, f"/debug/vars: {read['why']}") if r is None
+           else go_runtime_record(r.status, r.body))
+    rec["read"] = read
+    return rec
+
+
 def _cmd_go_runtime(a) -> int:
-    """One line: the go_runtime record (the in-cluster runtime606 Job's whole output). Exit 2 when the
-    settings could not be read; the record says why."""
+    """The runtime606 Job's whole output: a go_runtime_attempt line per attempt, then the go_runtime
+    record. Exit 2 when the settings could not be read; the record says why."""
+    def sink(rec):
+        print(json.dumps(rec), flush=True)
     try:
         tok = login(a.authn_url, a.user, a.password)
     except Exception as e:  # noqa: BLE001
         rec = go_runtime_record(None, None, f"the login failed ({type(e).__name__})")
     else:
-        r = HttpClient(a.snowplow_url).get("/debug/vars", tok)
-        rec = go_runtime_record(r.status, r.body)
-    print(json.dumps(rec), flush=True)
+        rec = go_runtime_read(HttpClient(a.snowplow_url), tok, deadline=a.deadline, sink=sink)
+    sink(rec)
     return 0 if rec["ok"] else 2
+
+
+# ─── the boot-window probe (BENCH_606_REHEARSAL=bootwindow) ─────────────────
+#
+# What held the runs 26j/27 read for 30 s without a byte, 6-11 s after the rebooted pod's Ready? From
+# the loadgen node, every BOOT_EVERY_S, CONCURRENTLY: /readyz (anonymous), /debug/pprof/goroutine?
+# debug=1 and /debug/vars (the bench's debug reader) and the portal's boot root (/call, the preflight
+# user), each a fresh connection timed to its connect and its first byte (HttpClient), from before the
+# reboot to BOOT_WINDOW_S past the new pod's Ready. Whenever a probe passes BOOT_STALL_S without a
+# byte, a goroutine dump (debug=2, every goroutine with its wait) is SAVED, so a stall names what
+# holds it; a probe that stalls while a dump is in flight is recorded as covered by it. When /debug/
+# vars answers, its GC fields are kept (memstats NumGC, PauseTotalNs, GCCPUFraction, HeapAlloc, the
+# effective GOGC): a GC-driven stall reads apart from the others. Records only metadata: no body
+# except the dumps (files), no identity (the roles are named by their bench constant's role).
+BOOT_EVERY_S = 5.0
+BOOT_WINDOW_S = 180.0
+BOOT_STALL_S = 5.0
+#: (route, the identity it is read as); each route's request is BootProbe._get (a literal path per route,
+#: so tests/test_debug_reader.py's call-graph guard sees every /debug read); the boot root is the INIT
+BOOT_ROUTES = (("readyz", "anonymous"), ("goroutine", "debug_reader"), ("vars", "debug_reader"),
+               ("call", "preflight_user"))
+BOOT_READY_FILE, BOOT_DONE_FILE, BOOT_RECORDS = "ready", "done", "probes.jsonl"
+
+
+def vars_gc(body) -> dict | None:
+    """The GC and boot fields of one /debug/vars document (metadata only), None when it is not one."""
+    try:
+        v = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(v, dict):
+        return None
+    m = v.get("memstats") if isinstance(v.get("memstats"), dict) else {}
+    g = v.get(GO_RUNTIME_VAR) if isinstance(v.get(GO_RUNTIME_VAR), dict) else {}
+    return {"num_gc": m.get("NumGC"), "pause_total_ns": m.get("PauseTotalNs"),
+            "gc_cpu_fraction": m.get("GCCPUFraction"), "heap_alloc": m.get("HeapAlloc"),
+            "last_gc": m.get("LastGC"), "gogc": g.get("gogc"), "memory_limit_bytes": g.get("memory_limit_bytes"),
+            "prewarm_complete": v.get("snowplow_prewarm_complete")}
+
+
+class BootProbe:
+    """One boot-window probe run (see the section's comment). `tokens`: role -> token (None for
+    anonymous); `login`: role -> a fresh token (a 401 asks for one); `out_dir`: where the ready file is
+    read and the dumps written; `sink`: every record, from several threads (serialised here)."""
+
+    def __init__(self, client: HttpClient, init: str, tokens: dict, login: dict, *, out_dir: str,
+                 sink: Callable[[dict], None], every_s: float = BOOT_EVERY_S, window_s: float = BOOT_WINDOW_S,
+                 stall_s: float = BOOT_STALL_S, bound_s: float, dump_client: HttpClient | None = None,
+                 clock: Callable[[], float] = time.time, tick_s: float = 0.25):
+        self.client, self.dump_client = client, dump_client or client
+        self.init = init
+        self.routes = list(BOOT_ROUTES)
+        self.tokens, self.login = dict(tokens), login
+        self.out_dir, self.every_s, self.window_s, self.stall_s, self.bound_s = (
+            out_dir, every_s, window_s, stall_s, bound_s)
+        self.clock, self.tick_s = clock, tick_s
+        self._lock = threading.Lock()
+        self._sink = sink
+        self.inflight: dict = {}         # (route, tick) -> {"t", "timing", "covered"}
+        self.dumps = 0
+        self.dump_inflight: int | None = None
+        self.threads: list[threading.Thread] = []
+        self.relogin: set = set()
+
+    def sink(self, rec: dict) -> None:
+        with self._lock:
+            self._sink(rec)
+
+    def ready(self) -> float | None:
+        try:
+            with open(os.path.join(self.out_dir, BOOT_READY_FILE)) as fh:
+                return float(fh.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    def _token(self, who: str):
+        if who == "anonymous":
+            return None
+        if who in self.relogin or self.tokens.get(who) is None:
+            self.relogin.discard(who)
+            try:
+                self.tokens[who] = self.login[who]()
+            except Exception as e:  # noqa: BLE001 — recorded; the route is probed without a token
+                self.sink({"kind": "login_error", "who": who, "t": round(self.clock(), 3),
+                           "error_class": error_class(e)})
+        return self.tokens.get(who)
+
+    def _get(self, route: str, token, timing: dict) -> Response:
+        if route == "readyz":
+            return self.client.get("/readyz", token, timing=timing)
+        if route == "goroutine":
+            return self.client.get("/debug/pprof/goroutine?debug=1", token, timing=timing)
+        if route == "vars":
+            return self.client.get("/debug/vars", token, timing=timing)
+        return self.client.get(self.init, token, timing=timing)
+
+    def _probe(self, route: str, who: str, tick: int, token) -> None:
+        timing: dict = {}
+        t = self.clock()
+        with self._lock:
+            self.inflight[(route, tick)] = {"t": t, "timing": timing, "covered": False}
+        r = self._get(route, token, timing)
+        rec = {"kind": "probe", "route": route, "who": who, "tick": tick, "t": round(t, 3),
+               **r.attempt(), "bytes": len(r.body or b"")}
+        if route == "vars" and r.status == 200:
+            rec["gc"] = vars_gc(r.body)
+        if r.status == 401:
+            self.relogin.add(who)
+        with self._lock:
+            covered = self.inflight.pop((route, tick), {}).get("covered")
+        rec["dump"] = covered or None
+        self.sink(rec)
+
+    def _dump(self, n: int, triggers: list[dict]) -> None:
+        tok = self.tokens.get("debug_reader")
+        t = self.clock()
+        r = self.dump_client.get("/debug/pprof/goroutine?debug=2", tok)      # every goroutine, with its wait
+        name = None
+        if r.status == 200 and r.body:
+            name = f"goroutines-{n:02d}-{time.strftime('%H%M%S', time.gmtime(t))}.txt.gz"
+            with open(os.path.join(self.out_dir, name), "wb") as fh:
+                fh.write(gzip.compress(r.body))
+        self.sink({"kind": "dump", "n": n, "t": round(t, 3), "triggers": triggers, **r.attempt(),
+                   "bytes": len(r.body or b""), "file": name})
+        with self._lock:
+            self.dump_inflight = None
+
+    def watch(self) -> None:
+        """One look at the probes in flight: each past stall_s with no byte, not yet covered, is
+        covered by the dump in flight, or starts one."""
+        now = self.clock()
+        with self._lock:
+            stalled = [(k, v) for k, v in self.inflight.items() if not v["covered"]
+                       and v["timing"].get("first_byte_ms") is None and now - v["t"] > self.stall_s]
+            if not stalled:
+                return
+            if self.dump_inflight is None:
+                self.dumps += 1
+                self.dump_inflight = n = self.dumps
+                start = True
+            else:
+                n, start = self.dump_inflight, False
+            for _, v in stalled:
+                v["covered"] = n
+        if start:
+            triggers = [{"route": k[0], "tick": k[1], "waited_s": round(now - v["t"], 1)} for k, v in stalled]
+            th = threading.Thread(target=self._dump, args=(n, triggers), daemon=True)
+            th.start()
+            self.threads.append(th)
+
+    def run(self, sleep: Callable[[float], None] = time.sleep) -> dict:
+        t0 = self.clock()
+        self.sink({"kind": "boot_probe_start", "t": round(t0, 3), "every_s": self.every_s,
+                   "window_s": self.window_s, "stall_s": self.stall_s, "bound_s": self.bound_s,
+                   "timeout_s": self.client.timeout, "routes": [list(r) for r in self.routes]})
+        tick, reason = 0, "bound"
+        while True:
+            now = self.clock()
+            ready = self.ready()
+            if ready is not None and now >= ready + self.window_s:
+                reason = "window"
+                break
+            if now >= t0 + self.bound_s:
+                break
+            if now >= t0 + tick * self.every_s:
+                for route, who in self.routes:
+                    th = threading.Thread(target=self._probe, args=(route, who, tick, self._token(who)),
+                                          daemon=True)
+                    th.start()
+                    self.threads.append(th)
+                tick += 1
+            self.watch()
+            sleep(self.tick_s)
+        # the probes in flight end within their bound; the watch keeps covering them meanwhile
+        while any(th.is_alive() for th in self.threads):
+            self.watch()
+            sleep(self.tick_s)
+        end = {"kind": "boot_probe_end", "t": round(self.clock(), 3), "ticks": tick, "dumps": self.dumps,
+               "ready": self.ready(), "reason": reason}
+        self.sink(end)
+        return end
+
+
+def _cmd_boot_probe(a) -> int:
+    os.makedirs(a.out, exist_ok=True)
+    sink = _jsonl_sink(os.path.join(a.out, BOOT_RECORDS))
+    users = {"debug_reader": a.debug_user, "preflight_user": a.preflight_user}
+    logins = {who: (lambda u=u: login(a.authn_url, u, a.password)) for who, u in users.items()}
+    probe = BootProbe(HttpClient(a.snowplow_url), a.init, {}, logins, out_dir=a.out, sink=sink,
+                      every_s=a.every_s, window_s=a.window_s, stall_s=a.stall_s, bound_s=a.bound_s)
+    for who in users:
+        probe._token(who)
+    end = probe.run()
+    with open(os.path.join(a.out, BOOT_DONE_FILE), "w") as fh:
+        fh.write(json.dumps(end))
+    print(json.dumps(end), flush=True)
+    time.sleep(a.linger_s)
+    return 0
 
 
 def _cmd_login_tokens(a) -> int:
@@ -6263,6 +6644,10 @@ def _cmd_evaluate(a) -> int:
     result["report"]["snowplow_env"] = env = _report_only(snowplow_env.report, a.snowplow_env)
     for ln in env.get("lines") or []:
         print(ln, file=sys.stderr, flush=True)
+    if env.get("runtime_read_stall"):
+        # the boot-window stall is a finding of its own, whatever the read ended with (runs 26j/27)
+        result["report"].setdefault("report_warnings", []).append(
+            f"{snowplow_env.READ_FINDING}: {snowplow_env.read_text(env.get('runtime_read'))}")
     for w in (result.get("report") or {}).get("report_warnings") or []:
         print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(json.dumps(result, indent=2, default=str))
@@ -6364,7 +6749,21 @@ def main(argv: list[str] | None = None) -> int:
                                            "(/debug/vars snowplow_go_runtime), as one JSON line")
     for flag in ("--snowplow-url", "--authn-url", "--user", "--password"):
         gr.add_argument(flag, required=True)
+    gr.add_argument("--deadline", type=float, required=True,
+                    help="epoch s: the step's own deadline (run606 GO_RUNTIME_S from the Job's apply); no "
+                         "attempt starts that could not end before it")
     gr.set_defaults(func=_cmd_go_runtime)
+    bp = sub.add_parser("boot-probe", help="the boot-window probe (BENCH_606_REHEARSAL=bootwindow): /readyz, "
+                                           "/debug/pprof/goroutine, /debug/vars and the boot root, concurrently")
+    for flag in ("--snowplow-url", "--authn-url", "--debug-user", "--preflight-user", "--password", "--init",
+                 "--out"):
+        bp.add_argument(flag, required=True)
+    bp.add_argument("--every-s", type=float, default=BOOT_EVERY_S)
+    bp.add_argument("--window-s", type=float, default=BOOT_WINDOW_S)
+    bp.add_argument("--stall-s", type=float, default=BOOT_STALL_S)
+    bp.add_argument("--bound-s", type=float, required=True)
+    bp.add_argument("--linger-s", type=float, default=0.0)
+    bp.set_defaults(func=_cmd_boot_probe)
     pc = sub.add_parser("portal-config",
                         help="config.json on stdin -> PORTAL_* shell exports")
     pc.set_defaults(func=_cmd_portal_config)
@@ -6438,7 +6837,7 @@ def main(argv: list[str] | None = None) -> int:
     vf.add_argument("--poll-s", type=float, default=0.2)
     vf.set_defaults(func=_cmd_view_feed)
     pr = sub.add_parser("pod-record", help="kubectl get pods -o json on stdin -> snowplow_pod record")
-    pr.add_argument("--phase", required=True, choices=["before", "after"])
+    pr.add_argument("--phase", required=True, choices=["before", "after", "boot"])   # boot: bootwindow's reboot
     pr.set_defaults(func=_cmd_pod_record)
     dg = sub.add_parser("digest-gate",
                         help="kubectl get pods -o json on stdin -> image_digest record; exit 3 = VOID")

@@ -232,10 +232,58 @@ def effective_of(path: str | None) -> tuple[dict | None, str]:
         return None, f"the reading of the process's settings is not JSON ({path})"
     rec = next((r for r in rows if isinstance(r, dict) and r.get("kind") == "go_runtime"), None)
     if rec is None:
+        tried = [r for r in rows if isinstance(r, dict) and r.get("kind") == "go_runtime_attempt"]
+        if tried:
+            from bench import load606
+            return None, (f"the Job that reads the process's settings printed no reading: its {len(tried)} "
+                          f"attempt(s) so far had no answer, over {round(tried[-1]['t_end'] - tried[0]['t'], 1)} s "
+                          f"(the last: {load606.attempt_text(tried[-1])}), and the step's wait ended first")
         return None, "the Job that reads the process's settings printed no reading"
     if not rec.get("ok") or not isinstance(rec.get("effective"), dict):
         return None, str(rec.get("why") or "the reading says neither ok nor why not")
     return rec["effective"], ""
+
+
+def read_of(path: str | None) -> dict | None:
+    """How the runtime606 Job's read of /debug/vars went (load606 read_summary: attempts, no_answer,
+    answered, seconds_to_answer, stall), from its record, or rebuilt from its attempt lines when the
+    record never came; None when neither is there (no reading, or a Job from before the attempts)."""
+    try:
+        with open(path) as fh:
+            rows = [json.loads(ln) for ln in fh if ln.lstrip().startswith("{")]
+    except (OSError, TypeError, ValueError):
+        return None
+    rec = next((r for r in rows if isinstance(r, dict) and r.get("kind") == "go_runtime"), None)
+    if rec is not None and isinstance(rec.get("read"), dict):
+        return rec["read"]
+    tried = [r for r in rows if isinstance(r, dict) and r.get("kind") == "go_runtime_attempt"]
+    if not tried:
+        return None
+    no = [a for a in tried if not a.get("status")]
+    ans = next((a for a in tried if a.get("status")), None)
+    secs = round(ans["t_end"] - tried[0]["t"], 1) if ans else None
+    return {"attempts": len(tried), "no_answer": len(no), "answered": ans["status"] if ans else None,
+            "seconds_to_answer": secs, "unfinished": True,
+            "stall": {"no_answer_attempts": len(no), "seconds_to_answer": secs, "answered": ans["status"] if ans else None,
+                      "first": no[0], "last": no[-1]} if no else None}
+
+
+def read_text(read: dict | None) -> str:
+    """The read's own finding, one line: answered at once, STALLED (answered only after attempts with no
+    answer: how many, the seconds from the first attempt to the answer), or no answer at all."""
+    from bench import load606
+    if not isinstance(read, dict):
+        return "its attempts were not recorded (no reading, or a runtime606 Job that predates them)"
+    st = read.get("stall")
+    if not st:
+        a = read.get("answered")
+        return f"answered {a} on its first attempt" if a else "not one attempt was made: " + str(read.get("why"))
+    if read.get("answered") is None:
+        return (f"NO ANSWER: {st['no_answer_attempts']} attempt(s), none answered (the first: "
+                f"{load606.attempt_text(st['first'])}; the last: {load606.attempt_text(st['last'])})")
+    return (f"STALLED: {st['no_answer_attempts']} attempt(s) with no answer (the first: "
+            f"{load606.attempt_text(st['first'])}), then HTTP {st['answered']} "
+            f"{st['seconds_to_answer']} s after the first attempt began")
 
 
 def effective_text(e: dict | None) -> str:
@@ -258,6 +306,8 @@ def check(declared: dict[str, str], tracing_path: str, *, arm: str = "", now=tim
                            "reading before the measure), never the rendered values"}
     eff, eff_why = effective_of(effective_path)
     rec["effective"] = eff
+    # the read's own finding (a boot-window stall), kept apart from the verdict on the settings
+    rec["runtime_read"] = read_of(effective_path)
     if eff is None:
         rec["mismatches"].append(f"the settings the process runs with could not be read: {eff_why}")
     else:
@@ -392,12 +442,18 @@ def report(path: str | None) -> dict:
         return {"state": "UNKNOWN", "why": why, "lines": [f"INFO snowplow env: UNKNOWN ({why})"]}
     state = "VERIFIED" if rec.get("verified") else "NOT_VERIFIED"
     und = ", ".join(key_text(k, r) for k, r in (rec.get("undeclared") or {}).items()) or "none"
-    return dict(rec, state=state, lines=[
+    read = rec.get("runtime_read")
+    return dict(rec, state=state, runtime_read_stall=(read or {}).get("stall"), lines=[
         f"INFO snowplow Go runtime, effective (read from the running process before the measure): "
         f"{effective_text(rec.get('effective'))}",
         f"INFO snowplow env declared: {declared_text(rec.get('declared') or {})}; "
         + (f"the process and the pod's env have it as declared; undeclared Go runtime keys in the env: {und}"
-           if rec.get("verified") else f"NOT verified: {rec.get('why')}")])
+           if rec.get("verified") else f"NOT verified: {rec.get('why')}"),
+        f"INFO {READ_FINDING}: {read_text(read)}"])
+
+
+#: the stall's own finding, named so in the record, the report and the run log
+READ_FINDING = "the measure's first snowplow read (runtime606, /debug/vars as the debug reader)"
 
 
 def _arm(v: dict | None) -> dict | None:
@@ -571,6 +627,7 @@ def rehearsal_lines(out_dir: str) -> list[str]:
                  "snowplow_go_runtime, as the bench's debug reader): "
                  + (f"{effective_text(eff)}; raw: {json.dumps(eff, sort_keys=True)}" if eff is not None
                     else f"NOT READ ({eff_why})"))
+    lines.append(f"{READ_FINDING}: {read_text(read_of(os.path.join(out_dir, 'go-runtime.jsonl')))}")
     lines.append("the pod's Go runtime env, read before any load: "
                  + (goruntime.reading_text(g) if g is not None else f"NOT READ ({why})"))
     rec = load(os.path.join(out_dir, "snowplow-env.json"))
@@ -627,9 +684,14 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--out", required=True)
     h = sub.add_parser("rehearsal-report", help="the one block a rehearsal run prints, from its files")
     h.add_argument("--out-dir", required=True)
+    rs = sub.add_parser("read-said", help="the runtime606 read's own finding, one line (run606 logs it)")
+    rs.add_argument("--effective", required=True)
     a = ap.parse_args(argv)
     if a.cmd == "rehearsal-report":
         print("\n".join(rehearsal_lines(a.out_dir)))
+        return 0
+    if a.cmd == "read-said":
+        print(f"{READ_FINDING}: {read_text(read_of(a.effective))}")
         return 0
     try:
         if a.cmd == "same-keys":

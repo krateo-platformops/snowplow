@@ -309,8 +309,10 @@ def test_the_runtime_job_reads_what_snowplow_publishes():
     assert load606.GO_RUNTIME_FIELDS == ("gogc", "memory_limit_bytes", "memory_limit_source",
                                          "cgroup_memory_limit_bytes")
     from bench import load606_job
-    job = load606_job.render_go_runtime(snowplow_url="http://s", authn_url="http://a", user="u", password="pw")
+    job = load606_job.render_go_runtime(snowplow_url="http://s", authn_url="http://a", user="u", password="pw",
+                                        deadline=1794812999)
     assert "name: runtime606" in job and "load606.py go-runtime" in job and "bench.krateo.io/pool: loadgen" in job
+    assert "--deadline 1794812999" in job      # the step's own deadline, never one of the Job's making
 
 
 # ─── agreed between the arms of a launch ────────────────────────────────────
