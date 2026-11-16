@@ -57,6 +57,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
@@ -183,7 +184,7 @@ func (r *resolveRun) refuseBackgroundWrite(gctx context.Context, sc *stageCtx, i
 		slog.String("name", sc.id),
 		slog.String("verb", verb),
 		slog.String("origin", origin),
-		slog.String("path", call.Path),
+		redact.PathAttr("path", call.Path),
 		slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 		slog.String("restaction_name", r.opts.RESTActionName))
 	return true

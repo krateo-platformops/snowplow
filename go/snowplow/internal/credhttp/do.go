@@ -53,6 +53,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"k8s.io/client-go/rest"
 )
@@ -88,7 +89,7 @@ func DoAs(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *re
 func do(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *response.Status {
 	u, err := url.Parse(RequestURL(opts.Endpoint.ServerURL, opts.Path))
 	if err != nil {
-		return response.New(http.StatusInternalServerError, err)
+		return response.New(http.StatusInternalServerError, redact.ErrorURL(err))
 	}
 
 	verb := ptr.Deref(opts.Verb, http.MethodGet)
@@ -100,7 +101,7 @@ func do(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *resp
 
 	call, err := http.NewRequestWithContext(ctx, verb, u.String(), body)
 	if err != nil {
-		return response.New(http.StatusInternalServerError, err)
+		return response.New(http.StatusInternalServerError, redact.ErrorURL(err))
 	}
 	// Additional headers for AWS Signature 4 algorithm.
 	if opts.Endpoint.HasAwsAuth() {
@@ -154,7 +155,10 @@ func do(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *resp
 		if st, ok := DestinationStatus(err); ok {
 			return st // #1131 — 502 DestinationRefused
 		}
-		return response.New(http.StatusInternalServerError, err)
+		// #1481 — a transport error's text quotes the request's URL (a
+		// *url.Error), and the /call handler logs the envelope's message: the
+		// URL is rendered without its query values or userinfo (#523).
+		return response.New(http.StatusInternalServerError, redact.ErrorURL(err))
 	}
 	defer respo.Body.Close()
 
@@ -171,7 +175,7 @@ func do(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *resp
 	if respo.StatusCode < 200 || respo.StatusCode >= 300 {
 		dat, err := io.ReadAll(io.LimitReader(respo.Body, maxUnstructuredResponseTextBytes))
 		if err != nil {
-			return response.New(http.StatusInternalServerError, err)
+			return response.New(http.StatusInternalServerError, redact.ErrorURL(err))
 		}
 		return nonOKEnvelope(respo.StatusCode, dat)
 	}

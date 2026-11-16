@@ -448,7 +448,7 @@ func (r *resolveRun) recordServedListDeny(dictMu *sync.Mutex, itemErrs []error, 
 	r.log.Log(r.ctx, expectedDenyLevel(r.ctx, call.Path), "api call response failure", slog.String("name", id),
 		slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 		slog.String("restaction_name", r.opts.RESTActionName),
-		slog.String("path", call.Path),
+		redact.PathAttr("path", call.Path),
 		slog.String("dispatch", dispatch),
 		slog.String("error", deny.Error()))
 	r.recordRBACDeny(dictMu, itemErrs, id, i, call, deny)
@@ -964,7 +964,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 
 	r.log.Debug("calling api", slog.String("name", id),
 		slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-		slog.String("path", call.Path),
+		redact.PathAttr("path", call.Path),
 	)
 
 	// RETIRED (2026-06-22 unified ship): the /call?resource=...&apiVersion=...
@@ -1015,7 +1015,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if rerr != nil {
 			r.log.ErrorContext(gctx, "in-process resolve failed",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch+"-resolve"),
 				slog.String("error", rerr.Error()))
 			var itemErr error
@@ -1033,7 +1033,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if ferr := feedBytes(bytesToFeed); ferr != nil {
 			r.log.ErrorContext(gctx, "response handler failed",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", ferr.Error()))
 			var itemErr error
@@ -1106,7 +1106,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				// error, never a fall-through that would rebuild the refused list.
 				r.log.ErrorContext(fallCtx, "apistage content fill not admitted",
 					slog.String("name", id),
-					slog.String("path", call.Path),
+					redact.PathAttr("path", call.Path),
 					slog.String("error", cerr.Error()))
 				var itemErr error
 				if !call.ContinueOnError {
@@ -1145,7 +1145,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 					if rerr != nil {
 						r.log.ErrorContext(fallCtx, "in-process resolve failed",
 							slog.String("name", id),
-							slog.String("path", call.Path),
+							redact.PathAttr("path", call.Path),
 							slog.String("dispatch", "apistage-content-resolve"),
 							slog.String("error", rerr.Error()))
 						var itemErr error
@@ -1169,7 +1169,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 						if ferr != nil {
 							r.log.ErrorContext(fallCtx, "apistage-content response handler failed",
 								slog.String("name", id),
-								slog.String("path", call.Path),
+								redact.PathAttr("path", call.Path),
 								slog.String("dispatch", dispatch),
 								slog.String("error", ferr.Error()))
 							var itemErr error
@@ -1184,7 +1184,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 					r.log.Debug("api successfully resolved",
 						slog.String("name", id),
 						slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-						slog.String("path", call.Path),
+						redact.PathAttr("path", call.Path),
 						slog.Int("depth", depth),
 						slog.String("dispatch", dispatch),
 					)
@@ -1226,7 +1226,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			r.log.Debug("api successfully resolved",
 				slog.String("name", id),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.Int("depth", depth),
 				slog.String("dispatch", dispatch),
 			)
@@ -1287,7 +1287,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 				slog.String("restaction_name", r.opts.RESTActionName),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", "internal-rest-config"),
 				// diagnostic for #271 — self-name the SAR-401 root cause. sa_dial
 				// reads the SAME provenance marker the dial consumes (gctx :=
@@ -1337,7 +1337,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
 		)
@@ -1387,7 +1387,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 				slog.String("restaction_name", r.opts.RESTActionName),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", "discovery"),
 				// diagnostic for #271 (C3 caveat). dispatchViaDiscovery uses the
 				// process-wide SA rest.Config SINGLETON, independent of the
@@ -1408,7 +1408,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		} else if ferr := feedBytes(raw); ferr != nil {
 			r.log.ErrorContext(gctx, "discovery response handler failed",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", ferr.Error()))
 			var itemErr error
@@ -1421,7 +1421,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
 		)
@@ -1465,7 +1465,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if rerr != nil {
 			r.log.ErrorContext(gctx, "in-process resolve failed (cache-off path)",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", rerr.Error()))
 			var itemErr error
@@ -1477,7 +1477,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		} else if ferr := feedBytes(substituted); ferr != nil {
 			r.log.ErrorContext(gctx, "in-process resolve response handler failed (cache-off path)",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", ferr.Error()))
 			var itemErr error
@@ -1490,7 +1490,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
 		)
@@ -1548,7 +1548,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// cohort seed + prewarm scope, prewarm, live) and to the cell it was
 		// populating (key_hash), from stamps the ctx already carries.
 		r.log.WarnContext(gctx, "branch-E SA-endpoint dial re-gated and failed closed",
-			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)), slog.String("path", call.Path),
+			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)), redact.PathAttr("path", call.Path),
 			slog.String("sa_regate_origin", rbac.SARegateOrigin(gctx)),
 			slog.String("sa_regate_trigger", rbac.SARegateTrigger(gctx)),
 			slog.String("sa_regate_scope", rbac.SARegateScope(gctx)),
@@ -1560,7 +1560,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, msg, msg, itemErr)
 		r.log.Debug("api resolved (branch-E SA-endpoint dial re-gated, fail-closed)",
 			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.String("dispatch", "branch-e-sa-regate-denied"))
 		return nil
 	}
@@ -1661,7 +1661,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 			slog.String("restaction_name", r.opts.RESTActionName),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			// diagnostic for #271 — external/owned-fetch site. sa_dial reads
 			// the SAME provenance marker the dial consumes (gctx := sc.gctx,
 			// marked at runStage when isSA): sa_dial=true names a stale
@@ -1746,7 +1746,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	r.log.Debug("api successfully resolved",
 		slog.String("name", id),
 		slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-		slog.String("path", call.Path),
+		redact.PathAttr("path", call.Path),
 		slog.Int("depth", depth),
 	)
 	return nil
@@ -2564,7 +2564,7 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 			log.Info("cache.lazy_register.inner_call",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
-				slog.String("path", path),
+				redact.PathAttr("path", path),
 				slog.Duration("ensure_elapsed", elapsed),
 				slog.String("hint", "resolver inner-call first touch — informer registered + dep-tracker handlers wired"),
 			)

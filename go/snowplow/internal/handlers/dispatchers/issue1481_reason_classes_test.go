@@ -5,12 +5,14 @@ package dispatchers
 // through the REAL chain on the #443 harness (the requester's own clientconfig
 // pointing at a fake apiserver), as each reader of it sees it:
 //
-//   A  the RESTAction /call answer: the code, and the reason that agrees with
-//      it (a 502 answers none, never plumbing's InternalError);
-//   W  the widget apiRef frame (apiref.Resolve, what the refresher and the
-//      seed resolve): the refresher's class (cache.ClassifyRefreshError) and
+//   A  the RESTAction /call answer to a customer (inside its page budget): the
+//      code, and the reason that agrees with it (a 502 answers none, never
+//      plumbing's InternalError);
+//   W  the widget apiRef frame resolved in the background (apiref.Resolve with
+//      no page budget, as the refresher and the seed run it): the error's code,
+//      the refresher's class (cache.ClassifyRefreshError), IsInternalError and
 //      the seed's verdict (classifySeedErr: every one is operational, so it is
-//      retried), and no 502 reads IsInternalError.
+//      retried). A refused redirect is a 502 with no reason, "unclassified".
 //
 // Every expectation is a literal (credhttp/reason.go has the decision).
 
@@ -22,6 +24,7 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -31,20 +34,29 @@ import (
 const i1481Path = "/api/v1/namespaces/" + psTargetNS + "/configmaps/fail1481"
 
 type i1481Case struct {
-	name     string
-	answer   int    // what the fake apiserver answers the stage's GET with
-	code     int    // what snowplow reports
-	reason   any    // the answer's "reason" (nil: none)
-	class    string // cache.ClassifyRefreshError
-	internal bool   // apierrors.IsInternalError
+	name   string
+	answer int // what the fake apiserver answers the stage's GET with
+	// A — the customer's /call, inside its page budget: what it answers.
+	code   int
+	reason any // the answer's "reason" (nil: none)
+	// W — a background resolve (no page budget), as the refresher and the seed
+	// run it: the error's code, the refresher's class, IsInternalError.
+	bgCode   int
+	class    string
+	internal bool
 }
 
+// A background read of a 5xx or a 429 is reported 500 InternalError: plumbing's
+// RetryClient gives up with an error ("server error after N retries: 502") and
+// the code is lost before any reason is derived. Unchanged by #1481; pinned so
+// that changing it is a decision.
 var i1481Cases = []i1481Case{
-	{"502", http.StatusBadGateway, http.StatusBadGateway, nil, cache.RefreshErrUnclassified, false},
-	{"503", http.StatusServiceUnavailable, http.StatusServiceUnavailable, "ServiceUnavailable", cache.RefreshErrUnavailable, false},
-	{"504", http.StatusGatewayTimeout, http.StatusGatewayTimeout, "Timeout", cache.RefreshErrTimeout, false},
-	{"429", http.StatusTooManyRequests, http.StatusTooManyRequests, "TooManyRequests", cache.RefreshErrUnavailable, false},
-	{"302 refused redirect", http.StatusFound, http.StatusBadGateway, nil, cache.RefreshErrUnclassified, false},
+	{"502", http.StatusBadGateway, http.StatusBadGateway, nil, http.StatusInternalServerError, cache.RefreshErrUnavailable, true},
+	{"503", http.StatusServiceUnavailable, http.StatusServiceUnavailable, "ServiceUnavailable", http.StatusInternalServerError, cache.RefreshErrUnavailable, true},
+	{"504", http.StatusGatewayTimeout, http.StatusGatewayTimeout, "Timeout", http.StatusInternalServerError, cache.RefreshErrUnavailable, true},
+	{"429", http.StatusTooManyRequests, http.StatusTooManyRequests, "TooManyRequests", http.StatusInternalServerError, cache.RefreshErrUnavailable, true},
+	// Never retried: the 502 is snowplow's own, and carries no reason.
+	{"302 refused redirect", http.StatusFound, http.StatusBadGateway, nil, http.StatusBadGateway, cache.RefreshErrUnclassified, false},
 }
 
 func i1481Setup(t *testing.T, c i1481Case) (*in443API, map[string]any) {
@@ -68,7 +80,9 @@ func TestIssue1481_A_RESTActionAnswerCarriesTheAgreeingReason(t *testing.T) {
 	for _, c := range i1481Cases {
 		t.Run(c.name, func(t *testing.T) {
 			f, ra := i1481Setup(t, c)
-			rec := serveStored(t, f, in443Ctx(f, psAlice), ra)
+			// The /call middleware gives a customer request its page budget
+			// (#1115): a read's last attempt is then the answer.
+			rec := serveStored(t, f, pagebudget.WithCustomer(in443Ctx(f, psAlice), time.Now()), ra)
 			if rec.Code != c.code {
 				t.Fatalf("PRE: code=%d, want %d: %s", rec.Code, c.code, rec.Body.String())
 			}
@@ -100,8 +114,8 @@ func TestIssue1481_W_WidgetApiRefClassAndSeedVerdict(t *testing.T) {
 				RC: &rest.Config{Host: f.srv.URL}, ApiRef: i431ApiRef("fail-1481"), AuthnNS: psAuthnNS,
 			})
 			var se *apierrors.StatusError
-			if !errors.As(err, &se) || int(se.Status().Code) != c.code {
-				t.Fatalf("PRE: apiref.Resolve: want a typed %d, got %T: %v", c.code, err, err)
+			if !errors.As(err, &se) || int(se.Status().Code) != c.bgCode {
+				t.Fatalf("PRE: apiref.Resolve: want a typed %d, got %T: %v", c.bgCode, err, err)
 			}
 			if class, _ := cache.ClassifyRefreshError(err); class != c.class {
 				t.Errorf("RED: the refresher classifies it %q (reason %q), want %q", class, se.Status().Reason, c.class)

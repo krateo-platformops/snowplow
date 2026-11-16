@@ -19,9 +19,9 @@ package credhttp
 // value, the request body, and the 2xx response body and its Set-Cookie. The
 // log sink is both the request's logger and slog's default, at DEBUG. What a
 // /call logs of a failure is the envelope's message (handlers/call.go), so that
-// is checked too, for every outcome but a non-2xx answer: an upstream's own
-// error body is echoed there by design (nonOKEnvelope), so none of these
-// fixtures puts a canary in one.
+// is checked too: a transport error's text quotes the URL, which Do renders
+// without its query values. An upstream's own error body is echoed there by
+// design (nonOKEnvelope), so no fixture puts a canary in one.
 
 import (
 	"bytes"
@@ -165,11 +165,7 @@ func TestIssue1481_DoLogsNoCredentialQueryOrBody(t *testing.T) {
 					if (outcome == "2xx") != (st.Code < 300) {
 						t.Fatalf("PRE: outcome %s answered %d %s", outcome, st.Code, st.Message)
 					}
-					msg := st.Message
-					if outcome == "5xx" {
-						msg = "" // the upstream's own error body, echoed by design (no canary in it)
-					}
-					x1481RequireClean(t, logs, msg)
+					x1481RequireClean(t, logs, st.Message)
 				})
 			}
 		}
@@ -196,11 +192,7 @@ func TestIssue1481_DoAsLogsNoCredentialQueryOrBody(t *testing.T) {
 				if (outcome == "2xx") != (st.Code < 300) {
 					t.Fatalf("PRE: outcome %s answered %d %s", outcome, st.Code, st.Message)
 				}
-				msg := st.Message
-				if outcome == "5xx" {
-					msg = ""
-				}
-				x1481RequireClean(t, sink.String(), msg)
+				x1481RequireClean(t, sink.String(), st.Message)
 			})
 		}
 	}

@@ -7,7 +7,8 @@ package api
 //   E  a named endpointRef, on both dial chains (the owned client-go chain for
 //      a bearer token, plumbing's for a password-only Secret), for every body:
 //      empty, text, JSON that is not a Status, a Status claiming InternalError,
-//      a Status naming the code's own reason. The stage failure's code and
+//      a Status with no reason; sent as a write, as a customer's read (page
+//      budget) and as a background read (none). The stage failure's code and
 //      reason, the refresher's class (cache.ClassifyRefreshError), the stage
 //      outcome header's reason.
 //   X  a redirect the dial refused: reported 502, no reason, not "unavailable".
@@ -81,29 +82,56 @@ func TestIssue1481_E_EndpointStageClassPerCode(t *testing.T) {
 			return map[string]string{"server-url": url, "password": x1106Token}
 		},
 	}
+	// How the stage is sent: a write once; a customer's read inside its page
+	// budget (#1115: the last attempt's answer is the answer); a background
+	// read (the refresher's, the seed's, the prewarm's: no page budget) through
+	// plumbing's RetryClient.
+	type arm struct {
+		verb   string
+		budget bool
+	}
+	arms := map[string]arm{
+		"write":           {http.MethodPut, false},
+		"customer read":   {http.MethodGet, true},
+		"background read": {http.MethodGet, false},
+	}
 	for code, w := range x1481Wants {
 		for bname, body := range bodies {
 			for sname, secret := range secrets {
-				t.Run(fmt.Sprintf("%d/%s/%s", code, bname, sname), func(t *testing.T) {
-					ct, b := body(code)
-					ep := newX1106Srv(t, false, func(rw http.ResponseWriter, _ *http.Request) {
-						if ct != "" {
-							rw.Header().Set("Content-Type", ct)
+				for aname, a := range arms {
+					t.Run(fmt.Sprintf("%d/%s/%s/%s", code, bname, sname, aname), func(t *testing.T) {
+						t.Setenv("CLIENT_BASE_BACKOFF", "1ms")
+						t.Setenv("CLIENT_MAX_BACKOFF", "1ms")
+						ct, b := body(code)
+						ep := newX1106Srv(t, false, func(rw http.ResponseWriter, _ *http.Request) {
+							if ct != "" {
+								rw.Header().Set("Content-Type", ct)
+							}
+							rw.WriteHeader(code)
+							_, _ = rw.Write([]byte(b))
+						})
+						x1106Env(t, "", map[string]map[string]string{x1106Ref: secret(ep.srv.URL)})
+						o := x1106ResolveWith(t, x1106Opts{budget: a.budget}, x1106Extras, x1106Stage("s", a.verb, "/zd/tickets/42"))
+						if len(ep.all()) == 0 {
+							t.Fatal("PRE: the endpoint was not dialled")
 						}
-						rw.WriteHeader(code)
-						_, _ = rw.Write([]byte(b))
+						wantCode, want := code, w
+						if aname == "background read" {
+							// RetryClient gives up on a 5xx or a 429 with an error
+							// ("server error after N retries: 502"), which the
+							// fetch reports as 500 InternalError: the code is lost
+							// before any reason is derived. Unchanged by #1481;
+							// pinned here so that changing it is a decision.
+							wantCode, want = http.StatusInternalServerError,
+								x1481Want{"InternalError", cache.RefreshErrUnavailable, StageReasonError}
+						}
+						x1481Check(t, o.failure, wantCode, want)
+						rows := x1106Rows(t, o.outcomes)
+						if len(rows) != 1 || rows[0].OK || rows[0].Reason != want.outcome {
+							t.Errorf("RED: the stage outcome is %+v, want reason %q", rows, want.outcome)
+						}
 					})
-					x1106Env(t, "", map[string]map[string]string{x1106Ref: secret(ep.srv.URL)})
-					o := x1106Resolve(t, x1106Extras, x1106Stage("read", http.MethodGet, "/zd/tickets/42"))
-					if len(ep.all()) == 0 {
-						t.Fatal("PRE: the endpoint was not dialled")
-					}
-					x1481Check(t, o.failure, code, w)
-					rows := x1106Rows(t, o.outcomes)
-					if len(rows) != 1 || rows[0].OK || rows[0].Reason != w.outcome {
-						t.Errorf("RED: the stage outcome is %+v, want reason %q", rows, w.outcome)
-					}
-				})
+				}
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 package redact
 
 import (
+	"log/slog"
 	"net/url"
 	"strings"
 )
@@ -157,3 +158,17 @@ func Path(raw string) string {
 	}
 	return rest
 }
+
+// PathAttr is the log attribute key=Path(raw), rendered only when a record
+// that carries it is emitted (#1481): a stage path is logged at DEBUG on every
+// dial, and a disabled level then costs no parse. A stage path is the
+// RESTAction's own text after templating, so its query can carry a credential
+// (an `?apikey=`), and no log line may hold the value.
+func PathAttr(key, raw string) slog.Attr {
+	return slog.Any(key, pathValue(raw))
+}
+
+// pathValue defers Path to the handler that emits the record.
+type pathValue string
+
+func (p pathValue) LogValue() slog.Value { return slog.StringValue(Path(string(p))) }
