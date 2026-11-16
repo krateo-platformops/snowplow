@@ -72,11 +72,25 @@ const (
 	// --stat` of the two tags changes http/request, http/response and
 	// docs/api.md; crdgen/ and crdgen/schemas/ have no change at all, so the
 	// output above stands.
+	//
+	// v1.75.0 → v1.84.0 (snowplow#1481): crdgen/ CHANGES (plumbing#186, in
+	// v1.82.0: a node crdgen cannot type, such as an array's missing `items`,
+	// is any value instead of `type: object`). Measured at the bump with
+	// generate()'s options: helm/snowplow-crds' CRD is byte-identical; in
+	// helm/snowplow's, five array items lose `type: object` and keep
+	// x-kubernetes-preserve-unknown-fields (args, imagePullSecrets,
+	// ingress.tls, initContainers, tolerations), a loosening that carries no
+	// rule and no cost. The crdgen that compiles the chart moved too: core-provider
+	// 2.13.105, which installer 0.3.670 deploys, requires plumbing v1.82.0, and
+	// crdgen/ is byte-identical between v1.82.0 and v1.84.0 (`git diff --quiet
+	// v1.82.0 v1.84.0 -- crdgen`). So coreProviderCrdgenVersion is v1.82.0, and
+	// the invariant holds by code again, not only by output.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.75.0"
-	// coreProviderCrdgenVersion is the plumbing core-provider compiles with.
-	coreProviderCrdgenVersion = "v1.28.1"
+	crdgenVersion       = "v1.84.0"
+	// coreProviderCrdgenVersion is the plumbing core-provider compiles with
+	// (core-provider 2.13.105's go/core-provider/go.mod).
+	coreProviderCrdgenVersion = "v1.82.0"
 
 	// core-provider's statics/status.schema.json at coreProviderVersion, copied
 	// verbatim. crdgen compiles it into the same CRD, so it counts toward the

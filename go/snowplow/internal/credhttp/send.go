@@ -296,7 +296,11 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 // v1.74.0 → v1.75.0 (plumbing#173, the release's one commit) re-audited by
 // `git diff --stat` of the two tags: under http/ it changes request/request.go
 // and response/status.go; http/util/ (retry.go included) is byte-identical.
-const retryPolicyTranscribedFrom = "v1.75.0"
+//
+// v1.75.0 → v1.84.0 (snowplow#1481) re-audited by `git diff --stat` of the two
+// tags: under http/ it changes request/request.go, request/transport.go and
+// response/status.go; http/util/ (retry.go included) is byte-identical.
+const retryPolicyTranscribedFrom = "v1.84.0"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
 // v1.28.1 http/util/retry.go backoff(0, base, max)): base capped at max,

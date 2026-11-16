@@ -22,7 +22,8 @@ package credhttp
 //     request.Do's RetryClient re-sent a PUT or a DELETE.
 //
 //  4. (#1112 D4) a Debug endpoint's wire dump is WireDump (metadata only),
-//     never plumbing's, which logs the Authorization header and the bodies.
+//     never plumbing's debug round tripper, which sits under the credential
+//     round trippers (wiredump.go, #1481).
 //
 //  5. (#1131) a refused destination is reported as itself: DestinationStatus.
 //
@@ -128,9 +129,9 @@ func do(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *resp
 	if rc != nil {
 		cli, err = rest.HTTPClientFor(rc)
 	} else {
-		// #1112 D4 — plumbing never installs its wire dump (it logs the
-		// Authorization header and the bodies); a Debug endpoint gets WireDump,
-		// which logs metadata only (wiredump.go).
+		// #1112 D4 — plumbing never installs its debug round tripper (it sees
+		// the Authorization header; wiredump.go, #1481); a Debug endpoint gets
+		// WireDump, which logs metadata only.
 		cli, err = request.HTTPClientForEndpoint(WithoutPlumbingWireDump(opts.Endpoint), &opts.RequestInfo)
 		if err == nil && opts.Endpoint != nil && opts.Endpoint.Debug {
 			cli.Transport = WireDump(cli.Transport)
@@ -160,11 +161,11 @@ func do(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *resp
 	// #726 — the refused redirect itself. As #729 ruled for the resolver path,
 	// a 3xx is not an answer a client can act on (and carries no Location
 	// here): report a Failure with 502 Bad Gateway; the fixed message names the
-	// redirect's own code and never its target.
+	// redirect's own code and never its target. #1481: with no reason
+	// (FailureStatus): the refusal is deterministic, never plumbing's
+	// InternalError, which a classifier reads as a transient server failure.
 	if respo.StatusCode >= 300 && respo.StatusCode < 400 {
-		st := response.New(http.StatusBadGateway, &RedirectRefusedError{StatusCode: respo.StatusCode})
-		st.Status = response.StatusFailure
-		return st
+		return FailureStatus(http.StatusBadGateway, &RedirectRefusedError{StatusCode: respo.StatusCode})
 	}
 
 	if respo.StatusCode < 200 || respo.StatusCode >= 300 {
@@ -221,8 +222,9 @@ const BudgetStatusReason = "Timeout"
 // BudgetStatus shapes an exchange its page budget ended (#1115) into the
 // envelope a stage or a /call passthrough reports: 504 Gateway Timeout, a
 // Failure, reason Timeout, the identity-free ExhaustedError text. ok=false for
-// any other error. (plumbing's response.New(504, …) would read as a Success:
-// 504 is not in its list.)
+// any other error. Its reason is snowplow's own decision, set here: it does
+// not depend on what plumbing's response.New derives for 504 (Timeout since
+// plumbing v1.84.0, none before).
 func BudgetStatus(err error) (*response.Status, bool) {
 	var e *pagebudget.ExhaustedError
 	if !errors.As(err, &e) {
@@ -284,18 +286,20 @@ func DecodeUpstreamStatus(dat []byte) *response.Status {
 func nonOKEnvelope(code int, dat []byte) *response.Status {
 	res := DecodeUpstreamStatus(dat)
 	if res == nil {
-		res = response.New(code, fmt.Errorf("%s", string(dat)))
+		res = FailureStatus(code, fmt.Errorf("%s", string(dat)))
 	}
 	res.Code = code
 	res.Status = response.StatusFailure
-	// A body that names no reason gets the one plumbing derives from the code
-	// (response.New), as every other non-2xx envelope here does: an object-
-	// bodied 500 reads InternalError. A code plumbing does not map (502, 504,
-	// 429) keeps no reason: before #1088 those read InternalError only because
-	// the RetryClient's give-up error was re-wrapped as a 500, which also hid
-	// the real code. Inventing one would claim what the upstream never said.
+	// A body that names no reason gets the one derived from the code that
+	// agrees with it (ReasonForCode, #1481), as every other non-2xx envelope
+	// here does: an object-bodied 500 reads InternalError, a 504 Timeout, a
+	// 429 TooManyRequests. A 502 keeps no reason: plumbing (v1.84.0) derives
+	// InternalError for it, the reason of a 500, which would claim a failure
+	// the upstream never named. (Before #1088 a 502 read InternalError only
+	// because the RetryClient's give-up error was re-wrapped as a 500, which
+	// also hid the real code.)
 	if res.Reason == "" {
-		res.Reason = response.New(code, nil).Reason
+		res.Reason = ReasonForCode(code)
 	}
 	if res.Kind == "" {
 		res.Kind, res.APIVersion = "Status", "v1"

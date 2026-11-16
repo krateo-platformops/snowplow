@@ -13,6 +13,7 @@ import (
 	"github.com/krateo-platformops/snowplow/apis"
 	v1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
@@ -531,7 +532,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		}
 		var statusErr *apierrors.StatusError
 		if errors.As(err, &statusErr) {
-			response.Encode(wri, response.New(int(statusErr.Status().Code), fmt.Errorf("%s", statusErr.Status().Message)))
+			// #1481 — the reason that agrees with the code
+			// (credhttp.ReasonForCode): a 502 answers none.
+			response.Encode(wri, credhttp.FailureStatus(int(statusErr.Status().Code), fmt.Errorf("%s", statusErr.Status().Message)))
 			return
 		}
 		response.InternalError(wri, err)

@@ -213,8 +213,15 @@ func newStageItemFailure(stage string, accumVal any, itemErr error) *stageItemFa
 		f.Code = http.StatusBadGateway
 		f.Reason = ""
 	}
+	// #1481 — the reason never names another code than f.Code
+	// (credhttp/reason.go): a 502, whether an upstream's, a redirect's (#729)
+	// or client-go's (its NewGenericServerResponse says InternalError for any
+	// 5xx body that is not a Status), carries no reason, so no classifier reads
+	// it as InternalError. A reason that agrees, or is not a Kubernetes one
+	// (DestinationRefused), is kept; a missing one is derived from the code.
+	f.Reason = credhttp.ReasonAgreeing(f.Reason, f.Code)
 	if f.Reason == "" {
-		f.Reason = string(response.New(f.Code, nil).Reason)
+		f.Reason = string(credhttp.ReasonForCode(f.Code))
 	}
 	return &stageItemFailure{err: itemErr, failure: f}
 }
