@@ -640,15 +640,16 @@ def test_the_rehearsal_installs_reads_the_pod_prints_one_block_and_tears_down_wi
                  'snowplow env, rendered by the installer chart: as declared: componentValues.snowplow.env of the '
                  'Installer CR the chart applies: {"GOGC": "100"}',
                  "the snowplow process's effective GC settings, read before any load (/debug/vars snowplow_go_runtime, "
-                 "as the bench's preflight user): GOGC 100, memory limit 7.00 GiB (7516192768 bytes) (source cgroup_v2; the "
+                 "as the bench's debug reader): GOGC 100, memory limit 7.00 GiB (7516192768 bytes) (source cgroup_v2; the "
                  "container's limit 8.00 GiB (8589934592 bytes)); raw: {",
                  "the pod's Go runtime env, read before any load: GOGC=100 (",
                  "comparison with the declaration: VERIFIED: declared GOGC=100 (the Go default, set explicitly)"):
         assert said in block, (said, block)
     # no data, no drivers, no verdict; the cluster is deleted
-    # the reading's user is the bench's own preflight user, created by the rehearsal before the Job logs in
+    # the reading's user is the bench's debug reader, created by the rehearsal before the Job logs in; the
+    # preflight user is the rehearsal's preflight's (tests/test_debug_reader.py)
     users = (state / "users").read_text().split()
-    assert users == ["scaleuser-0000"]
+    assert users == ["scaleuser-debug-reader", "scaleuser-0000"]
     for step in ("=== step data ===", "=== step measure ===", "=== step evaluate ===", "run complete"):
         assert step not in log
     assert not (out / "verdict.json").exists()

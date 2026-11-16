@@ -1303,10 +1303,25 @@ def wait_for_customer_load(client: HttpClient, token: str, *, min_delta: int = 1
     `min_delta` from this probe's first reading. It is only a START gate (the
     refresher also adds lookups, #552, so it is never used as a measurement).
     Returns {started, waited_s, delta}; started=False after max_wait_s.
+
+    `token` is the bench's debug reader's (bench/rbac_model.py THE DEBUG READER): snowplow #1365 authorizes
+    /debug by RBAC. An HTTP answer that is not 200 (401, 403, 5xx) is a REFUSAL, returned at once with
+    `refused` (its status) and `why`: it is not "the load has not started yet", and waiting it out would
+    cost the whole max_wait_s for nothing (review of #1471). No HTTP answer at all (status 0) is waited
+    out as before: snowplow may be restarting.
     """
+    refused: list = []
+
     def total():
-        v = read_vars(client, token)
-        if not v:
+        r = client.get("/debug/vars", token)
+        if r.status == 0:
+            return None
+        if r.status != 200:
+            refused.append(r.status)
+            return None
+        try:
+            v = json.loads(r.body)
+        except ValueError:
             return None
         s = summarize_vars(v)
         if s["l1_hit"] is None:
@@ -1316,6 +1331,9 @@ def wait_for_customer_load(client: HttpClient, token: str, *, min_delta: int = 1
     base = None
     while clock() - t0 < max_wait_s:
         cur = total()
+        if refused:
+            return {"started": False, "waited_s": round(clock() - t0, 1), "delta": None, "refused": refused[0],
+                    "why": f"/debug/vars answered {refused[0]}: the start gate cannot read snowplow's counters"}
         if cur is not None:
             if base is None:
                 base = cur
@@ -4593,12 +4611,21 @@ def driver_stream_checks(streams: list[dict]) -> list[dict]:
     return framed_stream_checks(DRIVER_FRAMING, streams, required=True)
 
 
+_TIMED_OUT = re.compile(r"(?i)\b(timed out|timeout)\b|TimeoutError")
+
+
 def classify(resp: "Response") -> str:
     """ok | config (a request the cluster cannot serve: 404, or snowplow's
     'no matches for <GVR>' for an unserved type — run 6) | forbidden |
-    product (any other non-2xx: a FINDING, recorded, never a tooling stop)."""
+    timeout / unreachable (no HTTP answer: the client's bound passed, or no
+    server was reached) | product (any other non-2xx: a FINDING, recorded,
+    never a tooling stop)."""
     if 200 <= resp.status < 300:
         return "ok"
+    if resp.status == 0:
+        # no HTTP answer at all (HttpClient: status 0 with the exception in `error`): a timeout, or a server
+        # that could not be reached; never a status snowplow answered
+        return "timeout" if _TIMED_OUT.search(resp.error or "") else "unreachable"
     body = (resp.body or b"")[:2000].decode("utf-8", "replace")
     if resp.status == 404 or "no matches for" in body:
         return "config"
@@ -4882,7 +4909,9 @@ def _redact_strings(obj, redact):
 #: what a boot root that is not 200 means, by its class (classify)
 BOOT_ROOT_WHY = {"forbidden": "its groups are not granted the portal's shell",
                  "config": "the portal has no such object, or its type is not served",
-                 "product": "snowplow or the API server failed the call"}
+                 "product": "snowplow or the API server failed the call",
+                 "timeout": "the call timed out: no answer within the client's bound",
+                 "unreachable": "the call reached no server"}
 
 
 def _preflight(client: HttpClient, token: str, portal: "Portal", *,
@@ -4908,9 +4937,10 @@ def _preflight(client: HttpClient, token: str, portal: "Portal", *,
         out["init_status"] = r.status
         if cls != "ok":
             body = (r.body or b"")[:400].decode("utf-8", "replace")
-            out["refused"].append({"path": portal.init, "status": r.status, "boot_root": True, "body": (
-                f"the portal's boot root did not answer 200 for this login ({BOOT_ROOT_WHY.get(cls, cls)}; "
-                + (f"body: {body}" if body.strip() else "an empty body") + ")")})
+            said = (f"after {r.ms:.0f} ms, {r.error}" if cls in ("timeout", "unreachable") else
+                    f"body: {body}" if body.strip() else "an empty body")
+            out["refused"].append({"path": portal.init, "status": r.status, "class": cls, "boot_root": True, "body": (
+                f"the portal's boot root did not answer 200 for this login ({BOOT_ROOT_WHY.get(cls, cls)}; {said})")})
             out["ok"] = False
             return out
         shell, routes, content = first_load(client, token, portal, pool=pool,
@@ -4933,8 +4963,9 @@ def _preflight(client: HttpClient, token: str, portal: "Portal", *,
             out["routes"].append(row)
             if c == "config":
                 out["refused"].append({**row, "body": (rr.body or b"")[:400].decode("utf-8", "replace")})
-            elif c == "product":
-                out["product_errors"].append({**row, "body": (rr.body or b"")[:400].decode("utf-8", "replace")})
+            elif c in ("product", "timeout", "unreachable"):
+                out["product_errors"].append({**row, "class": c, "body": (
+                    (rr.body or b"")[:400].decode("utf-8", "replace") if c == "product" else rr.error)})
             elif c == "forbidden":
                 out["forbidden"].append(row)
         again = menu_reread(client, token, out["menu"], routes, portal.frontend_ns)
@@ -5200,12 +5231,22 @@ def _drive(a, sink, navs: list["NavResult"]) -> tuple[int, str | None]:
           "curve": curve})
     if failed:
         return 2, f"only {len(tokens)}/{len(users)} users logged in; refusing a partial population"
-    probe_user = users[0]
+    # snowplow #1365: /debug is authorized by RBAC as a non-resource request. The sampler reads as the
+    # bench's debug reader (bench/rbac_model.py THE DEBUG READER), never as a measured user: no measured
+    # user holds a /debug grant, so the measurement keeps the customer's RBAC shape
+    debug_token = None
+    if a.vars_interval > 0:
+        if not a.debug_user:
+            return 2, "the /debug/vars sampler (--vars-interval > 0) needs the debug reader (--debug-user)"
+        try:
+            debug_token = login(a.authn_url, a.debug_user, a.password)
+        except Exception as e:  # noqa: BLE001
+            return 2, f"the debug reader's login failed: {type(e).__name__}"
     stop = threading.Event()
 
     def _sampler():
         while not stop.is_set():
-            v = read_vars(client, tokens[probe_user])
+            v = read_vars(client, debug_token)
             sink({"kind": "vars", "t": time.time(),
                   **(summarize_vars(v) if v else {"unreadable": True})})
             stop.wait(a.vars_interval)
@@ -5343,9 +5384,23 @@ def _cmd_fresh(a) -> int:
     # Start only once the driver's navigations reach snowplow (run 7's first
     # samples ran during the login phase, with no read load at all).
     if a.wait_for_load:
-        gate = wait_for_customer_load(client, token, min_delta=a.load_min_delta,
+        # the gate reads /debug/vars, as the bench's debug reader (snowplow #1365); the probe's own reads stay
+        # this user's
+        if not a.debug_user:
+            print("fresh: the start gate (--wait-for-load) reads /debug/vars and needs the debug reader "
+                  "(--debug-user)", file=sys.stderr)
+            return 2
+        try:
+            debug_token = login(a.authn_url, a.debug_user, a.password)
+        except Exception as e:  # noqa: BLE001
+            print(f"fresh: the debug reader's login failed: {type(e).__name__}", file=sys.stderr)
+            return 2
+        gate = wait_for_customer_load(client, debug_token, min_delta=a.load_min_delta,
                                       max_wait_s=a.load_max_wait_s)
         sink({"kind": "fresh_start_gate", **gate})
+        if gate.get("refused"):
+            print(f"fresh: REFUSED: {gate['why']}", file=sys.stderr)
+            return 2
     rates = a.rates if a.rates else [a.churn_rate]
     fresh_phases(client, token, sink, modes=modes, rates=rates, mutators=mutators,
                  paths=paths, targets=targets, probe=(a.namespace, a.probe_name),
@@ -6251,6 +6306,9 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--nav-workers", type=int, default=128)
     d.add_argument("--call-workers", type=int, default=512)
     d.add_argument("--vars-interval", type=float, default=15.0)
+    d.add_argument("--debug-user", default=None,
+                   help="the identity the /debug/vars sampler reads as (bench/rbac_model.py DEBUG_READER); "
+                        "required when --vars-interval > 0")
     d.add_argument("--no-viewers", action="store_true",
                    help="do NOT open /refreshes viewers (#764: then #710/#740 cannot run)")
     d.add_argument("--out", required=True)
@@ -6278,6 +6336,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="start only after the driver's navigations reach snowplow")
     f.add_argument("--load-min-delta", type=int, default=100)
     f.add_argument("--load-max-wait-s", type=float, default=1800.0)
+    f.add_argument("--debug-user", default=None,
+                   help="the identity the start gate reads /debug/vars as (bench/rbac_model.py DEBUG_READER); "
+                        "required with --wait-for-load")
     f.add_argument("--churn-rate", type=float, default=0.0)
     f.add_argument("--churn-namespaces", type=int, default=50)
     f.add_argument("--churn-per-ns", type=int, default=20)

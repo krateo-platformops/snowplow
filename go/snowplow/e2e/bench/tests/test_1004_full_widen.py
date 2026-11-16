@@ -106,7 +106,10 @@ class FakeSnowplow:
         self.t += s
 
     def login(self):
-        return "tok"
+        return "tok-read"
+
+    def debug_login(self):
+        return "tok-debug"
 
     def arm(self):
         self.armed = True
@@ -222,8 +225,13 @@ class FakeSnowplow:
     def get(self, path, token):
         self.t += 0.01
         if path == "/debug/vars":
+            # snowplow #1365: a non-resource request, granted to the debug reader's ClusterRole only
+            if token != "tok-debug":
+                return 403, b""
             return 200, json.dumps(self.vars()).encode()
         assert path.startswith("/call?"), path
+        if token != "tok-read":
+            return 403, b""
         self._advance()
         self._read()
         return 200, b"{}"
@@ -259,7 +267,8 @@ def watch(sp: FakeSnowplow, bounds=None, sample_s=1.0, widen_wait_s=30.0):
     def arm():
         armed_at.append(sp.reads)
         sp.arm()
-    rc = fw.Watch(get=sp.get, login=sp.login, emit=recs.append, arm=arm, widened=sp.widened,
+    rc = fw.Watch(get=sp.get, login=sp.login, debug_login=sp.debug_login, emit=recs.append, arm=arm,
+                  widened=sp.widened,
                   bounds=bounds or B(), widen_wait_s=widen_wait_s, sample_s=sample_s, clock=sp.clock,
                   sleep=sp.sleep).run()
     return rc, recs, armed_at

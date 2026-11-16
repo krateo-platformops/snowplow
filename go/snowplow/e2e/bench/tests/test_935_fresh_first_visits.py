@@ -85,7 +85,8 @@ def test_the_browser_config_carries_each_sessions_fresh_users():
     p = fresh_classes.plan(sessions=2, routes=2, think_s=10, duration_s=120, namespaces=2, user_prefix="scaleuser-")
     cfg = k6_job.browser_config(sessions=sessions, routes=["/a", "/b"], password="pw", think_s=10,
                                 duration_s=120, fresh=p, frontend_url="http://10.0.0.9",
-                                snowplow_url="http://10.0.0.9/content")
+                                snowplow_url="http://10.0.0.9/content", authn_url="http://authn:8082",
+                                debug_user="scaleuser-debug-reader")
     # 2 routes x 10 s: a 40 s class cycle; 120 s: 3 classes, the initial user and 2 fresh
     assert cfg["sessions"][1]["fresh"] == ["scaleuser-fresh-2-001", "scaleuser-fresh-2-002"]
     assert cfg["snowplowUrl"] == "http://10.0.0.9/content" and cfg["frontendUrl"] == "http://10.0.0.9"

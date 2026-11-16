@@ -76,7 +76,7 @@ def _indent(text: str, n: int) -> str:
 
 
 def render(*, users: int, shards: int, think_s: float, duration_s: float,
-           snowplow_url: str, authn_url: str, password: str,
+           snowplow_url: str, authn_url: str, password: str, debug_user: str,
            init: str, frontend_ns: str = "krateo-system",
            builders_ns: str = "krateo-system", src: str | None = None,
            composite_routes: list[str] | tuple = (), burst_users: int = 0,
@@ -108,13 +108,13 @@ case "$JOB_COMPLETION_INDEX" in
 {case}
   *) echo "bad index" >&2; exit 2;;
 esac
-VARS=0; [ "$JOB_COMPLETION_INDEX" = "0" ] && VARS=15
+VARS=0; DEBUG=""; [ "$JOB_COMPLETION_INDEX" = "0" ] && VARS=15 && DEBUG={json.dumps(debug_user)}
 BURST=0; [ "$JOB_COMPLETION_INDEX" = "{shards - 1}" ] && BURST={burst_users}
 rc=0
 python3 -u /opt/load606/load606.py drive \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
   --password {json.dumps(password)} --user-start "$S" --user-end "$E" \\
-  --think-s {think_s} --duration-s {duration_s} --vars-interval "$VARS" \\
+  --think-s {think_s} --duration-s {duration_s} --vars-interval "$VARS" --debug-user "$DEBUG" \\
   {portal_args}{burst_args}{"" if viewers else " --no-viewers"} --out {DRIVE_OUT} || rc=$?
 printf '{{"kind": "drive_exit", "rc": %d, "t": %d}}\\n' "$rc" "$(date +%s)" >> {DRIVE_OUT}
 echo "drive exited rc=$rc; results in {DRIVE_OUT}; holding {linger_s:g}s for collect"
@@ -200,7 +200,7 @@ GO_RUNTIME_JOB = "runtime606"
 
 def render_go_runtime(*, snowplow_url: str, authn_url: str, user: str, password: str,
                       src: str | None = None, job_name: str = GO_RUNTIME_JOB) -> str:
-    """Namespace + ConfigMap + the runtime606 Job: the bench's preflight user logs in and reads
+    """Namespace + ConfigMap + the runtime606 Job: the bench's debug reader logs in and reads
     /debug/vars' snowplow_go_runtime (`load606 go-runtime`): the GC settings the snowplow process
     runs with, as one JSON line. Seconds-scale, on the loadgen pool like the preflight."""
     script = f"""set -eu
@@ -351,7 +351,7 @@ spec:
 """
 
 
-def render_fresh(*, snowplow_url: str, authn_url: str, user: str, password: str,
+def render_fresh(*, snowplow_url: str, authn_url: str, user: str, password: str, debug_user: str,
                  rates: list[str], samples: int, gap_s: float, probe_name: str,
                  namespaces: int, comp_group: str, comp_version: str,
                  comp_plural: str, poll_ms: int = 100,
@@ -382,7 +382,7 @@ def render_fresh(*, snowplow_url: str, authn_url: str, user: str, password: str,
 sleep {delay_s:g}
 exec python3 -u /opt/load606/load606.py fresh --mutator incluster \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
-  --user {json.dumps(user)} --password {json.dumps(password)} \\
+  --user {json.dumps(user)} --debug-user {json.dumps(debug_user)} --password {json.dumps(password)} \\
   --group {comp_group} --version {comp_version} --plural {comp_plural} \\
   --probe-name {probe_name} --rates {rate_args} --samples {samples} \\
   --gap-s {gap_s} --poll-ms {poll_ms} --churn-namespaces {namespaces} \\
@@ -569,13 +569,15 @@ def render_k6_driver(a) -> str:
     bcfg = k6_job.browser_config(sessions=sessions, routes=[r["path"] for r in routes],
                                  password=a.password, think_s=a.browser_think_s,
                                  duration_s=a.duration_s, fresh=fresh,
-                                 frontend_url=a.browser_origin, snowplow_url=a.browser_snowplow_url)
+                                 frontend_url=a.browser_origin, snowplow_url=a.browser_snowplow_url,
+                                 authn_url=a.authn_url, debug_user=a.debug_user)
     return (k6_job.render_k6(config=cfg, authn_url=a.authn_url, password=a.password,
                              linger_s=a.linger_s)
             + k6_job.render_browser(config=bcfg, linger_s=a.linger_s))
 
 
 def main(argv: list[str] | None = None) -> int:
+    from bench import rbac_model
     p = argparse.ArgumentParser(prog="load606_job")
     p.add_argument("--users", type=int, default=1000)
     p.add_argument("--shards", type=int, default=2)
@@ -595,6 +597,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--preflight-only", action="store_true",
                    help="render ONLY the preflight Job (+ namespace/configmap)")
     p.add_argument("--preflight-user", default="scaleuser-0000")
+    p.add_argument("--debug-user", default=rbac_model.DEBUG_READER,
+                   help="the ONE identity every /debug read is done as (bench/rbac_model.py THE DEBUG READER)")
     p.add_argument("--go-runtime-only", action="store_true",
                    help="render only the runtime606 Job: the preflight user reads the GC settings the snowplow "
                         "process runs with (/debug/vars snowplow_go_runtime)")
@@ -649,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.go_runtime_only:
         sys.stdout.write(render_go_runtime(snowplow_url=a.snowplow_url, authn_url=a.authn_url,
-                                           user=a.preflight_user, password=a.password))
+                                           user=a.debug_user, password=a.password))
         return 0
     if a.preflight_only:
         sys.stdout.write(render_preflight(
@@ -664,7 +668,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(render(users=a.users, shards=a.shards, think_s=a.think_s,
                             duration_s=a.duration_s,
                             snowplow_url=a.snowplow_url,
-                            authn_url=a.authn_url, password=a.password,
+                            authn_url=a.authn_url, password=a.password, debug_user=a.debug_user,
                             init=a.init, frontend_ns=a.frontend_ns,
                             builders_ns=a.builders_ns,
                             composite_routes=a.composite_route or [],
@@ -673,14 +677,14 @@ def main(argv: list[str] | None = None) -> int:
     if a.mem_duration_s > 0:
         sys.stdout.write(render_mem(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,
-            user=a.preflight_user, password=a.password,
+            user=a.debug_user, password=a.password,
             duration_s=a.mem_duration_s,
             vars_prefixes=tuple(a.mem_vars_prefix or ()), linger_s=a.linger_s,
             burst_at_s=a.burst_at_s if a.burst_users > 0 else None))
     if a.fresh_rates:
         sys.stdout.write(render_fresh(
             snowplow_url=a.snowplow_url, authn_url=a.authn_url,
-            user=a.fresh_user, password=a.password, rates=a.fresh_rates,
+            user=a.fresh_user, password=a.password, debug_user=a.debug_user, rates=a.fresh_rates,
             samples=a.fresh_samples, gap_s=a.fresh_gap_s,
             probe_name=a.probe_name, namespaces=a.namespaces,
             comp_group=a.comp_group, comp_version=a.comp_version,

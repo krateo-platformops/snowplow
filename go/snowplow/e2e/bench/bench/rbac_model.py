@@ -38,10 +38,31 @@ __all__ = [
     "team_namespace",
     "grant_scope",
     "menu_class",
+    "DEBUG_READER",
+    "DEBUG_GROUP",
+    "DEBUG_READ_PATHS",
+    "debug_reader_rbac_yaml",
 ]
 
 BASE_GROUP = "devs"
 ADMIN_GROUP = "bench-platform-admins"
+
+# THE DEBUG READER (snowplow #1365, Fixes #1362; every image after 1.12.70): /debug/* is authorized
+# through Kubernetes RBAC as a NON-RESOURCE request (verb = the HTTP method, path = the URL path), so a
+# reader needs a ClusterRole rule with nonResourceURLs, bound by a ClusterRoleBinding (only those apply
+# to non-resource requests, as upstream). The bench's own /debug reads (the Go runtime read, mem606's
+# memstats and profiles, the driver's /debug/vars sampler, the browser's learned-class counters, the
+# full-widen stage's watch) are done as ONE identity of their own, as #1365 has the S6 harness read
+# /debug with a separate operator token: no measured user, and no customer group, holds a /debug grant,
+# so the measurement keeps the customer's exact RBAC shape. The identity is in its own group only (no
+# portal shell, no namespace team), and its ClusterRole grants `get` on exactly the paths the bench
+# reads (DEBUG_READ_PATHS; tests/test_debug_reader.py holds the list to the code), nothing else. On
+# snowplow 1.12.70 and earlier /debug needs only a valid JWT, which this identity also has.
+DEBUG_READER = "scaleuser-debug-reader"
+DEBUG_GROUP = "bench-debug-readers"
+DEBUG_ROLE = "bench-debug-reader"
+#: every /debug path the bench requests (the query string is not part of a non-resource path)
+DEBUG_READ_PATHS = ("/debug/pprof/goroutine", "/debug/pprof/heap", "/debug/pprof/profile", "/debug/vars")
 
 # What a namespace team may read: its compositions, the per-composition
 # widgets and the RESTActions the panels resolve. Same rule set the S8 stage
@@ -216,6 +237,45 @@ subjects:
 - apiGroup: rbac.authorization.k8s.io
   kind: Group
   name: {grp}
+"""
+
+
+def preflight_groups() -> list[str]:
+    """The preflight user's groups (scaleuser-0000): the portal's base group and the first team, as a data
+    user of that team has (ONE definition: data606-preflight-user creates it, the schema step validates it)."""
+    return [BASE_GROUP, team_group(1)]
+
+
+def debug_reader_rbac_yaml() -> str:
+    """ClusterRole + ClusterRoleBinding: `get` on the bench's /debug paths, for the debug reader's
+    group alone (module doc: THE DEBUG READER). Non-resource rules only: no API group, no resource."""
+    urls = "".join(f"\n  - {p}" for p in DEBUG_READ_PATHS)
+    return f"""\
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {DEBUG_ROLE}
+  labels:
+    app: scaletest
+rules:
+- nonResourceURLs:{urls}
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {DEBUG_ROLE}
+  labels:
+    app: scaletest
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {DEBUG_ROLE}
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: {DEBUG_GROUP}
 """
 
 

@@ -568,7 +568,7 @@ def rehearsal_lines(out_dir: str) -> list[str]:
     g, why = reading_of(os.path.join(out_dir, "tracing.json"))
     eff, eff_why = effective_of(os.path.join(out_dir, "go-runtime.jsonl"))
     lines.append("the snowplow process's effective GC settings, read before any load (/debug/vars "
-                 "snowplow_go_runtime, as the bench's preflight user): "
+                 "snowplow_go_runtime, as the bench's debug reader): "
                  + (f"{effective_text(eff)}; raw: {json.dumps(eff, sort_keys=True)}" if eff is not None
                     else f"NOT READ ({eff_why})"))
     lines.append("the pod's Go runtime env, read before any load: "
@@ -580,6 +580,10 @@ def rehearsal_lines(out_dir: str) -> list[str]:
         f"{rec.get('why')}"))
     lines += image_lines(_last_json_line(os.path.join(out_dir, "image-digest.jsonl"), "image_digest"))
     lines += readers_lines(j("portal-readers.json"))
+    lv = j("portal-readers-live.json")
+    from bench import portal_readers
+    lines.append(portal_readers.live_said(lv) if isinstance(lv, dict) else
+                 "portal readers, LIVE: NO RECORD (portal-readers-live.json): the live grant was not read")
     lines += preflight_lines(_last_json_line(os.path.join(out_dir, "preflight.jsonl"), "preflight"))
     lines.append("=== end of rehearsal report ===")
     return lines

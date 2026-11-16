@@ -25,6 +25,7 @@
 // /events, as on 057). pageload.sseStreamOf tells them apart.
 // `browser_sse_opened{session, stream}`; the evaluator wants >= 1 of each.
 import { browser } from 'k6/browser'
+import encoding from 'k6/encoding'
 import exec from 'k6/execution'
 import http from 'k6/http'
 import { Counter, Trend } from 'k6/metrics'
@@ -209,15 +210,44 @@ async function gotoLogin (page) {
   }
 }
 
-// #935: snowplow's learned-class counters (/debug/vars, as the signed-in
-// user): the proof a fresh class was one snowplow had not learned. null when
-// there is no token yet or the read fails (the class is then not proven).
+// The bench's debug reader (bench/rbac_model.py THE DEBUG READER): snowplow
+// #1365 authorizes /debug by RBAC, and no session's user holds a /debug grant
+// (the measurement keeps the customer's RBAC shape), so the counters are read
+// as this one identity, logged in once per VU at authn and again after a 401.
+// null when it cannot log in (the class is then not proven).
+let DEBUG_TOKEN = null
+function debugToken (renew) {
+  if (renew) DEBUG_TOKEN = null
+  if (DEBUG_TOKEN || !CFG.authnUrl || !CFG.debugUser) return DEBUG_TOKEN
+  try {
+    const r = http.get(`${CFG.authnUrl}/basic/login`, {
+      headers: { Authorization: `Basic ${encoding.b64encode(`${CFG.debugUser}:${CFG.password}`)}` },
+      tags: { bench: 'debug_reader_login' }, timeout: '30s',
+    })
+    if (r.status === 200) DEBUG_TOKEN = r.json().accessToken || null
+  } catch (e) {
+    DEBUG_TOKEN = null
+  }
+  return DEBUG_TOKEN
+}
+
+// #935: snowplow's learned-class counters (/debug/vars, as the debug reader:
+// the counters are snowplow's, whoever reads them): the proof a fresh class
+// was one snowplow had not learned. `token` is the session's own: no token
+// yet means no sign-in to judge, and null; null too when the read fails (the
+// class is then not proven).
 function learnedCounts (token) {
   if (!token || !CFG.snowplowUrl) return null
   try {
-    const r = http.get(`${CFG.snowplowUrl}/debug/vars`, {
-      headers: { Authorization: `Bearer ${token}` }, tags: { bench: 'learned_classes' }, timeout: '30s',
-    })
+    let r = null
+    for (const renew of [false, true]) {
+      const dt = debugToken(renew)
+      if (!dt) return null
+      r = http.get(`${CFG.snowplowUrl}/debug/vars`, {
+        headers: { Authorization: `Bearer ${dt}` }, tags: { bench: 'learned_classes' }, timeout: '30s',
+      })
+      if (r.status !== 401) break
+    }
     if (r.status !== 200) return null
     const v = r.json()
     return { registered: v.snowplow_learned_classes_registered, seeded: v.snowplow_learned_classes_seeded }

@@ -160,12 +160,28 @@ def test_wait_for_customer_load():
             return load606.Response(0, b"", 1)
     res = load606.wait_for_customer_load(Dead(), "t", max_wait_s=20, poll_s=5,
                                          clock=clk.now, sleep=clk.sleep)
-    assert res["started"] is False
+    assert res["started"] is False and "refused" not in res        # no answer: waited out, as before
+
+    # #1471 review: an HTTP refusal (snowplow #1365's 403 for an identity without the /debug grant) is not
+    # "the load has not started yet": the gate stops at the first one, it never waits out max_wait_s
+    for status in (401, 403, 500):
+        class Refusing:
+            calls = 0
+
+            def get(self, path, token, _s=status):
+                Refusing.calls += 1
+                return load606.Response(_s, b"", 1)
+        t0 = clk.now()
+        res = load606.wait_for_customer_load(Refusing(), "t", max_wait_s=1800, poll_s=5,
+                                             clock=clk.now, sleep=clk.sleep)
+        assert res == {"started": False, "waited_s": 0.0, "delta": None, "refused": status,
+                       "why": f"/debug/vars answered {status}: the start gate cannot read snowplow's counters"}
+        assert Refusing.calls == 1 and clk.now() == t0
 
 
 def test_fresh_job_waits_for_load():
     m = load606_job.render_fresh(snowplow_url="http://s", authn_url="http://a",
-                                 user="scaleuser-0001", password="pw", rates=["10"],
+                                 user="scaleuser-0001", password="pw", debug_user="d", rates=["10"],
                                  samples=2, gap_s=1, probe_name="p", namespaces=1,
                                  comp_group="g", comp_version="v", comp_plural="x")
     assert "--wait-for-load" in m

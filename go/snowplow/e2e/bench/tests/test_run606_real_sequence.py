@@ -310,9 +310,17 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                         open(os.path.join(STATE, "vap-" + d["metadata"]["name"]), "w").write("1")
                     if d.get("kind") == "Job":
                         jobs.write((d.get("metadata") or {}).get("name", "") + "\\n")
+                        # the Job as applied (the runtime606 fake reads which user its command logs in as)
+                        open(os.path.join(STATE, "job-" + (d.get("metadata") or {}).get("name", "")), "w").write(
+                            json.dumps(d))
                     if d.get("kind") == "User":       # authn's users: only one that exists can log in
                         with open(os.path.join(STATE, "users"), "a") as uf:
                             uf.write((d.get("metadata") or {}).get("name", "") + "\\n")
+                    # who may read /debug; FAKE_DROP_KIND: the API server keeps no object of that kind
+                    if d.get("kind") in ("User", "ClusterRole", "ClusterRoleBinding") and \\
+                            d.get("kind") != os.environ.get("FAKE_DROP_KIND"):
+                        with open(os.path.join(STATE, "rbac.jsonl"), "a") as rf:
+                            rf.write(json.dumps(d) + "\\n")
         # #1383 gap 4: FAKE_TTL_APPLY_FAIL=1: the API server refuses gke-up's TTL CronJob
         if os.environ.get("FAKE_TTL_APPLY_FAIL") == "1" and "ttl-self-destruct" in text:
             sys.stderr.write("Error from server (InternalError): cronjobs.batch is refused\\n"); sys.exit(1)
@@ -326,14 +334,44 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     # of fields the process has instead; FAKE_GO_RUNTIME_FAIL: login | vars401 | nokey | pending
     if "runtime606" in a or "job/runtime606" in a:
         fail = os.environ.get("FAKE_GO_RUNTIME_FAIL", "")
-        # authn answers a login only for a user that exists: the Job logs in as the bench's preflight user
-        # (scaleuser-0000), which the run must have created first
+        # authn answers a login only for a user that exists: the Job logs in as the user its command names,
+        # which the run must have created first
+        import re
+        jf = os.path.join(STATE, "job-runtime606")
+        cmd = ""
+        if os.path.exists(jf):
+            cmd = " ".join(json.load(open(jf))["spec"]["template"]["spec"]["containers"][0].get("args") or [])
+        m = re.search(r'--user "([^"]+)"', cmd)
+        who = m.group(1) if m else ""
         uf = os.path.join(STATE, "users")
-        if "scaleuser-0000" not in (open(uf).read().split() if os.path.exists(uf) else []) and not fail:
+        if who not in (open(uf).read().split() if os.path.exists(uf) else []) and not fail:
             fail = "login"
+        # snowplow #1365 (every image after 1.12.70): /debug/vars is a NON-RESOURCE request, allowed only
+        # by a ClusterRoleBinding of the user (or one of its groups) to a ClusterRole whose rule has
+        # nonResourceURLs matching the path and verb get, as upstream RuleAllows decides (exact, "*", or a
+        # trailing-"*" prefix); a resource rule never opens it. FAKE_SNOWPLOW_DEBUG_AUTHZ=jwt: 1.12.70, where
+        # any valid JWT reads /debug
+        if not fail and os.environ.get("FAKE_SNOWPLOW_DEBUG_AUTHZ", "rbac") == "rbac":
+            rf = os.path.join(STATE, "rbac.jsonl")
+            docs = [json.loads(x) for x in open(rf).read().splitlines()] if os.path.exists(rf) else []
+            groups = {g for d in docs if d.get("kind") == "User" and d["metadata"]["name"] == who
+                      for g in (d.get("spec") or {}).get("groups") or []}
+            roles = {d["metadata"]["name"]: d.get("rules") or [] for d in docs if d.get("kind") == "ClusterRole"}
+
+            def url_ok(u):
+                return u == "*" or u == "/debug/vars" or (u.endswith("*") and "/debug/vars".startswith(u[:-1]))
+            allowed = any(
+                any(s.get("kind") == "User" and s.get("name") == who or s.get("kind") == "Group" and s.get("name") in groups
+                    for s in d.get("subjects") or [])
+                and any(any(url_ok(u) for u in r.get("nonResourceURLs") or [])
+                        and any(v in ("get", "*") for v in r.get("verbs") or [])
+                        for r in roles.get((d.get("roleRef") or {}).get("name"), []))
+                for d in docs if d.get("kind") == "ClusterRoleBinding")
+            if not allowed:
+                fail = "vars403"
         if "get" in a:
             done = fail != "pending"
-            bad = fail in ("login", "vars401", "nokey")
+            bad = fail in ("login", "vars401", "vars403", "nokey")
             if any(x.endswith("{.status.succeeded}") for x in a):
                 print("1" if done and not bad else "")
             elif any(x.endswith("{.status.failed}") for x in a):
@@ -347,12 +385,54 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                    "memory_limit_source": "cgroup_v2", "cgroup_memory_limit_bytes": 8589934592}
             eff.update(json.loads(os.environ.get("FAKE_GO_RUNTIME") or "{}"))
             why = {"login": "the login failed (HTTPError)", "vars401": "/debug/vars answered 401",
+                   "vars403": "/debug/vars answered 403",
                    "nokey": "/debug/vars holds no snowplow_go_runtime: this snowplow image does not publish "
                             "the settings its Go runtime runs with"}.get(fail)
             if fail != "pending":
                 print(json.dumps({"kind": "go_runtime", "ok": why is None, "effective": None if why else eff,
                                   "why": why}))
             sys.exit(0)
+        sys.exit(0)
+    # #1471 review (g): the live chain of the portal's grant, as the installer leaves it: the Installer CR (with
+    # its registryAuth username, which the bench must never write anywhere), the Portal CR the installer merges
+    # componentValues.portal into, and the Role and RoleBinding the portal's shell-readers template renders in
+    # krateo-system for each reader group. FAKE_LIVE_READERS: installer-drops (the Installer CR lacks the key:
+    # installer #173/#174's schema expansion) | portal-drops (the Portal CR lacks it) | no-binding (no
+    # RoleBinding rendered) | norestactions (the Role lacks the RESTActions rule)
+    if "get" in a and any(x.startswith("installers.composition.krateo.io,") for x in a):
+        mode = os.environ.get("FAKE_LIVE_READERS", "ok")
+        cf = os.path.join(STATE, "installer-cv.json")
+        cv = json.load(open(cf)) if os.path.exists(cf) else {}
+        groups = list(((cv.get("portal") or {}).get("readerGroups")) or [])
+        inst_cv = json.loads(json.dumps(cv))
+        if mode == "installer-drops":
+            (inst_cv.get("portal") or {}).pop("readerGroups", None)
+            groups = []
+        portal_groups = [] if mode == "portal-drops" else groups
+        items = [{"apiVersion": "composition.krateo.io/v0-3-641", "kind": "Installer",
+                  "metadata": {"name": "installer", "namespace": "krateo-system"},
+                  "spec": {"componentValues": inst_cv, "registryAuth": {"username": "fake-registry-user-7f3a"}}},
+                 {"apiVersion": "composition.krateo.io/v1-8-118", "kind": "Portal",
+                  "metadata": {"name": "portal", "namespace": "krateo-system"},
+                  "spec": dict({"enableAdminUser": True}, **({"readerGroups": portal_groups} if portal_groups else {}))}]
+        for g in portal_groups:
+            rules = [{"apiGroups": ["widgets.templates.krateo.io"], "resources": ["*"], "verbs": ["get", "list"]}]
+            if mode != "norestactions":
+                rules.append({"apiGroups": ["templates.krateo.io"], "resources": ["restactions"], "verbs": ["get"]})
+            name = g + "-read-portal-shell"
+            items.append({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+                          "metadata": {"name": name, "namespace": "krateo-system"}, "rules": rules})
+            if mode != "no-binding":
+                items.append({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+                              "metadata": {"name": name, "namespace": "krateo-system"},
+                              "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": name},
+                              "subjects": [{"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": g}]})
+        # a binding of an admin USER the record must not keep
+        items.append({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+                      "metadata": {"name": "admin-reads", "namespace": "krateo-system"},
+                      "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "admin-reads"},
+                      "subjects": [{"kind": "User", "name": "fake-admin-person-9c1d"}]})
+        print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
         sys.exit(0)
     if a[:3] == ["get", "job", "ttl-delete-proof"]:
         print(json.dumps({"kind": "Job", "status": {"succeeded": 1}})); sys.exit(0)
@@ -1549,6 +1629,8 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         vals = yaml.safe_load(open(vf)) if vf else {}
         env = (((vals or {}).get("componentValues") or {}).get("snowplow") or {}).get("env") or {}
         json.dump(env, open(os.path.join(STATE, "snowplow-declared-env.json"), "w"))
+        # the componentValues the Installer CR is created with (the live readers listing answers from it)
+        json.dump((vals or {}).get("componentValues") or {}, open(os.path.join(STATE, "installer-cv.json"), "w"))
     if a[:1] == ["pull"]:
         d = os.path.join(a[a.index("-d") + 1], "installer")
         os.makedirs(os.path.join(d, "files"), exist_ok=True)
