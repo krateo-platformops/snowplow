@@ -3,17 +3,22 @@ package api
 // rev1032_guard_test.go — #1025 / #1032 review: the STRUCTURAL guard that
 // keeps the one rule in front of every Secret lookup.
 //
-// The #1025 rule (refusePerUserRef) runs once, at the top of
-// resolveStageEndpoint, before the stage branches on userAccessFilter;
-// resolveOne itself does not re-check. That is only safe while:
+// The #1025 rule (refusePerUserRef) runs once per stage, in
+// refuseStageEndpointRef, which runStage calls for EVERY stage before it plans
+// the stage and before it branches on userAccessFilter (#1477 review B1: the
+// rule is decided whatever the data); resolveOne itself does not re-check. That
+// is only safe while:
 //   - resolveOne has no caller other than resolveStageEndpoint (a new direct
-//     caller would look up a ref the rule never saw), and
-//   - in resolveStageEndpoint, refusePerUserRef is an unconditional
-//     top-level `if err := ...; err != nil` statement that precedes every
-//     resolveOne reference (moving it below the UAF branches would put the
-//     caller-supplied UAF branch's resolveOne in front of it).
-// This test parses the package's non-test files and fails on either. Same
-// allow-list idea as #443's gatedAtCaller guard (inline443_enum_test.go).
+//     caller would look up a ref the rule never saw);
+//   - resolveStageEndpoint has no production caller other than runStage, and
+//     takes its ref only from r.stageRef (never renders one itself);
+//   - in runStage, `if r.refuseStageEndpointRef(...) {` is an unconditional
+//     top-level statement that precedes every resolveStageEndpoint reference;
+//   - in refuseStageEndpointRef, refusePerUserRef is an unconditional
+//     top-level `if err := ...; err != nil` statement, and the only writer of
+//     r.stageRef in the package.
+// This test parses the package's non-test files and fails on any of them.
+// Same allow-list idea as #443's gatedAtCaller guard (inline443_enum_test.go).
 // Adopted from the #1032 reviewer's sketch.
 
 import (
@@ -25,14 +30,21 @@ import (
 	"testing"
 )
 
-func TestRev1032_ResolveOneOnlyBehindRefusePerUserRef(t *testing.T) {
+type rev1032Func struct {
+	file string
+	decl *ast.FuncDecl
+}
+
+// rev1032Funcs parses the package's non-test files and returns every function
+// declaration by name (methods by method name).
+func rev1032Funcs(t *testing.T) (*token.FileSet, map[string][]rev1032Func) {
+	t.Helper()
 	fset := token.NewFileSet()
 	ents, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	allowed := map[string]bool{"resolveStageEndpoint": true}
-	sawResolveOne := 0
+	out := map[string][]rev1032Func{}
 	for _, e := range ents {
 		n := e.Name()
 		if !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
@@ -43,59 +55,135 @@ func TestRev1032_ResolveOneOnlyBehindRefusePerUserRef(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, d := range f.Decls {
-			fd, ok := d.(*ast.FuncDecl)
-			if !ok || fd.Body == nil {
-				continue
-			}
-			var refusePos []token.Pos
-			var oneCalls []token.Pos
-			ast.Inspect(fd.Body, func(x ast.Node) bool {
-				sel, ok := x.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				switch sel.Sel.Name {
-				case "resolveOne":
-					oneCalls = append(oneCalls, sel.Pos())
-				case "refusePerUserRef":
-					refusePos = append(refusePos, sel.Pos())
-				}
-				return true
-			})
-			if len(oneCalls) == 0 {
-				continue
-			}
-			sawResolveOne += len(oneCalls)
-			if !allowed[fd.Name.Name] {
-				t.Errorf("%s: %s references resolveOne; only resolveStageEndpoint may (it applies the #1025 rule first)",
-					fset.Position(oneCalls[0]), fd.Name.Name)
-				continue
-			}
-			if len(refusePos) == 0 {
-				t.Errorf("%s: no refusePerUserRef call", fd.Name.Name)
-				continue
-			}
-			// The refusal must be a TOP-LEVEL statement of the body (unconditional)
-			// and precede every resolveOne reference.
-			top := false
-			for _, st := range fd.Body.List {
-				if st.Pos() <= refusePos[0] && refusePos[0] < st.End() {
-					if is, ok := st.(*ast.IfStmt); ok && is.Init != nil && is.Init.Pos() <= refusePos[0] && refusePos[0] < is.Init.End() {
-						top = true
-					}
-				}
-			}
-			if !top {
-				t.Errorf("%s: refusePerUserRef is not an unconditional top-level `if err := ...; err != nil` statement", fd.Name.Name)
-			}
-			for _, p := range oneCalls {
-				if p < refusePos[0] {
-					t.Errorf("%s: resolveOne referenced before refusePerUserRef", fset.Position(p))
-				}
+			if fd, ok := d.(*ast.FuncDecl); ok && fd.Body != nil {
+				out[fd.Name.Name] = append(out[fd.Name.Name], rev1032Func{file: n, decl: fd})
 			}
 		}
 	}
-	if sawResolveOne == 0 {
-		t.Fatal("found no resolveOne reference: the guard is not looking at the right package")
+	return fset, out
+}
+
+// selectorRefs returns the positions of every `x.<name>` in body.
+func selectorRefs(body ast.Node, name string) []token.Pos {
+	var out []token.Pos
+	ast.Inspect(body, func(x ast.Node) bool {
+		if sel, ok := x.(*ast.SelectorExpr); ok && sel.Sel.Name == name {
+			out = append(out, sel.Pos())
+		}
+		return true
+	})
+	return out
+}
+
+// topLevelIfHolds reports whether pos lies in the init or the condition of a
+// top-level `if` statement of body.
+func topLevelIfHolds(body *ast.BlockStmt, pos token.Pos) bool {
+	for _, st := range body.List {
+		is, ok := st.(*ast.IfStmt)
+		if !ok || pos < st.Pos() || pos >= st.End() {
+			continue
+		}
+		if is.Init != nil && is.Init.Pos() <= pos && pos < is.Init.End() {
+			return true
+		}
+		if is.Cond != nil && is.Cond.Pos() <= pos && pos < is.Cond.End() {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRev1032_ResolveOneOnlyBehindRefusePerUserRef(t *testing.T) {
+	fset, funcs := rev1032Funcs(t)
+	sawResolveOne, sawStageEndpoint := 0, 0
+	var resolveStageEndpointCallers []string
+	for name, fs := range funcs {
+		for _, fn := range fs {
+			if refs := selectorRefs(fn.decl.Body, "resolveOne"); len(refs) > 0 {
+				sawResolveOne += len(refs)
+				if name != "resolveStageEndpoint" {
+					t.Errorf("%s: %s references resolveOne; only resolveStageEndpoint may (runStage applies the #1025 rule before calling it)",
+						fset.Position(refs[0]), name)
+				}
+			}
+			if refs := selectorRefs(fn.decl.Body, "resolveStageEndpoint"); len(refs) > 0 {
+				sawStageEndpoint += len(refs)
+				resolveStageEndpointCallers = append(resolveStageEndpointCallers, name)
+			}
+			if name != "refuseStageEndpointRef" {
+				ast.Inspect(fn.decl.Body, func(x ast.Node) bool {
+					as, ok := x.(*ast.AssignStmt)
+					if !ok {
+						return true
+					}
+					for _, l := range as.Lhs {
+						if sel, ok := l.(*ast.SelectorExpr); ok && sel.Sel.Name == "stageRef" {
+							t.Errorf("%s: %s writes r.stageRef; only refuseStageEndpointRef may (it applies the #1025 rule to what it writes)",
+								fset.Position(sel.Pos()), name)
+						}
+					}
+					return true
+				})
+			}
+		}
+	}
+	if sawResolveOne == 0 || sawStageEndpoint == 0 {
+		t.Fatal("found no resolveOne / resolveStageEndpoint reference: the guard is not looking at the right package")
+	}
+	for _, c := range resolveStageEndpointCallers {
+		if c != "runStage" {
+			t.Errorf("%s references resolveStageEndpoint; only runStage may (it runs refuseStageEndpointRef first)", c)
+		}
+	}
+
+	// resolveStageEndpoint takes its ref from r.stageRef and renders none.
+	for _, fn := range funcs["resolveStageEndpoint"] {
+		if refs := selectorRefs(fn.decl.Body, "evalEndpointRef"); len(refs) > 0 {
+			t.Errorf("%s: resolveStageEndpoint renders an endpointRef itself; it must use r.stageRef, which the #1025 rule saw",
+				fset.Position(refs[0]))
+		}
+		if len(selectorRefs(fn.decl.Body, "stageRef")) == 0 {
+			t.Error("resolveStageEndpoint does not read r.stageRef")
+		}
+	}
+
+	// refuseStageEndpointRef: the rule is an unconditional top-level
+	// `if err := ...; err != nil`.
+	refusers := funcs["refuseStageEndpointRef"]
+	if len(refusers) != 1 {
+		t.Fatalf("want exactly one refuseStageEndpointRef, got %d", len(refusers))
+	}
+	rf := refusers[0].decl
+	rule := selectorRefs(rf.Body, "refusePerUserRef")
+	if len(rule) == 0 {
+		t.Fatal("refuseStageEndpointRef: no refusePerUserRef call")
+	}
+	inInit := false
+	for _, st := range rf.Body.List {
+		if is, ok := st.(*ast.IfStmt); ok && is.Init != nil && is.Init.Pos() <= rule[0] && rule[0] < is.Init.End() {
+			inInit = true
+		}
+	}
+	if !inInit {
+		t.Error("refuseStageEndpointRef: refusePerUserRef is not an unconditional top-level `if err := ...; err != nil` statement")
+	}
+
+	// runStage: `if r.refuseStageEndpointRef(...) {` is top-level and precedes
+	// every resolveStageEndpoint reference (and the plan).
+	for _, fn := range funcs["runStage"] {
+		gate := selectorRefs(fn.decl.Body, "refuseStageEndpointRef")
+		if len(gate) == 0 {
+			t.Fatal("runStage: no refuseStageEndpointRef call")
+		}
+		if !topLevelIfHolds(fn.decl.Body, gate[0]) {
+			t.Error("runStage: refuseStageEndpointRef is not an unconditional top-level `if` statement")
+		}
+		for _, name := range []string{"resolveStageEndpoint", "planStage"} {
+			for _, p := range selectorRefs(fn.decl.Body, name) {
+				if p < gate[0] {
+					t.Errorf("%s: runStage references %s before refuseStageEndpointRef", fset.Position(p), name)
+				}
+			}
+		}
 	}
 }

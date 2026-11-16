@@ -26,8 +26,10 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 )
 
@@ -128,6 +130,78 @@ func TestIssue1477_Predicate(t *testing.T) {
 	}
 	if restactionNeedsRequestExtras(nil, nil) {
 		t.Error("a nil RESTAction needs nothing")
+	}
+}
+
+// TestIssue1477_Predicate_ThroughStageOutputs — #1477 review B2: a stage's
+// output satisfies a read only when that stage needs no uncarried extra
+// itself, transitively. Each case is also decoded by predicateStepsOf (the
+// walk's and the widget seed's decoder, N3) and must answer as the full
+// conversion does.
+func TestIssue1477_Predicate_ThroughStageOutputs(t *testing.T) {
+	type st = map[string]any
+	ep := func(name string) st { return st{"name": name, "namespace": h1NS} }
+	cases := []struct {
+		name    string
+		api     []any
+		carried map[string]any
+		want    bool
+	}{
+		{"A's path reads .name; B's endpointRef reads .A (the reviewer's shape)", []any{
+			st{"name": "A", "path": `${ "/apis/x.io/v1/namespaces/krateo-system/clusters/" + .name }`},
+			st{"name": "B", "path": "/v1/crds", "dependsOn": st{"name": "A"}, "endpointRef": ep(`${ .A.metadata.name + "-endpoint" }`)},
+		}, nil, true},
+		{"the same, carrying name", []any{
+			st{"name": "A", "path": `${ "/apis/x.io/v1/namespaces/krateo-system/clusters/" + .name }`},
+			st{"name": "B", "path": "/v1/crds", "dependsOn": st{"name": "A"}, "endpointRef": ep(`${ .A.metadata.name + "-endpoint" }`)},
+		}, map[string]any{"name": "spoke-a"}, false},
+		{"two hops: C reads .B, B iterates .A, A's payload reads .name", []any{
+			st{"name": "A", "path": "/a", "payload": `${ {q: .name} | tojson }`},
+			st{"name": "B", "path": `${ "/b/" + .id }`, "dependsOn": st{"name": "A", "iterator": ".A.items"}},
+			st{"name": "C", "path": "/c", "endpointRef": ep(`${ .B.items[0].name }`)},
+		}, nil, true},
+		{"an iterator stage's path reads its element, not the dict", []any{
+			st{"name": "A", "path": "/a"},
+			st{"name": "B", "path": `${ "/b/" + .name }`, "dependsOn": st{"name": "A", "iterator": ".A.items"}},
+			st{"name": "C", "path": "/c", "endpointRef": ep(`${ .B.items[0].name }`)},
+		}, nil, false},
+		{"A's endpointRef reads .name; B's reads .A", []any{
+			st{"name": "A", "path": "/a", "endpointRef": ep(`${ .name }`)},
+			st{"name": "B", "path": "/b", "endpointRef": ep(`${ .A.host }`)},
+		}, nil, true},
+		{"A's header reads .token", []any{
+			st{"name": "A", "path": "/a", "headers": []any{`${ "X-T: " + .token }`}},
+			st{"name": "B", "path": "/b", "endpointRef": ep(`${ .A.host }`)},
+		}, nil, true},
+		{"A's resourcesFrom reads .kinds", []any{
+			st{"name": "A", "path": "/a", "userAccessFilter": st{"verb": "list", "group": "", "resourcesFrom": ".kinds"}},
+			st{"name": "B", "path": "/b", "endpointRef": ep(`${ .A.host }`)},
+		}, nil, true},
+		{"a stage that reads itself (a cycle) is not satisfied", []any{
+			st{"name": "A", "path": "/a", "endpointRef": ep(`${ .A.host }`)},
+		}, nil, true},
+		{"a constant template reads nothing", []any{
+			st{"name": "s", "path": "/x", "endpointRef": ep(`${ "hub" + "-endpoint" }`)},
+		}, nil, false},
+	}
+	for _, c := range cases {
+		obj := map[string]any{"apiVersion": "templates.krateo.io/v1", "kind": "RESTAction",
+			"metadata": map[string]any{"name": "ra", "namespace": h1NS}, "spec": map[string]any{"api": c.api}}
+		var cr templatesv1.RESTAction
+		if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(obj, &cr); err != nil {
+			t.Fatalf("%s: convert: %v", c.name, err)
+		}
+		if got := restactionNeedsRequestExtras(&cr, c.carried); got != c.want {
+			t.Errorf("%s: restactionNeedsRequestExtras = %v; want %v", c.name, got, c.want)
+		}
+		steps, templated := predicateStepsOf(obj)
+		if got := templated && restactionsapi.NeedsRequestExtras(steps, c.carried); got != c.want {
+			t.Errorf("%s: predicateStepsOf decode answers %v; the full conversion answers %v", c.name, got, c.want)
+		}
+	}
+	// No templated endpointRef: nothing is decoded.
+	if steps, templated := predicateStepsOf(spokeRA1477("spoke-a-endpoint").Object); templated || steps != nil {
+		t.Fatalf("a RESTAction with no templated endpointRef must decode nothing; got %v %v", steps, templated)
 	}
 }
 

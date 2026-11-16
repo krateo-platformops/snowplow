@@ -488,36 +488,13 @@ const (
 // endpointRef carrying a third party's OWN credential. runStage marks the
 // dispatch ctx with credhttp.WithHeldCredential on it, and the dial site then
 // builds a client that never follows a redirect. Provenance, never shape.
+//
+// The stage's endpointRef is r.stageRef: rendered and passed through the #1025
+// rule by refuseStageEndpointRef, which runStage runs for every stage before
+// the plan; runStage reaches this function only when the plan has a request
+// (#1477). TestRev1032_ResolveOneOnlyBehindRefusePerUserRef keeps both true.
 func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, bool, bool, stageAction) {
-	// #113 — template endpointRef.name through the SAME jq/extras evaluator that
-	// already renders this stage's path/payload/headers (evalJQ over r.dict, the
-	// exact ds createRequestOptions is handed at :405), so `.name` resolves
-	// identically to how `path` resolves it. ONLY the templated (MaybeQuery-shaped)
-	// named-ref path is touched; a nil ref (internal/clientconfig synthesis) and a
-	// literal ref pass through byte-identically (§1.3, guardrail (a): namespace
-	// stays literal, never templated).
-	ref, templated := r.evalEndpointRef(apiCall.EndpointRef)
-	r.stageRef = ref
-	// #1025 — every stage passes here before it branches on userAccessFilter,
-	// so the one rule covers every stage: a named ref to a per-user credential
-	// Secret is refused for every provenance, literal or templated, UAF or
-	// not (a UAF stage ignores its endpointRef, but naming one is still
-	// refused). Same truncating posture as any endpoint-resolve failure (R-2
-	// stageReturn); nothing was read or dialed. The Secret name embeds a
-	// username, so it is not logged, in clear or as a label (#1192).
-	if err := r.mapper.refusePerUserRef(ref); err != nil {
-		// audit#22 (a) — denied, per_user_credential_ref. The record never
-		// carries the reference: its name embeds a username. With no
-		// endpoint resolved, it names no target (marked target).
-		r.auditStageRefusal(r.ctx, stageRefusal{apiCall: apiCall,
-			outcome: audit.OutcomeDenied, reason: audit.DenialPerUserCredentialRef})
-		r.log.ErrorContext(r.ctx, "endpointRef refused: it names a per-user credential Secret",
-			slog.String("name", id),
-			slog.String("provenance", provenanceLabel(r.opts.Provenance)),
-			slog.Bool("templated", templated),
-			slog.String("namespace", ref.Namespace))
-		return endpoints.Endpoint{}, false, false, stageReturn
-	}
+	ref := r.stageRef
 	if uafActive && r.opts.Provenance == ProvenanceCallerSupplied {
 		// #443 part 2 — an inline (caller-vouched) draft's UAF stage dials the
 		// CALLER's own clientconfig, never the ServiceAccount: isSA=false, so
@@ -591,6 +568,46 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 // not: rendering never turns a nil ref into a named one or back.
 func stageHoldsCredential(uafActive bool, ref *templates.Reference) bool {
 	return uafActive || ref == nil
+}
+
+// refuseStageEndpointRef renders the stage's endpointRef into r.stageRef and
+// applies the #1025 rule to it; it reports whether the stage was refused.
+// runStage calls it for EVERY stage, before the plan (#1477 review B1), so the
+// rule is decided whatever the data, like refuseUAFOnNonReadVerb: a stage whose
+// iterator yields nothing is refused all the same. It reads and dials nothing:
+// the render is jq over r.dict, the rule a name check.
+//
+// #113 — the endpointRef.name is templated through the SAME jq/extras evaluator
+// that already renders this stage's path/payload/headers (evalJQ over r.dict),
+// so `.name` resolves identically to how `path` resolves it. ONLY the templated
+// (MaybeQuery-shaped) named-ref path is touched; a nil ref (internal/clientconfig
+// synthesis) and a literal ref pass through byte-identically (§1.3, guardrail
+// (a): namespace stays literal, never templated).
+//
+// #1025 — every stage passes here before it branches on userAccessFilter, so
+// the one rule covers every stage: a named ref to a per-user credential Secret
+// is refused for every provenance, literal or templated, UAF or not (a UAF
+// stage ignores its endpointRef, but naming one is still refused). Same
+// truncating posture as any endpoint-resolve failure (R-2 stageReturn); nothing
+// was read or dialed. The Secret name embeds a username, so it is not logged,
+// in clear or as a label (#1192).
+func (r *resolveRun) refuseStageEndpointRef(id string, apiCall *templates.API) (refused bool) {
+	ref, templated := r.evalEndpointRef(apiCall.EndpointRef)
+	r.stageRef = ref
+	if err := r.mapper.refusePerUserRef(ref); err != nil {
+		// audit#22 (a) — denied, per_user_credential_ref. The record never
+		// carries the reference: its name embeds a username. With no
+		// endpoint resolved, it names no target (marked target).
+		r.auditStageRefusal(r.ctx, stageRefusal{apiCall: apiCall,
+			outcome: audit.OutcomeDenied, reason: audit.DenialPerUserCredentialRef})
+		r.log.ErrorContext(r.ctx, "endpointRef refused: it names a per-user credential Secret",
+			slog.String("name", id),
+			slog.String("provenance", provenanceLabel(r.opts.Provenance)),
+			slog.Bool("templated", templated),
+			slog.String("namespace", ref.Namespace))
+		return true
+	}
+	return false
 }
 
 // evalEndpointRef renders a templated endpointRef.name (#113). For a nil ref or
@@ -1895,10 +1912,17 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// the stage's shape (stageHoldsCredential). A stage that plans no request
 	// (an iterator over nothing) produces its empty result here, and reads no
 	// endpointRef Secret, no ServiceAccount token and no clientconfig: its
-	// endpoint is never used, so a miss of it cannot fail the resolve. #723/#724
+	// endpoint is never used, so a miss of it cannot fail the resolve (the
+	// #1025 rule above is name-only and has already run). #723/#724
 	// — the provenance mark, set to THIS stage's value, true or false, never
 	// inherited (#1019 review F1: a nested resolve's named-ref stage must not
 	// read as held because its outer stage was).
+	// #1025 — render the endpointRef and apply the per-user-credential rule
+	// FIRST, for every stage, whatever the data (#1477 review B1). No I/O.
+	if r.refuseStageEndpointRef(id, apiCall) {
+		recordStageTiming()
+		return true
+	}
 	heldCred := stageHoldsCredential(uafActive, apiCall.EndpointRef)
 	planCtx := credhttp.WithHeldCredentialValue(r.ctx, heldCred)
 	elems, planned := r.planStage(planCtx, id, apiCall)
@@ -1933,7 +1957,7 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// on planCtx above, so the render, the collapse and the lazy register see
 	// it as the dispatch does (gctx derives from provCtx below).
 	// #1283 — the stage's dials record which endpointRef they went through
-	// (r.stageRef: resolveStageEndpoint just set it for THIS stage).
+	// (r.stageRef: refuseStageEndpointRef set it for THIS stage).
 	provCtx := withStageEndpointRef(planCtx, r.stageRef)
 
 	// User-bearer-token append: only for non-UAF stages. When UAF is active

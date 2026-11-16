@@ -41,13 +41,13 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/krateo-platformops/plumbing/jqutil"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 )
 
 // Background resolve sites (closed set).
@@ -150,8 +150,10 @@ func restactionNeedsRequestExtras(cr *templatesv1.RESTAction, carried map[string
 // the widget w (no request extras): the RESTAction its spec.apiRef names,
 // with the extras widgets.Resolve threads into that RESTAction
 // (widgets.ApiRefExtras). A widget with no apiRef, or whose RESTAction cannot
-// be read or decoded, is not skipped: its resolve reports what it reports
-// today. The RESTAction is read through backgroundRESTActionGetFn (objects.Get)
+// be read, is not skipped: its resolve reports what it reports today. It runs
+// for every walked widget and every seed unit, so it decodes only the stage
+// fields the predicate reads (predicateStepsOf), and only for a RESTAction
+// that has a templated endpointRef at all (#1477 review N3). The RESTAction is read through backgroundRESTActionGetFn (objects.Get)
 // from the informer only (cache.WithInformerOnlyReads, as
 // apiref.DeclaresExternalEndpoint reads it): the predicate never costs an
 // apiserver round trip, and a RESTAction the informer does not hold is
@@ -168,11 +170,86 @@ func widgetNeedsRequestExtras(ctx context.Context, w *unstructured.Unstructured)
 	if got.Err != nil || got.Unstructured == nil {
 		return false
 	}
-	var cr templatesv1.RESTAction
-	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); err != nil {
+	steps, templated := predicateStepsOf(got.Unstructured.Object)
+	if !templated {
 		return false
 	}
-	return restactionNeedsRequestExtras(&cr, widgets.ApiRefExtras(ctx, w.Object, nil))
+	return restactionsapi.NeedsRequestExtras(steps, widgets.ApiRefExtras(ctx, w.Object, nil))
+}
+
+// predicateStepsOf reads, from a RESTAction's unstructured object, exactly the
+// api-step fields restactionsapi.NeedsRequestExtras reads (name, path, payload,
+// headers, errorKey, endpointRef, dependsOn.iterator, userAccessFilter
+// resourcesFrom), without converting the whole object. templated is false, and
+// nothing is decoded, when no step's endpointRef.name is a `${...}` template:
+// the predicate is then false whatever the rest says. A field of the wrong
+// type is read as absent, as the predicate would see a step without it.
+func predicateStepsOf(obj map[string]any) (steps []*templatesv1.API, templated bool) {
+	raw, found, err := unstructured.NestedFieldNoCopy(obj, "spec", "api")
+	if err != nil || !found {
+		return nil, false
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return nil, false
+	}
+	str := func(m map[string]any, k string) string {
+		v, _ := m[k].(string)
+		return v
+	}
+	sub := func(m map[string]any, k string) map[string]any {
+		v, _ := m[k].(map[string]any)
+		return v
+	}
+	for _, it := range list {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, isTemplate := jqutil.MaybeQuery(str(sub(m, "endpointRef"), "name")); isTemplate {
+			templated = true
+			break
+		}
+	}
+	if !templated {
+		return nil, false
+	}
+	steps = make([]*templatesv1.API, 0, len(list))
+	for _, it := range list {
+		m, ok := it.(map[string]any)
+		if !ok {
+			steps = append(steps, nil)
+			continue
+		}
+		st := &templatesv1.API{Name: str(m, "name"), Path: str(m, "path")}
+		if v, ok := m["payload"].(string); ok {
+			st.Payload = &v
+		}
+		if v, ok := m["errorKey"].(string); ok {
+			st.ErrorKey = &v
+		}
+		if hs, ok := m["headers"].([]any); ok {
+			for _, h := range hs {
+				if hv, ok := h.(string); ok {
+					st.Headers = append(st.Headers, hv)
+				}
+			}
+		}
+		if ep := sub(m, "endpointRef"); ep != nil {
+			st.EndpointRef = &templatesv1.Reference{Name: str(ep, "name"), Namespace: str(ep, "namespace")}
+		}
+		if dep := sub(m, "dependsOn"); dep != nil {
+			st.DependsOn = &templatesv1.Dependency{Name: str(dep, "name")}
+			if v, ok := dep["iterator"].(string); ok {
+				st.DependsOn.Iterator = &v
+			}
+		}
+		if uaf := sub(m, "userAccessFilter"); uaf != nil {
+			st.UserAccessFilter = &templatesv1.UserAccessFilterSpec{ResourcesFrom: str(uaf, "resourcesFrom")}
+		}
+		steps = append(steps, st)
+	}
+	return steps, true
 }
 
 // logBackgroundResolveSkip counts the skip and writes its DEBUG line: the

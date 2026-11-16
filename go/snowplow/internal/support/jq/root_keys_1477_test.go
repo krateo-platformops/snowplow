@@ -16,6 +16,10 @@ func TestRootKeys_1477(t *testing.T) {
 		{`.name`, []string{"name"}, true},
 		{`.name + "-endpoint"`, []string{"name"}, true},
 		{`(.name // "") + "-clientconfig"`, []string{"name"}, true},
+		// A read under an alternative is a read (file comment): the live
+		// portal spoke endpointRef, and a hub default.
+		{`((.name // "") | gsub("[^a-zA-Z0-9.-]"; "")) + "-endpoint"`, []string{"name"}, true},
+		{`(.name // "hub") + "-endpoint"`, []string{"name"}, true},
 		{`"\(.name)-\(.namespace)"`, []string{"name", "namespace"}, true},
 		{`."name"`, []string{"name"}, true},
 		{`.["name"]`, []string{"name"}, true},

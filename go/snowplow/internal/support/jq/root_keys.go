@@ -27,6 +27,15 @@ package jq
 // root itself, so the right side of a pipe never sees the root unless its
 // left side is `.`. ok=false is the caller's "cannot tell": it must take the
 // conservative answer for its question.
+//
+// A READ IS A READ, ALTERNATIVES INCLUDED. A key read on the left of `//` (`.k
+// // d`) is reported like any other. That a template supplies a default for a
+// missing key shows only that its author handled the absence in jq, not that
+// the default renders anything a request would use: the live portal's spoke
+// endpointRef is `((.name // "") | gsub(...)) + "-endpoint"`, whose default
+// renders the Secret name "endpoint", the miss #1477 removes. So the caller
+// (restactionsapi.NeedsRequestExtras) treats a key read under an alternative
+// as needed.
 
 import (
 	"sort"

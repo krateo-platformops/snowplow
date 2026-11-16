@@ -28,6 +28,7 @@ import (
 	"testing"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"k8s.io/client-go/rest"
@@ -151,6 +152,120 @@ func TestIssue1477_OneItemStage_MissingEndpointSecret_StillFails(t *testing.T) {
 	}
 	if failure == nil || failure.Stage != "spokeCrds" {
 		t.Fatalf("the resolve must report the spokeCrds stage failure; got %+v", failure)
+	}
+}
+
+// #1477 review B1 — the #1025 rule is decided whatever the data: a stage whose
+// endpointRef names a per-user credential Secret is refused even when its
+// iterator yields nothing, exactly as when it has an item (and as before
+// #1477): the refusal is logged and audited, the resolve fails at that stage,
+// the stage after it does not run, and nothing is read or dialed.
+func TestIssue1477_PerUserRefRefusedWhateverTheData(t *testing.T) {
+	for _, items := range []string{`[]`, `null`, `[{"name":"a"}]`} {
+		t.Run(items, func(t *testing.T) {
+			var secretReads, dials, afterDials atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.Contains(r.URL.Path, "/secrets/"):
+					secretReads.Add(1)
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`)
+				case strings.HasPrefix(r.URL.Path, "/victim/"):
+					dials.Add(1)
+					_, _ = io.WriteString(w, `{}`)
+				case r.URL.Path == "/after":
+					afterDials.Add(1)
+					_, _ = io.WriteString(w, `{}`)
+				default:
+					_, _ = io.WriteString(w, `{"apiVersion":"v1","kind":"List","items":`+items+`}`)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			env410(t, srv.URL, srv.URL)
+			arec := records410(t)
+
+			target := &templates.API{Name: "target", Path: "/apis/clusters.example.io/v1/namespaces/krateo-system/clusters",
+				Verb: ptr.To(http.MethodGet)}
+			victim := &templates.API{Name: "victim", Path: `${ "/victim/" + .name }`, Verb: ptr.To(http.MethodPost),
+				EndpointRef: &templates.Reference{Name: "u-other-1477-clientconfig", Namespace: raNS410},
+				DependsOn:   &templates.Dependency{Name: "target", Iterator: ptr.To(".target.items")}}
+			after := &templates.API{Name: "after", Path: "/after", Verb: ptr.To(http.MethodGet),
+				DependsOn: &templates.Dependency{Name: "victim"}}
+			rec := &rec1477{}
+			ctx := xcontext.BuildContext(ctxWithUser(user410, group410), xcontext.WithLogger(slog.New(rec)))
+			dict, failure := ResolveWithFailure(ctx, ResolveOptions{RC: &rest.Config{Host: srv.URL}, AuthnNS: raNS410,
+				Items: []*templates.API{target, victim, after}, RESTActionNamespace: raNS410, RESTActionName: "per-user-1477"})
+
+			if secretReads.Load() != 0 || dials.Load() != 0 {
+				t.Fatalf("SECURITY: a per-user-named ref was read (%d) or dialed (%d)", secretReads.Load(), dials.Load())
+			}
+			if !rec.has("endpointRef refused: it names a per-user credential Secret") {
+				t.Fatalf("#1477 B1 RED: the per-user ref was not refused (log at WARN+ = %v)", rec.atOrAbove(slog.LevelWarn))
+			}
+			if failure == nil || failure.Stage != "victim" {
+				t.Fatalf("#1477 B1 RED: the resolve must fail at the refused stage; got %+v", failure)
+			}
+			if _, ok := dict["after"]; ok || afterDials.Load() != 0 {
+				t.Fatal("#1477 B1 RED: the stage after a refused one ran (the refusal truncates)")
+			}
+			denied := 0
+			for _, a := range attrs410(arec) {
+				for _, v := range a {
+					if strings.Contains(v, "per_user_credential_ref") {
+						denied++
+					}
+				}
+			}
+			if denied != 1 {
+				t.Fatalf("#1477 B1 RED: want 1 denied per_user_credential_ref audit record, got %d", denied)
+			}
+		})
+	}
+}
+
+// #1477 review N1 — the plan's provenance comes from the stage's shape: a
+// userAccessFilter stage dials the ServiceAccount, a credential snowplow
+// holds, even when it names an endpointRef. So its plan applies the #288 shape
+// guard (targetsOwnCluster): a malformed object path is refused, not dialed
+// with the ServiceAccount token. A plan that read the stage as not held would
+// skip the guard and dial it.
+func TestIssue1477_UAFStageWithNamedRefPlansAsHeld(t *testing.T) {
+	if !stageHoldsCredential(true, &templates.Reference{Name: extRef410, Namespace: raNS410}) {
+		t.Fatal("#1477 N1 RED: a userAccessFilter stage with a named endpointRef must read as held")
+	}
+	if stageHoldsCredential(false, &templates.Reference{Name: extRef410, Namespace: raNS410}) || !stageHoldsCredential(false, nil) {
+		t.Fatal("stageHoldsCredential: a named ref without userAccessFilter is not held; a nil ref is")
+	}
+
+	var dials atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if strings.Contains(r.URL.Path, "/configmaps/") {
+			dials.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"x","namespace":"team-a"}}`)
+	}))
+	t.Cleanup(srv.Close)
+	env410(t, srv.URL, srv.URL)
+	t.Cleanup(SetServiceAccountEndpointForTest(func() (*endpoints.Endpoint, error) {
+		return &endpoints.Endpoint{ServerURL: srv.URL, Token: "sa-token"}, nil
+	}))
+
+	stage := &templates.API{Name: "cms", Path: "/api/v1/namespaces/team-a/configmaps/bad-", Verb: ptr.To(http.MethodGet),
+		EndpointRef:      &templates.Reference{Name: extRef410, Namespace: raNS410},
+		UserAccessFilter: &templates.UserAccessFilterSpec{Verb: "get", Group: "", Resource: "configmaps"}}
+	ctx := xcontext.BuildContext(ctxWithUser(user410, group410), xcontext.WithLogger(slog.New(&rec1477{})))
+	_, failure := ResolveWithFailure(ctx, ResolveOptions{RC: &rest.Config{Host: srv.URL}, AuthnNS: raNS410,
+		Items: []*templates.API{stage}, RESTActionNamespace: raNS410, RESTActionName: "uaf-held-1477"})
+	if dials.Load() != 0 {
+		t.Fatalf("#1477 N1 RED: a malformed object path of a ServiceAccount-dialed stage was dialed %d time(s); "+
+			"the #288 guard must refuse it", dials.Load())
+	}
+	if failure == nil || failure.Stage != "cms" || failure.Code != http.StatusBadRequest || !strings.Contains(failure.Message, "(#288)") {
+		t.Fatalf("the refused path must fail the stage as a #288 refusal (400); got %+v", failure)
 	}
 }
 
