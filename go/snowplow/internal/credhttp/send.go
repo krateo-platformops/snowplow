@@ -296,7 +296,14 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 // v1.74.0 → v1.75.0 (plumbing#173, the release's one commit) re-audited by
 // `git diff --stat` of the two tags: under http/ it changes request/request.go
 // and response/status.go; http/util/ (retry.go included) is byte-identical.
-const retryPolicyTranscribedFrom = "v1.75.0"
+//
+// v1.75.0 → v1.84.0 (snowplow#1481) re-audited by `git diff --stat` of the two
+// tags: under http/ it changes request/request.go, request/transport.go and
+// response/status.go; http/util/ (retry.go included) is byte-identical.
+//
+// v1.84.0 → v1.85.0 (snowplow#1481): `git diff --stat` changes only dialguard/
+// and the Makefile; http/ is byte-identical.
+const retryPolicyTranscribedFrom = "v1.85.0"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
 // v1.28.1 http/util/retry.go backoff(0, base, max)): base capped at max,
@@ -381,9 +388,18 @@ func (o *attemptObserver) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	tr := &attemptTrace{}
 	start := time.Now()
-	resp, err := next.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), tr.hooks())))
+	// tr.shared: an attempt answered by a request already on the wire (#1320)
+	// is classified through it, never measured (shared_attempt.go).
+	resp, err := next.RoundTrip(req.WithContext(httptrace.WithClientTrace(withSharedAttemptSink(req.Context(), tr.shared), tr.hooks())))
 	o.prevMS = time.Since(start).Milliseconds()
 	o.prevCause = tr.cause(resp, err)
+	// #1476 — the status line this attempt got, or none: the dial's answer
+	// keeps the last one (answer.go).
+	if resp != nil {
+		AnswerFrom(req.Context()).attempted(resp.StatusCode)
+	} else {
+		AnswerFrom(req.Context()).attempted(0)
+	}
 	// #1131 — RetryClient has no way to be told an error is final, and it reads
 	// MaxRetries after each attempt, sequentially, so this ends its loop with
 	// this error. TestIssue1131_RefusalIsSentOnce pins that.

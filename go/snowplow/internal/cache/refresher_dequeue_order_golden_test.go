@@ -10,8 +10,8 @@ package cache
 //     cluster_list keys. The re-resolve order is recorded by tier: it pins the
 //     tier priority and every turn rule, a cluster_list dequeue's included.
 //   - FOUR WORKERS (production's default): every re-resolve is held at a gate,
-//     and at each point where all four workers are busy the arm records how
-//     many run viewed work and how many normal. It pins the viewed cap and how
+//     and once each phase settles the arm records how many workers run viewed
+//     work and how many normal. It pins the viewed cap, the unviewed cap and how
 //     the workers split between the tiers, which one worker cannot show.
 
 import (
@@ -23,20 +23,27 @@ import (
 	"time"
 )
 
-// The one-worker goldens, main's sequences (RUN on a9b02fb9): H the held key, V a
-// key open on a page, U an unviewed key, C a cluster_list key. Two interleavings:
-// without cluster_list keys the turn between viewed and normal work shows on its
-// own; with them, a cluster_list dequeue taking its turn shows as well (a
-// cluster_list turn also clears the viewed one, so it hides a normal turn that
-// stopped clearing it, and the first interleaving is what shows that).
+// The one-worker goldens: H the held key, V a key open on a page, U an unviewed
+// key, C a cluster_list key. Two interleavings: without cluster_list keys the
+// turn between viewed and normal work shows on its own; with them, a cluster_list
+// dequeue taking its turn shows as well (a cluster_list turn also clears the
+// viewed one, so it hides a normal turn that stopped clearing it, and the first
+// interleaving is what shows that).
+//
+// #1085 changes ONE of these, on purpose (#1069: the wake key is not a turn).
+// main (924d4aee) reads HVUVUVVUUUUUU: an idle worker's wake key cleared the
+// viewed turn, so two viewed keys ran back to back. Here the wake key leaves the
+// turn as it was, so viewed and normal alternate strictly while both have work.
 const (
-	dequeueOrderGolden        = "HVUVUVVUUUUUU"
-	dequeueOrderClusterGolden = "HVCVCVCVUUUUUUUU"
+	dequeueOrderGolden        = "HVUVUVUVUUUUU"    // main: HVUVUVVUUUUUU
+	dequeueOrderClusterGolden = "HVCVCVCVUUUUUUUU" // main: the same
 )
 
-// dequeueSplitGolden is main's four-worker split (RUN on a9b02fb9): viewed and
-// normal workers busy at each point where every worker is.
-const dequeueSplitGolden = "3V0U|3V1U|3V1U|0V4U"
+// dequeueSplitGolden is the four-worker split: viewed and normal workers busy in
+// each phase once it settles. #1085 changes the last phase, on purpose: with only
+// normal work left, the reservation keeps one worker free for viewed work, so
+// normal work runs on three. main (924d4aee) reads 3V0U|3V1U|3V1U|0V4U.
+const dequeueSplitGolden = "3V0U|3V1U|3V1U|0V3U"
 
 func TestRefresherDequeueOrder_IsTheGoldenSequence(t *testing.T) {
 	// #1233: this test writes the store under a complete snapshot.
@@ -111,7 +118,7 @@ func oneWorkerGolden(t *testing.T, nCluster int, want string) {
 	}
 	t.Logf("dequeue order: %s", got.String())
 	if got.String() != want {
-		t.Fatalf("the refresher's one-worker dequeue order is %s, want main's %s: something that should only count changed what runs next",
+		t.Fatalf("the refresher's one-worker dequeue order is %s, want %s: what runs next changed",
 			got.String(), want)
 	}
 }
@@ -194,23 +201,30 @@ func TestRefresherDequeueOrder_FourWorkersSplitAsTheGolden(t *testing.T) {
 	StartRefresher(ctx)
 
 	var split []string
-	snap := func(phase int) {
+	// settled snapshots a phase once its workers stop changing: at least one is
+	// busy and the count holds for 300 ms. It never assumes how many workers a
+	// phase may hold, so a rule that caps a tier shows as a smaller count.
+	settled := func(phase int) {
+		t.Helper()
+		last, since := -1, time.Now()
+		waitFor(t, 15*time.Second, fmt.Sprintf("phase %d settled", phase), func() bool {
+			v, u := g.in(phase)
+			if n := v + u; n != last {
+				last, since = n, time.Now()
+				return false
+			}
+			return last > 0 && time.Since(since) >= 300*time.Millisecond
+		})
 		v, u := g.in(phase)
 		split = append(split, fmt.Sprintf("%dV%dU", v, u))
 	}
 	// Viewed work alone first: how many workers it may take.
 	terminalMark(viewed)
-	waitFor(t, 10*time.Second, "viewed work started", func() bool { v, _ := g.in(0); return v >= 3 })
-	time.Sleep(200 * time.Millisecond) // a worker the viewed cap admits would have taken a key by now
-	snap(0)
-	// Then normal work beside it, until every worker is busy, phase after phase.
+	settled(0)
+	// Then normal work beside it, phase after phase, each held until it settles.
 	terminalMark(unviewed)
 	for phase := 0; phase < 3; phase++ {
-		waitFor(t, 10*time.Second, fmt.Sprintf("all %d workers busy in phase %d", p, phase), func() bool {
-			v, u := g.in(phase)
-			return v+u == p
-		})
-		snap(phase)
+		settled(phase)
 		g.next(phase == 2)
 	}
 	waitFor(t, 20*time.Second, "every key re-resolved", func() bool {
@@ -221,7 +235,7 @@ func TestRefresherDequeueOrder_FourWorkersSplitAsTheGolden(t *testing.T) {
 	got := strings.Join(split, "|")
 	t.Logf("four-worker split: %s", got)
 	if got != dequeueSplitGolden {
-		t.Fatalf("the refresher's four-worker split is %s, want main's %s: something that should only count changed how the workers split",
+		t.Fatalf("the refresher's four-worker split is %s, want %s: how the workers split changed",
 			got, dequeueSplitGolden)
 	}
 }

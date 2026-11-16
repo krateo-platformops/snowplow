@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/env"
@@ -25,6 +26,7 @@ import (
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
@@ -161,6 +163,9 @@ type x1106Out struct {
 
 type x1106Opts struct {
 	verbose bool
+	// budget gives the resolve a customer's page budget, as the /call
+	// middleware does (#1115), so a read is sent the budgeted way.
+	budget bool
 }
 
 func x1106Resolve(t *testing.T, extras map[string]any, stages ...*templates.API) x1106Out {
@@ -178,6 +183,9 @@ func x1106ResolveWith(t *testing.T, o x1106Opts, extras map[string]any, stages .
 	ctx := xcontext.BuildContext(context.Background(),
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: x1106User, Groups: []string{"tenants"}}),
 		xcontext.WithLogger(lg))
+	if o.budget {
+		ctx = pagebudget.WithCustomer(ctx, time.Now())
+	}
 	ctx, oc := WithStageOutcomes(ctx)
 	dict, f := ResolveWithFailure(ctx, ResolveOptions{
 		RC: &rest.Config{Host: "http://127.0.0.1:1"}, AuthnNS: x1106NS, Items: stages, Extras: extras,

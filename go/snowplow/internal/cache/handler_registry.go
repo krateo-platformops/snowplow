@@ -139,6 +139,12 @@ type eventHandlerAttacher interface {
 //
 // Returns the count of extensions attached for observability assertions;
 // the watcher does not propagate failures upstream.
+// handlerRegistrationKeeper is an attacher that keeps each extension handler's
+// registration, by extension name (#1458).
+type handlerRegistrationKeeper interface {
+	keepRegistration(extension string, reg clientcache.ResourceEventHandlerRegistration)
+}
+
 func attachMatchingHandlerExtensions(rw *ResourceWatcher, gvr schema.GroupVersionResource, attacher eventHandlerAttacher) int {
 	handlerExtMu.RLock()
 	exts := make([]HandlerExtension, len(handlerExtensions))
@@ -154,7 +160,8 @@ func attachMatchingHandlerExtensions(rw *ResourceWatcher, gvr schema.GroupVersio
 		if handlers == nil {
 			continue
 		}
-		if _, err := attacher.AddEventHandler(handlers); err != nil {
+		reg, err := attacher.AddEventHandler(handlers)
+		if err != nil {
 			// Best-effort: log via the watcher's logging path is owned by
 			// the caller — the caller already has the resource type
 			// string and the gvr context. We deliberately do NOT log here
@@ -162,6 +169,11 @@ func attachMatchingHandlerExtensions(rw *ResourceWatcher, gvr schema.GroupVersio
 			// counter only ticks on success.
 			_ = err
 			continue
+		}
+		// #1458 — the registration says when THIS handler has been delivered
+		// the informer's initial list (HasSynced); the attacher keeps it.
+		if keeper, ok := attacher.(handlerRegistrationKeeper); ok {
+			keeper.keepRegistration(ext.Name, reg)
 		}
 		attached++
 		incHandlerExtensionsAttached(ext.Name)

@@ -51,13 +51,17 @@ func ResetEvaluateRBACCallCount() {
 
 // WinningSubjectClass classifies HOW the FIRST-permitting binding's WINNING
 // subject matched the request — the RBAC fact only the evaluator knows. It is
-// the #261 case-2 serve-time-detector substrate: a binding that permits a
-// request ONLY through an IMPLICIT group (system:authenticated, or a synthetic
-// system:serviceaccounts[:ns] group) rotates no per-subject RBAC sub-gen when
-// its grant changes (RBACSubGenForSubject sums only the presented ui.Groups,
-// not the implicit ones), so a grant/revoke through it can shift the serve-time
-// first-match BindingUID with NO sub-gen bump — the bounded self-stale-leak
-// carrier. Surfaced via EvaluateOptions.WinningSubjectClassOut (below) WITHOUT
+// the #261 case-2 serve-time-detector substrate: it marks a request permitted
+// ONLY through a group the requester holds without presenting it
+// (system:authenticated, or a system:serviceaccounts[:ns] group). When the
+// detector was written such a binding rotated no per-subject RBAC sub-gen,
+// because the key fold read only the presented groups. That is no longer so:
+// the fold reads the apiserver's implicit group since #424 and, since #1443,
+// the whole matched-subject set the evaluator matches with
+// (cache.SubjectMatcher), the ServiceAccount groups included — a grant, revoke
+// or rules edit through an implicit group now rotates the key. The class still
+// says HOW the request was permitted; it no longer marks a rotation gap.
+// Surfaced via EvaluateOptions.WinningSubjectClassOut (below) WITHOUT
 // widening EvaluateRBAC's public (bool,string,error) signature.
 //
 // CRITICAL (arch): it is the WINNING subject specifically — the FIRST subject
@@ -76,8 +80,8 @@ const (
 	// SubjectClassImplicitGroup — the winning subject matched via the implicit
 	// system:authenticated group, or via a synthetic system:serviceaccounts /
 	// system:serviceaccounts:<ns> group that exists only because the requester
-	// is a ServiceAccount (effectiveGroups' SA-synthetic additions). The
-	// #261 case-2 at-risk carrier.
+	// is a ServiceAccount (cache.SubjectMatcher's implicit entries). The
+	// #261 case-2 carrier; since #1443 the key fold reads these groups too.
 	SubjectClassImplicitGroup
 )
 
@@ -463,6 +467,9 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 	// 1) ClusterRoleBindings — apply cluster-wide. Cluster-wide
 	//    permits override namespace scope. Sort in stable order
 	//    (design §6) so the first-match BindingUID is deterministic.
+	// The requester's matcher is built ONCE per evaluation and tested against
+	// every candidate binding (#1443).
+	who := subjectMatcher(opts)
 	crbCandidates := selectCRBCandidates(snap, opts)
 	// The stable sort exists ONLY to make the returned matchedBindingUID
 	// deterministic; the verdict is order-independent (first match wins,
@@ -475,7 +482,7 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 		// walk when no subject matches. The index already narrowed
 		// the candidate set; this matcher is the post-lookup
 		// correctness gate.
-		if !anySubjectMatches(crb.Subjects, opts) {
+		if !anySubjectMatches(&who, crb.Subjects) {
 			continue
 		}
 		permits, err := roleRefPermits(ctx, snap, "", crb.RoleRef, opts, log)
@@ -497,7 +504,7 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 			sortRBsStable(rbCandidates)
 		}
 		for _, rb := range rbCandidates {
-			if !anySubjectMatches(rb.Subjects, opts) {
+			if !anySubjectMatches(&who, rb.Subjects) {
 				continue
 			}
 			permits, err := roleRefPermits(ctx, snap, opts.Namespace, rb.RoleRef, opts, log)
@@ -524,44 +531,23 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 // #261 case-2: the class is IMPLICIT-GROUP iff the winning subject is a Group
 // subject that matched via system:authenticated, or via a synthetic
 // system:serviceaccounts[:ns] group that exists only because the requester is a
-// ServiceAccount (effectiveGroups' SA additions). A User match, a match against
+// ServiceAccount (cache.MatchedSubject.Implicit). A User match, a match against
 // a PRESENTED group (opts.Groups), or a direct ServiceAccount subject is
 // REGULAR. The winning subject specifically decides the class — a binding whose
 // requester matched a regular subject is NOT implicit-group even if it also
 // lists an implicit subject (regular subjects are checked in subject order, so
 // the first matching subject wins).
 func firstMatchSubjectClass(subjects []rbacv1.Subject, opts EvaluateOptions) WinningSubjectClass {
-	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
-	implicit := implicitGroup(opts)
+	m := subjectMatcher(opts)
 	for _, s := range subjects {
-		switch s.Kind {
-		case rbacv1.UserKind:
-			if s.Name == opts.Username {
-				return SubjectClassRegular
-			}
-		case rbacv1.GroupKind:
-			// A PRESENTED group (opts.Groups) match is REGULAR — checked first
-			// so an author-presented group name that happens to collide with a
-			// synthetic name is classed as regular.
-			for _, g := range opts.Groups {
-				if s.Name == g {
-					return SubjectClassRegular
-				}
-			}
-			// A synthetic system:serviceaccounts[:ns] group match — present only
-			// because the requester is a ServiceAccount — is IMPLICIT.
-			if isSA && (s.Name == allServiceAccountsGroup || s.Name == serviceAccountsNamespacePfx+saNS) {
+		// Match reports the FIRST entry of the matched-subject set equal to s,
+		// and presented entries come first, so a presented group whose name
+		// collides with an implicit one is classed as regular.
+		if matched, implicit := m.Match(s); matched {
+			if implicit {
 				return SubjectClassImplicitGroup
 			}
-			// The apiserver's implicit group (implicitGroup — mirrors
-			// anySubjectMatches' branch) is an IMPLICIT match.
-			if implicit != "" && s.Name == implicit {
-				return SubjectClassImplicitGroup
-			}
-		case rbacv1.ServiceAccountKind:
-			if isSA && s.Namespace == saNS && s.Name == saName {
-				return SubjectClassRegular
-			}
+			return SubjectClassRegular
 		}
 	}
 	return SubjectClassRegular
@@ -606,15 +592,17 @@ func sortRBsStable(rbs []*rbacv1.RoleBinding) {
 // Routing — mirrors the index population in cache.rebuildSubjectIndexes
 // and the architect's §3 case-walk one-to-one:
 //
+// One landing per entry of the requester's matched-subject set
+// (cache.SubjectMatcher.Visit, #1443 — the enumeration anySubjectMatches
+// itself matches with, so the index and the matcher agree by construction),
+// in its order:
+//
 //  1. CRBsByUser[opts.Username]                          (User subjects)
-//  2. CRBsByGroup[g] for every g in effectiveGroups(opts) (Group subjects;
-//     effectiveGroups adds the synthetic system:serviceaccounts groups
-//     for SA identities, evaluate.go:451-462 — REUSED here so the index
-//     and the matcher agree on group expansion)
-//  3. CRBsByGroup[implicitGroup(opts)]                   (the apiserver's
-//     implicit group — system:authenticated for an authenticated request;
-//     none for an empty username or one presenting system:unauthenticated,
-//     #1334. Same predicate as anySubjectMatches' implicit branch.)
+//  2. CRBsByGroup[g] for every presented group, then for an SA identity
+//     the two system:serviceaccounts groups              (Group subjects)
+//  3. CRBsByGroup[the apiserver's implicit group]        (system:authenticated
+//     for an authenticated request; none for an empty username or one
+//     presenting system:unauthenticated, #1334)
 //  4. CRBsByServiceAccount["<ns>/<name>"]                (SA subjects;
 //     only when opts.Username is a canonical SA)
 //  5. CRBsCatchAll                                        (unrecognised
@@ -635,12 +623,6 @@ func selectCRBCandidates(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbac
 		return nil
 	}
 
-	// effectiveGroups handles the SA-synthetic-groups expansion. We
-	// derive isSA + saNS here so both selectCRBCandidates and
-	// effectiveGroups agree on the SA identity.
-	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
-	groups := effectiveGroups(opts, isSA, saNS)
-
 	// Pointer-keyed dedup. A binding appearing under multiple index
 	// landings is added once.
 	seen := make(map[*rbacv1.ClusterRoleBinding]struct{})
@@ -655,22 +637,20 @@ func selectCRBCandidates(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbac
 		}
 	}
 
-	if opts.Username != "" {
-		add(snap.CRBsByUser[opts.Username])
-	}
-	for _, g := range groups {
-		add(snap.CRBsByGroup[g])
-	}
-	// The apiserver's implicit group (implicitGroup: system:authenticated
-	// for an authenticated request, none for an empty username or one
-	// presenting system:unauthenticated, #1334) — the SAME predicate
-	// anySubjectMatches uses, so the index landing and the matcher agree.
-	if ig := implicitGroup(opts); ig != "" {
-		add(snap.CRBsByGroup[ig])
-	}
-	if isSA {
-		add(snap.CRBsByServiceAccount[saNS+"/"+saName])
-	}
+	// One index landing per matched subject (#1443): the routes are the
+	// matcher's own enumeration, so the index and anySubjectMatches cannot
+	// disagree on who the requester is.
+	subjectMatcher(opts).Visit(func(ms cache.MatchedSubject) bool {
+		switch ms.Kind {
+		case rbacv1.UserKind:
+			add(snap.CRBsByUser[ms.Name])
+		case rbacv1.GroupKind:
+			add(snap.CRBsByGroup[ms.Name])
+		case rbacv1.ServiceAccountKind:
+			add(snap.CRBsByServiceAccount[ms.Namespace+"/"+ms.Name])
+		}
+		return true
+	})
 	// CRBsCatchAll — unrecognised Kind safety net. Always included;
 	// post-lookup anySubjectMatches rejects unrecognised kinds via its
 	// default switch arm (no case → no match).
@@ -681,9 +661,10 @@ func selectCRBCandidates(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbac
 
 // routeRBSubjects is the shared subject-routing body extracted from
 // selectRBCandidates (v7 Step 2A — design §2.1; PM condition 6, the
-// evaluate.go:512-543 span: parseServiceAccountUsername + effectiveGroups +
-// the seen/add pointer-dedup + the User/Group/system:authenticated-gated/SA/
-// catch-all routing). It routes an identity onto a set of ALREADY
+// evaluate.go:512-543 span: the seen/add pointer-dedup + the
+// User/Group/system:authenticated-gated/SA/catch-all routing; since #1443 the
+// routes are the matched-subject set's own enumeration,
+// cache.SubjectMatcher.Visit). It routes an identity onto a set of ALREADY
 // namespace-scoped RoleBinding subject-index maps and returns the ORDERED,
 // pointer-deduped candidate slice.
 //
@@ -709,9 +690,6 @@ func routeRBSubjects(
 	byUser, byGroup, byServiceAccount map[string][]*rbacv1.RoleBinding,
 	catchAll []*rbacv1.RoleBinding,
 ) []*rbacv1.RoleBinding {
-	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
-	groups := effectiveGroups(opts, isSA, saNS)
-
 	seen := make(map[*rbacv1.RoleBinding]struct{})
 	var out []*rbacv1.RoleBinding
 	add := func(rbs []*rbacv1.RoleBinding) {
@@ -724,20 +702,18 @@ func routeRBSubjects(
 		}
 	}
 
-	if opts.Username != "" {
-		add(byUser[opts.Username])
-	}
-	for _, g := range groups {
-		add(byGroup[g])
-	}
-	// The apiserver's implicit group — the same implicitGroup predicate
-	// anySubjectMatches uses (#1334).
-	if ig := implicitGroup(opts); ig != "" {
-		add(byGroup[ig])
-	}
-	if isSA {
-		add(byServiceAccount[saNS+"/"+saName])
-	}
+	// One index landing per matched subject (#1443), as in selectCRBCandidates.
+	subjectMatcher(opts).Visit(func(ms cache.MatchedSubject) bool {
+		switch ms.Kind {
+		case rbacv1.UserKind:
+			add(byUser[ms.Name])
+		case rbacv1.GroupKind:
+			add(byGroup[ms.Name])
+		case rbacv1.ServiceAccountKind:
+			add(byServiceAccount[ms.Namespace+"/"+ms.Name])
+		}
+		return true
+	})
 	add(catchAll)
 
 	return out
@@ -1014,126 +990,43 @@ func stringSliceMatches(allowed []string, want string) bool {
 	return false
 }
 
-// anySubjectMatches returns true iff opts.Username, any of opts.Groups
-// (as Kind="Group") or the system-authenticated group appears in subjects.
-// ServiceAccount subjects are matched when opts.Username has the
-// canonical "system:serviceaccount:<ns>:<name>" form.
+// anySubjectMatches reports whether the requester matches one of a binding's
+// subjects: whether one of them is in the requester's matched-subject set
+// (cache.SubjectMatcher, #1443). That set is the single statement of who a
+// requester is to RBAC — its user name (a ServiceAccount's username included),
+// its presented groups, the apiserver's implicit group (#1334), and for a
+// ServiceAccount the two groups Kubernetes places it in (system:serviceaccounts,
+// system:serviceaccounts:<ns>; 0.30.109 G3/G6) and its ServiceAccount subject.
+// The identity class folds the sub-generation of exactly the same set
+// (cache.RBACSubGenForSubject), so a binding that can move a verdict here
+// always rotates the requester's key.
 //
-// 0.30.109 (G3/G6) — ServiceAccount synthetic groups. Kubernetes
-// implicitly places every ServiceAccount in two synthetic groups:
-//   - "system:serviceaccounts"            (all ServiceAccounts)
-//   - "system:serviceaccounts:<ns>"       (all SAs in the SA's namespace)
-//
-// A binding granting a Group subject of either name must therefore
-// match a request whose Username is a canonical ServiceAccount in the
-// matching namespace. effectiveGroups (below) computes the augmented
-// group set; anySubjectMatches consults it for every Group subject.
-// This mirrors k8s.io/apiserver's serviceaccount.UserInfo.
-func anySubjectMatches(subjects []rbacv1.Subject, opts EvaluateOptions) bool {
-	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
-	groups := effectiveGroups(opts, isSA, saNS)
-	implicit := implicitGroup(opts)
-
-	for _, s := range subjects {
-		switch s.Kind {
-		case rbacv1.UserKind:
-			if s.Name == opts.Username {
-				return true
-			}
-		case rbacv1.GroupKind:
-			for _, g := range groups {
-				if s.Name == g {
-					return true
-				}
-			}
-			// The apiserver's implicit group (system:authenticated
-			// for an authenticated request, none for one presenting
-			// system:unauthenticated, #1334). Username=="" is "no
-			// requester": no implicit group.
-			if implicit != "" && s.Name == implicit {
-				return true
-			}
-		case rbacv1.ServiceAccountKind:
-			if isSA && s.Namespace == saNS && s.Name == saName {
-				return true
-			}
-		}
-	}
-	return false
+// who is the requester's matcher (subjectMatcher), built once by the caller for
+// all the bindings it tests.
+func anySubjectMatches(who *cache.SubjectMatcher, subjects []rbacv1.Subject) bool {
+	return who.MatchAny(subjects)
 }
 
-// well-known ServiceAccount synthetic group names (0.30.109, G3/G6).
-// Mirrors k8s.io/apiserver/pkg/authentication/serviceaccount.
-const (
-	allServiceAccountsGroup     = "system:serviceaccounts"
-	serviceAccountsNamespacePfx = "system:serviceaccounts:"
-)
-
-// implicitGroup is the group the kube-apiserver adds to opts' requester
-// (cache.ImplicitGroup: system:authenticated unless the user is
-// system:anonymous or the groups already name system:authenticated or
-// system:unauthenticated; system:unauthenticated for system:anonymous), or ""
-// for none. Username=="" is "no requester" and gets none — the prewarm group
-// representative carries system:authenticated as a presented group instead
-// (WithAuthenticatedGroup). The ONE place the evaluator decides that a
-// requester is authenticated (#1334): anySubjectMatches, firstMatchSubjectClass
-// and both candidate selectors read it, so the index route and the matcher
-// cannot disagree.
-func implicitGroup(opts EvaluateOptions) string {
-	if opts.Username == "" {
-		return ""
-	}
-	return cache.ImplicitGroup(opts.Username, opts.Groups)
-}
-
-// effectiveGroups returns the group set used for Group-subject matching.
-// It is opts.Groups plus, when the request identity is a canonical
-// ServiceAccount, the two synthetic ServiceAccount groups Kubernetes
-// adds implicitly:
-//
-//	system:serviceaccounts
-//	system:serviceaccounts:<the-SA's-namespace>
-//
-// For a non-ServiceAccount identity the synthetic groups are not added
-// and the function returns opts.Groups unchanged (no allocation when
-// there is nothing to add).
-func effectiveGroups(opts EvaluateOptions, isSA bool, saNS string) []string {
-	if !isSA {
-		return opts.Groups
-	}
-	groups := make([]string, 0, len(opts.Groups)+2)
-	groups = append(groups, opts.Groups...)
-	groups = append(groups,
-		allServiceAccountsGroup,
-		serviceAccountsNamespacePfx+saNS,
-	)
-	return groups
-}
-
-// parseServiceAccountUsername decodes the
-// "system:serviceaccount:<ns>:<name>" form. Returns (ns, name, true) on
-// success; ("", "", false) for non-ServiceAccount usernames.
-func parseServiceAccountUsername(u string) (string, string, bool) {
-	const prefix = "system:serviceaccount:"
-	if !strings.HasPrefix(u, prefix) {
-		return "", "", false
-	}
-	rest := u[len(prefix):]
-	parts := strings.SplitN(rest, ":", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
+// subjectMatcher is opts' requester as the shared matcher. The ONE place the
+// evaluator decides who the requester is: anySubjectMatches,
+// firstMatchSubjectClass and both candidate selectors read it, so the index
+// route and the matcher cannot disagree (#1334, #1443). Username=="" is "no
+// requester" and gets no implicit group — the prewarm group representative
+// carries system:authenticated as a presented group instead
+// (WithAuthenticatedGroup).
+func subjectMatcher(opts EvaluateOptions) cache.SubjectMatcher {
+	return cache.NewSubjectMatcher(opts.Username, opts.Groups)
 }
 
 // IsServiceAccountUsername reports whether u is a canonical Kubernetes
 // ServiceAccount username of the form "system:serviceaccount:<ns>:<name>".
-// It is the boolean projection of parseServiceAccountUsername — the single
-// source of truth for the SA-identity prefix test — so callers outside this
-// package (e.g. the internal-REST-config dispatcher's serve-un-narrowed
-// predicate) never hand-roll the "system:serviceaccount:" prefix check.
+// It is the boolean projection of cache.ParseServiceAccountUsername — the
+// single parser of that form, which the shared matcher also reads — so callers
+// outside this package (e.g. the internal-REST-config dispatcher's
+// serve-un-narrowed predicate) never hand-roll the "system:serviceaccount:"
+// prefix check.
 func IsServiceAccountUsername(u string) bool {
-	_, _, ok := parseServiceAccountUsername(u)
+	_, _, ok := cache.ParseServiceAccountUsername(u)
 	return ok
 }
 

@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"sync/atomic"
 
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
@@ -75,6 +76,19 @@ const (
 	// alone. It keeps the requeue budget (a CRD re-registration clears inside
 	// it) and at the drop point the cell stays resident and known-stale.
 	RefreshErrTypeNotInstalled = "type_not_installed"
+	// RefreshErrRedirectRefused (#1481): snowplow refused to follow a redirect
+	// the stage's upstream answered (#729), reported as a 502 with snowplow's
+	// own reason RedirectRefused. Deterministic, yet it keeps the requeue
+	// budget as before (IsNonRetryableRefreshError is unchanged).
+	RefreshErrRedirectRefused = "redirect_refused"
+	// RefreshErrBadGateway (#1481): any other 502. A gateway in front of the
+	// upstream failed. Read from the code: a 502 carries no Kubernetes reason
+	// (credhttp/reason.go), and InternalError, which client-go and plumbing
+	// give it, is a 500's reason.
+	RefreshErrBadGateway = "bad_gateway"
+	// RefreshErrServerError (#1481): a 5xx other than 500, 502, 503 and 504
+	// (501, 505, 507, 508, 599, ...), read from the code for the same reason.
+	RefreshErrServerError = "server_error"
 )
 
 // refreshClasses is the closed class set, in counter-index order.
@@ -82,6 +96,7 @@ var refreshClasses = [...]string{
 	RefreshErrForbidden, RefreshErrUnauthorized, RefreshErrNotFound,
 	RefreshErrTimeout, RefreshErrUnavailable, RefreshErrSchemaInvalid,
 	RefreshErrDiscovery, RefreshErrJQ, RefreshErrDestinationRefused, RefreshErrTypeNotInstalled,
+	RefreshErrRedirectRefused, RefreshErrBadGateway, RefreshErrServerError,
 	RefreshErrUnclassified,
 }
 
@@ -136,6 +151,15 @@ func ClassifyRefreshError(err error) (class, stage string) {
 		return RefreshErrDestinationRefused, stage
 	case typeNotInstalled(err):
 		return RefreshErrTypeNotInstalled, stage
+	case redirectRefused(err):
+		return RefreshErrRedirectRefused, stage
+	// #1481 — the code decides before any reason does: a 502 or another 5xx
+	// without a reason of its own code is read as what its code says, never
+	// as the InternalError (a 500's reason) client-go or plumbing gives it.
+	case statusCodeOf(err) == http.StatusBadGateway:
+		return RefreshErrBadGateway, stage
+	case serverErrorCode(statusCodeOf(err)):
+		return RefreshErrServerError, stage
 	case apierrors.IsTimeout(err), apierrors.IsServerTimeout(err):
 		return RefreshErrTimeout, stage
 	case apierrors.IsServiceUnavailable(err), apierrors.IsInternalError(err),
@@ -186,6 +210,32 @@ func IsNonRetryableRefreshError(err error) bool {
 func typeNotInstalled(err error) bool {
 	var tni *statusdetails.TypeNotInstalledError
 	return errors.As(err, &tni)
+}
+
+// redirectRefused reports a stage failure whose reason is snowplow's refusal of
+// a redirect (#729). Only snowplow records that reason: trustedReason drops it
+// from an upstream answer (#714).
+func redirectRefused(err error) bool {
+	return apierrors.ReasonForError(err) == metav1.StatusReason(credhttp.RedirectRefusedReason)
+}
+
+// statusCodeOf is the HTTP code of the apiserver status err carries, 0 if none.
+func statusCodeOf(err error) int {
+	var s apierrors.APIStatus
+	if !errors.As(err, &s) {
+		return 0
+	}
+	return int(s.Status().Code)
+}
+
+// serverErrorCode reports a 5xx that is not 500, 502, 503 or 504: the codes
+// with no class of their own (#1481, RefreshErrServerError).
+func serverErrorCode(code int) bool {
+	switch code {
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return false
+	}
+	return code >= 500 && code <= 599
 }
 
 // destinationRefused reports a stage failure whose reason is the destination

@@ -49,6 +49,7 @@ import (
 
 	"github.com/krateo-platformops/plumbing/maps"
 	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -109,7 +110,7 @@ func embedInlineChildren(ctx context.Context, log *slog.Logger, res *unstructure
 		if cerr != nil {
 			log.WarnContext(ctx, "inline child resolve failed; serving parent without this rendered child",
 				slog.String("id", asString(m["id"])),
-				slog.String("path", pathStr),
+				redact.PathAttr("path", pathStr),
 				slog.Any("err", cerr),
 				slog.String("effect", "item keeps its path (old SPA follows it); no rendered body embedded"),
 			)
@@ -129,7 +130,7 @@ func embedInlineChildren(ctx context.Context, log *slog.Logger, res *unstructure
 		if uerr := json.Unmarshal(childBytes, &childMap); uerr != nil {
 			log.WarnContext(ctx, "inline child decode failed; serving parent without this rendered child",
 				slog.String("id", asString(m["id"])),
-				slog.String("path", pathStr),
+				redact.PathAttr("path", pathStr),
 				slog.Any("err", uerr),
 			)
 			continue

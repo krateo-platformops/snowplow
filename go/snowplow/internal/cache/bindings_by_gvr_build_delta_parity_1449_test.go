@@ -64,12 +64,12 @@ func i1449View() i1449IndexView {
 			v.ByGVR[gr] = i1449SortedIDs(set)
 		}
 	}
-	for rk, set := range idx.byRole {
+	for rk, set := range idx.membersByRole {
 		if len(set) > 0 {
 			v.ByRole[rk] = i1449SortedIDs(set)
 		}
 	}
-	for id, e := range idx.entries {
+	for id, e := range idx.members {
 		v.Entries[string(id)] = append([]subjectKey(nil), e.subjects...)
 	}
 	return v
@@ -152,7 +152,7 @@ func TestIssue1449_BuildAndDeltaHookProduceOneIndex(t *testing.T) {
 	// --- every binding arrives by the BUILD.
 	reset()
 	PublishRBACSnapshotForTest(world(true, roles))
-	if n := BuildBindingsByGVRIndex(navigated); n != len(crbs)+len(rbs) {
+	if n := SeedBindingsIndexFromSnapshotForTest(navigated); n != len(crbs)+len(rbs) {
 		t.Errorf("the build must record every binding in the snapshot: recorded %d of %d", n, len(crbs)+len(rbs))
 	}
 	built := i1449View()
@@ -161,7 +161,7 @@ func TestIssue1449_BuildAndDeltaHookProduceOneIndex(t *testing.T) {
 	// --- every binding arrives by the DELTA HOOK.
 	reset()
 	PublishRBACSnapshotForTest(world(false, roles))
-	BuildBindingsByGVRIndex(navigated)
+	SeedBindingsIndexFromSnapshotForTest(navigated)
 	PublishRBACSnapshotForTest(world(true, roles))
 	for _, b := range crbs {
 		onBindingAdd(b)

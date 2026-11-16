@@ -231,7 +231,7 @@ func l262Setup(t *testing.T, o l262Opts) *l262Env {
 	cache.RebuildRBACSnapshotForTest(rw)
 	prev := cache.Global()
 	cache.SetGlobal(rw)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1WidgetGVR, h1RAGVR, l262TargetGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1WidgetGVR, h1RAGVR, l262TargetGVR})
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
 	t.Cleanup(func() {
 		rw.Stop()

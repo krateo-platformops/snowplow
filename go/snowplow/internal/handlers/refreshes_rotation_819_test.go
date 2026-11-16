@@ -175,7 +175,7 @@ func TestRefreshes819_R1_EpochBumpAnnouncesOldKey_NewKeyKeepsFlowing(t *testing.
 	if f, got := awaitFrame(t, frames, 300*time.Millisecond); got {
 		t.Fatalf("R1: frame %q before any class moved", f.key)
 	}
-	cache.BuildBindingsByGVRIndex(nil)
+	cache.SeedBindingsIndexFromSnapshotForTest(nil)
 	if cache.RBACSubGenEpoch() != 1 {
 		t.Fatalf("precondition: epoch=%d after the first build, want 1", cache.RBACSubGenEpoch())
 	}
@@ -206,7 +206,7 @@ func TestRefreshes819_R1_EpochBumpAnnouncesOldKey_NewKeyKeepsFlowing(t *testing.
 func TestRefreshes819_R2_BindingForTheTabsGroupAnnouncesOldKey(t *testing.T) {
 	const name = "rot-bar"
 	dyn := setup819(t, name)
-	cache.BuildBindingsByGVRIndex(nil) // index built, epoch quiet: a plain binding change
+	cache.SeedBindingsIndexFromSnapshotForTest(nil) // index built, epoch quiet: a plain binding change
 	k := widgetsKey819(t, name)
 	base := refreshServer(t)
 	frames, cancel := openArmedStreamSub(t, base, widgetsSub819(name), []string{k})
@@ -224,7 +224,7 @@ func TestRefreshes819_R2_BindingForTheTabsGroupAnnouncesOldKey(t *testing.T) {
 func TestRefreshes819_N1_UnrelatedBindingSendsNoFrame(t *testing.T) {
 	const name = "rot-table"
 	dyn := setup819(t, name)
-	cache.BuildBindingsByGVRIndex(nil)
+	cache.SeedBindingsIndexFromSnapshotForTest(nil)
 	k := widgetsKey819(t, name)
 	base := refreshServer(t)
 	frames, cancel := openArmedStreamSub(t, base, widgetsSub819(name), []string{k})
@@ -259,7 +259,7 @@ func TestRefreshes819_N2_IdentityFreeKeyNeverRotates(t *testing.T) {
 		"rules":    []any{map[string]any{"apiGroups": []any{""}, "resources": []any{"configmaps"}, "verbs": []any{"get"}}},
 	})
 	awaitPublished(t, "the window ClusterRole", func(s *cache.RBACSnapshot) bool { return s.ClusterRolesByName["window-819-n2"] != nil })
-	cache.BuildBindingsByGVRIndex(nil)
+	cache.SeedBindingsIndexFromSnapshotForTest(nil)
 	if cache.RBACSubGenEpoch() != 1 {
 		t.Fatalf("precondition: epoch=%d, want 1", cache.RBACSubGenEpoch())
 	}
@@ -308,7 +308,7 @@ func rotateWholeTab(t *testing.T, n int, prefix string) (string, <-chan wireFram
 		"rules":    []any{map[string]any{"apiGroups": []any{""}, "resources": []any{"configmaps"}, "verbs": []any{"get"}}},
 	})
 	awaitPublished(t, "the window ClusterRole", func(s *cache.RBACSnapshot) bool { return s.ClusterRolesByName["window-"+prefix] != nil })
-	cache.BuildBindingsByGVRIndex(nil)
+	cache.SeedBindingsIndexFromSnapshotForTest(nil)
 	return base, frames, cancel, old, names
 }
 

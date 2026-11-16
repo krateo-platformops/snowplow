@@ -24,7 +24,16 @@ import (
 //     change that touched the requester (#1439). It moves on any grant, revoke
 //     or rules edit touching the subject — including a grant-then-revoke or a
 //     Role edit that leaves the binding set unchanged (#435) — and one value is
-//     one state, so equal classes at two different times are equal verdicts too.
+//     one state, so equal classes at two different times are equal verdicts
+//     too, PROVIDED every subject through which a binding matches the requester
+//     is one the sub-generation folds and the binding is in the role index.
+//     Both hold (cache.RBACSubGenForSubject states how). The first since
+//     #1443: the fold and the evaluator read the subjects from one shared
+//     matcher, cache.SubjectMatcher, and parity arms pin that they agree. The
+//     second since #1458: the role index is a fold of the RBAC informers'
+//     events, written by the event hooks alone from the first event on, each
+//     binding update in one critical section; nothing rebuilds it from the
+//     snapshot.
 //
 // Both read the published snapshot / counters; neither is ever logged.
 func IdentityClassOf(ui jwtutil.UserInfo) cache.IdentityClass {

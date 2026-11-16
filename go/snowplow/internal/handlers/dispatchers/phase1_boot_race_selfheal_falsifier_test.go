@@ -455,7 +455,7 @@ func TestBootRace_ReWalk_SeedsCorrectlyScopedCohort(t *testing.T) {
 
 	compGVR := schema.GroupVersionResource{Group: "composition.krateo.io", Resource: "compositions"}
 	panelGVR := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Resource: "panels"}
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{compGVR, panelGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{compGVR, panelGVR})
 
 	// The re-walk resolves under the SA-credentialed cohort identity. Derive
 	// the target GVR the compositions-panels RA LISTs — this is exactly what

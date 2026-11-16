@@ -13,6 +13,7 @@ import (
 	"github.com/krateo-platformops/snowplow/apis"
 	v1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
@@ -221,7 +222,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			}
 			// Depth-8 backstop: bounded 508-class error (never empty, never a
 			// panic), mirroring the in-process depth guard (nested_call.go:114).
-			response.Encode(wri, response.New(http.StatusLoopDetected,
+			response.Encode(wri, credhttp.FailureStatus(http.StatusLoopDetected,
 				fmt.Errorf("nested resolve depth limit exceeded (%d) for %s/%s/%s over HTTP self-loopback",
 					cache.NestedCallMaxDepth(), got.GVR.Resource,
 					got.Unstructured.GetNamespace(), got.Unstructured.GetName())))
@@ -531,7 +532,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		}
 		var statusErr *apierrors.StatusError
 		if errors.As(err, &statusErr) {
-			response.Encode(wri, response.New(int(statusErr.Status().Code), fmt.Errorf("%s", statusErr.Status().Message)))
+			// #1481 — the reason that agrees with the code
+			// (credhttp.ReasonForCode): a 502 answers none.
+			response.Encode(wri, credhttp.FailureStatus(int(statusErr.Status().Code), fmt.Errorf("%s", statusErr.Status().Message)))
 			return
 		}
 		response.InternalError(wri, err)

@@ -50,7 +50,7 @@ func TestIssue608_ClassifyRefreshError(t *testing.T) {
 		// #1131 — the reason is what decides: a refused destination is its own
 		// class and cannot clear, and a 502 with any other reason keeps the budget.
 		{"refused destination at apiref", wrap(ResolveStageApiRef, x1131Refused()), RefreshErrDestinationRefused, ResolveStageApiRef, true},
-		{"an ordinary 502 at apiref", wrap(ResolveStageApiRef, x1131Status("BadGateway")), RefreshErrUnclassified, ResolveStageApiRef, false},
+		{"an ordinary 502 at apiref", wrap(ResolveStageApiRef, x1131Status("BadGateway")), RefreshErrBadGateway, ResolveStageApiRef, false},
 		// #630 — the re-fetch of the cell's own CR is its own stage, and a 403
 		// on it is forbidden + non-retryable like every other 403.
 		{"403 at refetch", fmt.Errorf("resolveAndPopulateL1 widgets/x: %w",

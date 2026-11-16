@@ -91,6 +91,11 @@ type StageFailure struct {
 	// (objects.Get's error, from the nested call). No upstream answered: the
 	// failure is reported as that decision (Err), never rebuilt from its code.
 	notInstalled *statusdetails.TypeNotInstalledError
+	// perIdentity (#1476) is set when the stage's item failed with an expected
+	// per-identity deny (IsPerIdentityDenied: a re-gate deny, the caller's own
+	// Forbidden). Err marks its error as one, so the site that reports the
+	// failed resolve (a widget's apiRef) classifies it by type.
+	perIdentity bool
 }
 
 // Err is the failure as the error a caller reports: snowplow's own
@@ -102,6 +107,9 @@ func (f *StageFailure) Err(raNamespace, raName string) error {
 	}
 	if f.notInstalled != nil {
 		return fmt.Errorf("restaction %s/%s stage %q failed: %w", raNamespace, raName, f.Stage, f.notInstalled)
+	}
+	if f.perIdentity {
+		return MarkPerIdentityDenied(f.StatusError(raNamespace, raName))
 	}
 	return f.StatusError(raNamespace, raName)
 }
@@ -191,6 +199,8 @@ func newStageItemFailure(stage string, accumVal any, itemErr error) *stageItemFa
 	// #1429 — the in-process resolve's target is of a type that is not
 	// installed: the error chain carries objects.Get's own error.
 	errors.As(itemErr, &f.notInstalled)
+	// #1476 — an expected per-identity deny, by type.
+	f.perIdentity = IsPerIdentityDenied(itemErr)
 	// #1131 — the destination policy refused the dial: the error chain, never a
 	// recorded value, says so.
 	if st, ok := credhttp.DestinationStatus(itemErr); ok {
@@ -207,14 +217,23 @@ func newStageItemFailure(stage string, accumVal any, itemErr error) *stageItemFa
 	// never follows a redirect (#723/#724, internal/credhttp), so a stage that
 	// got one failed because the upstream misbehaved (or is an attack): report
 	// 502 Bad Gateway, never a bare 302 with no Location. The 3xx itself stays
-	// in the canonical message and under the stage's errorKey.
+	// in the canonical message and under the stage's errorKey. #1481: with
+	// snowplow's own reason, RedirectRefused, so the refresher classes the
+	// deterministic refusal as itself (redirect_refused).
 	if f.Code >= 300 && f.Code < 400 {
 		f.redirect = f.Code
 		f.Code = http.StatusBadGateway
-		f.Reason = ""
+		f.Reason = credhttp.RedirectRefusedReason
 	}
+	// #1481 — the reason never names another code than f.Code
+	// (credhttp/reason.go): an upstream's 502, or client-go's (its
+	// NewGenericServerResponse says InternalError for any 5xx body that is not
+	// a Status), carries no reason, so no classifier reads it as InternalError.
+	// A reason that agrees, or is not a Kubernetes one (DestinationRefused,
+	// RedirectRefused), is kept; a missing one is derived from the code.
+	f.Reason = credhttp.ReasonAgreeing(f.Reason, f.Code)
 	if f.Reason == "" {
-		f.Reason = string(response.New(f.Code, nil).Reason)
+		f.Reason = string(credhttp.ReasonForCode(f.Code))
 	}
 	return &stageItemFailure{err: itemErr, failure: f}
 }

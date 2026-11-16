@@ -21,10 +21,13 @@
 // to the change (design §fix-options (c) vs (a)).
 //
 // GROUP-GRANT CRUX (C-118-2): a binding can grant via a GROUP the requesting
-// user is in. RBACSubGenForSubject therefore folds over the user counter AND
-// every presented group's counter (and the SA counter when the identity is a
-// ServiceAccount) — so a group-scoped grant/revoke moves the user's effective
-// sub-gen. Folding only the user counter is BLIND to group grants (the RED arm).
+// user is in. RBACSubGenForSubject therefore folds over the counter of EVERY
+// subject the requester matches bindings through — its matched-subject set
+// (SubjectMatcher, match_subject.go; #1443), the set the evaluator itself
+// matches with — so a grant/revoke through any of them moves the requester's
+// effective sub-gen. Folding only the user counter is BLIND to group grants
+// (the RED arm); folding only the PRESENTED groups was blind to the groups a
+// ServiceAccount holds without presenting them (#1443).
 //
 // CONCURRENCY: a sync.Map[subjectKey]*atomic.Uint64. Bumps come from the RBAC
 // informer hooks (onBindingAdd/Update/Delete, single informer goroutine but the
@@ -237,58 +240,87 @@ func BumpSubjectSubGens(subjects []subjectKey) {
 
 // RBACSubGenForSubject returns the requesting identity's EFFECTIVE RBAC
 // sub-generation: the number of the last RBAC state change that touched the
-// identity — the LATEST state over its own subject counter(s) (the User
-// counter, every presented Group's counter, and, when the username is a
-// ServiceAccount, the SA counter) and the #682 boot-window epoch. Any relevant
-// subject's bump writes a state above all of them, so the folded key rotates on
-// a grant/revoke via the user OR any of its groups OR (for an SA) the SA
-// identity — the C-118-2 group-grant crux. Lock-free (a handful of atomic
+// identity — the LATEST state over the counters of its matched-subject set
+// (SubjectMatcher.Visit: the User counter, every presented Group's, the
+// apiserver's implicit group's and, when the username is a ServiceAccount, the
+// two ServiceAccount groups' and the SA counter) and the #682 boot-window
+// epoch. Any of those subjects' bump writes a state above all of them, so the
+// folded key rotates on a grant/revoke through every subject the evaluator can
+// match the requester by — the C-118-2 group-grant crux. Lock-free (a handful of atomic
 // Loads). O(len(groups)) map reads on the hot path; a user has O(10) groups
 // (design INFERRED bound, pinned by the herd arm). Returns 0 for an identity
 // none of whose subjects has ever been touched (correct: nothing changed → no
 // key rotation).
 //
-// #1439 — WHY THE LATEST STATE NAMES ONE RBAC STATE. Take two identities that
-// hold one binding set and read the same value v, at any two times. Neither has
-// had a subject bumped after state v. Every change that can move a verdict of
-// theirs without moving the binding set bumps one of their subjects: a rules
-// change, create or delete of a role one of their bindings references bumps
-// every subject of that binding, and a binding re-pointed at one of their
-// subjects, or to another role, bumps both sides. So for both, the roles behind
-// the binding set are exactly those of state v: the same verdicts. With the sum
-// this fold used before, equal values meant only an equal NUMBER of changes.
-// Both halves are needed: a sum of clock values collides (states 3 and 4 add up
-// to state 7), and the latest of per-subject counts collides (2 and 2).
+// #1439 — WHY THE LATEST STATE NAMES ONE RBAC STATE, AND UNDER WHICH CONDITION.
+// Take two identities that hold one binding set and read the same value v, at
+// any two times outside the publish window (a snapshot is live and the bumps
+// its changes owe are not written yet: at most one rebuild late, see
+// rbac_subgen_pending.go). Neither has had a FOLDED subject bumped after state
+// v. A rules change, create or delete of a role bumps every subject of every
+// binding the role index (bindingsByGVRIndex.byRole) lists under that role,
+// and a binding
+// re-pointed at other subjects, or to another role, bumps both sides. So the
+// roles behind the binding set are exactly those of state v for both — the
+// same verdicts — PROVIDED THAT, for every binding in the set:
+//
+//	(a) every subject through which the binding matches the identity is one
+//	    this function folds, and
+//	(b) the binding is in the role index under the role it references.
+//
+// Where (a) or (b) fails, a verdict can move with no bump of a folded subject,
+// and the identity keeps its old class. It can then be served a pre-change
+// cell: its own, or one that ANOTHER identity with the same binding set stored
+// under that class before the change. The guarantee above does not hold for it
+// in either direction.
+//
+// (a) holds since #1443, by the shared matcher and its parity arms: the fold
+// below reads the counters of SubjectMatcher.Visit, the one enumeration the
+// evaluator matches bindings with (see "THE FOLDED SUBJECTS ARE THE MATCHED
+// SUBJECTS" below), and TestIssue1443_FoldRotatedAndMatchAgree /
+// TestIssue1443_MatchIsMembershipOfTheVisitedSet pin that the two agree for
+// every requester shape. Before it, a
+// ServiceAccount matched through its two ServiceAccount groups, or through a
+// User-kind subject naming its username, was matched by a subject the fold did
+// not read.
+//
+// (b) holds since #1458, for every binding the RBAC informers have delivered:
+// the index's membership is a fold of their events, written by the binding
+// event hooks alone from the informers' first event on (the initial list
+// included), and a binding's update replaces its old side by its new one in ONE
+// critical section, so no role hook ever finds the binding absent. Nothing
+// rebuilds the index from the published snapshot (until #1458 every prewarm
+// pass did, and dropped a binding whose event was applied but whose snapshot
+// was not published yet). A binding whose role is absent is listed under the
+// role it names since #1449. Pinned by
+// TestIssue1458_GeneratedHistory_IndexIsTheFoldOfTheLiveObjects,
+// TestIssue1458_BindingUpdateIsOneCriticalSection and the source guard
+// TestIssue1458_NoProductionPathRefillsMembershipFromTheSnapshot.
+//
+// With the sum this fold used before, equal values meant only an equal NUMBER
+// of changes. Both halves are needed: a sum of clock values collides (states 3
+// and 4 add up to state 7), and the latest of per-subject counts collides (2
+// and 2).
 //
 // A read that races a flush sees, per counter, either the old value or the new
 // state; the fold is then the old value or the new state, never a third one.
 //
-// The subjectKey mapping mirrors subjectsFromRBAC exactly: a User is
-// {Kind:"User",Name:username}; a Group is {Kind:"Group",Name:g}; a
-// ServiceAccount username "system:serviceaccount:<ns>:<name>" folds the SA
-// subject {Kind:"ServiceAccount",Name:<name>,Namespace:<ns>} so a binding whose
-// subject is that SA (which onBinding* recorded as an SA subjectKey) bumps it.
+// #1443 — THE FOLDED SUBJECTS ARE THE MATCHED SUBJECTS. The counters read here
+// are those of SubjectMatcher.Visit, the one enumeration the evaluator matches
+// bindings with, in the (Kind, Name, Namespace) form a binding event bumps
+// (subjectsFromRBAC). A ServiceAccount username therefore folds its User
+// counter (a User-kind subject naming it), the two ServiceAccount groups'
+// counters (held whether presented or not) and its ServiceAccount counter.
+// groups is the caller's EFFECTIVE group set (WithAuthenticatedGroup), which is
+// what gives the empty-username seed representative system:authenticated.
 func RBACSubGenForSubject(username string, groups []string) uint64 {
 	// #682 — the process-wide boot-window epoch is one more state of the same
 	// clock (rbac_subgen_epoch.go).
 	gen := rbacSubGenEpochState.Load()
-	if username != "" {
-		if ns, name, ok := parseServiceAccountUsername(username); ok {
-			// The identity is a ServiceAccount: fold the SA subject counter (the
-			// shape onBinding* recorded), NOT a User counter — a binding granting
-			// this SA is indexed under the SA subjectKey.
-			gen = foldSubGen(gen, subGenValue(subjectKey{Kind: subjectKindServiceAccount, Name: name, Namespace: ns}))
-		} else {
-			// A human/user identity: fold the User subject counter.
-			gen = foldSubGen(gen, subGenValue(subjectKey{Kind: subjectKindUser, Name: username}))
-		}
-	}
-	for _, g := range groups {
-		if g == "" {
-			continue
-		}
-		gen = foldSubGen(gen, subGenValue(subjectKey{Kind: subjectKindGroup, Name: g}))
-	}
+	NewSubjectMatcher(username, groups).Visit(func(ms MatchedSubject) bool {
+		gen = foldSubGen(gen, subGenValue(ms.key()))
+		return true
+	})
 	return gen
 }
 
@@ -315,10 +347,12 @@ const (
 // as its username on the request (system:serviceaccount:<ns>:<name>).
 const serviceAccountUsernamePrefix = "system:serviceaccount:"
 
-// parseServiceAccountUsername splits a canonical SA username into (namespace,
-// name). Returns ok=false for a non-SA username (a human user), which the caller
-// then folds as a User subject. Mirrors f3SubjectFor / the k8s canonical form.
-func parseServiceAccountUsername(username string) (namespace, name string, ok bool) {
+// ParseServiceAccountUsername splits a canonical ServiceAccount username
+// (system:serviceaccount:<ns>:<name>) into (namespace, name); ok=false for any
+// other username. The ONE parser of that form: the shared matcher
+// (SubjectMatcher) and rbac.IsServiceAccountUsername both read it, so "is this
+// requester a ServiceAccount" has one answer (#1443).
+func ParseServiceAccountUsername(username string) (namespace, name string, ok bool) {
 	rest, found := strings.CutPrefix(username, serviceAccountUsernamePrefix)
 	if !found {
 		return "", "", false

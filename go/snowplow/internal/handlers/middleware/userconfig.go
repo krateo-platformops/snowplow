@@ -178,7 +178,19 @@ import (
 // adds response.Status.Details (omitted from a body when nil; no constructor
 // sets it, so every body this file writes through plumbing's response is the
 // same bytes) and makes http/request.Do drop an upstream's "details".
-const PinnedPlumbingVersion = "v1.75.0"
+//
+// v1.75.0 → v1.84.0 (snowplow#1481): re-audited by `git diff` of the two
+// tags. server/, jwtutil/, endpoints/, kubeconfig/ and context/ are
+// byte-identical, so this file's upstream line numbers stand. http/response's
+// New now gives 504 Timeout, 429 TooManyRequests and any other unlisted 5xx
+// InternalError, and a non-2xx code it does not list is a Failure (it was a
+// Success); this file writes only 500 and 503 through it (its 401s are
+// credential_status.go's own), whose bodies are the same bytes.
+//
+// v1.84.0 → v1.85.0 (snowplow#1481): `git diff --stat` of the two tags changes
+// only dialguard/ and the Makefile; every package this file transcribes is
+// byte-identical.
+const PinnedPlumbingVersion = "v1.85.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,

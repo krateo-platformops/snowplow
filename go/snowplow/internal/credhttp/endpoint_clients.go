@@ -124,6 +124,15 @@ func EndpointKeyOf(ep *endpoints.Endpoint, provenance ...string) EndpointKey {
 	return k
 }
 
+// ExactEndpointKeyOf is EndpointKeyOf plus whether the key identifies the
+// endpoint exactly (endpointKeyExact). Anything shared by such a key must be
+// shared by nobody when exact is false: a key that may not separate identities
+// shares nothing (#1320, the external read flight, fails closed the same way
+// Get does).
+func ExactEndpointKeyOf(ep *endpoints.Endpoint, provenance ...string) (key EndpointKey, exact bool) {
+	return EndpointKeyOf(ep, provenance...), endpointKeyExact
+}
+
 // endpointIdle is the idle-connection timeout of the transports these clients
 // are built on (see the file comment).
 func endpointIdle() time.Duration {

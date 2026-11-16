@@ -52,6 +52,7 @@ import (
 	httpcall "github.com/krateo-platformops/plumbing/http/request"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/listenvelope"
+	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -638,7 +639,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 				log.Debug("informer_dispatch.sync_wait.served",
 					slog.String("gvr", gvr.String()),
 					slog.String("ns", namespace),
-					slog.String("path", call.Path),
+					redact.PathAttr("path", call.Path),
 				)
 				dispatchInformerSyncWaitServed.Add(1)
 				servedAfterWait = true
@@ -650,7 +651,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 				slog.String("gvr", gvr.String()),
 				slog.String("ns", namespace),
 				slog.String("name", name),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 			)
 			dispatchInformerFallthrough.Add(1)
 			// Ship D — F-2 sub-reason: GVR not yet synced (Gate 6 —
@@ -706,7 +707,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 				log.Debug("informer_dispatch.fallthrough.list_not_servable",
 					slog.String("gvr", gvr.String()),
 					slog.String("ns", namespace),
-					slog.String("path", call.Path),
+					redact.PathAttr("path", call.Path),
 					slog.String("shape", "raw"),
 				)
 				dispatchInformerFallthrough.Add(1)
@@ -750,7 +751,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			log.Debug("informer_dispatch.fallthrough.list_not_servable",
 				slog.String("gvr", gvr.String()),
 				slog.String("ns", namespace),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 			)
 			dispatchInformerFallthrough.Add(1)
 			// Ship D — F-2 sub-reason: LIST informer unservable (the

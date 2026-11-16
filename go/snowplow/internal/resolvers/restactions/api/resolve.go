@@ -445,10 +445,10 @@ func (r *resolveRun) recordDefiniteNotFound(dictMu *sync.Mutex, itemErrs []error
 // expected per-identity deny logs (#711: WARN once per cell generation, DEBUG
 // after).
 func (r *resolveRun) recordServedListDeny(dictMu *sync.Mutex, itemErrs []error, id string, i int, call httpcall.RequestOptions, deny error, dispatch string) {
-	r.log.Log(r.ctx, expectedDenyLevel(r.ctx, call.Path), "api call response failure", slog.String("name", id),
+	r.log.Log(r.ctx, expectedDenyLevel(r.ctx, stageFailureTarget(id, call.Path)), "api call response failure", slog.String("name", id),
 		slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 		slog.String("restaction_name", r.opts.RESTActionName),
-		slog.String("path", call.Path),
+		redact.PathAttr("path", call.Path),
 		slog.String("dispatch", dispatch),
 		slog.String("error", deny.Error()))
 	r.recordRBACDeny(dictMu, itemErrs, id, i, call, deny)
@@ -562,7 +562,10 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	resolved, isSA, err := r.mapper.resolveOne(r.ctx, ref)
 	if err != nil {
 		r.auditEndpointUnresolved(apiCall, ref, err)
-		r.log.ErrorContext(r.ctx, "unable to resolve api endpoint reference",
+		// #1476 — an unchanged failure of the same ref in this cell's
+		// generation logs once at ERROR, then DEBUG (failure_log.go).
+		r.log.Log(r.ctx, FailureLogLevel(r.ctx, slog.LevelError, endpointRefTarget(id, ref), FailureClassOf(err)),
+			"unable to resolve api endpoint reference",
 			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
 		// #1115 — the endpointRef Secret read is a network exchange of this
 		// request: if the page budget ended it, the stage outcome reads
@@ -964,7 +967,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 
 	r.log.Debug("calling api", slog.String("name", id),
 		slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-		slog.String("path", call.Path),
+		redact.PathAttr("path", call.Path),
 	)
 
 	// RETIRED (2026-06-22 unified ship): the /call?resource=...&apiVersion=...
@@ -1015,7 +1018,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if rerr != nil {
 			r.log.ErrorContext(gctx, "in-process resolve failed",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch+"-resolve"),
 				slog.String("error", rerr.Error()))
 			var itemErr error
@@ -1033,7 +1036,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if ferr := feedBytes(bytesToFeed); ferr != nil {
 			r.log.ErrorContext(gctx, "response handler failed",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", ferr.Error()))
 			var itemErr error
@@ -1106,7 +1109,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				// error, never a fall-through that would rebuild the refused list.
 				r.log.ErrorContext(fallCtx, "apistage content fill not admitted",
 					slog.String("name", id),
-					slog.String("path", call.Path),
+					redact.PathAttr("path", call.Path),
 					slog.String("error", cerr.Error()))
 				var itemErr error
 				if !call.ContinueOnError {
@@ -1145,7 +1148,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 					if rerr != nil {
 						r.log.ErrorContext(fallCtx, "in-process resolve failed",
 							slog.String("name", id),
-							slog.String("path", call.Path),
+							redact.PathAttr("path", call.Path),
 							slog.String("dispatch", "apistage-content-resolve"),
 							slog.String("error", rerr.Error()))
 						var itemErr error
@@ -1169,7 +1172,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 						if ferr != nil {
 							r.log.ErrorContext(fallCtx, "apistage-content response handler failed",
 								slog.String("name", id),
-								slog.String("path", call.Path),
+								redact.PathAttr("path", call.Path),
 								slog.String("dispatch", dispatch),
 								slog.String("error", ferr.Error()))
 							var itemErr error
@@ -1184,7 +1187,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 					r.log.Debug("api successfully resolved",
 						slog.String("name", id),
 						slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-						slog.String("path", call.Path),
+						redact.PathAttr("path", call.Path),
 						slog.Int("depth", depth),
 						slog.String("dispatch", dispatch),
 					)
@@ -1226,7 +1229,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			r.log.Debug("api successfully resolved",
 				slog.String("name", id),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.Int("depth", depth),
 				slog.String("dispatch", dispatch),
 			)
@@ -1276,18 +1279,38 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if raw, served, ierr := dispatchViaInternalRESTConfig(gctx, call); served || ierr != nil {
 		dispatch := "internal-rest-config"
 		if ierr != nil {
-			// #711 — an expected per-identity re-gate deny (classified by its
-			// type) logs at WARN once per cell generation, DEBUG after; every
-			// other failure stays at ERROR. predial_total{denied} counts each.
-			failLevel := slog.LevelError
-			if isRegateDenied(ierr) {
-				failLevel = expectedDenyLevel(r.ctx, call.Path)
+			// #1481 — a client-go transport error quotes the request's URL,
+			// query included (a *url.Error), and it is logged and recorded
+			// below. redact.ErrorURL keeps the chain (a StatusError, a deny).
+			ierr = redact.ErrorURL(ierr)
+			// #1476 — classify BEFORE logging, so the line's level is the
+			// class's: an expected per-identity re-gate deny (#711) logs at
+			// WARN, an authorized definite NotFound (#1080 N2, which requires
+			// continueOnError: the stage declared the outcome) at DEBUG, any
+			// other failure at ERROR; a failure unchanged since the cell's
+			// previous round at DEBUG (failure_log.go). Every occurrence is
+			// still counted where it is recorded below (predial_total{denied},
+			// the stage-error and per-identity sinks).
+			regateDenied := isRegateDenied(ierr)
+			var definiteNF string
+			var isDefiniteNF bool
+			if !regateDenied {
+				definiteNF, isDefiniteNF = classifyAuthorizedNotFound(call, ierr)
+			}
+			var failLevel slog.Level
+			switch {
+			case regateDenied:
+				failLevel = expectedDenyLevel(r.ctx, stageFailureTarget(id, call.Path))
+			case isDefiniteNF:
+				failLevel = slog.LevelDebug
+			default:
+				failLevel = FailureLogLevel(r.ctx, slog.LevelError, stageFailureTarget(id, call.Path), FailureClassOf(ierr))
 			}
 			r.log.Log(r.ctx, failLevel, "api call response failure", slog.String("name", id),
 				slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 				slog.String("restaction_name", r.opts.RESTActionName),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", "internal-rest-config"),
 				// diagnostic for #271 — self-name the SAR-401 root cause. sa_dial
 				// reads the SAME provenance marker the dial consumes (gctx :=
@@ -1306,14 +1329,14 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// the real error behind a second x509 failure) — the
 			// success-log line + return below covers both the error
 			// and the fed-bytes case.
-			if isRegateDenied(ierr) {
+			if regateDenied {
 				// #681 F1 — a per-identity re-gate deny: the ONE identity-free
 				// canonical body (per_identity_forbidden.go).
 				r.recordRBACDeny(dictMu, itemErrs, id, i, call, ierr)
-			} else if nf, ok := classifyAuthorizedNotFound(call, ierr); ok {
+			} else if isDefiniteNF {
 				// #1080 N2 — an authorized GET of a named object that does not
 				// exist: a definite answer, with its canonical body.
-				r.recordDefiniteNotFound(dictMu, itemErrs, id, i, call, nf)
+				r.recordDefiniteNotFound(dictMu, itemErrs, id, i, call, definiteNF)
 			} else {
 				var itemErr error
 				if !call.ContinueOnError {
@@ -1337,7 +1360,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
 		)
@@ -1383,11 +1406,16 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if raw, served, derr := dispatchViaDiscovery(gctx, call); served || derr != nil {
 		dispatch := "discovery"
 		if derr != nil {
-			r.log.ErrorContext(gctx, "api call response failure", slog.String("name", id),
+			derr = redact.ErrorURL(derr) // #1481, as for the internal dispatch above
+			// #1476 — an unchanged repeat in the cell's generation logs at
+			// DEBUG (failure_log.go); it is recorded and counted below every
+			// time.
+			r.log.Log(gctx, FailureLogLevel(r.ctx, slog.LevelError, stageFailureTarget(id, call.Path), FailureClassOf(derr)),
+				"api call response failure", slog.String("name", id),
 				slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 				slog.String("restaction_name", r.opts.RESTActionName),
 				slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", "discovery"),
 				// diagnostic for #271 (C3 caveat). dispatchViaDiscovery uses the
 				// process-wide SA rest.Config SINGLETON, independent of the
@@ -1408,7 +1436,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		} else if ferr := feedBytes(raw); ferr != nil {
 			r.log.ErrorContext(gctx, "discovery response handler failed",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", ferr.Error()))
 			var itemErr error
@@ -1421,7 +1449,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
 		)
@@ -1465,7 +1493,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if rerr != nil {
 			r.log.ErrorContext(gctx, "in-process resolve failed (cache-off path)",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", rerr.Error()))
 			var itemErr error
@@ -1477,7 +1505,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		} else if ferr := feedBytes(substituted); ferr != nil {
 			r.log.ErrorContext(gctx, "in-process resolve response handler failed (cache-off path)",
 				slog.String("name", id),
-				slog.String("path", call.Path),
+				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
 				slog.String("error", ferr.Error()))
 			var itemErr error
@@ -1490,7 +1518,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.Int("depth", depth),
 			slog.String("dispatch", dispatch),
 		)
@@ -1540,15 +1568,15 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		branchEImp, branchE, branchEReason = branchEDecide(gctx, call)
 	}
 	if saEndpointDial && (rbac.MustRegateSADial(gctx) || branchE == branchEFailClosed) {
-		msg := fmt.Sprintf("branch-E SA-endpoint dial re-gated: caller not authorized to read %s (Part 2, #268 site 1)", call.Path)
+		msg := fmt.Sprintf("branch-E SA-endpoint dial re-gated: caller not authorized to read %s (Part 2, #268 site 1)", redact.Path(call.Path))
 		if branchE == branchEFailClosed {
-			msg = fmt.Sprintf("branch-E SA-endpoint dial refused under impersonation: %s (%s, #615)", branchEReason, call.Path)
+			msg = fmt.Sprintf("branch-E SA-endpoint dial refused under impersonation: %s (%s, #615)", branchEReason, redact.Path(call.Path))
 		}
 		// #574 — attribute the refusal to its driver (refresher trigger/trigger-less,
 		// cohort seed + prewarm scope, prewarm, live) and to the cell it was
 		// populating (key_hash), from stamps the ctx already carries.
 		r.log.WarnContext(gctx, "branch-E SA-endpoint dial re-gated and failed closed",
-			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)), slog.String("path", call.Path),
+			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)), redact.PathAttr("path", call.Path),
 			slog.String("sa_regate_origin", rbac.SARegateOrigin(gctx)),
 			slog.String("sa_regate_trigger", rbac.SARegateTrigger(gctx)),
 			slog.String("sa_regate_scope", rbac.SARegateScope(gctx)),
@@ -1560,7 +1588,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, msg, msg, itemErr)
 		r.log.Debug("api resolved (branch-E SA-endpoint dial re-gated, fail-closed)",
 			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			slog.String("dispatch", "branch-e-sa-regate-denied"))
 		return nil
 	}
@@ -1596,8 +1624,13 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if branchE == branchEImpersonate {
 		fctx = withEndpointImpersonation(fctx, branchEImp)
 	}
-	// Always a live fetch; the CONVERSION is memoised by the response's bytes
-	// (external_fetch_cache.go). The touch above still declines the L1 Put.
+	// Always a live fetch of this caller's own: its send policy, page budget,
+	// audit record, item error and stage outcome are its own. Only a request
+	// on the wire may be shared with an identical read waiting at the same
+	// time (#1320: same request, credentials and every header included; never
+	// after it completes), and the CONVERSION is memoised by the response's
+	// bytes (external_fetch_cache.go, external_fetch_flight.go). The touch
+	// above still declines the L1 Put.
 	// AUDIT-4 — observe what the authority answered (the real code, an accepted
 	// body that could not be used) for the audit record below.
 	fctx, answer := credhttp.WithAnswer(fctx)
@@ -1652,11 +1685,40 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	}
 
 	if res.Status == response.StatusFailure {
-		r.log.ErrorContext(fctx, "api call response failure", slog.String("name", id),
+		// #681 F2 — the apiserver's typed 403 Forbidden on the requester's OWN
+		// dial of an apiserver read: a per-identity forbidden. Its message names
+		// the requester, so it is replaced by the identity-free canonical body
+		// before it enters the result (S1), and counted on the per-identity
+		// forbidden sink (stage + external: this dial bumped the external sink).
+		// #1080 N1 — the apiserver's typed 404 NotFound on the requester's OWN
+		// dial of a named object, in a continueOnError stage, that the watcher
+		// confirms absent: a definite answer for this identity (the apiserver
+		// authorized the `get` first), recorded with the canonical NotFound body
+		// and counted on the same sink (external: this dial bumped the sink).
+		// #1476 — both are classified BEFORE the failure line, so its level is
+		// the class's: the caller's own Forbidden is an expected per-identity
+		// deny (WARN), the definite NotFound (which requires continueOnError:
+		// the stage declared the outcome) DEBUG, any other failure ERROR; a
+		// failure unchanged since the cell's previous round DEBUG
+		// (failure_log.go). Every occurrence is still recorded and counted
+		// below.
+		ownDenied, isOwnDenied := classifyOwnDialForbidden(gctx, apiCall, call, res)
+		ownNotFound, isOwnNotFound := classifyOwnDialNotFound(gctx, apiCall, call, res)
+		var failLevel slog.Level
+		switch {
+		case isOwnDenied:
+			failLevel = expectedDenyLevel(r.ctx, stageFailureTarget(id, call.Path))
+		case isOwnNotFound:
+			failLevel = slog.LevelDebug
+		default:
+			failLevel = FailureLogLevel(r.ctx, slog.LevelError, stageFailureTarget(id, call.Path),
+				externalFailureClass(res, fetchErr, answer.LastStatus()))
+		}
+		r.log.Log(fctx, failLevel, "api call response failure", slog.String("name", id),
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 			slog.String("restaction_name", r.opts.RESTActionName),
 			slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-			slog.String("path", call.Path),
+			redact.PathAttr("path", call.Path),
 			// diagnostic for #271 — external/owned-fetch site. sa_dial reads
 			// the SAME provenance marker the dial consumes (gctx := sc.gctx,
 			// marked at runStage when isSA): sa_dial=true names a stale
@@ -1684,27 +1746,22 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			accumVal = asMap
 		}
 		bumpMsg := res.Message
-		// #681 F2 — the apiserver's typed 403 Forbidden on the requester's OWN
-		// dial of an apiserver read: a per-identity forbidden. Its message names
-		// the requester, so it is replaced by the identity-free canonical body
-		// before it enters the result (S1), and counted on the per-identity
-		// forbidden sink (stage + external: this dial bumped the external sink).
-		ownDenied, isOwnDenied := classifyOwnDialForbidden(gctx, apiCall, call, res)
+		// F2 / N1 (classified above): the identity-free canonical bodies.
 		if isOwnDenied {
 			accumVal, bumpMsg = canonicalForbiddenBody(ownDenied), ownDenied
 		}
-		// #1080 N1 — the apiserver's typed 404 NotFound on the requester's OWN
-		// dial of a named object, in a continueOnError stage, that the watcher
-		// confirms absent: a definite answer for this identity (the apiserver
-		// authorized the `get` first), recorded with the canonical NotFound body
-		// and counted on the same sink (external: this dial bumped the sink).
-		ownNotFound, isOwnNotFound := classifyOwnDialNotFound(gctx, apiCall, call, res)
 		if isOwnNotFound {
 			accumVal, bumpMsg = canonicalNotFoundBody(ownNotFound), ownNotFound
 		}
 		var itemErr error
 		if !call.ContinueOnError {
 			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, bumpMsg)
+			// #1476 — the caller's own Forbidden stays an expected per-identity
+			// deny on its way to the resolve's StageFailure, so the site that
+			// reports the failed resolve (a widget's apiRef) logs it as one.
+			if isOwnDenied {
+				itemErr = &causedItemError{text: itemErr.Error(), cause: MarkPerIdentityDenied(errors.New(ownDenied))}
+			}
 			// #1115 — the page budget ended the fetch: the item error carries
 			// the *pagebudget.ExhaustedError (same text), so the resolve's
 			// StageFailure reports the budget, not an upstream answer.
@@ -1741,7 +1798,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	r.log.Debug("api successfully resolved",
 		slog.String("name", id),
 		slog.String("host", redact.URL(call.Endpoint.ServerURL)),
-		slog.String("path", call.Path),
+		redact.PathAttr("path", call.Path),
 		slog.Int("depth", depth),
 	)
 	return nil
@@ -2088,7 +2145,16 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		thirdPartyDial: !heldCred && !requesterBearer,
 	}
 
+	requestGone := false
 	for i := range tmp {
+		// #1320 review B1 — the request is gone (its client left, its scope
+		// was cut): no further item is dispatched. With a bounded fan-out the
+		// loop reaches item N only after earlier items finished, so without
+		// this a request that ended during item 1 still walked every item.
+		if r.ctx.Err() != nil {
+			requestGone = true
+			break
+		}
 		call := tmp[i]
 
 		// Edge type 3 dep recording — see 0.30.94 ship for full
@@ -2146,6 +2212,20 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	if err := g.Wait(); err != nil {
 		r.log.Debug("api stage short-circuited on hard error",
 			slog.String("name", id), slog.Any("err", err))
+		stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
+		recordStageTiming()
+		return true
+	}
+	if requestGone {
+		// The stage did not run every item: a truncating exit, like the
+		// hard-error one above, and a stage error for the Put gates, so the
+		// partial result of a request nobody waits for is never stored. Not a
+		// stage failure for the caller (ResolveWithFailure: a caller
+		// cancellation is not one).
+		r.taintNarrow() // #603 PR-2: an errored resolve never narrows its list edges
+		r.stageErrSink.Bump(id, "the request ended before every item was dispatched")
+		r.log.Debug("api stage stopped: the request ended before every item was dispatched",
+			slog.String("name", id), slog.Int("items", len(tmp)))
 		stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
 		recordStageTiming()
 		return true
@@ -2209,6 +2289,12 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	if len(opts.Items) == 0 {
 		return map[string]any{}, nil
 	}
+
+	// #1476 — this resolve is one failure-log round of its cell (or joins the
+	// round its caller opened for the same cell): a failure unchanged since the
+	// cell's previous round logs at DEBUG (failure_log.go).
+	ctx, endFailureRound := BeginFailureRound(ctx)
+	defer endFailureRound()
 
 	// #1116 (SECURITY) — the dict is seeded from extras below (newResolveRun),
 	// and the resolver writes its own keys into it. Extras that name one of
@@ -2536,7 +2622,7 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 			log.Info("cache.lazy_register.inner_call",
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
-				slog.String("path", path),
+				redact.PathAttr("path", path),
 				slog.Duration("ensure_elapsed", elapsed),
 				slog.String("hint", "resolver inner-call first touch — informer registered + dep-tracker handlers wired"),
 			)

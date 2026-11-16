@@ -1,16 +1,26 @@
-// implicit_group_detector_261_test.go — #261 case-2 serve-time detector
-// falsifier (implicit-group first-match missed-rotation carrier).
+// implicit_group_detector_261_test.go — #261 case-2 serve-time counter: L1
+// hits of a cell whose request was permitted only through an implicit group.
 //
-// #261 is a SERVE-TIME DETECTOR (observability only; the keying FIX is
-// v7-deferred). The bounded self-stale-leak class: a BindingUID identity key
-// can rotate with NO sub-gen bump. Case-2 carrier: the serve-time
-// first-permitting binding's WINNING subject matched only through an IMPLICIT
-// group (system:authenticated, or a synthetic system:serviceaccounts[:ns]
-// group). RBACSubGenForSubject sums only the requester's PRESENTED groups, so a
-// grant/revoke through such a binding rotates the serve-time first-match
-// BindingUID with NO sub-gen bump. The counter measures the AT-RISK SERVE
-// POPULATION (a structural proxy); off-zero => reassess, NOT a confirmed-leak
-// count.
+// WHAT IT WAS WRITTEN FOR. #261 was a serve-time DETECTOR (observability only)
+// for a class in which a grant or revoke could change what an identity may
+// read with NO sub-generation bump, so its key did not rotate. Case-2 carrier:
+// the serve-time first-permitting binding's WINNING subject matched only
+// through an IMPLICIT group (system:authenticated, or a synthetic
+// system:serviceaccounts[:ns] group). When the detector was written
+// RBACSubGenForSubject read only the requester's PRESENTED groups, so a change
+// through such a binding bumped nothing the requester's key folds, and the
+// counter measured the AT-RISK SERVE POPULATION (a structural proxy, never a
+// confirmed-leak count).
+//
+// WHAT HOLDS NOW. Since #424 (system:authenticated) and #1443 (the
+// ServiceAccount groups) the fold reads every subject the evaluator matches
+// with (cache.SubjectMatcher), so a change through such a binding bumps and
+// the key rotates: no cell counted here is at risk for that reason any more.
+// The counter still counts exactly what these arms pin — L1 hits of a cell
+// whose first-permitting binding's winning subject matched only through an
+// implicit group — and that says HOW the served request was permitted, not
+// that a rotation was missed. Its name (serve_missed_rotation_atrisk_…) and
+// the "at-risk" wording in the assertions below date from the detector.
 //
 // WHY THIS ARM DRIVES THE REAL BOUNDARY
 // (feedback_falsifier_must_drive_real_boundary_not_install_crossed_state):
@@ -161,7 +171,7 @@ func TestC2_ImplicitGroup_HitBumpsDetector(t *testing.T) {
 	// Build the index against the LIVE (full) snapshot — the c2-reader ClusterRole
 	// IS present, so the binding resolves normally: any bump here comes from the
 	// RBAC winning-subject fact.
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR})
 
 	reqCtx := h1ReqCtx(h1User) // alice, Groups=["devs"]
 	key, handle, inputs := dispatchCacheLookupKey(reqCtx, "restactions",
@@ -226,7 +236,7 @@ func TestC2_RegularSubject_ControlDoesNotBump(t *testing.T) {
 	h1BuildWatcher(t) // h1-bind CRB subject is User=alice — a REGULAR match.
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR})
 
 	reqCtx := h1ReqCtx(h1User)
 	key, handle, inputs := dispatchCacheLookupKey(reqCtx, "restactions",

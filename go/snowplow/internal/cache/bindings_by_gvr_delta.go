@@ -1,6 +1,16 @@
 // bindings_by_gvr_delta.go — Ship 1: the incremental delta hooks that
 // keep the BindingsByGVR index current on RBAC informer events.
 //
+// #1458 — THE BINDING HOOKS ARE THE ONLY WRITERS OF MEMBERSHIP (which binding
+// names which role, with which subjects), and they write it from the
+// informers' FIRST event on, the initial list included: there is no build that
+// refills it from the published snapshot. What waits for the index to be READY
+// (the initial lists delivered, markBindingsIndexReady) is only the
+// sub-generation BUMP and its counters: before ready no per-identity key can
+// have been minted from a complete snapshot, and the #682 note rotates every
+// key once at ready if an RBAC event the keys only see through the
+// sub-generation arrived in that window (rbac_subgen_epoch.go).
+//
 // These hooks ride the SAME RBAC informer events that drive
 // scheduleRBACRebuild (rbacSnapshotEventHandlers, rbac_snapshot.go:804).
 // They are O(navigatedGVRs) per event (Gate-2: ~5.8 µs/event,
@@ -52,9 +62,11 @@ import (
 // NEITHER the expected typed *rbacv1.* pointer NOR convertible via the
 // defensive convertUnstructured* fallback. A non-zero value means the
 // typed transform missed (the logged-WARN regression case, rbac_snapshot.go:383)
-// AND the conversion fallback also failed — the index dropped that event
-// and will DRIFT until the next boot rebuild. S1: surfaced via expvar
-// (bindings_by_gvr_metrics.go) so the drift is observable, not silent.
+// AND the conversion fallback also failed — the index dropped that event.
+// The RBAC snapshot leaves the same object out (its rebuild converts the same
+// way), so the index and the evaluator agree; the object enters both when an
+// event delivers it convertible. S1: surfaced via expvar
+// (bindings_by_gvr_metrics.go) so the drop is observable, not silent.
 var bindingsIndexDeltaSkippedNonTyped atomic.Uint64
 
 // BindingsIndexDeltaSkippedNonTyped returns the cumulative count of delta
@@ -63,26 +75,25 @@ func BindingsIndexDeltaSkippedNonTyped() uint64 {
 	return bindingsIndexDeltaSkippedNonTyped.Load()
 }
 
-// deltaActive gates whether the delta hooks do work. The hooks no-op
-// until the index has been built once (BuildBindingsByGVRIndex after
-// WaitAllInformersSynced) — before the build, the boot enrol covers the
-// initial population, so a pre-build event has nothing to delta. After the
-// build, every event is a delta. This also keeps the hooks inert under
+// isReady reports whether the index is ready (markBindingsIndexReady): the
+// RBAC handlers have been delivered their initial lists. It gates the
+// sub-generation bumps and the role hooks' bucket re-routing — never the
+// binding hooks' membership writes (#1458). Also false for good under
 // cache-off (the RBAC informers are not registered, so events never fire).
-func (idx *bindingsByGVRIndex) deltaActive() bool {
+func (idx *bindingsByGVRIndex) isReady() bool {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	return idx.built
+	return idx.ready
 }
 
-// notePreBuildIfNotBuilt takes the #682 pre-build note UNDER the index read
-// lock: the first build holds the write lock, so either the note lands before
-// the build reads it, or the build has already set built and the event takes
-// the normal delta path (#257 rotation).
+// notePreBuildIfNotBuilt takes the #682 note UNDER the index read lock:
+// markBindingsIndexReady holds the write lock, so either the note lands before
+// it reads it, or the index is already ready and the event takes the normal
+// path (its own sub-generation bump, #257).
 func (idx *bindingsByGVRIndex) notePreBuildIfNotBuilt() {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	if !idx.built {
+	if !idx.ready {
 		notePreBuildRBACEvent()
 	}
 }
@@ -131,31 +142,33 @@ func deltaDropNonTyped(kind string) {
 		slog.String("subsystem", "cache"),
 		slog.String("kind", kind),
 		slog.String("effect", "delta event object neither typed nor convertible — "+
-			"index drops this event and will drift until next boot rebuild; "+
+			"the index drops this event, as the RBAC snapshot leaves the object out, until an event delivers it convertible; "+
 			"see snowplow_bindings_by_gvr_delta_skipped_non_typed at /debug/vars"),
 	)
 }
 
-// onBindingAdd enrols a newly-created (Cluster)RoleBinding. isBinding has
-// already been decided by the caller via gvr, so a CRB event arrives here
-// for the CRB GVR and an RB event for the RB GVR — but the wire object may
-// be either kind under a future shared handler, so we try both
-// normalisers. Falls back to convertUnstructured* (S1) before dropping.
+// onBindingAdd records a (Cluster)RoleBinding delivered by its informer: one
+// created now, or one of the informer's initial list (#1458: membership is
+// written from the first event on, ready or not). isBinding has already been
+// decided by the caller via gvr, so a CRB event arrives here for the CRB GVR
+// and an RB event for the RB GVR — but the wire object may be either kind
+// under a future shared handler, so we try both normalisers. Falls back to
+// convertUnstructured* (S1) before dropping. The sub-generation bump is
+// recorded only once the index is ready.
 func onBindingAdd(obj interface{}) {
 	idx := bindingsByGVRSingleton()
-	if !idx.deltaActive() {
-		return
-	}
 	if o, ok := asCRB(obj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
-		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj)
-		recordPendingSubGenBumps(subj, bumpSrcBindingAdd) // #118 (c)-v2 GAP-2 / #260 source
+		if idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj) {
+			recordPendingSubGenBumps(subj, bumpSrcBindingAdd) // #118 (c)-v2 GAP-2 / #260 source
+		}
 		return
 	}
 	if o, ok := asRB(obj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
-		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj)
-		recordPendingSubGenBumps(subj, bumpSrcBindingAdd) // #118 (c)-v2 GAP-2 / #260 source
+		if idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj) {
+			recordPendingSubGenBumps(subj, bumpSrcBindingAdd) // #118 (c)-v2 GAP-2 / #260 source
+		}
 		return
 	}
 	deltaDropNonTyped("RoleBinding/ClusterRoleBinding(add)")
@@ -198,33 +211,46 @@ func onBindingAdd(obj interface{}) {
 //
 // onBindingAdd and onBindingDelete are deliberately NOT given this treatment: a
 // create and a delete are real RBAC changes and bump unconditionally.
+//
+// #1458 — the index delta runs on EVERY update, ready or not (membership is
+// written from the first event on); the bumps and both no-op counters wait for
+// ready, as they always did.
+//
+// ONE CRITICAL SECTION (#1458). The old side's removal and the new side's
+// record are applied under a single hold of the index lock
+// (applyBindingUpdate). They used to be two: in between, the binding was in
+// the index under neither side, and a rules edit of its role handled in that
+// gap (the role hooks run on another informer's goroutine) found no binding and
+// bumped no subject. Every update opened the gap, the unchanged re-deliveries a
+// relist sends for every binding included.
 func onBindingUpdate(oldObj, newObj interface{}) {
 	idx := bindingsByGVRSingleton()
-	if !idx.deltaActive() {
-		return
-	}
 	var oldSide, newSide bindingUpdateSide
+	var oldRec, newRec bindingRecord
 	if o, ok := asCRB(oldObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
-		idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef))
+		oldRec = bindingRecord{held: true, ref: o.RoleRef, id: crbBindingID(o)}
 		oldSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, uid: string(o.UID), roleRef: o.RoleRef, subjects: subj}
 	} else if o, ok := asRB(oldObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
-		idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef))
+		oldRec = bindingRecord{held: true, namespace: o.Namespace, ref: o.RoleRef, id: rbBindingID(o)}
 		oldSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, uid: string(o.UID), namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-old)")
 	}
 	if o, ok := asCRB(newObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
-		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj)
+		newRec = bindingRecord{held: true, ref: o.RoleRef, id: crbBindingID(o), subjects: subj}
 		newSide = bindingUpdateSide{kind: bindingKindCRB, rv: o.ResourceVersion, uid: string(o.UID), roleRef: o.RoleRef, subjects: subj}
 	} else if o, ok := asRB(newObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
-		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj)
+		newRec = bindingRecord{held: true, namespace: o.Namespace, ref: o.RoleRef, id: rbBindingID(o), subjects: subj}
 		newSide = bindingUpdateSide{kind: bindingKindRB, rv: o.ResourceVersion, uid: string(o.UID), namespace: o.Namespace, roleRef: o.RoleRef, subjects: subj}
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-new)")
+	}
+	if !idx.applyBindingUpdate(oldRec, newRec) {
+		return
 	}
 	if !bindingUpdateSemanticallyUnchanged(oldSide, newSide) {
 		recordPendingSubGenBumps(oldSide.subjects, bumpSrcBindingUpdate) // #118 (c)-v2 GAP-2 / #260 source — OLD subjects lost this grant
@@ -239,20 +265,19 @@ func onBindingUpdate(oldObj, newObj interface{}) {
 // depEventHandlers.DeleteFunc.
 func onBindingDelete(obj interface{}) {
 	idx := bindingsByGVRSingleton()
-	if !idx.deltaActive() {
-		return
-	}
 	if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
 		obj = tomb.Obj
 	}
 	if o, ok := asCRB(obj); ok {
-		idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef))
-		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects), bumpSrcBindingDelete) // #118 (c)-v2 GAP-2 / #260 source — REVOKE
+		if idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef)) {
+			recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects), bumpSrcBindingDelete) // #118 (c)-v2 GAP-2 / #260 source — REVOKE
+		}
 		return
 	}
 	if o, ok := asRB(obj); ok {
-		idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef))
-		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects), bumpSrcBindingDelete) // #118 (c)-v2 GAP-2 / #260 source
+		if idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef)) {
+			recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects), bumpSrcBindingDelete) // #118 (c)-v2 GAP-2 / #260 source
+		}
 		return
 	}
 	deltaDropNonTyped("RoleBinding/ClusterRoleBinding(delete)")
@@ -268,7 +293,7 @@ func onBindingDelete(obj interface{}) {
 // event / build will re-resolve to "no grant".
 func onRoleObjectChanged(source subGenBumpSource, obj interface{}) {
 	idx := bindingsByGVRSingleton()
-	if !idx.deltaActive() {
+	if !idx.isReady() {
 		return
 	}
 	if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
@@ -298,7 +323,7 @@ func onRoleObjectChanged(source subGenBumpSource, obj interface{}) {
 // canonicalizes all five rule dimensions order-insensitively.
 func onRoleUpdated(oldObj, newObj interface{}) {
 	idx := bindingsByGVRSingleton()
-	if !idx.deltaActive() {
+	if !idx.isReady() {
 		return
 	}
 	// #260/#257 role no-op attribution (relist same-RV / rules-unchanged).
@@ -330,7 +355,7 @@ func onRoleUpdated(oldObj, newObj interface{}) {
 // ~1:1 role:binding from per-composition RBAC).
 func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name string, rules []rbacv1.PolicyRule, skipBump bool) {
 	idx := bindingsByGVRSingleton()
-	if !idx.deltaActive() {
+	if !idx.isReady() {
 		return
 	}
 	var rk string
@@ -345,11 +370,11 @@ func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name strin
 
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	set := idx.byRole[rk]
+	set := idx.membersByRole[rk]
 	if len(set) == 0 {
 		return
 	}
-	// Snapshot the ids — re-enrol mutates idx.byRole[rk] in place.
+	// Snapshot the ids — re-enrol mutates idx.membersByRole[rk] in place.
 	ids := make([]bindingID, 0, len(set))
 	for id := range set {
 		ids = append(ids, id)
@@ -363,7 +388,7 @@ func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name strin
 	// dedups a subject bound via multiple referencing bindings.
 	changed := make(map[subjectKey]struct{})
 	for _, id := range ids {
-		entry, present := idx.entries[id]
+		entry, present := idx.members[id]
 		if !present {
 			continue
 		}
@@ -380,20 +405,7 @@ func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name strin
 		for _, b := range idx.byGVR {
 			delete(b, id)
 		}
-		if rulesGrantWildcard(rules) {
-			idx.wildcard[id] = struct{}{}
-			continue
-		}
-		for gr := range idx.navigated {
-			if rulesGrantGetList(rules, gr) {
-				b := idx.byGVR[gr]
-				if b == nil {
-					b = map[bindingID]struct{}{}
-					idx.byGVR[gr] = b
-				}
-				b[id] = struct{}{}
-			}
-		}
+		idx.bucketLocked(id, rules)
 	}
 	if len(changed) > 0 && !skipBump {
 		// #257: skipBump gates ONLY the bump — the re-bucketing above ran
@@ -409,18 +421,60 @@ func onRoleRulesChanged(source subGenBumpSource, roleKind, namespace, name strin
 	}
 }
 
-// applyBindingAdd records the binding against the published snapshot, under
-// the write lock, through the same function the build uses (#1449).
-func (idx *bindingsByGVRIndex) applyBindingAdd(namespace string, ref rbacv1.RoleRef, id bindingID, subjects []subjectKey) {
+// applyBindingAdd records the binding under the write lock, through
+// recordBindingLocked (#1449). Its buckets are resolved against the published
+// snapshot; its membership needs no snapshot. Reports whether the index is
+// ready, read under the same lock, so the caller knows whether to record the
+// sub-generation bump.
+func (idx *bindingsByGVRIndex) applyBindingAdd(namespace string, ref rbacv1.RoleRef, id bindingID, subjects []subjectKey) (ready bool) {
 	snap := rbacSnap.Load()
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	idx.recordBindingLocked(snap, namespace, ref, id, subjects)
+	return idx.ready
 }
 
-// applyBindingDelete unrols the binding under the write lock.
-func (idx *bindingsByGVRIndex) applyBindingDelete(id bindingID, rk string) {
+// bindingRecord is one side of a binding update as the index files it. held is
+// false for a side the hook could not normalise.
+type bindingRecord struct {
+	held      bool
+	namespace string
+	ref       rbacv1.RoleRef
+	id        bindingID
+	subjects  []subjectKey
+}
+
+// bindingUpdateMidHookForTest, when non-nil, runs inside applyBindingUpdate
+// between the removal of the old side and the record of the new one — under
+// the index lock. TEST-ONLY: one atomic load per binding update in production.
+// The #1458 arm uses it to run a role's rules edit exactly there.
+var bindingUpdateMidHookForTest atomic.Pointer[func()]
+
+// applyBindingUpdate replaces a binding's old side by its new side under ONE
+// hold of the write lock: no reader of the index, and no role hook, ever sees
+// the binding absent during an update (#1458). Reports whether the index is
+// ready.
+func (idx *bindingsByGVRIndex) applyBindingUpdate(oldRec, newRec bindingRecord) (ready bool) {
+	snap := rbacSnap.Load()
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if oldRec.held {
+		idx.unrolLocked(oldRec.id, roleRefKey(oldRec.namespace, oldRec.ref))
+	}
+	if h := bindingUpdateMidHookForTest.Load(); h != nil {
+		(*h)()
+	}
+	if newRec.held {
+		idx.recordBindingLocked(snap, newRec.namespace, newRec.ref, newRec.id, newRec.subjects)
+	}
+	return idx.ready
+}
+
+// applyBindingDelete unrols the binding under the write lock, and reports
+// whether the index is ready.
+func (idx *bindingsByGVRIndex) applyBindingDelete(id bindingID, rk string) (ready bool) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	idx.unrolLocked(id, rk)
+	return idx.ready
 }

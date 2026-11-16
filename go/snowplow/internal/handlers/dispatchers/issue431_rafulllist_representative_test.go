@@ -452,7 +452,7 @@ func TestIssue431_SubGenMovesInsideRefresh_NoWrite(t *testing.T) {
 	dyn, saEP, saRC := i431Fixture(t, ra)
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, i431CMGVR}) // activates sub-gen deltas
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, i431CMGVR}) // activates sub-gen deltas
 	carol := i431Ctx(psCarol)
 	key, in := i431RAKey(t, carol, ra)
 	i431Serve(t, carol, ra, saRC)
