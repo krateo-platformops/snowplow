@@ -315,7 +315,10 @@ def test_the_runtime_job_reads_what_snowplow_publishes():
     assert "--deadline 1794812999" in job      # the step's own deadline, never one of the Job's making
 
 
-# ─── agreed between the arms of a launch ────────────────────────────────────
+# ─── agreed between the arms of a pair, AFTER the measure (owner's ruling 2026-11-16) ───
+#
+# No arm waits for another before its load: each arm's reading is recorded, and the pair (custlat pair and
+# replica) compares them after the measure (snowplow_env.agreement). One that differs makes the pair INVALID.
 
 def _arm_record(shared, tmp, arm, declared, cm, eff=None):
     d = tmp / arm
@@ -328,34 +331,27 @@ def _arm_record(shared, tmp, arm, declared, cm, eff=None):
     shutil.copy(out, shared / f"{arm}.json")
 
 
-def _agree(shared, tmp, arm, arms, wait="0"):
-    out = tmp / f"agree-{arm}.json"
-    p = _cli("agree", "--dir", str(shared), "--arm", arm, "--arms", *arms, "--wait-s", wait, "--out", str(out))
-    return p, json.loads(out.read_text())
+def _agreement(shared, a, b):
+    return snowplow_env.agreement(json.loads((shared / f"{a}.json").read_text()),
+                                  json.loads((shared / f"{b}.json").read_text()), (a, b))
 
 
 def test_arms_that_differ_only_in_what_they_declared_agree(tmp_path):
     shared = tmp_path / "shared"
     for arm, gogc in (("N1", "50"), ("N1B", "50"), ("N2", "100")):
         _arm_record(shared, tmp_path, arm, f"GOGC={gogc}", {"GOGC": gogc, "GOMEMLIMIT": "7GiB"})
-    p, res = _agree(shared, tmp_path, "N2", ["N1", "N1B", "N2"])
-    assert p.returncode == 0 and res["ok"] is True and res["compared"] == ["N1", "N1B"] and res["not_compared"] == []
-    assert "undeclared Go runtime keys: the same on N2 and N1, N1B" in p.stdout
+    assert _agreement(shared, "N1", "N2") == [] and _agreement(shared, "N1", "N1B") == []
 
 
-def test_an_undeclared_key_that_differs_between_arms_fails_before_load(tmp_path):
+def test_an_undeclared_key_that_differs_between_arms_makes_their_pair_invalid(tmp_path):
     shared = tmp_path / "shared"
     _arm_record(shared, tmp_path, "N1", "GOGC=50", {"GOGC": "50", "GOMEMLIMIT": "7GiB"})
     _arm_record(shared, tmp_path, "N2", "GOGC=100", {"GOGC": "100", "GOMEMLIMIT": "6GiB"})
-    for arm in ("N1", "N2"):
-        p, res = _agree(shared, tmp_path, arm, ["N1", "N2"])
-        assert p.returncode == 1 and res["ok"] is False
-        assert "GOMEMLIMIT is declared on no run and differs between them: N1: GOMEMLIMIT=7GiB, N2: GOMEMLIMIT=6GiB" \
-            in p.stdout
+    assert "GOMEMLIMIT is declared on no run and differs between them: N1: GOMEMLIMIT=7GiB, N2: GOMEMLIMIT=6GiB" \
+        in _agreement(shared, "N1", "N2")
     # set on one arm and unset on the other differs too
     _arm_record(shared, tmp_path, "N2", "GOGC=100", {"GOGC": "100"})
-    p, _ = _agree(shared, tmp_path, "N1", ["N1", "N2"])
-    assert p.returncode == 1 and "N1: GOMEMLIMIT=7GiB, N2: GOMEMLIMIT unset" in p.stdout
+    assert any("N1: GOMEMLIMIT=7GiB, N2: GOMEMLIMIT unset" in d for d in _agreement(shared, "N1", "N2"))
 
 
 @pytest.mark.parametrize("eff, why", [
@@ -364,57 +360,39 @@ def test_an_undeclared_key_that_differs_between_arms_fails_before_load(tmp_path)
     (dict(memory_limit_source="env"), "where the process's memory limit comes from differs between the runs: N1: "
                                       "cgroup_v2, N2: env"),
 ])
-def test_processes_with_different_memory_limits_fail_before_load(tmp_path, eff, why):
+def test_processes_with_different_memory_limits_disagree(tmp_path, eff, why):
     """Nothing in either pod's env differs: only what the processes run with."""
     shared = tmp_path / "shared"
     _arm_record(shared, tmp_path, "N1", "GOGC=50", {"GOGC": "50"})
     _arm_record(shared, tmp_path, "N2", "GOGC=100", {"GOGC": "100"}, eff=eff)
-    for arm in ("N1", "N2"):
-        p, res = _agree(shared, tmp_path, arm, ["N1", "N2"])
-        assert p.returncode == 1 and res["ok"] is False and why in p.stdout, p.stdout
+    assert why in _agreement(shared, "N1", "N2")
 
 
 def test_an_undeclared_gogc_must_be_the_same_and_a_declared_one_may_differ(tmp_path):
     shared = tmp_path / "shared"
     _arm_record(shared, tmp_path, "N1", "", {}, eff=dict(gogc=100))
     _arm_record(shared, tmp_path, "N2", "", {}, eff=dict(gogc=50))
-    p, _ = _agree(shared, tmp_path, "N1", ["N1", "N2"])
-    assert p.returncode == 1 and "the GOGC the process runs with (declared on no run) differs between the runs: " \
-                                 "N1: 100, N2: 50" in p.stdout
+    assert "the GOGC the process runs with (declared on no run) differs between the runs: N1: 100, N2: 50" \
+        in _agreement(shared, "N1", "N2")
     declared = tmp_path / "declared"
     _arm_record(declared, tmp_path, "N1", "GOGC=50", {"GOGC": "50"})
     _arm_record(declared, tmp_path, "N2", "GOGC=100", {"GOGC": "100"})
-    assert _agree(declared, tmp_path, "N1", ["N1", "N2"])[0].returncode == 0
+    assert _agreement(declared, "N1", "N2") == []
 
 
-def test_an_arm_with_no_reading_is_waited_for_then_named_not_assumed_equal(tmp_path):
+def test_an_arm_with_no_verified_reading_is_not_compared_it_is_invalid_on_its_own(tmp_path):
     shared = tmp_path / "shared"
-    _arm_record(shared, tmp_path, "N1", "GOGC=50", {"GOGC": "50"})
-    now, slept = [0.0], []
+    _arm_record(shared, tmp_path, "N1", "GOGC=50", {"GOGC": "50", "GOMEMLIMIT": "7GiB"})
+    rec = json.loads((shared / "N1.json").read_text())
+    assert snowplow_env.agreement(rec, dict(rec, verified=False, undeclared={}), ("N1", "N2")) == []
+    assert snowplow_env.agreement(rec, None, ("N1", "N2")) == []
+    assert snowplow_env.validity({"state": "NOT_VERIFIED", "why": "x"})["result"] == "FAIL"
 
-    def sleep(s):
-        slept.append(s)
-        now[0] += s
-    res = snowplow_env.agree(str(shared), "N1", ["N1", "N2"], 600, clock=lambda: now[0], sleep=sleep, poll_s=5)
-    assert sum(slept) == 600 and max(slept) <= 5                              # its whole bound, and no more
-    assert res["ok"] is True and res["compared"] == [] and res["not_compared"] == ["N2"]
-    assert "NOT compared with N2 (no reading within 600 s, or the run ended without one)" in res["line"]
-    # a run the launcher saw end is not waited for; through the CLI
-    (shared / "N2.gone").write_text("")
-    slept.clear()
-    assert snowplow_env.agree(str(shared), "N1", ["N1", "N2"], 600, clock=lambda: now[0], sleep=sleep)["ok"] is True
-    assert slept == []
-    p, res = _agree(shared, tmp_path, "N1", ["N1", "N2"], wait="600")
-    assert p.returncode == 0 and res["not_compared"] == ["N2"]
-    # a reading that arrives during the wait is compared
-    (shared / "N2.gone").unlink()
 
-    def arrives(s):
-        sleep(s)
-        if now[0] >= 900 and not (shared / "N2.json").exists():
-            _arm_record(shared, tmp_path, "N2", "GOGC=100", {"GOGC": "100", "GOMEMLIMIT": "7GiB"})
-    res = snowplow_env.agree(str(shared), "N1", ["N1", "N2"], 600, clock=lambda: now[0], sleep=arrives)
-    assert res["ok"] is False and res["compared"] == ["N2"] and "GOMEMLIMIT" in res["why"]
+def test_no_run_waits_for_another_before_its_load():
+    src = (BENCH / "run606.sh").read_text() + (BENCH / "run606_pair.sh").read_text()
+    for gone in ("ENV_AGREE_WAIT_S", "SNOWPLOW_ENV_DIR", "SNOWPLOW_ENV_ARMS", ".gone", "snowplow_env agree"):
+        assert gone not in src, gone
 
 
 # ─── the launcher: the same keys on every run, and what a pair may compare ──
@@ -457,10 +435,9 @@ def test_the_launch_is_refused_before_anything_starts(pairbed, over, refusal):  
     assert not (fake / "calls").exists()                                       # not even a dry pass
 
 
-def test_the_launcher_gives_each_run_its_declaration_and_the_shared_readings(pairbed):  # noqa: F811
+def test_the_launcher_gives_each_run_its_declaration_and_its_label(pairbed):  # noqa: F811
     src = (BENCH / "run606_pair.sh").read_text()
-    assert 'RUNENV+=(SNOWPLOW_ENV="${!se:-}" BENCH_ARM="$1" SNOWPLOW_ENV_DIR="$PAIR_OUT/snowplow-env"' in src
-    assert '[[ -f "$PAIR_OUT/snowplow-env/$x.json" ]] || : > "$PAIR_OUT/snowplow-env/$x.gone"' in src
+    assert 'RUNENV+=(SNOWPLOW_ENV="${!se:-}" BENCH_ARM="$1")' in src
 
 
 # ─── the pair's one line ────────────────────────────────────────────────────
@@ -495,7 +472,7 @@ def test_the_pair_says_same_image_different_env_in_one_line(tmp_path):
     assert arms["lines"] == [
         f"INFO arms: the same image ({DIG}); their processes ran with different GC settings: GOGC 50 on N1 "
         f"(baseline), GOGC 100 on N2 (candidate); memory limit 7.00 GiB (7516192768 bytes) from cgroup_v2 on both (they differ "
-        f"in GC settings only, not in image); each read from the running process before the measure (declared: N1 "
+        f"in GC settings only, not in image); each read from the running process alongside the load's start (declared: N1 "
         f"(baseline) GOGC=50; N2 (candidate) GOGC=100 (the Go default, set explicitly))",
         "INFO not comparable with run 26i: installer 0.3.616 there, 0.3.641 here"]
 
@@ -519,11 +496,13 @@ def test_the_pair_says_image_only_both_and_unknown_in_their_own_words(tmp_path):
         assert arms["env_differs"] is None
         assert arms["lines"] == [f"INFO arms: the same image ({DIG}); snowplow's GC settings UNKNOWN: no record "
                                  f"verified from the running process for N2 (candidate)"]
-    # an undeclared key that differs is said (the arms' own gate fails the run before load; this is its record)
+    # an undeclared key that differs is said, and, compared after the measure, makes the pair INVALID (named)
     und = _verdict(tmp_path / "f", DIG, "GOGC=100", {"GOGC": "100", "GOMEMLIMIT": "6GiB"})
     a2 = _verdict(tmp_path / "g", DIG, "GOGC=50", {"GOGC": "50", "GOMEMLIMIT": "7GiB"})
-    (line,) = _pair(a2, und)["lines"]
+    line, invalid = _pair(a2, und)["lines"]
     assert "UNDECLARED env keys differ: GOMEMLIMIT is declared on no run and differs between them" in line
+    assert invalid.startswith("INVALID arms: snowplow env, compared after the measure from each arm's reading: "
+                              "GOMEMLIMIT is declared on no run and differs between them")
     # the same env on both arms, and processes that run with different memory limits: said from the processes
     m1 = _verdict(tmp_path / "h", DIG, "GOGC=50", {"GOGC": "50"})
     m2 = _verdict(tmp_path / "i", DIG, "GOGC=50", {"GOGC": "50"}, eff=dict(memory_limit_bytes=6 * GIB))
@@ -540,7 +519,7 @@ def test_evaluate_reports_the_record_and_says_unknown_without_one(tmp_path):
     _cli("check", "--declared", "GOGC=100", "--tracing", str(_reading(tmp_path, cm={"GOGC": "100"})), "--effective",
          _eff(tmp_path, "GOGC=100"), "--out", str(out))
     for path, state, said in ((out, "VERIFIED", "INFO snowplow Go runtime, effective (read from the running process "
-                                                "before the measure): GOGC 100, memory limit 7.00 GiB (7516192768 bytes)"),
+                                                "alongside the load's start): GOGC 100, memory limit 7.00 GiB (7516192768 bytes)"),
                               (tmp_path / "none.json", "UNKNOWN", "INFO snowplow env: UNKNOWN (the run has no "
                                                                   "snowplow-env record")):
         p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", str(f), "--snowplow-env", str(path)],
@@ -585,10 +564,11 @@ def test_run606_installs_the_declaration_and_proves_it_from_the_pod_before_load(
 
 @needs_helm
 @pytest.mark.parametrize("extra, where, why", [
-    # the platform's ConfigMap never got it (the arm would run at the installer's 50): before any load
+    # the platform's ConfigMap never got it (the arm would run at the installer's 50): the load runs (it
+    # starts right after Ready, the owner's ruling 2026-11-16) and the run is INVALID, named
     ({"FAKE_SNOWPLOW_GO_ENV": '{"GOGC": "50"}'}, "measure",
-     "measure FAILED before any load: snowplow env NOT as declared: declared GOGC=100, the process runs with "
-     "GOGC 50; declared GOGC=100, the pod has GOGC=50"),
+     "snowplow_env.verified: snowplow env NOT as declared (the Go runtime read's deadline is the new pod's Ready + "
+     "its budget): declared GOGC=100, the process runs with GOGC 50; declared GOGC=100, the pod has GOGC=50"),
     # an installer that does not carry the declaration into its CR: before any cluster
     ({"FAKE_INSTALLER_HOLDS_GOGC": "50"}, "snowplow-env",
      "snowplow-env FAILED: the installer does not render the declared snowplow env (GOGC=100): NOT rendered as "
@@ -598,32 +578,17 @@ def test_run606_refuses_an_arm_that_would_not_run_what_it_declared(harness, extr
     env, state, _, tmp = harness
     p = _run606(env, SNOWPLOW_ENV="GOGC=100", **extra)
     log = (tmp / "out" / "run.log").read_text()
-    assert p.returncode != 0 and why in log, log[-3000:]
-    assert "run complete" not in log and "driver done" not in log
+    if where == "measure":
+        v = json.loads((tmp / "out" / "verdict.json").read_text())
+        assert p.returncode == 0 and "run complete" in log and v["verdict"] == "INVALID", log[-3000:]
+        assert why in v["invalid_reasons"] and f"INVALID: {why}" in log
+    else:
+        assert p.returncode != 0 and why in log, log[-3000:]
+        assert "run complete" not in log and "driver done" not in log
     gcl = [json.loads(x)["argv"][:3] for x in (state / "calls.jsonl").read_text().splitlines()
            if json.loads(x)["tool"] == "gcloud"]
     created = ["container", "clusters", "create"] in gcl
     assert created == (where == "measure")                # the render refuses before anything is created
-
-
-@needs_helm
-def test_run606_fails_before_load_when_an_undeclared_key_differs_from_another_arms(harness):  # noqa: F811
-    """Two arms of one launch: the other arm's reading (GOMEMLIMIT 6GiB) is already in the shared
-    directory; this arm's pod has 7GiB, which no one declared."""
-    env, state, _, tmp = harness
-    shared = tmp / "shared"
-    other = tmp / "other"
-    other.mkdir()
-    _arm_record(shared, other, "N1", "GOGC=50", {"GOGC": "50", "GOMEMLIMIT": "6GiB"})
-    p = _run606(env, SNOWPLOW_ENV="GOGC=100", BENCH_ARM="N2", SNOWPLOW_ENV_DIR=str(shared), SNOWPLOW_ENV_ARMS="N1 N2",
-                FAKE_SNOWPLOW_GO_ENV='{"GOGC": "100", "GOMEMLIMIT": "7GiB"}')
-    log = (tmp / "out" / "run.log").read_text()
-    assert p.returncode != 0, log[-3000:]
-    assert "measure FAILED before any load: the processes' memory limit and undeclared Go runtime keys: DIFFER: " \
-           "GOMEMLIMIT is declared on no run and differs between them: N1: GOMEMLIMIT=6GiB, N2: GOMEMLIMIT=7GiB" in log
-    assert "driver done" not in log and (shared / "N2.json").exists()
-    # the wait for the other runs is a term of the plan
-    assert " + env agreement 600 + measure " in log
 
 
 @needs_helm
@@ -684,19 +649,25 @@ def test_run606_refuses_a_bad_declaration_or_rehearsal_mode_at_once(harness):  #
 @needs_helm
 @pytest.mark.parametrize("extra, why", [
     # the pod's env has GOGC=100 (the install declared it) and the process runs with 50
-    ({"FAKE_GO_RUNTIME": '{"gogc": 50}'},
-     "measure FAILED before any load: snowplow env NOT as declared: declared GOGC=100, the process runs with GOGC 50"),
+    ({"FAKE_GO_RUNTIME": '{"gogc": 50}'}, "declared GOGC=100, the process runs with GOGC 50"),
     # an image that does not publish its settings: nothing to hold the declaration against
     ({"FAKE_GO_RUNTIME_FAIL": "nokey"},
-     "measure FAILED before any load: snowplow env NOT as declared: the settings the process runs with could not be "
-     "read: /debug/vars holds no snowplow_go_runtime"),
+     "the settings the process runs with could not be read: /debug/vars holds no snowplow_go_runtime"),
+    # the read never answered within its deadline (the new pod's Ready + GO_RUNTIME_S)
+    ({"FAKE_GO_RUNTIME_FAIL": "noanswer"},
+     "the settings the process runs with could not be read: /debug/vars: no answer to 8 attempt(s) over 275.0 s"),
 ])
-def test_run606_fails_before_load_when_the_process_does_not_run_with_the_declaration(harness, extra, why):  # noqa: F811
+def test_a_run_whose_process_does_not_run_with_the_declaration_is_invalid_and_its_load_ran(harness, extra, why):  # noqa: F811
+    """The owner's ruling (2026-11-16): the load starts right after Ready and the read runs alongside it;
+    the run counts only if the read answered in time as declared."""
     env, state, _, tmp = harness
     p = _run606(env, SNOWPLOW_ENV="GOGC=100", **extra)
     log = (tmp / "out" / "run.log").read_text()
-    assert p.returncode != 0 and why in log, log[-3000:]
-    assert "driver done" not in log and "run complete" not in log
+    v = json.loads((tmp / "out" / "verdict.json").read_text())
+    assert p.returncode == 0 and "run complete" in log and "driver done" in log, log[-3000:]
+    assert v["verdict"] == "INVALID"
+    [r] = [r for r in v["invalid_reasons"] if r.startswith("snowplow_env.verified: ")]
+    assert why in r, r
 
 
 @needs_helm
@@ -717,14 +688,14 @@ def test_run606_reads_the_process_before_load_and_keeps_the_password_out(harness
              if json.loads(x)["tool"] == "kubectl"]
     i_job = next(i for i, a in enumerate(calls) if "job/runtime606" in a and "logs" in a)
     i_load = next(i for i, a in enumerate(calls) if "apply" in a and any("loadgen-job.yaml" in x for x in a))
-    assert i_job < i_load
+    assert i_load < i_job        # the load starts right after Ready; the read runs alongside it
     pw = env["FAKE_PW"]
     for f in ("go-runtime-job.yaml", "run.log", "go-runtime.jsonl", "snowplow-env.json"):
         assert pw not in (out / f).read_text(), f
     assert "name: runtime606" in (out / "go-runtime-job.yaml").read_text()
     v = json.loads((out / "verdict.json").read_text())
     assert v["report"]["snowplow_env"]["lines"][0].startswith(
-        "INFO snowplow Go runtime, effective (read from the running process before the measure): GOGC 100, memory "
+        "INFO snowplow Go runtime, effective (read from the running process alongside the load's start): GOGC 100, memory "
         "limit 7.00 GiB (7516192768 bytes)")
     # the Job's wait is a term of the plan: named in the line, counted in the total, and the total with
     # its margin fits the cluster's TTL
@@ -738,14 +709,3 @@ def test_run606_reads_the_process_before_load_and_keeps_the_password_out(harness
     assert total + margin <= ttl_s
 
 
-@needs_helm
-def test_run606_fails_before_load_when_another_arms_process_has_another_memory_limit(harness):  # noqa: F811
-    env, state, _, tmp = harness
-    shared, other = tmp / "shared", tmp / "other"
-    other.mkdir()
-    _arm_record(shared, other, "N1", "GOGC=50", {"GOGC": "50"}, eff=dict(memory_limit_bytes=6 * GIB))
-    p = _run606(env, SNOWPLOW_ENV="GOGC=100", BENCH_ARM="N2", SNOWPLOW_ENV_DIR=str(shared), SNOWPLOW_ENV_ARMS="N1 N2")
-    log = (tmp / "out" / "run.log").read_text()
-    assert p.returncode != 0 and "driver done" not in log, log[-3000:]
-    assert "the memory limit the process runs with differs between the runs: N1: 6.00 GiB (6442450944 bytes), N2: " \
-           "7.00 GiB (7516192768 bytes)" in log

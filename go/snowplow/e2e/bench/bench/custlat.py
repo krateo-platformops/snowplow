@@ -1884,12 +1884,14 @@ def replica_in_run(dirs: tuple[str, str], label: str, digest: str,
     provs = [_provenance(d) for d in dirs]
     why: list[str] = []
     notes: list[str] = []
+    verdicts: list = []
     for d, c, pv, x in zip(dirs, completed, provs, ("1st", "2nd"), strict=True):
         try:
             with open(os.path.join(d, "verdict.json")) as fh:
                 v = json.load(fh)
         except (OSError, ValueError):
             v = None
+        verdicts.append(v)
         name = pv.get("dir")
         if c is not True:
             why.append(f"{x} run ({name}): its evaluate step did not run" if c is False else
@@ -1923,6 +1925,12 @@ def replica_in_run(dirs: tuple[str, str], label: str, digest: str,
             notes.append(f"{x} run ({name}): its readiness sampler saw nothing for "
                          f"{round(sum(float(e.get('seconds') or 0) for e in gaps), 1)} s between Ready samples "
                          f"(no restart signal)")
+    # the arms' snowplow env, compared AFTER the measure from each run's recorded reading (no run waits for
+    # another before its load: the owner's ruling, 2026-11-16): a key no run declared that differs disqualifies
+    from bench import snowplow_env
+    labs = tuple(label.split(":", 1)) if label and ":" in label else ("1st", "2nd")
+    for d_ in snowplow_env.agreement(*(snowplow_env._sec(v) for v in verdicts), labs):
+        why.append(f"the two runs' snowplow env, compared after the measure: {d_}")
     if provs[0].get("image_digest") != provs[1].get("image_digest"):
         why.append(f"the two runs ran different images ({provs[0].get('image_digest')} vs "
                    f"{provs[1].get('image_digest')}): not an A/A pair")
@@ -2184,6 +2192,12 @@ def main(argv: list[str] | None = None) -> int:
                             "lines": [f"INFO {section}: report failed: {type(e).__name__}: {e}"]}
     # what the arms differ in: the image, the declared snowplow env (verified from each pod), both or neither
     out["arms"] = arms_pair(va, vb, (f"{a.a_label} (baseline)", f"{a.b_label} (candidate)"), a.not_comparable)
+    # ... and, AFTER the measure, whether a key no arm declared reads the same on both (the owner's ruling,
+    # 2026-11-16: no arm waits for another before its load): one that differs makes the pair INVALID, named
+    if out["arms"].get("disagree"):
+        out["verdict"] = "INVALID"
+        out.setdefault("invalid_reasons", []).extend(
+            f"customer_latency.pair.snowplow_env_agreement: {d}" for d in out["arms"]["disagree"])
     # #1422: each arm's cluster operations per measured phase, and the phases only one arm measured under one
     out["cluster_operations_report_only"] = cluster_operations_pair(
         va, vb, (f"{a.a_label} (baseline)", f"{a.b_label} (candidate)"))

@@ -33,6 +33,7 @@ import binascii
 import json
 import os
 import sys
+import time
 
 ROUTES = ("readyz", "call", "vars")
 SAID = {"readyz": "/readyz (anonymous)", "call": "the boot root /call (preflight user)",
@@ -126,7 +127,16 @@ def write_dump(rows: list[dict], path: str) -> dict | None:
     return out
 
 
-def summarize(effective: str, pod: str | None, dump_path: str) -> dict:
+def _utc(t) -> str:
+    return (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + f".{int((t % 1) * 1000):03d}Z"
+            if isinstance(t, (int, float)) else "UNKNOWN")
+
+
+def _off(t, ref, name: str) -> str:
+    return f"{name} {t - ref:+.1f} s" if isinstance(t, (int, float)) and isinstance(ref, (int, float)) else f"{name} ?"
+
+
+def summarize(effective: str, pod: str | None, dump_path: str, load_start: str | None = None) -> dict:
     rows = _rows(effective)
     start = next((r for r in rows if r.get("kind") == "boot_window_start"), None)
     rec: dict = {"kind": KIND, "source": effective}
@@ -144,12 +154,31 @@ def summarize(effective: str, pod: str | None, dump_path: str) -> dict:
     gc = next(((r.get("read") or {}).get("gc") for r in rows if r.get("kind") == "go_runtime"), None)
     end = next((r for r in rows if r.get("kind") == "boot_window_end"), None)
     dump = write_dump(rows, dump_path)
+    # the load's start (run606 load-start.json): the window now overlaps the load's first seconds (the owner's
+    # ruling, 2026-11-16: the load starts right after Ready, the read and its probes run alongside it)
+    try:
+        with open(load_start) as fh:
+            ls = json.load(fh)
+        applied = ls.get("applied_at") if isinstance(ls, dict) and ls.get("kind") == "load_start" else None
+    except (OSError, TypeError, ValueError):
+        applied = None
+    t_end = (end or {}).get("t") or max((r.get("t") or 0) for r in rows)
     rec.update(ready_at=ready, ref=refname, window_start_from_ref_s=round(start["t"] - ref, 1), stall_bound_s=stall_s,
-               routes=routes, reading=reading(routes), gc=gc, dump=dump, end=end)
+               routes=routes, reading=reading(routes), gc=gc, dump=dump, end=end,
+               window={"start": start["t"], "end": t_end, "start_utc": _utc(start["t"]), "end_utc": _utc(t_end),
+                       "load_applied_at": applied,
+                       "overlap_with_load_s": (round(max(0.0, t_end - max(applied, start["t"])), 1)
+                                               if isinstance(applied, (int, float)) else None)})
     lines = [f"INFO boot window (report-only): from {refname}{'+' if start['t'] >= ref else ''}"
              f"{rec['window_start_from_ref_s']} s, every {start.get('every_s')} s, each request a new connection "
              f"bounded at {start.get('timeout_s')} s; a stall = past {stall_s:g} s without a byte"
-             + ("" if end else "; the window's end is not in the log (the step's wait ended first)")]
+             + ("" if end else "; the window's end is not in the log (the step's wait ended first)"),
+             f"INFO boot window: probes from {_utc(start['t'])} ({_off(start['t'], ready, 'Ready')}, "
+             f"{_off(start['t'], applied, 'load start')}) to {_utc(t_end)} ({_off(t_end, ready, 'Ready')}, "
+             f"{_off(t_end, applied, 'load start')}): "
+             + (f"{rec['window']['overlap_with_load_s']} s of them overlap the load (two small requests every "
+                f"{start.get('every_s')} s, the read's own attempts beside them)" if applied is not None else
+                "no load start recorded (no load in this run)")]
     for r in ROUTES:
         v = routes[r]
         said = (f"NOT SERVED: {v['stalled']} of {v['requests']} stalled, {v['failed_fast']} failed fast; for "
@@ -175,6 +204,10 @@ def summarize(effective: str, pod: str | None, dump_path: str) -> dict:
                    f"stalled too" if not dump.get("status") else "") + (f"; {dump['why']}" if dump.get("why") else ""))
         lines.append(f"INFO boot window: goroutine dump (taken when {SAID.get(t.get('route'), t.get('route'))} was "
                      f"{t.get('waited_s')} s without a byte): {what}")
+        dt = dump.get("t")
+        lines.append(f"INFO boot window: the goroutine dump (debug=2: it stops the world while it walks every "
+                     f"goroutine) ran at {_utc(dt)} ({_off(dt, ready, 'Ready')}, {_off(dt, applied, 'load start')}) "
+                     f"for {dump.get('elapsed_ms')} ms")
     rec["lines"] = lines
     return rec
 
@@ -185,10 +218,11 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("said", help="the boot window's block from the runtime606 Job's log (always exit 0)")
     s.add_argument("--effective", required=True, help="$OUT/go-runtime.jsonl")
     s.add_argument("--pod", default=None, help="$OUT/pod-before.jsonl: the new pod's Ready")
+    s.add_argument("--load-start", default=None, help="$OUT/load-start.json: when the drivers were applied")
     s.add_argument("--dump", required=True, help="where the goroutine dump (gzip) is written")
     s.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    rec = summarize(a.effective, a.pod, a.dump)
+    rec = summarize(a.effective, a.pod, a.dump, a.load_start)
     with open(a.out + ".part", "w") as fh:
         json.dump(rec, fh, indent=1)
     os.replace(a.out + ".part", a.out)
