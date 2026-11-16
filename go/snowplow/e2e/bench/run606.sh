@@ -1913,6 +1913,9 @@ menu_classes_cleanup() {
 # fails the step (tooling).
 s_settle() {
   local mf="$OUT/warmup-job.yaml" rc=0 container
+  # the data load and the warm-up never share the loadgen node (and nothing is rendered, with the bench users'
+  # password in it, before that is known)
+  data606_gone || return 1
   container="$(python3 -c 'import sys; from bench import load606_job; print(load606_job.WARMUP_CONTAINER[sys.argv[1]])' "$LOAD_DRIVER")"
   # shellcheck disable=SC2046
   python3 -m bench.load606_job --warmup --users "$USERS" --shards 1 \
@@ -1934,8 +1937,6 @@ s_settle() {
     log "DRY: kapply $mf (Job bench-loadgen/warmup606: the measure's customer load, ${LOAD_DRIVER}); python3 -m bench.clusterops settle --name $RUN_NAME --job warmup606 --container $container --start-within $PREFLIGHT_TIMEOUT_S --out $OUT/settle.json --verdict-out $OUT/verdict.json -- <kubectl> (settled: nothing ran on the cluster in the last ${SETTLE_WINDOW_S} s under the load and nothing runs; read every ${SETTLE_POLL_S} s; deadline the load's start + ${SETTLE_DEADLINE_S} s, else INVALID by environment, not measured); delete job/warmup606 (its pod gone before the reboot)"
     return 0
   fi
-  # the data load and the warm-up never share the loadgen node
-  data606_gone || return 1
   kapply "$mf"
   bounded "$SETTLE_BOUND_S" python3 -m bench.clusterops settle --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" \
       --created-from "$OUT/maintenance-exclusion.json" --job warmup606 --container "$container" \
