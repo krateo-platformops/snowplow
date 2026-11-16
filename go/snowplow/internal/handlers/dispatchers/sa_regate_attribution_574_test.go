@@ -590,8 +590,10 @@ func TestIssue574SAR_B3_PlatformTemplateSAFetch_StillDenied_WarnNamesCell(t *tes
 
 	got := sar574Refresh(t, logs.ctx(context.Background()), srv, "krateo-system", "sar574-platform", http.MethodPost, sar574SARPath)
 
-	if ok, _ := srv.saw(http.MethodGet, tplPath); !ok {
-		t.Fatalf("B3 precondition: the refresher never fetched the platform template, so the arm proves nothing.\n  wire:%s", srv.dump())
+	// #1483 — the cohort's `get` of the template is decided before the dial:
+	// a denied identity's ServiceAccount read never reaches the apiserver.
+	if ok, _ := srv.saw(http.MethodGet, tplPath); ok {
+		t.Fatalf("B3 (#1483): the refresher fetched a platform template the cohort may not get; the deny must be decided before the dial.\n  wire:%s", srv.dump())
 	}
 	if got.cellHasMarker || got.dialed {
 		t.Fatalf("B3: a platform template the cohort may not read was fetched with the SA and resolved "+
@@ -608,6 +610,9 @@ func TestIssue574SAR_B3_PlatformTemplateSAFetch_StillDenied_WarnNamesCell(t *tes
 	}
 	if kh := sar574Attr(rec, "key_hash"); kh != got.key {
 		t.Errorf("B3: key_hash = %q, want the cell's ComputeKey %q", kh, got.key)
+	}
+	if d := sar574Attr(rec, "decided"); d != "before_dial" {
+		t.Errorf("B3 (#1483): the re-gate WARN says decided=%q, want before_dial", d)
 	}
 }
 
