@@ -561,12 +561,13 @@ def pair(va: dict | None, vb: dict | None, labels: tuple[str, str], not_comparab
     sa, sb = ((x or {}).get("load_start") if isinstance(x, dict) else None for x in (_sec(va), _sec(vb)))
     oa, ob = ((s_ or {}).get("offset_s") for s_ in (sa, sb))
     out["load_start_offsets_s"] = {labels[0]: oa, labels[1]: ob}
-    out["lines"].append(
-        f"INFO load start: {labels[0]} at Ready + {oa if oa is not None else 'UNKNOWN'} s, {labels[1]} at Ready + "
-        f"{ob if ob is not None else 'UNKNOWN'} s"
-        + (f": a difference of {round(abs(oa - ob), 1)} s (the bench holds no tolerance for it: reported, not judged)"
-           if oa is not None and ob is not None else ": the difference is UNKNOWN")
-        + "; in every arm the load starts right after the reboot, the digest gate and the pod record")
+    if oa is not None or ob is not None:          # runs from before load-start.json have neither: nothing to say
+        out["lines"].append(
+            f"INFO load start: {labels[0]} at Ready + {oa if oa is not None else 'UNKNOWN'} s, {labels[1]} at "
+            f"Ready + {ob if ob is not None else 'UNKNOWN'} s"
+            + (f": a difference of {round(abs(oa - ob), 1)} s (the bench holds no tolerance for it: reported, not "
+               f"judged)" if oa is not None and ob is not None else ": the difference is UNKNOWN")
+            + "; in every arm the load starts right after the reboot, the digest gate and the pod record")
     out["disagree"] = agreement(_sec(va), _sec(vb), labels)
     if out["disagree"]:
         out["lines"].append("INVALID arms: snowplow env, compared after the measure from each arm's reading: "

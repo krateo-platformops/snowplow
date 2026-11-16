@@ -496,11 +496,13 @@ def test_the_pair_says_image_only_both_and_unknown_in_their_own_words(tmp_path):
         assert arms["env_differs"] is None
         assert arms["lines"] == [f"INFO arms: the same image ({DIG}); snowplow's GC settings UNKNOWN: no record "
                                  f"verified from the running process for N2 (candidate)"]
-    # an undeclared key that differs is said (the arms' own gate fails the run before load; this is its record)
+    # an undeclared key that differs is said, and, compared after the measure, makes the pair INVALID (named)
     und = _verdict(tmp_path / "f", DIG, "GOGC=100", {"GOGC": "100", "GOMEMLIMIT": "6GiB"})
     a2 = _verdict(tmp_path / "g", DIG, "GOGC=50", {"GOGC": "50", "GOMEMLIMIT": "7GiB"})
-    (line,) = _pair(a2, und)["lines"]
+    line, invalid = _pair(a2, und)["lines"]
     assert "UNDECLARED env keys differ: GOMEMLIMIT is declared on no run and differs between them" in line
+    assert invalid.startswith("INVALID arms: snowplow env, compared after the measure from each arm's reading: "
+                              "GOMEMLIMIT is declared on no run and differs between them")
     # the same env on both arms, and processes that run with different memory limits: said from the processes
     m1 = _verdict(tmp_path / "h", DIG, "GOGC=50", {"GOGC": "50"})
     m2 = _verdict(tmp_path / "i", DIG, "GOGC=50", {"GOGC": "50"}, eff=dict(memory_limit_bytes=6 * GIB))

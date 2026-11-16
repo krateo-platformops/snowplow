@@ -306,7 +306,11 @@ def test_the_dry_run_shows_both_readings_and_evaluate_reads_tracing_json(tmp_pat
     # the other, after its pod record
     assert len(reads) == 2 and "--phase preinstall" in reads[0] and "--phase before" in reads[1]
     src = (BENCH_DIR / "run606.sh").read_text()
-    assert "  snowplow_pod_record before\n  tracing_reading before\n" in src
+    # the measure's reading comes after the load is applied (the owner's ruling, 2026-11-16: nothing of variable
+    # time stands between Ready and the load), the observer's switch between them
+    m = src[src.index("s_measure() {"):]
+    assert m.index("  snowplow_pod_record before\n") < m.index('kapply "$OUT/loadgen-job.yaml"') \
+        < m.index("  tracing_reading before\n") < m.index("  go_runtime_finish\n")
     assert "  snowplow_pod_record after\n  tracing_reading after\n" in src
     ev = next(ln for ln in p.stderr.splitlines() if "DRY: python3 -m bench.load606 evaluate" in ln)
     assert f"--tracing {tmp_path / 'out' / 'tracing.json'}" in ev
