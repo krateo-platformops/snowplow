@@ -43,6 +43,7 @@ import (
 
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -126,6 +127,15 @@ func init() {
 	})
 }
 
+// backgroundRESTActionGetFn reads a RESTAction CR for a background resolve
+// site: the walk's and the widget seed's read of a widget's apiRef RESTAction
+// (widgetNeedsRequestExtras) and the content prewarm's fetch. Production wires
+// it to objects.Get; only the #1477 _test.go arms reassign it, to serve a
+// templated- or literal-endpointRef RESTAction without a cluster. Its own seam,
+// not seedObjectsGetFn: tests read a seedObjectsGetFn call as "the RESTAction
+// seed ran".
+var backgroundRESTActionGetFn = objects.Get
+
 // restactionNeedsRequestExtras is the one predicate (#1477) over a RESTAction
 // CR: a resolve of cr carrying `carried` would render a templated endpointRef
 // with a key nobody supplied. nil-safe.
@@ -141,8 +151,8 @@ func restactionNeedsRequestExtras(cr *templatesv1.RESTAction, carried map[string
 // with the extras widgets.Resolve threads into that RESTAction
 // (widgets.ApiRefExtras). A widget with no apiRef, or whose RESTAction cannot
 // be read or decoded, is not skipped: its resolve reports what it reports
-// today. The RESTAction is read through seedObjectsGetFn (objects.Get, the read
-// the resolve itself makes), under ctx.
+// today. The RESTAction is read through backgroundRESTActionGetFn (objects.Get,
+// the read the resolve itself makes), under ctx.
 func widgetNeedsRequestExtras(ctx context.Context, w *unstructured.Unstructured) bool {
 	if w == nil {
 		return false
@@ -151,7 +161,7 @@ func widgetNeedsRequestExtras(ctx context.Context, w *unstructured.Unstructured)
 	if err != nil || ref.Name == "" || ref.Namespace == "" {
 		return false
 	}
-	got := seedObjectsGetFn(ctx, ref)
+	got := backgroundRESTActionGetFn(ctx, ref)
 	if got.Err != nil || got.Unstructured == nil {
 		return false
 	}

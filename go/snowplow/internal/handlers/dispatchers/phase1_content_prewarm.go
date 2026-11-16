@@ -385,11 +385,6 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 // the RESTAction needs request extras this resolve does not carry.
 var errContentPrewarmNeedsRequestExtras = errors.New("content prewarm: the RESTAction needs request extras this resolve does not carry")
 
-// contentPrewarmResolveFn is the content prewarm's resolve seam. Production
-// wires it to restactions.Resolve; only the #1477 _test.go arm reassigns it,
-// to observe whether a resolve was reached without a cluster.
-var contentPrewarmResolveFn = restactions.Resolve
-
 // prewarmOneRESTAction resolves ONE data-source RESTAction under the
 // content-prewarm SA context. The resolve's side effect — F1's
 // apistageContentServe populating the identity-free content L1 for each
@@ -415,7 +410,7 @@ var contentPrewarmResolveFn = restactions.Resolve
 // errContentPrewarmNeedsRequestExtras, which the pass counts as skipped, not
 // failed.
 func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference, authnNS string) (int, error) {
-	got := seedObjectsGetFn(rctx, ref)
+	got := backgroundRESTActionGetFn(rctx, ref)
 	if got.Err != nil {
 		// #630 — keep the apiserver status typed; the text is unchanged.
 		return 0, fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
@@ -468,7 +463,7 @@ func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference,
 	// fail-fresh remark every warmed cell + bump unguarded_put_total on each boot /
 	// keepwarm cycle). No L1 key is set, so no phantom restactions edge is recorded.
 	rctx = cache.WithDepGenSink(rctx)
-	res, err := contentPrewarmResolveFn(rctx, restactions.ResolveOptions{
+	res, err := restactionsResolveFn(rctx, restactions.ResolveOptions{
 		In: &cr,
 		// Ship 0.30.230 fix-at-root: SArc threaded from ctx — the
 		// content prewarm runs under withContentPrewarmSAContext which

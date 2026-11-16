@@ -919,13 +919,11 @@ func hasTemplatedEndpointRef(cr *templatesv1.RESTAction) bool {
 // production never reassigns it. Idiom-match: resolveOnceFn.
 var hasTemplatedEndpointRefFn = hasTemplatedEndpointRef
 
-// seedObjectsGetFn is the RESTAction-fetch seam for seedOneRestaction and for
-// the #1477 predicate's read of a widget's apiRef RESTAction
-// (widgetNeedsRequestExtras: the walk and the widget seed) and of the content
-// prewarm's RESTAction. Production wires it to the real objects.Get; the ONLY
-// reassigners are the _test.go falsifiers, which inject a fetched RESTAction
-// unstructured (a templated- vs static-endpointRef shape) to drive the #113 /
-// #1477 skips hermetically — without a cluster. A package var (not a parameter) so
+// seedObjectsGetFn is the RESTAction-fetch seam for seedOneRestaction.
+// Production wires it to the real objects.Get; the ONLY reassigner is the
+// _test.go falsifier, which injects a fetched RESTAction unstructured (a
+// templated- vs static-endpointRef shape) to drive the #113 seed-skip
+// hermetically — without a cluster. A package var (not a parameter) so
 // seedOneRestaction's signature is untouched; production never reassigns it.
 // Idiom-match: resolveOnceFn / paginationFetchPageFn.
 var seedObjectsGetFn = objects.Get

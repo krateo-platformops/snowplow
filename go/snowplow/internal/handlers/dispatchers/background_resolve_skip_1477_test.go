@@ -7,7 +7,7 @@ package dispatchers
 // The shape is 057's: a widget whose apiRef RESTAction builds its spoke
 // endpointRef name from `.name`. Each arm drives the REAL site function —
 // phase1Walker.walk, seedOneWidget, prewarmOneRESTAction — with only the
-// RESTAction read (seedObjectsGetFn) and the resolve beyond the skip stood in,
+// RESTAction read (backgroundRESTActionGetFn) and the resolve beyond the skip stood in,
 // and reads whether the resolve was REACHED, not a counter alone:
 //   - the widget with no inline extras: not resolved, counted once at the site;
 //   - the same widget with an inline spec.apiRef.extras.name: resolved, not
@@ -66,12 +66,12 @@ func widget1477(inline map[string]any) *unstructured.Unstructured {
 	return h1WidgetUnstructured(map[string]any{"apiRef": apiRef})
 }
 
-// serveRA1477 makes seedObjectsGetFn return the RESTAction for ra1477.
+// serveRA1477 makes backgroundRESTActionGetFn return the RESTAction for ra1477.
 func serveRA1477(t *testing.T, endpointName string) {
 	t.Helper()
-	orig := seedObjectsGetFn
-	t.Cleanup(func() { seedObjectsGetFn = orig })
-	seedObjectsGetFn = func(_ context.Context, ref templatesv1.ObjectReference) objects.Result {
+	orig := backgroundRESTActionGetFn
+	t.Cleanup(func() { backgroundRESTActionGetFn = orig })
+	backgroundRESTActionGetFn = func(_ context.Context, ref templatesv1.ObjectReference) objects.Result {
 		if ref.Name != ra1477 || ref.Namespace != h1NS {
 			return objects.Result{}
 		}
@@ -210,9 +210,9 @@ func TestIssue1477_WidgetSeed_SkipsWidgetNeedingExtras_ResolvesInlineSupplied(t 
 // whether it reached the resolve.
 func prewarm1477(t *testing.T) (resolved bool, err error) {
 	t.Helper()
-	orig := contentPrewarmResolveFn
-	t.Cleanup(func() { contentPrewarmResolveFn = orig })
-	contentPrewarmResolveFn = func(context.Context, restactions.ResolveOptions) (*templatesv1.RESTAction, error) {
+	orig := restactionsResolveFn
+	t.Cleanup(func() { restactionsResolveFn = orig })
+	restactionsResolveFn = func(context.Context, restactions.ResolveOptions) (*templatesv1.RESTAction, error) {
 		resolved = true
 		return nil, nil
 	}
