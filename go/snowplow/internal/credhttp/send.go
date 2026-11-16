@@ -16,9 +16,11 @@ package credhttp
 // PATCH already did; PUT and DELETE now do too. This is #905's "a write is sent
 // exactly once", kept at the transport.
 //
-// A SAFE REQUEST keeps the RetryClient, built per send as before: a RetryClient
-// kept across sends would switch on its 30 QPS token bucket, and #920 rules out
-// a client-side limit.
+// A SAFE REQUEST keeps the RetryClient's policy, built per send as before: a
+// RetryClient kept across sends would switch on its 30 QPS token bucket, and
+// #920 rules out a client-side limit. Since #1509 its loop is transcribed
+// (sendRetrying, retry_loop_1509.go) with one deviation: a 429 from a server
+// that is leaving is redone at once on a fresh connection.
 //
 // EVERY RETRY IS COUNTED WITH ITS CAUSE. An attempt observer sits under the
 // retry loop (each RetryClient attempt is one Client.Do, so one observer
@@ -36,12 +38,10 @@ package credhttp
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"log/slog"
-	"math/big"
 	"net/http"
 	"net/http/httptrace"
 	"strconv"
@@ -134,7 +134,9 @@ func sendPolicy(site string, cli *http.Client, req *http.Request) (*http.Respons
 	observed := *cli
 	policy := util.NewRetryClient(&observed)
 	observed.Transport = &attemptObserver{next: cli.Transport, site: site, policy: policy}
-	return policy.Do(req)
+	// #1509 — RetryClient.Do's loop, transcribed with the one #1509 (a)
+	// deviation (retry_loop_1509.go); policy supplies its numbers.
+	return sendRetrying(policy, &observed, req)
 }
 
 // sendOnceBudgeted sends a write once inside its budget (#1115 §5). A write
@@ -342,6 +344,18 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 //
 // v1.84.0 → v1.85.0 (snowplow#1481): `git diff --stat` changes only dialguard/
 // and the Makefile; http/ is byte-identical.
+//
+// #1509 — since v1.85.0 the WHOLE RetryClient.Do loop is transcribed too
+// (sendRetrying, retry_loop_1509.go: transcribedBackoff is backoff(attempt, …),
+// sleepCtx is sleepWithContext), and it DEVIATES from plumbing in exactly one
+// place, deliberately (owner ruling on #1509): a 429 whose connection is
+// closing (HTTP/1.x Connection: close, HTTP/2 GOAWAY — kube-apiserver's
+// shutdown answer) is not counted as an attempt and is redone at once on a
+// fresh connection, once per send; plumbing waits its Retry-After on the
+// leaving instance. The budgeted send (sendBudgeted) applies the same rule.
+// Every other branch of the loop is plumbing's as transcribed. A plumbing bump
+// re-audits the whole of RetryClient.Do against sendRetrying, not only backoff
+// and parseRetryAfter.
 const retryPolicyTranscribedFrom = "v1.85.0"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
@@ -349,17 +363,7 @@ const retryPolicyTranscribedFrom = "v1.85.0"
 // jittered into [d/2, d). The jitter's random source is crypto/rand where plumbing's is
 // math/rand: the distribution is the same, d/2 plus a draw uniform over [0, d/2).
 func firstBackoff(base, maxB time.Duration) time.Duration {
-	d := min(base, maxB)
-	if d < 2 {
-		return d
-	}
-	// rand.Int has two failures and neither can happen here. It panics for a bound <= 0, and the
-	// bound d/2 is >= 1 because d >= 2. It returns an error only when its reader does, and since
-	// Go 1.24 crypto/rand's Reader never returns one (a failure to read random data stops the
-	// program instead; nothing in snowplow replaces rand.Reader). So the error is discarded, not
-	// handled.
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(d)/2))
-	return d/2 + time.Duration(n.Int64())
+	return transcribedBackoff(0, base, maxB)
 }
 
 // retryAfter is RetryClient's 429 wait (plumbing's parseRetryAfter): the

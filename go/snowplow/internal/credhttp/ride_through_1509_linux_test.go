@@ -144,18 +144,21 @@ func TestIssue1509_RideThroughAReplicaChange(t *testing.T) {
 			_ = f.Close()
 		}
 	})
-	// The server's accept loop may already sit in Accept and take one; a probe
-	// that cannot connect proves the queue is full.
-	for range 4 {
+	// Fill the queue until a connect cannot complete. A connect can complete
+	// even when its final handshake segment is then dropped (the kernel answered
+	// its SYN while there was still room), so each one that completes is kept as
+	// a filler and another is tried; one that times out means SYNs are dropped.
+	full := false
+	for range 16 {
 		c, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
 		if err != nil {
+			full = true
 			break
 		}
 		fillers = append(fillers, c)
 	}
-	if c, err := net.DialTimeout("tcp", addr, 300*time.Millisecond); err == nil {
-		_ = c.Close()
-		t.Fatal("the listener still accepts SYNs; the arm needs them dropped")
+	if !full {
+		t.Fatal("the listener still completes connects; the arm needs SYNs dropped")
 	}
 
 	// 3. The customer request; the server comes back 3.3 s after it started.

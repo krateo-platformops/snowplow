@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -329,5 +330,43 @@ func TestIssue1509_B_EndpointDialRaces(t *testing.T) {
 	}
 	if connClosedSignal(c) == nil {
 		t.Fatal("endpointDial's connection carries no close signal (#1509 a)")
+	}
+}
+
+// The cost bound (owner ruling on #1509): a dial that never connects opens at
+// most log2(cap / trigger) + 1 sockets inside its cap, and every attempt has
+// returned when raceDial does (nothing left racing).
+func TestIssue1509_B_SocketsPerStuckDialAreLogarithmic(t *testing.T) {
+	for _, tc := range []struct{ trigger, bound time.Duration }{
+		{10 * time.Millisecond, 640 * time.Millisecond},
+		{5 * time.Millisecond, 1300 * time.Millisecond},
+	} {
+		resetConnectTimes(t)
+		l := newRaceListener(t)
+		addr := l.ln.Addr().String()
+		seedConnectTimes(addr, tc.trigger)
+		var live atomic.Int32
+		s := &scriptedRaceDial{script: []string{"hang"}}
+		prev := endpointDialFn
+		endpointDialFn = func(ctx context.Context, network, a string) (net.Conn, error) {
+			live.Add(1)
+			defer live.Add(-1)
+			return s.dial(ctx, network, a)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), tc.bound)
+		_, err := raceDial(ctx, "tcp", addr)
+		cancel()
+		endpointDialFn = prev
+		if err == nil {
+			t.Fatal("every attempt hung, want an error")
+		}
+		n := len(s.startOffsets())
+		limit := int(math.Log2(float64(tc.bound)/float64(tc.trigger))) + 1
+		if n > limit || n < 2 {
+			t.Fatalf("trigger %v, cap %v: %d sockets; want 2..%d (log2(cap/trigger)+1)", tc.trigger, tc.bound, n, limit)
+		}
+		if v := live.Load(); v != 0 {
+			t.Fatalf("%d attempts still running after raceDial returned", v)
+		}
 	}
 }
