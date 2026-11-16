@@ -1281,12 +1281,12 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if ierr != nil {
 			// #1476 — classify BEFORE logging, so the line's level is the
 			// class's: an expected per-identity re-gate deny (#711) logs at
-			// WARN, an authorized definite NotFound the stage declared (#1080
-			// N2: continueOnError, recorded under its errorKey) at DEBUG, any
-			// other failure at ERROR; an unchanged repeat in the cell's
-			// generation at DEBUG (failure_log.go). Every occurrence is still
-			// counted where it is recorded below (predial_total{denied}, the
-			// stage-error and per-identity sinks).
+			// WARN, an authorized definite NotFound (#1080 N2, which requires
+			// continueOnError: the stage declared the outcome) at DEBUG, any
+			// other failure at ERROR; a failure unchanged since the cell's
+			// previous round at DEBUG (failure_log.go). Every occurrence is
+			// still counted where it is recorded below (predial_total{denied},
+			// the stage-error and per-identity sinks).
 			regateDenied := isRegateDenied(ierr)
 			var definiteNF string
 			var isDefiniteNF bool
@@ -1297,7 +1297,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			switch {
 			case regateDenied:
 				failLevel = expectedDenyLevel(r.ctx, stageFailureTarget(id, call.Path))
-			case isDefiniteNF && declaredOutcome(call):
+			case isDefiniteNF:
 				failLevel = slog.LevelDebug
 			default:
 				failLevel = FailureLogLevel(r.ctx, slog.LevelError, stageFailureTarget(id, call.Path), FailureClassOf(ierr))
@@ -1673,9 +1673,11 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// envelope and route it through the identical recordItemError handling —
 	// byte-identical to the pre-ship ResponseHandler-error path. (Falsifier
 	// TestFalsifierB_SuccessBranchDecodeFailure_NoTruncate.)
+	decodeFailed := false // #1476 — its own failure class, not the upstream's 500
 	if res.Status != response.StatusFailure {
 		if err := feedBytes(jsonBytes); err != nil {
 			res = response.New(http.StatusInternalServerError, err)
+			decodeFailed = true
 		}
 	}
 
@@ -1692,20 +1694,22 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// and counted on the same sink (external: this dial bumped the sink).
 		// #1476 — both are classified BEFORE the failure line, so its level is
 		// the class's: the caller's own Forbidden is an expected per-identity
-		// deny (WARN), the declared definite NotFound a declared outcome
-		// (DEBUG), any other failure ERROR; an unchanged repeat in the cell's
-		// generation DEBUG (failure_log.go). Every occurrence is still recorded
-		// and counted below.
+		// deny (WARN), the definite NotFound (which requires continueOnError:
+		// the stage declared the outcome) DEBUG, any other failure ERROR; a
+		// failure unchanged since the cell's previous round DEBUG
+		// (failure_log.go). Every occurrence is still recorded and counted
+		// below.
 		ownDenied, isOwnDenied := classifyOwnDialForbidden(gctx, apiCall, call, res)
 		ownNotFound, isOwnNotFound := classifyOwnDialNotFound(gctx, apiCall, call, res)
 		var failLevel slog.Level
 		switch {
 		case isOwnDenied:
 			failLevel = expectedDenyLevel(r.ctx, stageFailureTarget(id, call.Path))
-		case isOwnNotFound && declaredOutcome(call):
+		case isOwnNotFound:
 			failLevel = slog.LevelDebug
 		default:
-			failLevel = FailureLogLevel(r.ctx, slog.LevelError, stageFailureTarget(id, call.Path), failureClassOfCode(res.Code))
+			failLevel = FailureLogLevel(r.ctx, slog.LevelError, stageFailureTarget(id, call.Path),
+				externalFailureClass(res, fetchErr, decodeFailed, answer.LastStatus()))
 		}
 		r.log.Log(fctx, failLevel, "api call response failure", slog.String("name", id),
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
@@ -2282,6 +2286,12 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	if len(opts.Items) == 0 {
 		return map[string]any{}, nil
 	}
+
+	// #1476 — this resolve is one failure-log round of its cell (or joins the
+	// round its caller opened for the same cell): a failure unchanged since the
+	// cell's previous round logs at DEBUG (failure_log.go).
+	ctx, endFailureRound := BeginFailureRound(ctx)
+	defer endFailureRound()
 
 	// #1116 (SECURITY) — the dict is seeded from extras below (newResolveRun),
 	// and the resolver writes its own keys into it. Extras that name one of

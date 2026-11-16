@@ -12,9 +12,13 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -85,15 +89,149 @@ func TestIssue1476_ChangedClass_LogsAgain(t *testing.T) {
 		{"404", slog.LevelError}, {"404", slog.LevelDebug},
 	}
 	for i, s := range steps {
-		if got := FailureLogLevel(ctx, slog.LevelError, "t", s.class); got != s.want {
+		if got := round1476(ctx, "t", s.class); got != s.want {
 			t.Fatalf("step %d (class %s): level %v, want %v", i, s.class, got, s.want)
 		}
 	}
 	// No L1 key: no cell to deduplicate on, the line keeps its level.
 	for i := 0; i < 2; i++ {
-		if got := FailureLogLevel(context.Background(), slog.LevelError, "t", "404"); got != slog.LevelError {
+		if got := round1476(context.Background(), "t", "404"); got != slog.LevelError {
 			t.Fatalf("no cell: level %v, want ERROR every time", got)
 		}
+	}
+}
+
+// round1476 is one resolve of ctx's cell that fails on target with class
+// (class "" = the resolve does not fail), and the failure line's level.
+func round1476(ctx context.Context, target, class string) slog.Level {
+	ctx, end := BeginFailureRound(ctx)
+	defer end()
+	if class == "" {
+		return slog.LevelInfo
+	}
+	return FailureLogLevel(ctx, slog.LevelError, target, class)
+}
+
+// B2 — "unchanged since the last resolve" is literal: a resolve in which the
+// target succeeds drops its note, so a recurrence logs at its own level.
+func TestIssue1476_RecoveryThenRecurrence_LogsAgain(t *testing.T) {
+	setup711(t, func(string) bool { return true })
+	ctx := cache.WithL1KeyContext(context.Background(), "cell-1476-r")
+	want := []struct {
+		class string
+		level slog.Level
+	}{
+		{"500", slog.LevelError}, {"500", slog.LevelDebug},
+		{"", slog.LevelInfo}, {"", slog.LevelInfo},
+		{"500", slog.LevelError}, {"500", slog.LevelDebug},
+	}
+	for i, s := range want {
+		if got := round1476(ctx, "t", s.class); got != s.level {
+			t.Fatalf("resolve %d (fails=%q): level %v, want %v", i, s.class, got, s.level)
+		}
+	}
+	if _, notes := failureNotedForTest("cell-1476-r"); notes != 1 {
+		t.Fatalf("the cell holds %d notes, want 1 (its last resolve's failure)", notes)
+	}
+	// A successful resolve holds nothing.
+	round1476(ctx, "t", "")
+	if keys, notes := failureNotedForTest("cell-1476-r"); notes != 0 || keys != 0 {
+		t.Fatalf("after a successful resolve: %d keys, %d notes held, want 0 and 0", keys, notes)
+	}
+}
+
+// B2 — evicted, then stored again by a SUCCESSFUL resolve: the next failure is
+// a new generation's first.
+func TestIssue1476_EvictedThenRePutBySuccess_FirstFailureLogs(t *testing.T) {
+	var resident atomic.Bool
+	resident.Store(true)
+	setup711(t, func(string) bool { return resident.Load() })
+	ctx := cache.WithL1KeyContext(context.Background(), "cell-1476-g")
+	if got := round1476(ctx, "t", "500"); got != slog.LevelError {
+		t.Fatalf("first failure: %v", got)
+	}
+	resident.Store(false)
+	round1476(ctx, "t", "") // re-resolved successfully while evicted
+	resident.Store(true)    // re-Put
+	if got := round1476(ctx, "t", "500"); got != slog.LevelError {
+		t.Fatalf("the first failure of the new generation logged at %v, want ERROR", got)
+	}
+}
+
+// B3 — the notes are the cell's current failures: an iterator whose failing
+// item changes on every refresh holds one note, not one per name it ever
+// failed on.
+func TestIssue1476_ChurningTargets_HoldOnlyTheCurrentFailures(t *testing.T) {
+	setup711(t, func(string) bool { return true })
+	ctx := cache.WithL1KeyContext(context.Background(), "cell-1476-churn")
+	const n = 2000
+	for i := 0; i < n; i++ {
+		target := stageFailureTarget("pods", fmt.Sprintf("/api/v1/namespaces/a/pods/p-%d", i))
+		if got := round1476(ctx, target, "500"); got != slog.LevelError {
+			t.Fatalf("refresh %d: a new target logged at %v, want ERROR", i, got)
+		}
+	}
+	if keys, notes := failureNotedForTest("cell-1476-churn"); keys != 1 || notes != 1 {
+		t.Fatalf("after %d churned targets: %d keys, %d notes, want 1 and 1", n, keys, notes)
+	}
+}
+
+// N2 — the notes of keys that are no longer resident are swept, and the
+// sweep's residency probes amortise: a failing resolve of a non-resident key
+// probes once, it does not sweep every noted key.
+func TestIssue1476_NonResidentKeysAreSwept_AndProbesAmortise(t *testing.T) {
+	var mu sync.Mutex
+	gone := map[string]bool{}
+	var probes atomic.Int64
+	resetFailureNotedForTest()
+	t.Cleanup(resetFailureNotedForTest)
+	prev := failureResidentFn
+	failureResidentFn = func(k string) (bool, bool) {
+		probes.Add(1)
+		mu.Lock()
+		defer mu.Unlock()
+		return !gone[k], true
+	}
+	t.Cleanup(func() { failureResidentFn = prev })
+	const k = 500
+	for i := 0; i < k; i++ {
+		round1476(cache.WithL1KeyContext(context.Background(), fmt.Sprintf("old-%d", i)), "t", "500")
+	}
+	mu.Lock()
+	for i := 0; i < k; i++ {
+		gone[fmt.Sprintf("old-%d", i)] = true
+	}
+	mu.Unlock()
+	// Ten failing resolves of a key that is never stored: one probe each.
+	probes.Store(0)
+	cold := cache.WithL1KeyContext(context.Background(), "cold")
+	mu.Lock()
+	gone["cold"] = true
+	mu.Unlock()
+	for i := 0; i < 10; i++ {
+		if got := round1476(cold, "t", "500"); got != slog.LevelError {
+			t.Fatalf("a never-stored cell is never resident: each failure keeps its level, got %v", got)
+		}
+	}
+	if p := probes.Load(); p > 20 {
+		t.Fatalf("10 failing resolves of a non-resident key with %d noted keys made %d residency probes", k, p)
+	}
+	// New resident cells fail: before as many have been inserted as were held,
+	// the evicted keys are swept.
+	probes.Store(0)
+	for i := 0; i < 2*k; i++ {
+		round1476(cache.WithL1KeyContext(context.Background(), fmt.Sprintf("new-%d", i)), "t", "500")
+	}
+	for i := 0; i < k; i++ {
+		if _, ok := failureNoted.Load(fmt.Sprintf("old-%d", i)); ok {
+			t.Fatalf("an evicted key's notes were never swept (old-%d)", i)
+		}
+	}
+	if keys, _ := failureNotedForTest(""); keys > int64(2*k)+1 {
+		t.Fatalf("%d keys held, want at most the %d resident failing cells (+1)", keys, 2*k)
+	}
+	if p := probes.Load(); p > int64(2*2*k)+int64(2*k) {
+		t.Fatalf("%d failing resolves made %d residency probes: not amortised", 2*k, p)
 	}
 }
 
@@ -257,6 +395,134 @@ func TestIssue1476_CallersOwnForbidden_StageFailureIsMarked(t *testing.T) {
 		if !errors.As(err, &se) || se.Status().Code != http.StatusForbidden {
 			t.Fatalf("%s: the failure must stay a typed 403, got %v", c.path, err)
 		}
+	}
+}
+
+// Modes of switchAPI1476's "sw" object.
+const (
+	sw1476Upstream500 = iota // a 500 Status whose message changes on every answer
+	sw1476Reset              // the connection is reset: a transport fault
+	sw1476BadBody            // a 200 whose body does not decode
+	sw1476NotFound           // a 404 Status
+)
+
+// switchAPI1476 is the requester's own apiserver; "sw" answers per *mode.
+func switchAPI1476(t *testing.T, mode *atomic.Int32) *httptest.Server {
+	t.Helper()
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch mode.Load() {
+		case sw1476Upstream500:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprintf(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"InternalError","code":500,"message":"boom %d"}`, n.Add(1))
+		case sw1476Reset:
+			if hj, ok := w.(http.Hijacker); ok {
+				c, _, _ := hj.Hijack()
+				if tc, ok := c.(*net.TCPConn); ok {
+					_ = tc.SetLinger(0)
+				}
+				_ = c.Close()
+			}
+		case sw1476BadBody:
+			_, _ = w.Write([]byte(`{not json`))
+		case sw1476NotFound:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// failureLevels1476 is the level of each failure line in rec, in order.
+func failureLevels1476(rec *rec711) []slog.Level {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	var out []slog.Level
+	for _, r := range rec.recs {
+		if r.Message == "api call response failure" {
+			out = append(out, r.Level)
+		}
+	}
+	return out
+}
+
+// N4 — the class is the status line's code, never the message: an upstream
+// 500 whose message changes on every refresh is the same failure.
+func TestIssue1476_SameCodeDifferentMessage_IsTheSameFailure(t *testing.T) {
+	setup1476E(t)
+	var mode atomic.Int32
+	mode.Store(sw1476Upstream500)
+	srv := switchAPI1476(t, &mode)
+	rec := &rec711{}
+	for i := 0; i < 3; i++ {
+		resolveAsUser1476(t, srv.URL, "cell-1476-m", rec, stage1476("sw", "/api/v1/namespaces/team-a/configmaps/sw", false))
+	}
+	got := failureLevels1476(rec)
+	if len(got) != 3 || got[0] != slog.LevelError || got[1] != slog.LevelDebug || got[2] != slog.LevelDebug {
+		t.Fatalf("an upstream 500 with a changing message: want ERROR, DEBUG, DEBUG, got %v", got)
+	}
+}
+
+// N1 — a transport fault and an undecodable body are not the upstream's 500,
+// though the fetch shapes both into one: each change of cause logs again.
+func TestIssue1476_TransportAndDecodeFaults_AreNotTheUpstreams500(t *testing.T) {
+	setup1476E(t)
+	var mode atomic.Int32
+	srv := switchAPI1476(t, &mode)
+	rec := &rec711{}
+	st := stage1476("sw", "/api/v1/namespaces/team-a/configmaps/sw", false)
+	for _, m := range []int32{sw1476Upstream500, sw1476Reset, sw1476Reset, sw1476BadBody, sw1476Upstream500} {
+		mode.Store(m)
+		resolveAsUser1476(t, srv.URL, "cell-1476-t", rec, st)
+	}
+	got := failureLevels1476(rec)
+	want := []slog.Level{slog.LevelError, slog.LevelError, slog.LevelDebug, slog.LevelError, slog.LevelError}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("500, reset, reset, bad body, 500: want %v, got %v", want, got)
+	}
+}
+
+// N4 — continueOnError demotes only the AUTHORIZED DEFINITE NotFound: a 404
+// under continueOnError that the watcher does not confirm absent (here no
+// watcher holds the GVR) keeps its ERROR first line.
+func TestIssue1476_ContinueOnError404NotDefinite_KeepsError(t *testing.T) {
+	setup1476E(t)
+	var mode atomic.Int32
+	mode.Store(sw1476NotFound)
+	srv := switchAPI1476(t, &mode)
+	rec := &rec711{}
+	for i := 0; i < 2; i++ {
+		resolveAsUser1476(t, srv.URL, "cell-1476-nf", rec, stage1476("sw", "/api/v1/namespaces/team-a/configmaps/sw", true))
+	}
+	got := failureLevels1476(rec)
+	if len(got) != 2 || got[0] != slog.LevelError || got[1] != slog.LevelDebug {
+		t.Fatalf("a 404 under continueOnError that is not a definite NotFound: want ERROR, DEBUG, got %v", got)
+	}
+}
+
+// N4 — branch C: a 404 under continueOnError on an SA dial whose pre-dial
+// authorization did NOT run (the GVR's scope cannot be resolved, so a
+// cluster-scoped GET falls back) says nothing about the identity: it is not a
+// definite NotFound and keeps its ERROR first line.
+func TestIssue1476_BranchC404WithoutPreDialAuthorization_KeepsError(t *testing.T) {
+	setup711(t, func(string) bool { return true })
+	prevScope := preDialScopeFn
+	preDialScopeFn = func(schema.GroupVersionResource) (bool, error) { return false, errors.New("scope unknown") }
+	t.Cleanup(func() { preDialScopeFn = prevScope })
+	rec := &rec711{}
+	stage := stage1476("kt", "/apis/core.krateo.io/v1alpha1/kubernetestargets/ghost", true)
+	for i := 0; i < 2; i++ {
+		s := resolveStage711(t, rec, "cell-1476-c404", stage)
+		if s.stage.Count() != 1 || s.forb.Stage() != 0 {
+			t.Fatalf("resolve %d: stage-error %d, per-identity %d, want 1 and 0 (a plain 404, not a definite answer)",
+				i, s.stage.Count(), s.forb.Stage())
+		}
+	}
+	got := failureLevels1476(rec)
+	if len(got) != 2 || got[0] != slog.LevelError || got[1] != slog.LevelDebug {
+		t.Fatalf("an unauthorized SA dial's 404 under continueOnError: want ERROR, DEBUG, got %v", got)
 	}
 }
 

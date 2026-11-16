@@ -27,6 +27,16 @@ func TestIssue1476_ForbiddenIsPerIdentityOnlyForTheCtxIdentitysCredential(t *tes
 	t.Cleanup(func() { env.SetTestMode(prev) })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("Impersonate-User") == "u1476-refused" {
+			// kube-apiserver's impersonation filter, when the dialler may not
+			// impersonate: before any authorization of the read. Its details
+			// name users, not the requested resource.
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure",` +
+				`"message":"users \"u1476-refused\" is forbidden: cannot impersonate resource \"users\"",` +
+				`"reason":"Forbidden","details":{"name":"u1476-refused","kind":"users"},"code":403}`))
+			return
+		}
 		switch r.URL.Path {
 		case "/api":
 			_, _ = w.Write([]byte(`{"kind":"APIVersions","versions":["v1"]}`))
@@ -39,7 +49,8 @@ func TestIssue1476_ForbiddenIsPerIdentityOnlyForTheCtxIdentitysCredential(t *tes
 			_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"x","namespace":"ns"}}`))
 		case "/api/v1/namespaces/ns/configmaps/refused":
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}`))
+			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden",` +
+				`"details":{"name":"refused","kind":"configmaps"},"code":403}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -65,6 +76,12 @@ func TestIssue1476_ForbiddenIsPerIdentityOnlyForTheCtxIdentitysCredential(t *tes
 		{name: "a_credential_impersonating_the_ctx_identity", object: "refused", want: true, ctx: func() context.Context {
 			return cache.WithInternalRESTConfig(context.Background(),
 				&rest.Config{Host: srv.URL, Impersonate: rest.ImpersonationConfig{UserName: "u1476"}})
+		}},
+		// The apiserver refuses the IMPERSONATION itself (#608 shape): the
+		// ServiceAccount's own fault, whatever object was asked for.
+		{name: "the_impersonation_refused", object: "x", want: false, ctx: func() context.Context {
+			return cache.WithInternalRESTConfig(context.Background(),
+				&rest.Config{Host: srv.URL, Impersonate: rest.ImpersonationConfig{UserName: "u1476-refused"}})
 		}},
 		// The ServiceAccount read under a background driver's real identity is
 		// re-gated for that identity; with no RBAC snapshot the gate fails

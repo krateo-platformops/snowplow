@@ -38,6 +38,31 @@ type Answer struct {
 	// itself ended with no answer; "" when it was not snowplow's doing.
 	refusal  string
 	bodyNote string
+	// lastStatus (#1476) is the status line of the dial's last attempt that
+	// got one (0 = none did). Unlike code it survives the retry client turning
+	// a final 5xx into an error with no response.
+	lastStatus int
+}
+
+// attempted records the status line of one attempt. Nil-safe.
+func (a *Answer) attempted(code int) {
+	if a != nil {
+		a.lastStatus = code
+	}
+}
+
+// LastStatus is the status line of the dial's last attempt that got one, 0
+// when no attempt got a response (a reset, a refused connection, a dial
+// snowplow ended). It is what the authority last answered, read by the
+// failure log's class (#1476); the audit record's code stays Outcome's.
+func (a *Answer) LastStatus() int {
+	if a == nil {
+		return 0
+	}
+	if a.code != 0 {
+		return a.code
+	}
+	return a.lastStatus
 }
 
 type answerCtxKey struct{}

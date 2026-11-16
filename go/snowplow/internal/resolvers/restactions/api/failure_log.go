@@ -1,5 +1,6 @@
-// failure_log.go — a failure that repeats unchanged in one cell's generation
-// logs once at its own level, then at DEBUG (#711, generalised by #1476).
+// failure_log.go — a failure that is unchanged since the cell's previous
+// resolve logs at DEBUG, not at its own level again (#711, generalised by
+// #1476).
 //
 // THE DEFECT. A resident cell is re-resolved on every refresh (#604), keepwarm
 // pass and prewarm pass. A stage that fails there fails the same way each
@@ -10,49 +11,72 @@
 // unchanged failures). Log volume then measures refresh work, not failures,
 // and buries the failures that are new.
 //
-// THE RULE. A failure line is logged at ITS OWN level the first time its
-// (target, class) is seen in the cell's current generation, and at DEBUG while
-// it repeats unchanged. A different class for the same target, a new target,
-// an eviction or a new generation logs at its own level again. It is neither a
-// rate limit nor a cutoff: the dedupe key is the cell's generation, so the line
-// comes back whenever the cell could have a different answer.
+// THE RULE. Each resolve of a cell is a ROUND. A failure line logs at ITS OWN
+// level unless the cell's PREVIOUS round failed with the same (target, class);
+// then it logs at DEBUG. At the end of the round its own failures replace the
+// previous round's. So, literally, "unchanged since the last resolve":
+//   - a failure that repeats on every resolve logs once at its level, then DEBUG;
+//   - a target that succeeds, or is not failing, in a round loses its note: if
+//     it fails again later it logs at its own level (a recurrence is new);
+//   - a different class for the same target, or a new target, logs again;
+//   - a new generation of the cell logs again: when the first failure of a
+//     round finds the cell's key NOT resident (evicted, never stored), the
+//     previous round's notes are dropped first.
+// It is neither a rate limit nor a cutoff.
 //
 //   - target: what failed, named by the log site: the stage and the path it
 //     read, the stage's endpointRef, a widget's apiRef. Held only as a SHA-256
 //     digest, so the notes hold no path, name or identity in clear.
 //   - class: a closed, identity-free label decided by the error's TYPE and its
 //     status code — never its message, which can name the requester (#681 S1).
-//     failureClassOf / failureClassOfCode build it; classPerIdentityDenied is
+//     FailureClassOf / failureClassOfCode build it; classPerIdentityDenied is
 //     the expected per-identity deny (#711: a re-gate deny, #1476: the
-//     caller's own Forbidden).
-//   - its own level: decided by the site from the class: WARN for an expected
-//     per-identity deny, DEBUG for a declared outcome (an authorized definite
-//     NotFound under continueOnError, which does not go through the notes at
+//     caller's own Forbidden), classUncoded a transport fault with no code,
+//     classDecode a body that could not be used.
+//   - its own level: decided by the site from the class, BEFORE the line: WARN
+//     for an expected per-identity deny, DEBUG for an authorized definite
+//     NotFound under continueOnError (which does not go through the notes at
 //     all), ERROR for everything else.
 //
 // Counters are not touched here: every stage-error, pre-dial, per-identity
 // and external sink and expvar is bumped where the failure is decided, for
 // every occurrence, exactly as before.
 //
-// WHAT A CELL GENERATION IS. The cell is the L1 key on the resolve's ctx (the
-// refresher, the seed, the dispatchers and /call all set it). Its generation
-// is one residency of that key in the resolved cache: the notes for a key are
-// dropped whenever a failure is seen while the key is NOT resident (the cell
-// was evicted, or has not been Put yet), so the next resident period logs its
-// first failure again. The key itself folds the identity's RBAC class (#424),
-// so an RBAC change that could change the verdict is a new key and logs again
-// too. The notes hold nothing beyond that key: a digest of the target and a
-// constant class label.
+// WHERE A ROUND IS. BeginFailureRound opens one for the L1 key on the ctx, at
+// the top of api.ResolveWithFailure and of widgets.Resolve; a resolve nested
+// under the SAME key (a widget's apiRef RESTAction, a `resolve: true` stage)
+// joins the open round, so the cell's failures are one set. A nested resolve
+// under another key (the RAFullList cell) is that key's own round. A failure
+// logged with no round for its ctx's key (no L1 key, the cache off) logs at its
+// own level. Two concurrent rounds of one key (a refresh and a /call) each
+// read the notes when they first fail and write them when they end: the last
+// to end wins, which can cost one extra line, never hide a new failure for
+// longer than one round.
 //
-// BOUNDED, NO KNOB. Only keys that saw a failure are held, and a key holds one
-// note per target its resolves failed on. Inserting a new key sweeps the notes
-// of every key that is no longer resident, so the set tracks the resident
-// failure-holding cells. With no L1 key or no resolved cache there is no cell
-// to deduplicate on: the line logs at its own level each time.
+// BOUNDED BY CONSTRUCTION, NO KNOB.
+//   - Per cell: the notes ARE the previous round's failures, so they are
+//     bounded by the cell's current failures (an iterator over a churning list
+//     holds the names failing now, not every name it ever failed on).
+//   - Across cells: a round with no failure deletes its key's notes, and a
+//     failing round on a non-resident key resets them, so what is held is the
+//     resident cells whose last resolve failed, plus the keys noted since the
+//     last sweep. The sweep drops non-resident keys; it runs once as many keys
+//     have been inserted as were held when the last one ended, so its
+//     residency probes (each one takes the resolved cache's lock) amortise to
+//     at most two per inserted key. A round probes residency once, at its
+//     first failure; a round without a failure never probes.
 //
-// DRY RUNS. An inert (#443) resolve never touches the notes, so a draft resolve
-// can neither spend nor reset a cell's first line. Its expected per-identity
-// deny logs at DEBUG (#711); every other failure logs at its own level.
+// WHAT IT DOES NOT REDUCE. A cell whose failing resolve is never stored is
+// never resident, so every round resets: its line logs at its own level each
+// time. The dedupe follows residency on purpose: a cell nobody holds has no
+// generation to dedupe within, and holding notes for keys that are never
+// stored (a request's extras make the key) would be the unbounded set this
+// avoids.
+//
+// DRY RUNS. An inert (#443) resolve opens no round and never touches the
+// notes, so a draft resolve can neither spend nor reset a cell's first line.
+// Its expected per-identity deny logs at DEBUG (#711); every other failure
+// logs at its own level.
 
 package api
 
@@ -63,8 +87,9 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
-	httpcall "github.com/krateo-platformops/plumbing/http/request"
+	"github.com/krateo-platformops/plumbing/http/response"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
@@ -76,17 +101,32 @@ const (
 	// classPerIdentityDenied is an expected per-identity deny: the identity
 	// may not make the read (IsPerIdentityDenied). Its own level is WARN.
 	classPerIdentityDenied = "per_identity_denied"
-	// classUncoded is a failure that carries no status code (a transport or
-	// decode error).
+	// classUncoded is a failure that carries no status code (a transport
+	// fault: a reset, a refused connection, a TLS error).
 	classUncoded = "error"
+	// classDecode is an answer that arrived but could not be used (a body
+	// that does not decode, a filter that fails on it).
+	classDecode = "decode"
 )
 
 // failureTarget is the digest a failure's target is noted under.
 type failureTarget [sha256.Size]byte
 
-// failureNoted maps an L1 key to the class last logged at its own level for
-// each target in the key's current generation.
-var failureNoted sync.Map // string -> *sync.Map (failureTarget -> string)
+// failureNotes is one cell's previous-round failures: target -> class.
+type failureNotes map[failureTarget]string
+
+var (
+	// failureNoted maps an L1 key to the failures of its last round.
+	failureNoted sync.Map // string -> failureNotes
+	// failureNotedKeys is the number of keys held; failureInsertsSinceSweep
+	// the number inserted since the last sweep, and failureSweepAfter the
+	// number held when it ended: the next sweep runs once that many have been
+	// inserted (the amortisation clock).
+	failureNotedKeys         atomic.Int64
+	failureInsertsSinceSweep atomic.Int64
+	failureSweepAfter        atomic.Int64
+	failureSweeping          atomic.Bool
+)
 
 // failureResidentFn reports whether an L1 key is resident. A seam only so a
 // unit arm can drive generations without a store; production never reassigns
@@ -99,11 +139,103 @@ var failureResidentFn = func(l1Key string) (resident, tracked bool) {
 	return store.Has(l1Key), true
 }
 
-// FailureLogLevel returns the level of a failure line logged under ctx's cell:
-// own the first time (target, class) is seen in the cell's generation, DEBUG
-// while it repeats unchanged. own is the class's level; target names what
-// failed (any text: only its digest is kept); class is a closed,
-// identity-free label (FailureClassOf, classPerIdentityDenied).
+// failureRound is one resolve of a cell.
+type failureRound struct {
+	key  string
+	once sync.Once
+	// off: no resolved cache to follow residency in; no dedupe.
+	off  bool
+	prev failureNotes
+	mu   sync.Mutex
+	cur  failureNotes
+}
+
+type failureRoundCtxKey struct{}
+
+// BeginFailureRound opens the failure-log round of the cell whose L1 key is on
+// ctx, and returns the ctx that carries it and the func that ends it (its
+// failures replace the cell's notes). With no L1 key, on an inert ctx, or when
+// a round for the same key is already open on ctx, it returns ctx unchanged
+// and a no-op: the enclosing round is the cell's.
+func BeginFailureRound(ctx context.Context) (context.Context, func()) {
+	if cache.Inert(ctx) {
+		return ctx, func() {}
+	}
+	key := cache.L1KeyFromContext(ctx)
+	if key == "" {
+		return ctx, func() {}
+	}
+	if r, ok := ctx.Value(failureRoundCtxKey{}).(*failureRound); ok && r.key == key {
+		return ctx, func() {}
+	}
+	r := &failureRound{key: key}
+	return context.WithValue(ctx, failureRoundCtxKey{}, r), r.end
+}
+
+// load reads the cell's previous-round notes, at the round's first failure.
+func (r *failureRound) load() {
+	resident, tracked := failureResidentFn(r.key)
+	if !tracked {
+		r.off = true
+		return
+	}
+	if !resident {
+		// No cell holds this key now: whatever was noted belonged to an
+		// earlier generation, or to a resolve whose cell was never stored.
+		if _, ok := failureNoted.LoadAndDelete(r.key); ok {
+			failureNotedKeys.Add(-1)
+		}
+		return
+	}
+	if v, ok := failureNoted.Load(r.key); ok {
+		r.prev = v.(failureNotes)
+	}
+}
+
+// level notes (target, class) in the round and returns its line's level.
+func (r *failureRound) level(own slog.Level, target, class string) slog.Level {
+	r.once.Do(r.load)
+	if r.off {
+		return own
+	}
+	t := failureTarget(sha256.Sum256([]byte(target)))
+	r.mu.Lock()
+	if r.cur == nil {
+		r.cur = failureNotes{}
+	}
+	r.cur[t] = class
+	r.mu.Unlock()
+	if prev, seen := r.prev[t]; seen && prev == class {
+		return slog.LevelDebug
+	}
+	return own
+}
+
+// end replaces the cell's notes with this round's failures: none (a round
+// without a failure, or one with no store to follow) deletes them.
+func (r *failureRound) end() {
+	r.mu.Lock()
+	cur := r.cur
+	r.mu.Unlock()
+	if r.off || len(cur) == 0 {
+		if _, ok := failureNoted.LoadAndDelete(r.key); ok {
+			failureNotedKeys.Add(-1)
+		}
+		return
+	}
+	if _, loaded := failureNoted.Swap(r.key, cur); !loaded {
+		failureNotedKeys.Add(1)
+		failureInsertsSinceSweep.Add(1)
+		sweepFailureNoted(r.key)
+	}
+}
+
+// FailureLogLevel returns the level of a failure line logged under ctx's
+// cell: own, unless the cell's previous round failed on target with the same
+// class, then DEBUG. own is the class's level; target names what failed (any
+// text: only its digest is kept); class is a closed, identity-free label
+// (FailureClassOf, classPerIdentityDenied). With no open round for ctx's key
+// the line keeps its own level.
 func FailureLogLevel(ctx context.Context, own slog.Level, target, class string) slog.Level {
 	// #443 — an inert (dry-run) resolve neither reads nor writes the notes: it
 	// cannot spend a cell's first line. Its expected deny is DEBUG (#711).
@@ -113,33 +245,16 @@ func FailureLogLevel(ctx context.Context, own slog.Level, target, class string) 
 		}
 		return own
 	}
-	l1Key := cache.L1KeyFromContext(ctx)
-	if l1Key == "" {
+	r, ok := ctx.Value(failureRoundCtxKey{}).(*failureRound)
+	if !ok || r.key != cache.L1KeyFromContext(ctx) {
 		return own
 	}
-	resident, tracked := failureResidentFn(l1Key)
-	if !tracked {
-		return own
-	}
-	if !resident {
-		// No cell holds this key now: whatever was noted belonged to an
-		// earlier generation. Start this one fresh.
-		failureNoted.Delete(l1Key)
-	}
-	v, loaded := failureNoted.LoadOrStore(l1Key, &sync.Map{})
-	if !loaded {
-		sweepFailureNoted(l1Key)
-	}
-	prev, seen := v.(*sync.Map).Swap(failureTarget(sha256.Sum256([]byte(target))), class)
-	if seen && prev.(string) == class {
-		return slog.LevelDebug
-	}
-	return own
+	return r.level(own, target, class)
 }
 
 // expectedDenyLevel is the level of an expected per-identity deny's failure
-// line for target (#711): WARN the first time in the cell's generation, DEBUG
-// after.
+// line for target (#711): WARN unless the cell's previous round was denied
+// the same way, then DEBUG.
 func expectedDenyLevel(ctx context.Context, target string) slog.Level {
 	return FailureLogLevel(ctx, slog.LevelWarn, target, classPerIdentityDenied)
 }
@@ -158,17 +273,16 @@ func endpointRefTarget(id string, ref *templates.Reference) string {
 	return "endpointRef\x00" + id + "\x00" + ref.Namespace + "/" + ref.Name
 }
 
-// declaredOutcome reports whether a stage declared that a failure of call is
-// an expected outcome: it continues on error and records the failure under its
-// errorKey (#1476). An authorized definite NotFound (#1080) on such a stage is
-// logged at DEBUG; it is counted as before.
-func declaredOutcome(call httpcall.RequestOptions) bool {
-	return call.ContinueOnError && call.ErrorKey != ""
-}
-
 // FailureClassOf is the closed, identity-free class of err: the expected
 // per-identity deny, else the status code its chain carries (an apiserver
 // Status, the page budget's 504), else classUncoded. Never its message.
+//
+// At the internal-rest-config and discovery sites the code is the one
+// client-go read, which for a Status body is the body's code. Those sites dial
+// only the cluster's own apiserver with snowplow's credential, the authority
+// every RBAC decision already trusts, and the class steers only which repeat
+// is DEBUG, never a line's own level: so it is taken as read. The external
+// fetch, where the upstream may be anyone, uses the HTTP status line's code.
 func FailureClassOf(err error) string {
 	if IsPerIdentityDenied(err) {
 		return classPerIdentityDenied
@@ -176,9 +290,34 @@ func FailureClassOf(err error) string {
 	if st, ok := credhttp.BudgetStatus(err); ok {
 		return failureClassOfCode(int(st.Code))
 	}
+	if st, ok := credhttp.DestinationStatus(err); ok {
+		return failureClassOfCode(int(st.Code))
+	}
 	var status apierrors.APIStatus
 	if errors.As(err, &status) {
 		return failureClassOfCode(int(status.Status().Code))
+	}
+	return classUncoded
+}
+
+// externalFailureClass is the class of an external fetch's failure. The fetch
+// shapes every fault into one 500 envelope (an upstream 5xx after the retry
+// client gave up, a reset connection, a refused dial), so the class reads what
+// the dial itself observed: answered is the status line of its last attempt
+// (credhttp.Answer.LastStatus), 0 when no attempt got one. A body that arrived
+// and could not be used is classDecode; with an answer, its code; with none,
+// the fault's own class (the page budget's 504, the destination refusal, else
+// classUncoded).
+func externalFailureClass(res *response.Status, fetchErr error, decodeFailed bool, answered int) string {
+	switch {
+	case decodeFailed:
+		return classDecode
+	case answered != 0:
+		return failureClassOfCode(answered)
+	case fetchErr != nil:
+		return FailureClassOf(fetchErr)
+	case res != nil:
+		return failureClassOfCode(res.Code)
 	}
 	return classUncoded
 }
@@ -222,19 +361,34 @@ func IsPerIdentityDenied(err error) bool {
 	return errors.As(err, &e)
 }
 
-// sweepFailureNoted drops the notes of every key, other than keep, that is no
-// longer resident.
+// sweepFailureNoted drops the notes of every key that is no longer resident,
+// once as many keys have been inserted since the last sweep as were held when
+// it ended. A sweep probes every held key, at most that number plus the
+// inserts since: at most two residency probes per inserted key, amortised.
+// One sweep at a time. keep, the key whose insertion ran it, is kept: its
+// round has just ended and its cell is about to be stored (a first resolve
+// ends before the dispatcher's Put).
 func sweepFailureNoted(keep string) {
+	if failureInsertsSinceSweep.Load() < failureSweepAfter.Load() {
+		return
+	}
+	if !failureSweeping.CompareAndSwap(false, true) {
+		return
+	}
+	defer failureSweeping.Store(false)
+	failureInsertsSinceSweep.Store(0)
 	failureNoted.Range(func(k, _ any) bool {
-		key := k.(string)
-		if key == keep {
+		if k.(string) == keep {
 			return true
 		}
-		if resident, tracked := failureResidentFn(key); tracked && !resident {
-			failureNoted.Delete(key)
+		if resident, tracked := failureResidentFn(k.(string)); tracked && !resident {
+			if _, ok := failureNoted.LoadAndDelete(k); ok {
+				failureNotedKeys.Add(-1)
+			}
 		}
 		return true
 	})
+	failureSweepAfter.Store(failureNotedKeys.Load())
 }
 
 // resetFailureNotedForTest clears every note. Tests only.
@@ -243,6 +397,18 @@ func resetFailureNotedForTest() {
 		failureNoted.Delete(k)
 		return true
 	})
+	failureNotedKeys.Store(0)
+	failureInsertsSinceSweep.Store(0)
+	failureSweepAfter.Store(0)
+}
+
+// failureNotedForTest is the number of keys held and the number of notes the
+// key holds. Tests only.
+func failureNotedForTest(key string) (keys int64, notes int) {
+	if v, ok := failureNoted.Load(key); ok {
+		notes = len(v.(failureNotes))
+	}
+	return failureNotedKeys.Load(), notes
 }
 
 // SetFailureLogResidentForTest makes the failure-log dedupe read residency

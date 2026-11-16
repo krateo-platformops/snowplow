@@ -58,6 +58,14 @@ func apiserver1476(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("Impersonate-User") != "" {
+			// the apiserver refusing the impersonation itself (#608 shape)
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure",` +
+				`"message":"users \"u1476\" is forbidden: cannot impersonate resource \"users\"",` +
+				`"reason":"Forbidden","details":{"name":"u1476","kind":"users"},"code":403}`))
+			return
+		}
 		switch r.URL.Path {
 		case "/api":
 			_, _ = w.Write([]byte(`{"kind":"APIVersions","versions":["v1"]}`))
@@ -71,6 +79,7 @@ func apiserver1476(t *testing.T) *httptest.Server {
 		case "/apis/templates.krateo.io/v1/namespaces/ns1476/restactions/nav":
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403,` +
+				`"details":{"name":"nav","group":"templates.krateo.io","kind":"restactions"},` +
 				`"message":"restactions.templates.krateo.io \"nav\" is forbidden"}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -109,6 +118,12 @@ func TestIssue1476_WidgetApiRefForbidden_LevelByWhoseCredential(t *testing.T) {
 		// 403 is snowplow's own fault.
 		{"the_service_accounts_own_credential", func(ctx context.Context) context.Context {
 			return cache.WithInternalRESTConfig(ctx, &rest.Config{Host: srv.URL})
+		}, slog.LevelError},
+		// the ServiceAccount impersonating, and the apiserver refusing the
+		// impersonation: the ServiceAccount's own fault, not the identity's.
+		{"the_impersonation_refused", func(ctx context.Context) context.Context {
+			return cache.WithInternalRESTConfig(ctx,
+				&rest.Config{Host: srv.URL, Impersonate: rest.ImpersonationConfig{UserName: "u1476"}})
 		}, slog.LevelError},
 	} {
 		t.Run(c.name, func(t *testing.T) {

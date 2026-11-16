@@ -8,6 +8,7 @@ package objects
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -47,11 +48,12 @@ type Result struct {
 	// fetch of the dispatched CR) marks them from this.
 	RequesterDialled bool
 	// PerIdentityDenied (#1476): Err is a Forbidden for the ctx identity, not
-	// for snowplow's own credential: the apiserver's 403 on a read made with
-	// the requester's credential or impersonating the ctx identity, or the
+	// for snowplow's own credential: the apiserver's 403 refusing THIS read
+	// (its typed details name the requested resource) on a read made with the
+	// requester's credential or impersonating the ctx identity, or the
 	// ServiceAccount read re-gated and denied for the ctx identity. A caller
-	// reports it as an expected per-identity deny (WARN once per cell
-	// generation), never as a fault. The ServiceAccount's own 403 is not one.
+	// reports it as an expected per-identity deny (WARN), never as a fault. The
+	// ServiceAccount's own 403, the impersonation refused included, is not one.
 	PerIdentityDenied bool
 }
 
@@ -342,7 +344,7 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 			res.Err = st // #1115 — 504 Timeout
 		} else if apierrors.IsForbidden(err) {
 			res.Err = response.New(http.StatusForbidden, err)
-			res.PerIdentityDenied = dialsAsCtxIdentity(ctx, rc)
+			res.PerIdentityDenied = dialsAsCtxIdentity(ctx, rc) && forbidsRequested(err, res.GVR)
 		} else if dynamic.IsNotServed(err) {
 			// #1414 — 424, before the object's 404.
 			res.TypeNotInstalled = typeNotInstalled(res.GVR)
@@ -412,6 +414,21 @@ func dialsAsCtxIdentity(ctx context.Context, rc *rest.Config) bool {
 	}
 	imp := rc.Impersonate
 	return imp.UserName != "" || imp.UID != "" || len(imp.Groups) > 0
+}
+
+// forbidsRequested reports whether a Forbidden's typed Status details name the
+// resource the read asked for (#1476): the apiserver's authorization of THIS
+// read refused it. A Forbidden that names another resource is not an answer
+// about the read: the apiserver refusing the impersonation itself names
+// users, groups or serviceaccounts (the ServiceAccount's own fault, #608). By
+// type only, never the message.
+func forbidsRequested(err error, gvr schema.GroupVersionResource) bool {
+	var status apierrors.APIStatus
+	if !errors.As(err, &status) {
+		return false
+	}
+	d := status.Status().Details
+	return d != nil && d.Group == gvr.Group && d.Kind == gvr.Resource
 }
 
 // ReasonFailedDependency is the Status reason of a 424 answer

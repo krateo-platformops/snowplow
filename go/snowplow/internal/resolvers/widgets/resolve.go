@@ -74,6 +74,13 @@ var (
 func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	log := xcontext.Logger(ctx).With(loggerAttr(opts.In.Object))
 
+	// #1476 — this resolve is one failure-log round of the widget's cell; its
+	// apiRef RESTAction, resolved under the same cell key, joins it. A failure
+	// unchanged since the cell's previous round logs at DEBUG
+	// (api/failure_log.go).
+	ctx, endFailureRound := api.BeginFailureRound(ctx)
+	defer endFailureRound()
+
 	// A2 contract: server-trusted identity injection into the RESOLVE INPUT
 	// (definitive-cache-identity-architecture §1.3 + §2.4). For a widget whose CR
 	// declares spec.identityContext, fold the declared subset of the
