@@ -1171,12 +1171,13 @@ snowplow_env_gate() {
   fi
   log "snowplow env: ${line}"
 }
-# s_rehearsal (BENCH_606_REHEARSAL=env): after the install and the platform, the pod's reading and the
-# gate, the image the snowplow pod runs (#1468: digest_gate, the measuring run's own check, against
-# EXPECTED_IMAGE_DIGEST; no restart came before it here, so no leftover pod is expected), the
-# preflight (run 26j: the preflight user's boot call and the menu's routes, by s_preflight, the
-# measuring run's own step: the boot root must answer 200, the menu must list routes, and with
-# COMPOSITE_BURST_USERS > 0 one of them must be a composite page), the operations record, and ONE
+# s_rehearsal (BENCH_606_REHEARSAL=env): after the install and the platform, the preflight (run 26j:
+# the preflight user's boot call and the menu's routes, by s_preflight, the measuring run's own step:
+# the boot root must answer 200, the menu must list routes, and with COMPOSITE_BURST_USERS > 0 one of
+# them must be a composite page; first, since #1482's boot window probes that boot root as that user),
+# the pod's reading and the gate (with its boot window), the image the snowplow pod runs (#1468:
+# digest_gate, the measuring run's own check, against EXPECTED_IMAGE_DIGEST; no restart came before it
+# here, so no leftover pod is expected), the operations record, and ONE
 # block with everything the rehearsal exists to show. Each check runs whatever the one before it
 # said: the report shows them all, and the rehearsal fails when any of them did.
 s_rehearsal() {
