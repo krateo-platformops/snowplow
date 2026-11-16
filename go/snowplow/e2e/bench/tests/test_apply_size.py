@@ -121,9 +121,12 @@ def test_run606_applies_everything_through_one_server_side_apply():
     # single applies each under a wall-clock bound (a term of its budget).
     # #1297: the data606 Job (data) and the samplers' observer (env), each with its ServiceAccount, RBAC
     # and the bench-src ConfigMap (bench/incluster.py; tests/test_1297_incluster.py checks its size).
-    # the runtime606 Job (go_runtime_reading): the process's effective GC settings, before the measure
+    # the runtime606 Job (go_runtime_reading): the process's effective GC settings, before the measure;
+    # the boot606 probe (BENCH_606_REHEARSAL=bootwindow, before the reboot)
     assert sites == ['kapply "$OUT/go-runtime-job.yaml" >/dev/null || { log "the ${job} Job was not created: '
                      '$(kerr_line)"; return 0; }',
+                     'kapply "$OUT/boot-probe-job.yaml" >/dev/null || { record_failure "bootwindow FAILED: the '
+                     'boot606 Job was not created" || true; return 1; }',
                      'kapply "$OUT/netns-job.yaml" \\',
                      'kapply "$OUT/bench-flowschemas.yaml"', 'kapply "$OUT/psi-job.yaml"',
                      'kapply "$OUT/preflight-job.yaml"',
