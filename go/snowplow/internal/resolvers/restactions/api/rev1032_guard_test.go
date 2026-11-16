@@ -75,6 +75,25 @@ func selectorRefs(body ast.Node, name string) []token.Pos {
 	return out
 }
 
+// ifEndsReturningTrue reports whether the top-level `if` of body holding pos
+// has a body whose last statement is `return true` (the refusal stops the
+// stage: a gate that falls through refuses nothing).
+func ifEndsReturningTrue(body *ast.BlockStmt, pos token.Pos) bool {
+	for _, st := range body.List {
+		is, ok := st.(*ast.IfStmt)
+		if !ok || pos < st.Pos() || pos >= st.End() || len(is.Body.List) == 0 {
+			continue
+		}
+		ret, ok := is.Body.List[len(is.Body.List)-1].(*ast.ReturnStmt)
+		if !ok || len(ret.Results) != 1 {
+			return false
+		}
+		id, ok := ret.Results[0].(*ast.Ident)
+		return ok && id.Name == "true"
+	}
+	return false
+}
+
 // topLevelIfHolds reports whether pos lies in the init or the condition of a
 // top-level `if` statement of body.
 func topLevelIfHolds(body *ast.BlockStmt, pos token.Pos) bool {
@@ -167,6 +186,9 @@ func TestRev1032_ResolveOneOnlyBehindRefusePerUserRef(t *testing.T) {
 	if !inInit {
 		t.Error("refuseStageEndpointRef: refusePerUserRef is not an unconditional top-level `if err := ...; err != nil` statement")
 	}
+	if !ifEndsReturningTrue(rf.Body, rule[0]) {
+		t.Error("refuseStageEndpointRef: the refusal's `if` body does not end in `return true`")
+	}
 
 	// runStage: `if r.refuseStageEndpointRef(...) {` is top-level and precedes
 	// every resolveStageEndpoint reference (and the plan).
@@ -177,6 +199,9 @@ func TestRev1032_ResolveOneOnlyBehindRefusePerUserRef(t *testing.T) {
 		}
 		if !topLevelIfHolds(fn.decl.Body, gate[0]) {
 			t.Error("runStage: refuseStageEndpointRef is not an unconditional top-level `if` statement")
+		}
+		if !ifEndsReturningTrue(fn.decl.Body, gate[0]) {
+			t.Error("runStage: the refuseStageEndpointRef gate's body does not end in `return true` (the stage must stop)")
 		}
 		for _, name := range []string{"resolveStageEndpoint", "planStage"} {
 			for _, p := range selectorRefs(fn.decl.Body, name) {

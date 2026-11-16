@@ -36,9 +36,15 @@ import (
 //     its iterator, its userAccessFilter resourcesFrom, and, for a stage
 //     without an iterator, its path, payload and headers (an iterator stage
 //     renders those from its elements, which its iterator yields) — are
-//     satisfied by the same rule, transitively. A stage read through a cycle
-//     is not satisfied;
-//   - another key the resolver writes (an errorKey, the pagination block).
+//     satisfied by the same rule, transitively, and its filter reads no
+//     uncarried extra (its input holds the extras under `extras`, beside the
+//     stage's response and the pagination block, handler.go jsonHandlerCore:
+//     a read `.extras.k` needs k carried; a use of `.extras` the analysis
+//     cannot narrow to constant keys needs extras). A stage read through a
+//     cycle is not satisfied;
+//   - an errorKey, and EVERY stage writing it needs no uncarried extra (what
+//     lands there depends on whether those stages fail, B2');
+//   - the pagination block.
 //
 // Any other key is a request extra the resolve does not carry. A template whose
 // reads cannot be determined (RootKeys ok=false: it does not parse, or reads
@@ -66,6 +72,8 @@ type needsAnalysis struct {
 	carried  map[string]any
 	reserved map[string]ReservedKey
 	stages   map[string]*templates.API
+	// errorKeyStages: each effective errorKey and the stages that write it.
+	errorKeyStages map[string][]string
 	// state per stage name: 1 = being decided (a cycle reads as needing), 2 =
 	// needs nothing, 3 = needs an uncarried extra.
 	state map[string]int
@@ -77,9 +85,15 @@ func (n *needsAnalysis) init() {
 	}
 	n.reserved = ReservedDictKeys(n.items)
 	n.stages = map[string]*templates.API{}
+	n.errorKeyStages = map[string][]string{}
 	for _, it := range n.items {
 		if it != nil {
 			n.stages[it.Name] = it
+			ek := defaultErrorKey
+			if it.ErrorKey != nil {
+				ek = *it.ErrorKey
+			}
+			n.errorKeyStages[ek] = append(n.errorKeyStages[ek], it.Name)
 		}
 	}
 	n.state = map[string]int{}
@@ -108,19 +122,70 @@ func (n *needsAnalysis) templateNeeds(s string, wrapped bool) bool {
 	}
 	n.init()
 	for _, k := range keys {
-		if _, has := n.carried[k]; has {
-			continue
+		if n.keyNeeds(k) {
+			return true
 		}
-		if _, isStage := n.stages[k]; isStage {
-			if n.stageNeeds(k) {
+	}
+	return false
+}
+
+// keyNeeds reports whether the dict key k, read by a template, depends on an
+// uncarried extra (NeedsRequestExtras lists the rule).
+func (n *needsAnalysis) keyNeeds(k string) bool {
+	if _, has := n.carried[k]; has {
+		return false
+	}
+	if _, isStage := n.stages[k]; isStage {
+		return n.stageNeeds(k)
+	}
+	if r, written := n.reserved[k]; written {
+		if r.Owner != ReservedByErrorKey {
+			return false // the pagination block
+		}
+		for _, st := range n.errorKeyStages[k] {
+			if n.stageNeeds(st) {
 				return true
 			}
-			continue
 		}
-		if _, written := n.reserved[k]; written {
-			continue // an errorKey, the pagination block
-		}
+		return false
+	}
+	return true
+}
+
+// filterNeeds reports whether the stage filter f reads an uncarried extra. Its
+// input is {extras: the extras, <stage>: the response, slice}; a stage named
+// "extras" keeps its own response under that key (jsonHandlerCore).
+func (n *needsAnalysis) filterNeeds(stage, f string) bool {
+	q := f
+	if inner, isTemplate := jqutil.MaybeQuery(f); isTemplate {
+		q = inner
+	}
+	if q == "" {
+		return false
+	}
+	keys, sub, subOK, ok := jqsupport.RootKeysUnder(q, "extras")
+	if !ok {
 		return true
+	}
+	if stage == "extras" {
+		return false // `.extras` is the stage's own response
+	}
+	readsExtras := false
+	for _, k := range keys {
+		if k == "extras" {
+			readsExtras = true
+		}
+	}
+	if !readsExtras {
+		return false
+	}
+	if !subOK {
+		return true
+	}
+	for _, k := range sub {
+		if _, has := n.carried[k]; !has {
+			return true
+		}
 	}
 	return false
 }
@@ -149,6 +214,9 @@ func (n *needsAnalysis) stageNeeds(name string) bool {
 	}
 	if !needs && st.UserAccessFilter != nil && st.UserAccessFilter.ResourcesFrom != "" &&
 		n.templateNeeds(st.UserAccessFilter.ResourcesFrom, false) {
+		needs = true
+	}
+	if !needs && st.Filter != nil && n.filterNeeds(st.Name, *st.Filter) {
 		needs = true
 	}
 	if !needs && iterator == "" {

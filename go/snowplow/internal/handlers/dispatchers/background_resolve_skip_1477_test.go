@@ -180,6 +180,41 @@ func TestIssue1477_Predicate_ThroughStageOutputs(t *testing.T) {
 		{"a stage that reads itself (a cycle) is not satisfied", []any{
 			st{"name": "A", "path": "/a", "endpointRef": ep(`${ .A.host }`)},
 		}, nil, true},
+		// B2' — a stage filter sees the extras under `extras`.
+		{"A's filter reads .extras.name; B's endpointRef reads .A.ep (the reviewer's shape)", []any{
+			st{"name": "A", "path": "/a", "filter": `{ ep: ((.extras.name // "") + "-endpoint") }`},
+			st{"name": "B", "path": "/b", "endpointRef": ep(`${ .A.ep }`)},
+		}, nil, true},
+		{"the same, carrying name", []any{
+			st{"name": "A", "path": "/a", "filter": `{ ep: ((.extras.name // "") + "-endpoint") }`},
+			st{"name": "B", "path": "/b", "endpointRef": ep(`${ .A.ep }`)},
+		}, map[string]any{"name": "spoke-a"}, false},
+		{"A's filter uses .extras whole, carrying name", []any{
+			st{"name": "A", "path": "/a", "filter": `{ ep: (.extras | tojson) }`},
+			st{"name": "B", "path": "/b", "endpointRef": ep(`${ .A.ep }`)},
+		}, map[string]any{"name": "spoke-a"}, true},
+		{"A's filter reads only its response", []any{
+			st{"name": "A", "path": "/a", "filter": `{ ep: .A.host }`},
+			st{"name": "B", "path": "/b", "endpointRef": ep(`${ .A.ep }`)},
+		}, nil, false},
+		{"a stage named extras: its filter's .extras is its response", []any{
+			st{"name": "extras", "path": "/a", "filter": `{ ep: .extras.host }`},
+			st{"name": "B", "path": "/b", "endpointRef": ep(`${ .extras.ep }`)},
+		}, nil, false},
+		// B2' — an errorKey depends on whether the stages writing it fail.
+		{"reads A's errorKey; A's path reads .name (the reviewer's shape)", []any{
+			st{"name": "A", "path": `${ "/a/" + .name }`, "errorKey": "aErr"},
+			st{"name": "B", "path": "/b", "endpointRef": ep(`${ (.aErr // "ok") + "-endpoint" }`)},
+		}, nil, true},
+		{"reads A's errorKey; A reads nothing", []any{
+			st{"name": "A", "path": "/a", "errorKey": "aErr"},
+			st{"name": "B", "path": "/b", "endpointRef": ep(`${ (.aErr // "ok") + "-endpoint" }`)},
+		}, nil, false},
+		{"reads the shared default errorKey; one of its writers reads .name", []any{
+			st{"name": "A", "path": "/a"},
+			st{"name": "C", "path": `${ "/c/" + .name }`},
+			st{"name": "B", "path": "/b", "errorKey": "bErr", "endpointRef": ep(`${ (.error // "ok") + "-endpoint" }`)},
+		}, nil, true},
 		{"a constant template reads nothing", []any{
 			st{"name": "s", "path": "/x", "endpointRef": ep(`${ "hub" + "-endpoint" }`)},
 		}, nil, false},

@@ -179,7 +179,7 @@ func widgetNeedsRequestExtras(ctx context.Context, w *unstructured.Unstructured)
 
 // predicateStepsOf reads, from a RESTAction's unstructured object, exactly the
 // api-step fields restactionsapi.NeedsRequestExtras reads (name, path, payload,
-// headers, errorKey, endpointRef, dependsOn.iterator, userAccessFilter
+// headers, errorKey, filter, endpointRef, dependsOn.iterator, userAccessFilter
 // resourcesFrom), without converting the whole object. templated is false, and
 // nothing is decoded, when no step's endpointRef.name is a `${...}` template:
 // the predicate is then false whatever the rest says. A field of the wrong
@@ -227,6 +227,9 @@ func predicateStepsOf(obj map[string]any) (steps []*templatesv1.API, templated b
 		}
 		if v, ok := m["errorKey"].(string); ok {
 			st.ErrorKey = &v
+		}
+		if v, ok := m["filter"].(string); ok {
+			st.Filter = &v
 		}
 		if hs, ok := m["headers"].([]any); ok {
 			for _, h := range hs {

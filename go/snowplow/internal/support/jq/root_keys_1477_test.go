@@ -65,3 +65,33 @@ func TestRootKeys_1477(t *testing.T) {
 		}
 	}
 }
+
+// TestRootKeysUnder_1477 pins the reads beneath one key (a stage filter's
+// `extras`): constant indexes are sub keys; any other use of the key makes
+// every sub key possible (subOK=false).
+func TestRootKeysUnder_1477(t *testing.T) {
+	cases := []struct {
+		q     string
+		sub   []string
+		subOK bool
+	}{
+		{`{ ep: ((.extras.name // "") + "-endpoint") }`, []string{"name"}, true},
+		{`.extras["name"] + .extras."ns"`, []string{"name", "ns"}, true},
+		{`.A.items`, []string{}, true},
+		{`.extras`, []string{}, false},
+		{`.extras | .name`, []string{}, false},
+		{`.extras[]`, []string{}, false},
+		{`.extras[.k]`, []string{}, false},
+		{`{extras} | .extras.name`, []string{}, false},
+	}
+	for _, c := range cases {
+		_, sub, subOK, ok := RootKeysUnder(c.q, "extras")
+		if !ok {
+			t.Errorf("RootKeysUnder(%q): ok=false", c.q)
+			continue
+		}
+		if subOK != c.subOK || subOK && !reflect.DeepEqual(sub, c.sub) {
+			t.Errorf("RootKeysUnder(%q) = %v subOK=%v; want %v subOK=%v", c.q, sub, subOK, c.sub, c.subOK)
+		}
+	}
+}

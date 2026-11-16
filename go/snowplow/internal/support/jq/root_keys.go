@@ -35,7 +35,9 @@ package jq
 // endpointRef is `((.name // "") | gsub(...)) + "-endpoint"`, whose default
 // renders the Secret name "endpoint", the miss #1477 removes. So the caller
 // (restactionsapi.NeedsRequestExtras) treats a key read under an alternative
-// as needed.
+// as needed. The consequence: a hub-default template (`(.name // "hub") +
+// "-endpoint"`) is not prewarmed with no extras either; its no-extras cell is
+// filled by the first request that renders it.
 
 import (
 	"sort"
@@ -49,26 +51,79 @@ import (
 // sorted, or ok=false when it does not parse or reads its input in a way the
 // analysis does not follow (see the file comment).
 func RootKeys(query string) (keys []string, ok bool) {
+	keys, _, _, ok = RootKeysUnder(query, "")
+	return keys, ok
+}
+
+// RootKeysUnder is RootKeys plus, for one top-level key `under`, the keys read
+// directly beneath it (`.under.k`, `.under["k"]`), sorted. subOK is false when
+// the query reads `under` other than through such a constant index (as a whole
+// value, through a pipe, an iteration or a computed index): then any key
+// beneath it may be read. With under == "" (or a query that never reads it) sub
+// is empty and subOK true. #1477: a stage filter's input holds the request
+// extras under `extras` (handler.go jsonHandlerCore).
+func RootKeysUnder(query, under string) (keys, sub []string, subOK, ok bool) {
 	q, err := gojq.Parse(query)
 	if err != nil {
-		return nil, false
+		return nil, nil, false, false
 	}
-	w := rootKeyWalker{keys: map[string]struct{}{}}
+	w := rootKeyWalker{keys: map[string]struct{}{}, under: under, sub: map[string]struct{}{}}
 	w.query(q, true)
 	if w.unknown {
-		return nil, false
+		return nil, nil, false, false
 	}
-	keys = make([]string, 0, len(w.keys))
-	for k := range w.keys {
-		keys = append(keys, k)
+	return sortedKeys(w.keys), sortedKeys(w.sub), !w.subUnknown, true
+}
+
+func sortedKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
-	sort.Strings(keys)
-	return keys, true
+	sort.Strings(out)
+	return out
 }
 
 type rootKeyWalker struct {
 	keys    map[string]struct{}
 	unknown bool
+	// under, sub, subUnknown: RootKeysUnder's nested read set.
+	under      string
+	sub        map[string]struct{}
+	subUnknown bool
+}
+
+// readBeneath records what a root read of key does with the key's value:
+// next is the suffix applied to it (nil when none). Only a read of w.under is
+// tracked: a constant index beneath it is a sub key, anything else makes every
+// sub key possible.
+func (w *rootKeyWalker) readBeneath(key string, next *gojq.Suffix) {
+	if w.under == "" || key != w.under {
+		return
+	}
+	if next != nil && next.Index != nil {
+		if k, ok := constIndexKey(next.Index); ok {
+			w.sub[k] = struct{}{}
+			return
+		}
+	}
+	w.subUnknown = true
+}
+
+// constIndexKey is the key of a constant-string index (`.k`, `."k"`,
+// `.["k"]`).
+func constIndexKey(idx *gojq.Index) (string, bool) {
+	switch {
+	case idx == nil || idx.IsSlice || idx.End != nil:
+		return "", false
+	case idx.Start != nil:
+		return constString(idx.Start)
+	case idx.Name != "":
+		return idx.Name, true
+	case idx.Str != nil && idx.Str.Queries == nil:
+		return idx.Str.Str, true
+	}
+	return "", false
 }
 
 // query walks q; root reports whether q's input is the root.
@@ -154,8 +209,9 @@ func (w *rootKeyWalker) term(t *gojq.Term, root bool) {
 				w.unknown = true
 				return
 			}
-			w.rootIndex(suffixes[0].Index)
+			k := w.rootIndex(suffixes[0].Index)
 			suffixes = suffixes[1:]
+			w.readBeneath(k, firstSuffix(suffixes))
 		}
 	case gojq.TermTypeRecurse:
 		if root {
@@ -164,7 +220,7 @@ func (w *rootKeyWalker) term(t *gojq.Term, root bool) {
 		}
 	case gojq.TermTypeIndex:
 		if root {
-			w.rootIndex(t.Index)
+			w.readBeneath(w.rootIndex(t.Index), firstSuffix(suffixes))
 		} else {
 			w.innerIndex(t.Index, root)
 		}
@@ -240,26 +296,23 @@ func (w *rootKeyWalker) term(t *gojq.Term, root bool) {
 	}
 }
 
-// rootIndex records a constant-string index into the root, or gives up.
-func (w *rootKeyWalker) rootIndex(idx *gojq.Index) {
-	switch {
-	case idx == nil || idx.IsSlice || idx.End != nil:
+// rootIndex records a constant-string index into the root and returns its
+// key, or gives up ("").
+func (w *rootKeyWalker) rootIndex(idx *gojq.Index) string {
+	k, ok := constIndexKey(idx)
+	if !ok {
 		w.unknown = true
-	case idx.Start != nil:
-		// `.["name"]`: a constant string literal is a key; anything else is
-		// computed.
-		if k, ok := constString(idx.Start); ok {
-			w.keys[k] = struct{}{}
-		} else {
-			w.unknown = true
-		}
-	case idx.Name != "":
-		w.keys[idx.Name] = struct{}{}
-	case idx.Str != nil && idx.Str.Queries == nil:
-		w.keys[idx.Str.Str] = struct{}{}
-	default:
-		w.unknown = true
+		return ""
 	}
+	w.keys[k] = struct{}{}
+	return k
+}
+
+func firstSuffix(ss []*gojq.Suffix) *gojq.Suffix {
+	if len(ss) == 0 {
+		return nil
+	}
+	return ss[0]
 }
 
 // constString reports the value of a query that is exactly one string
@@ -306,8 +359,10 @@ func (w *rootKeyWalker) objectKeyVal(kv *gojq.ObjectKeyVal, root bool) {
 	case kv.Key != "" && kv.Key[0] == '$':
 	case kv.Key != "":
 		w.keys[kv.Key] = struct{}{}
+		w.readBeneath(kv.Key, nil)
 	case kv.KeyString != nil && kv.KeyString.Queries == nil:
 		w.keys[kv.KeyString.Str] = struct{}{}
+		w.readBeneath(kv.KeyString.Str, nil)
 	default:
 		w.unknown = true
 	}
