@@ -1647,6 +1647,95 @@ The operator-notable events:
 | `dispatcher.call.complete` | Info | `dispatchers/per_call_log.go` | per-dispatch structured timing (the per-call diagnostic) |
 | `cache.secrets.informer.assertion_violation` | Error | `internal/cache/secrets_informer.go` | secrets-informer invariant breach |
 
+### Failure lines: logged again only when they change (#711, #1476)
+
+A resident cell is re-resolved on every refresh, keepwarm pass and prewarm pass, and a stage
+that failed fails the same way each time. So a failure line logs at its own level only when
+the failure is **new since the cell's previous resolve**, and at **Debug** while it repeats
+unchanged. The lines are:
+
+- `api call response failure` (each dispatch branch of a stage);
+- `unable to resolve api endpoint reference` (a stage's `endpointRef`);
+- the widget's `unable to resolve api reference` (its `apiRef`).
+
+The rules are in `internal/resolvers/restactions/api/failure_log.go`:
+
+- **A resolve is a round.** Each resolve of a cell (its L1 key) is one round. A
+  RESTAction's stages, and a widget with its apiRef RESTAction resolved under the same key,
+  are one round. At the end of a round, its failures replace the cell's previous ones.
+- **What counts as the same failure.** The same target and the same class.
+  - The target is what failed: the stage and the path it read, the stage's `endpointRef`, or
+    the widget's `apiRef`.
+  - The class is a closed label decided by the error's type: `per_identity_denied`, the status
+    code (`404`, `500`, ...), or `error` for a fault with no answer (a reset or refused
+    connection).
+  - At the external fetch, the code is the status line of the dial's last attempt. So an
+    upstream 500, a reset and a 200 whose body could not be used are three different
+    failures, even though the fetch reports all three as a 500.
+  - The class never comes from the error's message, which can name the requester. Two
+    failures with the same code and different text are the same failure.
+- **When a line logs at its own level again:**
+  - when the target succeeds, or does not fail, in a resolve and then fails again;
+  - on a different class for the same target;
+  - on a new target;
+  - on a new generation. A generation is one residency of the cell's key in the resolved
+    cache: a round whose first failure finds the key not resident starts afresh. An eviction
+    ends a generation, and so does an RBAC change, because the key folds the identity's RBAC
+    class.
+
+  With no L1 key on the context (or the cache off), every line logs at its own level.
+- **Overlapping resolves of one cell** (a refresh and a `/call`, or two prewarm passes):
+  - Each resolve reads the notes at its first failure, and writes them at its end in one
+    compare-and-swap.
+  - If the notes moved in between (another resolve of the cell ended), the late resolve does
+    not write the failures it logged at Debug, so the next resolve logs them at their own
+    level.
+  - So a recurrence that a concurrent recovery hides stays hidden for that one overlapping
+    resolve only.
+  - Two overlapping failing resolves can cost one extra line at the failure's own level, never
+    a hidden one.
+- **Its own level.** Decided before the line is written, from the class:
+  - **Warn**: an expected per-identity deny. That is either a re-gate deny for the ctx identity
+    (#711), or the caller's own Forbidden:
+    - the apiserver's 403 on the requester's own dial (#681 F2);
+    - an `apiRef` read refused by the apiserver for the requester's credential or for the
+      identity being impersonated. The 403's typed details must name the object that was
+      read (group, resource and name);
+    - the ServiceAccount read re-gated and denied for the ctx identity.
+
+    The ServiceAccount's own 403 is not one, and neither is the apiserver refusing the
+    impersonation itself. That refusal's details name the impersonated user, group or
+    ServiceAccount, not the object read. Both stay Error. The one refusal this cannot tell
+    apart is a read of the very ServiceAccount being impersonated: it is marked as the
+    identity's deny.
+  - **Debug, every time**: an authorized definite NotFound (#1080 N1/N2). That classification
+    already requires `continueOnError`, so the stage declared the outcome. Every failure is
+    recorded under the stage's `errorKey` (it defaults to `error`), so that adds no condition.
+    The following keep Error:
+    - a NotFound on a stage without `continueOnError`;
+    - a NotFound the watcher does not confirm absent;
+    - a NotFound on a ServiceAccount dial whose pre-dial authorization did not run;
+    - any other failure under `continueOnError`.
+  - **Error**: everything else.
+- **Dry runs.** An inert (#443) resolve opens no round and never touches the notes. Its
+  expected deny logs at Debug, and its other failures at their own level.
+- **Counters are unchanged.** Every occurrence is still counted where it is recorded: the
+  stage-error and per-identity sinks, and `snowplow_internal_dispatch_predial_total{outcome=denied}`.
+  Read the counters for how often a failure happens; the lines say which failures exist.
+- **What is held.** For each cell whose last resolve failed: that resolve's failures, each
+  one a SHA-256 digest of the target plus the class label. No path, name or identity is held
+  in clear.
+  - Per cell, this is bounded by the cell's current failures.
+  - A resolve without a failure deletes the cell's notes.
+  - Keys that are no longer resident are swept. The sweep runs once as many keys have been
+    inserted as were held after the last sweep, so its residency probes average out to at most
+    two per inserted key.
+  - There is no cap and no timer.
+- **Not reduced.** A cell whose failing resolve is never stored is never resident, so each of
+  its resolves logs at its own level. The dedupe follows residency on purpose.
+
+To see every repeat, raise `LOG_LEVEL=debug`.
+
 There are many more dotted events in the `phase1.*`, `prewarm.engine.*`,
 `cache.crd_discovery.*`, `cache.rbac.snapshot.*`, and `cache.discovery.*`
 families (full set is greppable with
