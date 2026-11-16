@@ -1,58 +1,56 @@
-"""The boot-window rehearsal's report (BENCH_606_REHEARSAL=bootwindow): what the boot606 probe saw.
+"""The boot window of a measuring run (report-only): what answered while the Go runtime read waited.
 
-Runs 26j and 27 (2026-11-16, every GOGC=50 arm): the measure's first snowplow read (/debug/vars, the
-runtime606 Job) landed 6-11 s after the rebooted pod's Ready and got no byte for 30 s. The rehearsal
-probes the same window to say what holds it: from the loadgen node, every 5 s, concurrently, /readyz
-(anonymous), /debug/pprof/goroutine?debug=1 and /debug/vars (the bench's debug reader) and the portal's
-boot root (/call, the preflight user), from before the reboot to 180 s past the new pod's Ready
-(load606 BootProbe; its records in <out>/bootwindow/probes.jsonl, a goroutine dump saved whenever a
-probe passed 5 s without a byte). This module reads them, with the new pod's Ready (pod-boot.jsonl),
-the reboot's start (boot.jsonl) and the observer's `kubectl top` of the pod through the boot
-(top-boot.jsonl), into <out>/bootwindow.json and ONE block of lines.
+Runs 26j and 27 (2026-11-16): every failed Go runtime read (/debug/vars as the debug reader, the runtime606
+Job, the measure's first snowplow read) hit a pod Kubernetes had marked Ready, through the ClusterIP
+Service, the old pod gone; the 4 GOGC=50 boots gave no byte for 30 s, the 2 GOGC=100 boots answered; the
+CPU was not saturated. The owner's ruling: no separate rehearsal; every measuring run's own read carries
+the probe (load606 BootWindow), so the relaunched GC run answers the question itself. While the read
+runs, every 5 s, concurrently, /readyz (anonymous) and the portal's boot root (/call, the preflight user),
+until the read ended and one round more; ONE goroutine dump (/debug/pprof/goroutine?debug=2, the debug
+reader) when a request of the window passes 5 s without a byte. All of it is in the Job's log
+($OUT/go-runtime.jsonl), the dump as gzip+base64 chunks.
 
-Per route, in the window [Ready, Ready + window]: how many probes, their answers, how many STALLED
-(past the stall bound with no byte: a late first byte, or no answer that took longer than the bound),
-how many FAILED FAST (no answer within the bound: refused, reset, a name that does not resolve), the
-longest time without a byte, and when the stalls began and ended relative to Ready. A route with
-either is NOT SERVED, which is what the reading key reads (the owner's, 2026-11-16):
-  every route stalls                       network or endpoint churn (the Service's endpoints, kube-proxy)
-  /readyz fast, the gated routes stall     the auth/refresh gate (every authenticated request waits on it)
-  only /debug/vars stalls                  the expvar render (snowplow's /debug/vars handler itself)
-  none stalls                              no stall in the window
+This module reads that log (and the new pod's Ready from the before-record, pod-before.jsonl) into
+$OUT/boot-window.json, writes the dump to its own file, and says ONE block. Per route (/readyz, the boot
+root, and /debug/vars: the read's own attempts): requests, answers, how many STALLED (past the stall bound
+without a byte: a late first byte, or no answer that took longer), how many FAILED FAST (no answer within
+the bound: refused, reset, a name that does not resolve), the longest time without a byte, and the span
+of the stalls relative to Ready. The reading key (the owner's, 2026-11-16), over the routes not served:
+  every route                              network or endpoint churn
+  /readyz fast, the gated routes not       the auth/refresh gate
+  only /debug/vars                         the expvar render
+  none                                     no stall in the window
   any other pattern                        named as it is, with no reading
-Beside it: the GC activity /debug/vars reported when it answered (NumGC, PauseTotalNs, GCCPUFraction,
-the effective GOGC) and the pod's CPU from the observer's samples, so a GC-driven stall reads apart.
-Never a body, never an identity: the records hold neither, and this module prints only their fields.
+REPORT-ONLY: nothing here changes a verdict (the Go runtime gate is snowplow_env's). Never a body other
+than the dump (a file, never printed), never an identity: the records hold neither.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import os
-import re
 import sys
 
-ROUTES = ("readyz", "goroutine", "vars", "call")
-SAID = {"readyz": "/readyz (anonymous)", "goroutine": "/debug/pprof/goroutine?debug=1 (debug reader)",
-        "vars": "/debug/vars (debug reader)", "call": "the boot root /call (preflight user)"}
-GATED = ("goroutine", "vars", "call")
+ROUTES = ("readyz", "call", "vars")
+SAID = {"readyz": "/readyz (anonymous)", "call": "the boot root /call (preflight user)",
+        "vars": "/debug/vars (debug reader, the Go runtime read)"}
+GATED = ("call", "vars")
+KIND = "boot_window"
 
 
-def _rows(path: str) -> list[dict]:
+def _rows(path: str | None) -> list[dict]:
     try:
         with open(path) as fh:
-            return [json.loads(ln) for ln in fh if ln.lstrip().startswith("{")]
-    except (OSError, ValueError):
+            return [r for r in (json.loads(ln) for ln in fh if ln.lstrip().startswith("{")) if isinstance(r, dict)]
+    except (OSError, TypeError, ValueError):
         return []
 
 
-def _last(path: str, kind: str) -> dict | None:
-    return next((r for r in reversed(_rows(path)) if r.get("kind") == kind), None)
-
-
 def no_byte_s(p: dict) -> float:
-    """How long the probe went without a byte of an answer (s): to its first byte, or its whole time."""
+    """How long the request went without a byte of an answer (s): to its first byte, or its whole time."""
     ms = p.get("first_byte_ms")
     return round((ms if ms is not None else p.get("elapsed_ms") or 0.0) / 1000.0, 1)
 
@@ -64,171 +62,138 @@ def stalled(p: dict, stall_s: float) -> bool:
 
 
 def failed(p: dict, stall_s: float) -> bool:
-    """No HTTP answer, and quickly (refused, reset, a name that does not resolve): not served, not a stall."""
+    """No HTTP answer, and quickly (refused, reset, a name that does not resolve): not served, no stall."""
     return p.get("first_byte_ms") is None and not p.get("status") and not stalled(p, stall_s)
 
 
-def route_summary(probes: list[dict], ready: float, stall_s: float) -> dict:
-    """One route's probes started in the window: answers by status, stalls, fast failures, the longest
-    wait for a byte, and the stalls' (and failures') span relative to Ready (s)."""
-    st = [p for p in probes if stalled(p, stall_s) or failed(p, stall_s)]
+def route_summary(reqs: list[dict], ref: float, stall_s: float) -> dict:
+    """One route's requests: answers by status, stalls, fast failures, the longest wait for a byte, and
+    the span of the requests not served, in s from `ref` (the new pod's Ready, else the window's start)."""
+    bad = [p for p in reqs if stalled(p, stall_s) or failed(p, stall_s)]
     statuses: dict = {}
-    for p in probes:
+    for p in reqs:
         statuses[str(p.get("status"))] = statuses.get(str(p.get("status")), 0) + 1
-    out = {"probes": len(probes), "statuses": statuses, "stalled": sum(1 for p in probes if stalled(p, stall_s)),
-           "failed_fast": sum(1 for p in probes if failed(p, stall_s)), "not_served": len(st),
-           "max_no_byte_s": max((no_byte_s(p) for p in probes), default=None),
-           "error_classes": sorted({p["error_class"] for p in probes if p.get("error_class")})}
-    if st:
-        out["stall_from_ready_s"] = round(min(p["t"] for p in st) - ready, 1)
-        out["stall_until_ready_s"] = round(max(p["t"] + no_byte_s(p) for p in st) - ready, 1)
-        out["stalled_at"] = sorted({p.get("stalled_at") or "first_byte (late)" for p in st})
+    out = {"requests": len(reqs), "statuses": statuses, "stalled": sum(1 for p in reqs if stalled(p, stall_s)),
+           "failed_fast": sum(1 for p in reqs if failed(p, stall_s)), "not_served": len(bad),
+           "max_no_byte_s": max((no_byte_s(p) for p in reqs), default=None),
+           "error_classes": sorted({p["error_class"] for p in reqs if p.get("error_class")})}
+    if bad:
+        a, b = min(p["t"] for p in bad), max(p["t"] + no_byte_s(p) for p in bad)
+        out.update(from_s=round(a - ref, 1), until_s=round(b - ref, 1), stall_s=round(b - a, 1),
+                   stalled_at=sorted({p.get("stalled_at") or "first_byte (late)" for p in bad}))
     return out
 
 
 def reading(routes: dict) -> str:
-    """The owner's key, over which routes were not served in the window (a stall, or no answer at all)."""
+    """The owner's key, over the routes not served in the window."""
     s = {r for r, v in routes.items() if v.get("not_served")}
-    if not all(routes.get(r, {}).get("probes") for r in ROUTES):
-        return "NO READING: a route has no probe in the window"
+    if not all(routes.get(r, {}).get("requests") for r in ROUTES):
+        return "NO READING: a route has no request in the window (" + ", ".join(
+            SAID[r] for r in ROUTES if not routes.get(r, {}).get("requests")) + ")"
     if not s:
         return "no stall in the window"
     if s == set(ROUTES):
-        return "every route stalls: network or endpoint churn"
+        return "every route not served: network or endpoint churn"
     if "readyz" not in s and s == set(GATED):
-        return "/readyz fast, the gated routes stall: the auth/refresh gate"
+        return "/readyz fast, the gated routes not served: the auth/refresh gate"
     if s == {"vars"}:
-        return "only /debug/vars stalls: the expvar render"
-    return "a pattern the key does not name: stalled " + ", ".join(SAID[r] for r in ROUTES if r in s)
+        return "only /debug/vars not served: the expvar render"
+    return "a pattern the key does not name: not served " + ", ".join(SAID[r] for r in ROUTES if r in s)
 
 
-def gc_summary(probes: list[dict]) -> dict:
-    """GC activity across the /debug/vars answers in the window (first to last answer)."""
-    g = [p["gc"] for p in sorted(probes, key=lambda p: p["t"]) if isinstance(p.get("gc"), dict)]
-    if not g:
-        return {"answers": 0}
-    f, last = g[0], g[-1]
-
-    def d(k):
-        return (last[k] - f[k]) if isinstance(last.get(k), (int, float)) and isinstance(f.get(k), (int, float)) else None
-    fr = [x["gc_cpu_fraction"] for x in g if isinstance(x.get("gc_cpu_fraction"), (int, float))]
-    heap = [x["heap_alloc"] for x in g if isinstance(x.get("heap_alloc"), (int, float))]
-    pause = d("pause_total_ns")
-    return {"answers": len(g), "gogc": sorted({x.get("gogc") for x in g}, key=str),
-            "num_gc_first": f.get("num_gc"), "num_gc_delta": d("num_gc"),
-            "pause_ms_delta": None if pause is None else round(pause / 1e6, 1),
-            "gc_cpu_fraction_max": max(fr) if fr else None,
-            "heap_alloc_mib": [round(min(heap) / 2 ** 20), round(max(heap) / 2 ** 20)] if heap else None,
-            "prewarm_complete": [x.get("prewarm_complete") for x in (f, last)]}
-
-
-_TOP = re.compile(r"(\S+)\s+(\d+)m\s+(\d+)Mi")
-
-
-def cpu_summary(top_rows: list[dict], pod: str | None, lo: float, hi: float) -> dict:
-    """The pod's CPU (millicores) in the observer's `kubectl top` samples between lo and hi (epoch s)."""
-    vals = []
-    for r in top_rows:
-        if not (lo <= (r.get("t") or 0) <= hi):
-            continue
-        for name, m, _ in _TOP.findall(r.get("raw") or ""):
-            if name == pod:
-                vals.append(int(m))
-    if not vals:
-        return {"samples": 0}
-    s = sorted(vals)
-    return {"samples": len(s), "max_m": s[-1], "median_m": s[len(s) // 2]}
+def write_dump(rows: list[dict], path: str) -> dict | None:
+    """The window's one dump: its record, and its body (gzip) written to `path` when every chunk came."""
+    d = next((r for r in rows if r.get("kind") == "boot_dump"), None)
+    if d is None:
+        return None
+    out = {k: d.get(k) for k in ("t", "trigger", "status", "elapsed_ms", "connect_ms", "first_byte_ms",
+                                 "error_class", "stalled_at", "bytes", "chunks", "skipped")}
+    chunks = sorted((r for r in rows if r.get("kind") == "boot_dump_chunk"), key=lambda r: r.get("i", 0))
+    out["path"] = None
+    if d.get("chunks"):
+        if [c.get("i") for c in chunks] != list(range(d["chunks"])):
+            out["why"] = f"{len(chunks)} of its {d['chunks']} chunks are in the log"
+            return out
+        try:
+            data = base64.b64decode("".join(c["data"] for c in chunks), validate=True)
+        except (binascii.Error, KeyError, TypeError) as e:
+            out["why"] = f"its chunks do not decode ({type(e).__name__})"
+            return out
+        with open(path + ".part", "wb") as fh:
+            fh.write(data)
+        os.replace(path + ".part", path)
+        out["path"] = path
+    return out
 
 
-def report(out_dir: str, declared: str = "", window_s: float | None = None) -> tuple[dict, list[str]]:
-    bw = os.path.join(out_dir, "bootwindow")
-    rows = _rows(os.path.join(bw, "probes.jsonl"))
-    start = next((r for r in rows if r.get("kind") == "boot_probe_start"), {})
-    end = next((r for r in rows if r.get("kind") == "boot_probe_end"), None)
-    probes = [r for r in rows if r.get("kind") == "probe"]
-    dumps = [r for r in rows if r.get("kind") == "dump"]
-    pod = _last(os.path.join(out_dir, "pod-boot.jsonl"), "snowplow_pod") or {}
-    ready = pod.get("ready_at")
-    boot = _last(os.path.join(out_dir, "boot.jsonl"), "boot") or {}
-    window_s = float(window_s if window_s is not None else start.get("window_s") or 180.0)
+def summarize(effective: str, pod: str | None, dump_path: str) -> dict:
+    rows = _rows(effective)
+    start = next((r for r in rows if r.get("kind") == "boot_window_start"), None)
+    rec: dict = {"kind": KIND, "source": effective}
+    if start is None:
+        rec["why"] = "the runtime606 Job's log holds no boot window (no Job, or one that predates it)"
+        rec["lines"] = [f"INFO boot window: NO RECORD ({rec['why']})"]
+        return rec
     stall_s = float(start.get("stall_s") or 5.0)
-    rec: dict = {"kind": "bootwindow", "declared": declared, "ready_at": ready, "pod": pod.get("pod"),
-                 "t_restart": boot.get("t_restart"), "window_s": window_s, "stall_s": stall_s,
-                 "probe_end": end, "ok": False}
-    lines = ["=== bootwindow report ===", f"snowplow env declared: {declared or '(none)'}"]
-    if not probes or not isinstance(ready, (int, float)):
-        rec["why"] = ("the probe left no records (bootwindow/probes.jsonl)" if not probes else
-                      "the new pod's Ready is not known (pod-boot.jsonl)")
-        lines += [f"NO REPORT: {rec['why']}", "=== end of bootwindow report ==="]
-        return rec, lines
-    t_restart = boot.get("t_restart")
-    lines.append(f"the new pod: Ready {round(ready - t_restart, 1) if t_restart else '?'} s after the restart; "
-                 f"window: Ready to Ready+{window_s:g} s; every probe a new connection, bounded at "
-                 f"{start.get('timeout_s')} s; a stall = past {stall_s:g} s with no byte")
-    inwin = [p for p in probes if ready <= p["t"] <= ready + window_s]
-    routes = {r: route_summary([p for p in inwin if p.get("route") == r], ready, stall_s) for r in ROUTES}
-    rec["routes"] = routes
+    ready = next((r.get("ready_at") for r in reversed(_rows(pod)) if r.get("kind") == "snowplow_pod"), None)
+    ref, refname = (ready, "Ready") if isinstance(ready, (int, float)) else (start["t"], "the window's start")
+    reqs = {"readyz": [r for r in rows if r.get("kind") == "boot_probe" and r.get("route") == "readyz"],
+            "call": [r for r in rows if r.get("kind") == "boot_probe" and r.get("route") == "call"],
+            "vars": [r for r in rows if r.get("kind") == "go_runtime_attempt"]}
+    routes = {r: route_summary(v, ref, stall_s) for r, v in reqs.items()}
+    gc = next(((r.get("read") or {}).get("gc") for r in rows if r.get("kind") == "go_runtime"), None)
+    end = next((r for r in rows if r.get("kind") == "boot_window_end"), None)
+    dump = write_dump(rows, dump_path)
+    rec.update(ready_at=ready, ref=refname, window_start_from_ref_s=round(start["t"] - ref, 1), stall_bound_s=stall_s,
+               routes=routes, reading=reading(routes), gc=gc, dump=dump, end=end)
+    lines = [f"INFO boot window (report-only): from {refname}{'+' if start['t'] >= ref else ''}"
+             f"{rec['window_start_from_ref_s']} s, every {start.get('every_s')} s, each request a new connection "
+             f"bounded at {start.get('timeout_s')} s; a stall = past {stall_s:g} s without a byte"
+             + ("" if end else "; the window's end is not in the log (the step's wait ended first)")]
     for r in ROUTES:
         v = routes[r]
-        said = (f"{'STALLED' if v['stalled'] else 'NOT SERVED'}: {v['stalled']} of {v['probes']} probes stalled "
-                f"(past {stall_s:g} s without a byte), {v['failed_fast']} failed fast with no answer; from "
-                f"Ready+{v['stall_from_ready_s']} s to Ready+{v['stall_until_ready_s']} s, the longest "
+        said = (f"NOT SERVED: {v['stalled']} of {v['requests']} stalled, {v['failed_fast']} failed fast; for "
+                f"{v['stall_s']} s ({refname}{v['from_s']:+} s to {refname}{v['until_s']:+} s), the longest "
                 f"{v['max_no_byte_s']} s without a byte ({', '.join(v['stalled_at'])}"
                 f"{'; ' + ', '.join(v['error_classes']) if v['error_classes'] else ''})"
-                if v["not_served"] else
-                f"no stall: {v['probes']} probes, the longest {v['max_no_byte_s']} s to a first byte")
-        lines.append(f"  {SAID[r]}: {said}; answers {json.dumps(v['statuses'], sort_keys=True)}")
-    pre = [p for p in probes if p["t"] < ready]
-    pre_st = {r: sum(1 for p in pre if p.get("route") == r and (stalled(p, stall_s) or failed(p, stall_s))) for r in ROUTES}
-    lines.append(f"before Ready (the old pod, then the rollout): {len(pre)} probes, not served per route "
-                 f"{json.dumps(pre_st)}")
-    rec["reading"] = reading(routes)
-    lines.append(f"READING: {rec['reading']}")
-    rec["gc"] = gc = gc_summary([p for p in inwin if p.get("route") == "vars"])
-    lines.append("GC in the window (/debug/vars answers): " + (
-        "none answered" if not gc["answers"] else
-        f"{gc['answers']} answers, effective GOGC {gc['gogc']}, NumGC +{gc['num_gc_delta']} (from {gc['num_gc_first']}), "
-        f"GC pauses +{gc['pause_ms_delta']} ms, GCCPUFraction max {gc['gc_cpu_fraction_max']}, heap "
-        f"{gc['heap_alloc_mib']} MiB, prewarm complete first/last {gc['prewarm_complete']}"))
-    rec["cpu"] = cpu = cpu_summary(_rows(os.path.join(out_dir, "top-boot.jsonl")), pod.get("pod"), ready,
-                                   ready + window_s)
-    lines.append("the pod's CPU in the window (the observer's kubectl top): " + (
-        f"{cpu['samples']} samples, max {cpu['max_m']}m, median {cpu['median_m']}m" if cpu["samples"]
-        else "no sample of it"))
-    rec["dumps"] = [{k: d.get(k) for k in ("n", "t", "status", "first_byte_ms", "elapsed_ms", "error_class", "file",
-                                           "bytes", "triggers")} for d in dumps]
-    saved = [d for d in dumps if d.get("file")]
-    lines.append(f"goroutine dumps: {len(dumps)} taken, {len(saved)} saved"
-                 + "".join(f"\n    #{d['n']} at Ready{d['t'] - ready:+.1f} s: "
-                           + (f"saved bootwindow/{d['file']} ({d['bytes']} bytes)" if d.get("file") else
-                              f"NOT saved ({d.get('status')}: {d.get('error_class') or 'no body'})")
-                           + "; for " + ", ".join(f"{t['route']} (tick {t['tick']}, {t['waited_s']} s)"
-                                                  for t in d.get("triggers") or [])
-                           for d in dumps))
-    complete = all(routes[r]["probes"] for r in ROUTES) and end is not None and end.get("reason") == "window"
-    rec["ok"] = complete
-    if not complete:
-        rec["why"] = ("the probe did not cover the whole window (its end: "
-                      f"{(end or {}).get('reason', 'none recorded')}) or a route has no probe in it")
-        lines.append(f"INCOMPLETE: {rec['why']}")
-    lines.append("=== end of bootwindow report ===")
-    return rec, lines
+                if v.get("not_served") else
+                f"served: {v['requests']} request(s), the longest {v['max_no_byte_s']} s to a first byte")
+        lines.append(f"INFO boot window: {SAID[r]}: {said}; answers {json.dumps(v['statuses'], sort_keys=True)}")
+    lines.append(f"INFO boot window: READING: {rec['reading']}")
+    if isinstance(gc, dict):
+        lines.append(f"INFO boot window: /debug/vars, once answered: GOGC {gc.get('gogc')}, NumGC {gc.get('num_gc')}, "
+                     f"PauseTotalNs {gc.get('pause_total_ns')}, GCCPUFraction {gc.get('gc_cpu_fraction')}, "
+                     f"prewarm complete {gc.get('prewarm_complete')}")
+    if dump is None:
+        lines.append("INFO boot window: goroutine dump: none (no request passed the stall bound)")
+    else:
+        t = dump.get("trigger") or {}
+        what = (f"saved {dump['path']} ({dump.get('bytes')} bytes)" if dump.get("path") else
+                f"SKIPPED ({dump['skipped']})" if dump.get("skipped") else
+                f"NOT SAVED: it answered {dump.get('status')}"
+                + (f", {dump.get('error_class')} after {dump.get('elapsed_ms')} ms ({dump.get('stalled_at')}): the dump "
+                   f"stalled too" if not dump.get("status") else "") + (f"; {dump['why']}" if dump.get("why") else ""))
+        lines.append(f"INFO boot window: goroutine dump (taken when {SAID.get(t.get('route'), t.get('route'))} was "
+                     f"{t.get('waited_s')} s without a byte): {what}")
+    rec["lines"] = lines
+    return rec
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python3 -m bench.bootwindow")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("report", help="the bootwindow block from the run's files; exit 1 when the window is not covered")
-    r.add_argument("--out-dir", required=True)
-    r.add_argument("--declared", default="")
-    r.add_argument("--out", required=True)
+    s = sub.add_parser("said", help="the boot window's block from the runtime606 Job's log (always exit 0)")
+    s.add_argument("--effective", required=True, help="$OUT/go-runtime.jsonl")
+    s.add_argument("--pod", default=None, help="$OUT/pod-before.jsonl: the new pod's Ready")
+    s.add_argument("--dump", required=True, help="where the goroutine dump (gzip) is written")
+    s.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    rec, lines = report(a.out_dir, a.declared)
+    rec = summarize(a.effective, a.pod, a.dump)
     with open(a.out + ".part", "w") as fh:
         json.dump(rec, fh, indent=1)
     os.replace(a.out + ".part", a.out)
-    print("\n".join(lines))
-    return 0 if rec["ok"] else 1
+    print("\n".join(rec["lines"]))
+    return 0
 
 
 if __name__ == "__main__":

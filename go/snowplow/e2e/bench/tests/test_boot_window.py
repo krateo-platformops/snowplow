@@ -6,8 +6,10 @@ The fix (load606 read_answered, go_runtime_read): the start gate's rule for the 
 answer that is not 200 ends the read at once; no answer is tried again within the step's EXISTING budget
 (the step's deadline, run606 GO_RUNTIME_S), each attempt keeping its 30 s bound; every attempt is recorded
 (status, elapsed, connect, first byte, the error's class), and a stall is a finding of its own in the
-record, the run log and the report, however the read ended. Then the boot-window probe rehearsal
-(BENCH_606_REHEARSAL=bootwindow): the probe (load606 BootProbe) and its report (bench/bootwindow.py).
+record, the run log and the report, however the read ended. And its boot window (the owner's ruling: no
+separate rehearsal, every measuring run's own read carries the probe; load606 BootWindow, report-only):
+/readyz and the boot root every 5 s while the read runs and one round more, one goroutine dump when a
+request passes 5 s without a byte, said by bench/bootwindow.py.
 """
 
 from __future__ import annotations
@@ -238,22 +240,36 @@ def test_the_cli_requires_the_steps_deadline():
     assert p.returncode == 2 and "--deadline" in p.stderr
 
 
-# ─── the real run: the stall said in the run log, and the read's budget is the step's ───
+# ─── the real run: the stall and the boot window said in the run log; the read's budget is the step's ───
 
 def _run606(env, **extra):
     return subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=dict(env, **extra), capture_output=True,
                           text=True, timeout=600)
 
 
-def test_the_rehearsal_logs_the_stall_and_passes_once_answered(harness):  # noqa: F811
+def test_the_rehearsal_logs_the_stall_and_its_boot_window_and_passes_once_answered(harness):  # noqa: F811
     env, state, _, tmp = harness
     p = _run606(env, SNOWPLOW_ENV="GOGC=100", BENCH_606_REHEARSAL="env", FAKE_GO_RUNTIME_FAIL="stall")
-    log = (tmp / "out" / "run.log").read_text()
+    out = tmp / "out"
+    log = (out / "run.log").read_text()
     assert p.returncode == 0 and "rehearsal complete" in log, log[-3000:]
     assert f"{snowplow_env.READ_FINDING}: STALLED: 1 attempt(s) with no answer" in log
     job = json.load(open(state / "job-runtime606"))
     args = " ".join(job["spec"]["template"]["spec"]["containers"][0]["args"])
-    assert "--deadline " in args
+    assert "--deadline " in args and '--preflight-user "scaleuser-0000"' in args and '--init "/call?' in args
+    # the boot window: its block in the run log, its record, its dump written to its own file
+    assert "INFO boot window: READING: only /debug/vars not served: the expvar render" in log, log[-4000:]
+    bw = json.loads((out / "boot-window.json").read_text())
+    assert bw["dump"]["path"] == str(out / "boot-goroutines.txt.gz")
+    assert gzip.decompress((out / "boot-goroutines.txt.gz").read_bytes()).startswith(b"goroutine 1 [select")
+    assert f"goroutine dump (taken when /debug/vars (debug reader, the Go runtime read) was 5.3 s without a " \
+           f"byte): saved {out / 'boot-goroutines.txt.gz'}" in log
+    rec = json.loads((out / "snowplow-env.json").read_text())
+    assert rec["verified"] is True and rec["boot_window"]["reading"] == bw["reading"]
+    # the dump's body is in no log line, the bench password nowhere
+    assert "goroutine 1 [select" not in log
+    from bench.load606 import SCALEUSER_PASSWORD
+    assert SCALEUSER_PASSWORD not in log and SCALEUSER_PASSWORD not in (out / "go-runtime-job.yaml").read_text()
 
 
 def test_no_answer_to_the_end_fails_the_arm_naming_attempts_and_seconds(harness):  # noqa: F811
@@ -263,17 +279,35 @@ def test_no_answer_to_the_end_fails_the_arm_naming_attempts_and_seconds(harness)
     assert p.returncode != 0 and "rehearsal complete" not in log
     assert "/debug/vars: no answer to 8 attempt(s) over 275.0 s" in log, log[-3000:]
     assert f"{snowplow_env.READ_FINDING}: NO ANSWER: 8 attempt(s)" in log
+    assert "INFO boot window: READING: only /debug/vars not served: the expvar render" in log
 
 
-# ─── the boot-window probe ─────────────────────────────────────────────────
+def test_the_boot_window_never_changes_the_gate(harness):  # noqa: F811
+    env, state, _, tmp = harness
+    p = _run606(env, SNOWPLOW_ENV="GOGC=100", BENCH_606_REHEARSAL="env")
+    log = (tmp / "out" / "run.log").read_text()
+    assert p.returncode == 0 and "rehearsal complete" in log, log[-3000:]
+    assert "INFO boot window: READING: no stall in the window" in log
+    # a boot window that cannot be read (its file gone) says so, and the verdict on the settings stands
+    rec = snowplow_env.check({"GOGC": "100"}, str(tmp / "out" / "tracing.json"),
+                             effective_path=str(tmp / "out" / "go-runtime.jsonl"),
+                             boot_window_path=str(tmp / "nowhere.json"))
+    assert rec["verified"] is True and rec["boot_window"] is None
+    (tmp / "env.json").write_text(json.dumps(rec))
+    assert "INFO boot window: NO RECORD" in " ".join(snowplow_env.report(str(tmp / "env.json"))["lines"])
 
-class ProbeClient:
-    """Answers per path: `stall` paths take `stall_s` with no byte (status 0) while ticking a real
-    sleep (the probe's watch thread sees them in flight); everything else answers at once."""
 
-    def __init__(self, stall_paths=(), stall_s=0.0, timeout=30.0, slow_body_paths=()):
-        self.stall_paths, self.stall_s, self.timeout = stall_paths, stall_s, timeout
-        self.slow_body_paths = slow_body_paths
+# ─── the boot window (load606 BootWindow) ──────────────────────────────────
+
+class WindowClient:
+    """Answers per path at once, but /debug/vars (and, with `stall_call`, the boot root) holds `stall_s`
+    with no byte, then times out (status 0); `dump_stalls`: the dump does too. Real sleeps: the window's
+    watch sees the requests in flight."""
+
+    def __init__(self, stall_s=0.5, stall_vars=True, stall_call=False, dump_stalls=False, timeout=2.0,
+                 slow_body=False):
+        self.stall_s, self.stall_vars, self.stall_call, self.dump_stalls = stall_s, stall_vars, stall_call, dump_stalls
+        self.timeout, self.slow_body = timeout, slow_body
         self.calls, self.lock = [], threading.Lock()
 
     def get(self, path, token, timing=None):
@@ -281,227 +315,234 @@ class ProbeClient:
             self.calls.append((path, token))
         tm = timing if timing is not None else {}
         tm["connect_ms"] = 0.5
-        if any(path.startswith(p) for p in self.stall_paths) and not path.endswith("debug=2"):
+        hold = ((path == "/debug/vars" and self.stall_vars) or (path.startswith("/call") and self.stall_call)
+                or (path.endswith("debug=2") and self.dump_stalls))
+        if hold:
             time.sleep(self.stall_s)
             return load606.Response(0, b"", self.stall_s * 1000, "TimeoutError: timed out", connect_ms=0.5,
                                     error_class="TimeoutError")
         tm["first_byte_ms"] = 1.0
-        if any(path.startswith(p) for p in self.slow_body_paths):
-            time.sleep(self.stall_s)              # answered at once, its body slow: not a stall
+        if self.slow_body and path == "/debug/vars":
+            time.sleep(self.stall_s)               # answered at once, its body slow: no stall
         body = (json.dumps(GR).encode() if path == "/debug/vars" else
                 b"goroutine 1 [chan receive, 3 minutes]:\nmain.main()\n" if path.endswith("debug=2") else b"{}")
         return load606.Response(200, body, 1.5, connect_ms=0.5, first_byte_ms=1.0)
 
 
-def _probe(tmp_path, client, *, ready_after=0.0, window_s=0.6, stall_s=0.2, every_s=0.2):
+def _window(client, *, read_s=1.2, stall_s=0.2, every_s=0.2, deadline_s=30.0):
+    """A window around a stand-in for the Go runtime read: one tracked /debug/vars request (the client
+    decides how it goes) every 0.3 s for read_s, then the read ends."""
     recs = []
-    pr = load606.BootProbe(client, "/call?name=app-shell", {"debug_reader": "DBG", "preflight_user": "PFU"},
-                           {}, out_dir=str(tmp_path), sink=recs.append, every_s=every_s, window_s=window_s,
-                           stall_s=stall_s, bound_s=30.0, tick_s=0.02)
-    (tmp_path / "ready").write_text(str(time.time() + ready_after))
-    end = pr.run()
+    t0 = time.time()
+    w = load606.BootWindow(client, "/call?name=app-shell", {"debug_reader": "DBG", "preflight_user": "PFU"},
+                           deadline=t0 + deadline_s, sink=recs.append, every_s=every_s, stall_s=stall_s,
+                           tick_s=0.02).start()
+    while time.time() < t0 + read_s:
+        timing, done = w.track()
+        try:
+            client.get("/debug/vars", "DBG", timing=timing)
+        finally:
+            done()
+        time.sleep(0.05)
+    end = w.finish()
     return recs, end
 
 
-def boot_probe_identities(tmp_path):
-    """The proof tests/test_debug_reader.py names for BootProbe's /debug reads (its guard's table)."""
-    c = ProbeClient(stall_paths=("/debug/vars",), stall_s=0.5)
-    recs, end = _probe(tmp_path, c)
+def boot_window_identities():
+    """The proof tests/test_debug_reader.py names for BootWindow's /debug read (its guard's table)."""
+    c = WindowClient()
+    recs, _ = _window(c)
     who = {}
     for path, tok in c.calls:
         who.setdefault(path, set()).add(tok)
     assert who["/readyz"] == {None}
-    assert who["/debug/pprof/goroutine?debug=1"] == {"DBG"} and who["/debug/vars"] == {"DBG"}
-    assert who["/debug/pprof/goroutine?debug=2"] == {"DBG"}          # the dump
     assert who["/call?name=app-shell"] == {"PFU"}
-    assert end["reason"] == "window"
-    # no identity, no token and no body in any record
-    text = json.dumps(recs)
+    assert who["/debug/pprof/goroutine?debug=2"] == {"DBG"}           # the dump
+    text = json.dumps([r for r in recs if r["kind"] != "boot_dump_chunk"])
     assert "DBG" not in text and "PFU" not in text and "chan receive" not in text
 
 
-def test_a_probe_past_the_stall_bound_saves_a_dump_that_names_it(tmp_path):
-    c = ProbeClient(stall_paths=("/debug/vars",), stall_s=0.5)
-    recs, end = _probe(tmp_path, c)
-    dumps = [r for r in recs if r["kind"] == "dump"]
-    assert dumps and end["dumps"] == len(dumps)
+def test_the_window_probes_until_the_read_ends_and_one_round_more():
+    recs, end = _window(WindowClient(stall_vars=False), read_s=0.7, every_s=0.2)
+    rounds = sorted({r["round"] for r in recs if r["kind"] == "boot_probe"})
+    assert rounds == list(range(end["rounds"])) and end["rounds"] >= 3
+    for k in rounds:
+        assert {r["route"] for r in recs if r["kind"] == "boot_probe" and r["round"] == k} == {"readyz", "call"}
+    last = max(r["t"] for r in recs if r["kind"] == "boot_probe")
+    first_after = [r["t"] for r in recs if r["kind"] == "boot_probe" and r["round"] == rounds[-1]]
+    assert first_after and last >= end["t"] - 1.0
+    assert recs[0]["kind"] == "boot_window_start" and recs[-1]["kind"] == "boot_window_end"
+
+
+def test_one_dump_when_a_request_passes_the_stall_bound_and_only_one():
+    recs, end = _window(WindowClient(stall_s=0.5), read_s=1.5)
+    dumps = [r for r in recs if r["kind"] == "boot_dump"]
+    assert len(dumps) == 1 and end["dump"] is True
     d = dumps[0]
-    assert d["status"] == 200 and d["file"] and {t["route"] for t in d["triggers"]} == {"vars"}
-    assert gzip.decompress((tmp_path / d["file"]).read_bytes()).startswith(b"goroutine 1 [chan receive")
-    stalled = [r for r in recs if r["kind"] == "probe" and r["route"] == "vars"]
-    assert all(r["dump"] for r in stalled) and all(r["stalled_at"] == "first_byte" for r in stalled)
-    # the routes that answered never triggered one
-    assert all(r["dump"] is None for r in recs if r["kind"] == "probe" and r["route"] != "vars")
+    assert d["status"] == 200 and d["trigger"]["route"] == "vars" and d["trigger"]["waited_s"] >= 0.2
+    chunks = [r for r in recs if r["kind"] == "boot_dump_chunk"]
+    assert len(chunks) == d["chunks"] >= 1
+    import base64
+    assert gzip.decompress(base64.b64decode("".join(c["data"] for c in chunks))).startswith(b"goroutine 1 [chan")
 
 
-def test_a_401_logs_the_role_in_again_on_its_next_probe(tmp_path):
-    class Expiring(ProbeClient):
-        def get(self, path, token, timing=None):
-            if path == "/debug/vars" and token == "DBG":
-                with self.lock:
-                    self.calls.append((path, token))
-                return load606.Response(401, b"", 1.0, "http 401", connect_ms=0.5, first_byte_ms=0.9)
-            return super().get(path, token, timing)
-    c, recs, logins = Expiring(), [], []
-
-    def fresh():
-        logins.append(1)
-        return "DBG2"
-    pr = load606.BootProbe(c, "/call?x", {"debug_reader": "DBG", "preflight_user": "PFU"},
-                           {"debug_reader": fresh}, out_dir=str(tmp_path), sink=recs.append, every_s=0.2,
-                           window_s=0.6, stall_s=5, bound_s=30.0, tick_s=0.02)
-    (tmp_path / "ready").write_text(str(time.time()))
-    pr.run()
-    assert logins and ("/debug/vars", "DBG2") in c.calls
-    assert "DBG2" not in json.dumps(recs)
+def test_a_dump_that_stalls_is_recorded_so():
+    recs, _ = _window(WindowClient(stall_s=0.5, dump_stalls=True), read_s=1.0)
+    [d] = [r for r in recs if r["kind"] == "boot_dump"]
+    assert d["status"] == 0 and d["error_class"] == "TimeoutError" and d["chunks"] == 0
+    assert not [r for r in recs if r["kind"] == "boot_dump_chunk"]
 
 
-def test_a_slow_body_after_its_first_byte_is_no_stall_and_takes_no_dump(tmp_path):
-    recs, end = _probe(tmp_path, ProbeClient(slow_body_paths=("/debug/vars",), stall_s=0.5))
-    assert end["dumps"] == 0 and not [r for r in recs if r["kind"] == "dump"]
+def test_no_stall_no_dump():
+    recs, end = _window(WindowClient(stall_vars=False), read_s=0.6)
+    assert end["dump"] is False and not [r for r in recs if r["kind"] == "boot_dump"]
 
 
-def test_no_stall_no_dump_and_the_gc_fields_are_kept(tmp_path):
-    recs, end = _probe(tmp_path, ProbeClient())
-    assert end["dumps"] == 0 and not [r for r in recs if r["kind"] == "dump"]
-    v = next(r for r in recs if r["kind"] == "probe" and r["route"] == "vars")
-    assert v["gc"] == {"num_gc": 7, "pause_total_ns": 3_000_000, "gc_cpu_fraction": 0.01, "heap_alloc": 2 ** 30,
-                       "last_gc": None, "gogc": 50, "memory_limit_bytes": 7516192768, "prewarm_complete": None}
+def test_a_slow_body_after_its_first_byte_is_no_stall_and_takes_no_dump():
+    recs, end = _window(WindowClient(stall_vars=False, slow_body=True, stall_s=0.5), read_s=1.0)
+    assert end["dump"] is False
 
 
-def test_the_probe_ends_at_its_bound_without_a_ready_time(tmp_path):
-    recs = []
-    pr = load606.BootProbe(ProbeClient(), "/call?x", {"debug_reader": "D", "preflight_user": "P"}, {},
-                           out_dir=str(tmp_path), sink=recs.append, every_s=0.1, window_s=10, stall_s=1,
-                           bound_s=0.3, tick_s=0.02)
-    end = pr.run()
-    assert end["reason"] == "bound" and end["ready"] is None
+def test_a_round_that_cannot_end_before_the_deadline_is_not_started():
+    recs, end = _window(WindowClient(stall_vars=False, timeout=30.0), read_s=0.3, deadline_s=29.0)
+    assert end["rounds"] == 0 and end["skipped"] and not [r for r in recs if r["kind"] == "boot_probe"]
+
+
+def test_the_job_prints_the_window_and_the_record_last(tmp_path):
+    """The real Job program (`load606 go-runtime`) against a local server whose /debug/vars holds its first
+    byte past the stall bound once: the attempts, the window's probes and its dump, then the record."""
+    hits = {"vars": 0}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/debug/vars":
+                hits["vars"] += 1
+                if hits["vars"] == 1:
+                    time.sleep(6.5)                  # past BOOT_STALL_S, within the 30 s bound
+            body = (b'{"accessToken": "t"}' if self.path == "/basic/login" else
+                    json.dumps(GR).encode() if self.path == "/debug/vars" else
+                    b"goroutine 1 [select]:\n" if "debug=2" in self.path else b"{}")
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        p = subprocess.run([sys.executable, str(BENCH_DIR / "bench" / "load606.py"), "go-runtime", "--snowplow-url",
+                            url, "--authn-url", url, "--user", "u", "--password", "p", "--preflight-user", "v",
+                            "--init", "/call?name=app-shell", "--deadline", str(int(time.time()) + 120)],
+                           capture_output=True, text=True, timeout=90)
+    finally:
+        srv.shutdown()
+    rows = [json.loads(ln) for ln in p.stdout.splitlines()]
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert rows[-1]["kind"] == "go_runtime" and rows[-1]["ok"] and rows[-1]["read"]["gc"]["num_gc"] == 7
+    kinds = [r["kind"] for r in rows]
+    assert kinds[0] == "boot_window_start" and "boot_window_end" in kinds
+    assert kinds.count("boot_dump") == 1 and "boot_dump_chunk" in kinds
+    assert {r["route"] for r in rows if r["kind"] == "boot_probe"} == {"readyz", "call"}
+    (tmp_path / "go-runtime.jsonl").write_text(p.stdout)
+    rec = bootwindow.summarize(str(tmp_path / "go-runtime.jsonl"), None, str(tmp_path / "dump.gz"))
+    assert rec["reading"] == "only /debug/vars not served: the expvar render"
+    assert gzip.decompress((tmp_path / "dump.gz").read_bytes()) == b"goroutine 1 [select]:\n"
 
 
 # ─── the report's reading key ──────────────────────────────────────────────
 
 def _p(route, t, fb_ms, status=200):
-    return {"kind": "probe", "route": route, "t": t, "status": status if fb_ms is not None else 0,
+    return {"route": route, "t": t, "status": status if fb_ms is not None else 0,
             "elapsed_ms": fb_ms if fb_ms is not None else 30000.0, "first_byte_ms": fb_ms,
             **({} if fb_ms is not None else {"error_class": "TimeoutError", "stalled_at": "first_byte"})}
 
 
 @pytest.mark.parametrize("stalls,want", [
     (set(), "no stall in the window"),
-    ({"readyz", "goroutine", "vars", "call"}, "every route stalls: network or endpoint churn"),
-    ({"goroutine", "vars", "call"}, "/readyz fast, the gated routes stall: the auth/refresh gate"),
-    ({"vars"}, "only /debug/vars stalls: the expvar render"),
-    ({"vars", "call"}, "a pattern the key does not name: stalled /debug/vars (debug reader), the boot root /call "
-                       "(preflight user)"),
+    ({"readyz", "call", "vars"}, "every route not served: network or endpoint churn"),
+    ({"call", "vars"}, "/readyz fast, the gated routes not served: the auth/refresh gate"),
+    ({"vars"}, "only /debug/vars not served: the expvar render"),
+    ({"call"}, "a pattern the key does not name: not served the boot root /call (preflight user)"),
 ])
 def test_the_reading_key(stalls, want):
-    ready = 100.0
-    routes = {r: bootwindow.route_summary([_p(r, ready + 6, None if r in stalls else 3.0)], ready, 5.0)
+    routes = {r: bootwindow.route_summary([_p(r, 106.0, None if r in stalls else 3.0)], 100.0, 5.0)
               for r in bootwindow.ROUTES}
     assert bootwindow.reading(routes) == want
 
 
 def test_a_late_first_byte_is_a_stall_too():
     s = bootwindow.route_summary([_p("vars", 106.0, 12000.0)], 100.0, 5.0)
-    assert s["stalled"] == 1 and s["max_no_byte_s"] == 12.0 and s["stall_from_ready_s"] == 6.0
+    assert s["stalled"] == 1 and s["max_no_byte_s"] == 12.0 and s["from_s"] == 6.0 and s["stall_s"] == 12.0
 
 
 def test_a_fast_failure_is_not_served_but_no_stall():
-    refused = {"kind": "probe", "route": "vars", "t": 106.0, "status": 0, "elapsed_ms": 2.0, "connect_ms": None,
+    refused = {"route": "vars", "t": 106.0, "status": 0, "elapsed_ms": 2.0, "connect_ms": None,
                "first_byte_ms": None, "error_class": "ConnectionRefusedError", "stalled_at": "connect"}
     s = bootwindow.route_summary([refused], 100.0, 5.0)
     assert (s["stalled"], s["failed_fast"], s["not_served"]) == (0, 1, 1)
     routes = {r: bootwindow.route_summary([dict(refused, route=r)], 100.0, 5.0) for r in bootwindow.ROUTES}
-    assert bootwindow.reading(routes) == "every route stalls: network or endpoint churn"
+    assert bootwindow.reading(routes) == "every route not served: network or endpoint churn"
 
 
-def test_the_report_from_a_run_dir(tmp_path):
+def _log(tmp_path, ready):
+    rows = [{"kind": "boot_window_start", "t": ready + 6.0, "every_s": 5.0, "stall_s": 5.0, "timeout_s": 30.0}]
+    for k in range(4):
+        t = ready + 6.0 + 5 * k
+        rows += [dict(_p("readyz", t, 2.0), kind="boot_probe", round=k),
+                 dict(_p("call", t, None if k < 2 else 4.0), kind="boot_probe", round=k)]
+    rows += [dict(_p("vars", ready + 6.0, None), kind="go_runtime_attempt", n=1, t_end=ready + 36.0),
+             dict(_p("vars", ready + 41.0, 15.0), kind="go_runtime_attempt", n=2, t_end=ready + 41.1),
+             {"kind": "boot_dump", "t": ready + 11.3, "trigger": {"route": "vars", "waited_s": 5.3}, "status": 0,
+              "elapsed_ms": 30000.0, "first_byte_ms": None, "error_class": "TimeoutError", "stalled_at": "first_byte",
+              "bytes": 0, "chunks": 0},
+             {"kind": "boot_window_end", "t": ready + 46.0, "rounds": 4, "dump": True, "skipped": None},
+             {"kind": "go_runtime", "ok": True, "read": {"gc": {"gogc": 50, "num_gc": 7}}}]
+    (tmp_path / "go-runtime.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (tmp_path / "pod-before.jsonl").write_text(json.dumps({"kind": "snowplow_pod", "ready_at": ready}) + "\n")
+
+
+def test_the_block_from_a_runs_files(tmp_path):
     ready = 1794812705.0
-    bw = tmp_path / "bootwindow"
-    bw.mkdir()
-    rows = [{"kind": "boot_probe_start", "t": ready - 200, "every_s": 5, "window_s": 180, "stall_s": 5,
-             "timeout_s": 30.0}]
-    for k in range(37):
-        t = ready + 5 * k
-        stall = k in (1, 2)
-        for r in bootwindow.ROUTES:
-            p = _p(r, t, None if stall and r != "readyz" else 2.0)
-            if r == "vars" and not stall:
-                p["gc"] = {"num_gc": 10 + k, "pause_total_ns": 1_000_000 * k, "gc_cpu_fraction": 0.02,
-                           "heap_alloc": 2 ** 30, "gogc": 50, "prewarm_complete": k > 20}
-            rows.append(p)
-    rows.append({"kind": "dump", "n": 1, "t": ready + 11, "status": 0, "error_class": "TimeoutError", "file": None,
-                 "triggers": [{"route": "vars", "tick": 41, "waited_s": 5.2}]})
-    rows.append({"kind": "boot_probe_end", "reason": "window", "ticks": 77, "dumps": 1, "ready": ready})
-    (bw / "probes.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
-    (tmp_path / "pod-boot.jsonl").write_text(json.dumps({"kind": "snowplow_pod", "pod": "snowplow-new",
-                                                         "ready_at": ready}) + "\n")
-    (tmp_path / "boot.jsonl").write_text(json.dumps({"kind": "boot", "t_restart": ready - 190}) + "\n")
-    (tmp_path / "top-boot.jsonl").write_text(json.dumps(
-        {"kind": "top_boot", "t": ready + 15, "raw": "snowplow-old 54m 1414Mi snowplow-new 1358m 1331Mi"}) + "\n")
-    out = tmp_path / "bootwindow.json"
-    p = subprocess.run([sys.executable, "-m", "bench.bootwindow", "report", "--out-dir", str(tmp_path),
-                        "--declared", "GOGC=50", "--out", str(out)], cwd=BENCH_DIR, capture_output=True, text=True)
+    _log(tmp_path, ready)
+    out = tmp_path / "boot-window.json"
+    p = subprocess.run([sys.executable, "-m", "bench.bootwindow", "said", "--effective", str(tmp_path / "go-runtime.jsonl"),
+                        "--pod", str(tmp_path / "pod-before.jsonl"), "--dump", str(tmp_path / "d.gz"), "--out", str(out)],
+                       cwd=BENCH_DIR, capture_output=True, text=True)
     assert p.returncode == 0, p.stdout + p.stderr
     said = p.stdout
-    assert "READING: /readyz fast, the gated routes stall: the auth/refresh gate" in said
-    assert ("/debug/vars (debug reader): STALLED: 2 of 37 probes stalled (past 5 s without a byte), 0 failed fast "
-            "with no answer; from Ready+5.0 s to Ready+40.0 s") in said
-    assert "effective GOGC [50]" in said and "NumGC +36 (from 10)" in said and "GC pauses +36.0 ms" in said
-    assert "max 1358m" in said and "#1 at Ready+11.0 s: NOT saved (0: TimeoutError)" in said
+    assert "READING: /readyz fast, the gated routes not served: the auth/refresh gate" in said
+    assert ("the boot root /call (preflight user): NOT SERVED: 2 of 4 stalled, 0 failed fast; for 35.0 s "
+            "(Ready+6.0 s to Ready+41.0 s)") in said
+    assert "/debug/vars (debug reader, the Go runtime read): NOT SERVED: 1 of 2 stalled" in said
+    assert ("goroutine dump (taken when /debug/vars (debug reader, the Go runtime read) was 5.3 s without a byte): "
+            "NOT SAVED: it answered 0, TimeoutError after 30000.0 ms (first_byte): the dump stalled too") in said
+    assert "GOGC 50, NumGC 7" in said
     rec = json.loads(out.read_text())
-    assert rec["ok"] and rec["routes"]["readyz"]["stalled"] == 0
+    assert rec["routes"]["readyz"]["not_served"] == 0 and rec["dump"]["path"] is None
 
 
-def test_a_report_without_the_window_is_incomplete(tmp_path):
-    (tmp_path / "bootwindow").mkdir()
-    rec, lines = bootwindow.report(str(tmp_path))
-    assert not rec["ok"] and lines[1:] == ["snowplow env declared: (none)",
-                                           "NO REPORT: the probe left no records (bootwindow/probes.jsonl)",
-                                           "=== end of bootwindow report ==="]
+def test_no_window_in_the_log_says_so(tmp_path):
+    (tmp_path / "go-runtime.jsonl").write_text(json.dumps({"kind": "go_runtime", "ok": True}) + "\n")
+    rec = bootwindow.summarize(str(tmp_path / "go-runtime.jsonl"), None, str(tmp_path / "d.gz"))
+    assert rec["lines"] == ["INFO boot window: NO RECORD (the runtime606 Job's log holds no boot window (no Job, "
+                            "or one that predates it))"]
 
 
-def _steps(log):
-    return [ln.split("=== step ", 1)[1].split(" ===")[0] for ln in log.splitlines() if "=== step " in ln]
+def test_a_dump_missing_a_chunk_is_not_written(tmp_path):
+    rows = [{"kind": "boot_dump", "status": 200, "chunks": 2, "bytes": 9, "trigger": {"route": "vars"}},
+            {"kind": "boot_dump_chunk", "i": 0, "n": 2, "data": "AAAA"}]
+    d = bootwindow.write_dump(rows, str(tmp_path / "d.gz"))
+    assert d["path"] is None and d["why"] == "1 of its 2 chunks are in the log" and not (tmp_path / "d.gz").exists()
 
 
-def test_the_bootwindow_dry_pass_says_each_step(harness):  # noqa: F811
+def test_the_dry_pass_says_the_boot_window(harness):  # noqa: F811
     env, state, _, tmp = harness
-    p = _run606(env, BENCH_606_DRY_RUN="1", BENCH_606_REHEARSAL="bootwindow", SNOWPLOW_ENV="GOGC=50")
+    p = _run606(env, BENCH_606_DRY_RUN="1", SNOWPLOW_ENV="GOGC=50")
     log = (tmp / "out" / "run.log").read_text()
     assert p.returncode == 0, log[-3000:]
-    steps = _steps(log)
-    assert steps[steps.index("preflight"):] == ["preflight", "data", "bootwindow-start", "reboot", "bootwindow",
-                                                "digest"]
-    assert "load606_job --boot-probe-only" in log and "python3 -m bench.bootwindow report" in log
-    assert "rehearsal complete" in log
-
-
-def test_the_bootwindow_rehearsal_probes_the_reboot_and_reports_it(harness):  # noqa: F811
-    env, state, _, tmp = harness
-    (state / "vars-stall").write_text("0.8")          # /debug/vars: 0.8 s to its first byte, every read
-    p = _run606(env, BENCH_606_REHEARSAL="bootwindow", SNOWPLOW_ENV="GOGC=50", BOOT_WINDOW_S="3",
-                BOOT_EVERY_S="0.5", BOOT_STALL_S="0.3")
-    out = tmp / "out"
-    log = (out / "run.log").read_text()
-    assert p.returncode == 0 and "rehearsal complete" in log, log[-4000:]
-    steps = _steps(log)
-    assert steps[steps.index("preflight"):] == ["preflight", "data", "bootwindow-start", "reboot", "bootwindow",
-                                                "digest"]
-    # the probe ran before the reboot and through the window, its files came in, its Job is gone
-    rows = [json.loads(x) for x in (out / "bootwindow" / "probes.jsonl").read_text().splitlines()]
-    boot = json.loads((out / "boot.jsonl").read_text())["t_restart"]
-    assert any(r["kind"] == "probe" and r["t"] < boot for r in rows)
-    assert next(r for r in rows if r["kind"] == "boot_probe_end")["reason"] == "window"
-    rec = json.loads((out / "bootwindow.json").read_text())
-    assert rec["ok"] and rec["reading"] == "only /debug/vars stalls: the expvar render"
-    assert rec["dumps"] and all(d["file"] for d in rec["dumps"])
-    assert all((out / "bootwindow" / d["file"]).exists() for d in rec["dumps"])
-    assert "=== bootwindow report ===" in log and "READING: only /debug/vars stalls: the expvar render" in log
-    deleted = (state / "deleted.jsonl").read_text()
-    assert "job/boot606" in deleted
-    # the bench user's password is in no file of the run (the Job's manifest is redacted once applied)
-    from bench.load606 import SCALEUSER_PASSWORD
-    for f in out.rglob("*"):
-        if f.is_file() and not f.name.endswith(".gz"):
-            assert SCALEUSER_PASSWORD not in f.read_text(errors="replace"), f
+    m = log[log.index("=== step measure ==="):]
+    assert "its boot window probes /readyz anonymous and the boot root as the preflight user every 5s" in m
+    assert "python3 -m bench.bootwindow said" in m and "--boot-window" in m

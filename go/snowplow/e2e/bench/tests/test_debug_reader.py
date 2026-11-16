@@ -126,9 +126,7 @@ DEBUG_READERS = {
         "wait_for_customer_load": "(helper: reached through _cmd_fresh; tests/test_measure_validity.py)",
         "_cmd_go_runtime": "test_the_go_runtime_job_reads_as_the_debug_reader (its only identity is --user)",
         "go_runtime_read": "(helper: reached through _cmd_go_runtime; its token is the caller's)",
-        "BootProbe._get": "test_the_boot_probe_reads_debug_as_the_debug_reader_and_the_boot_root_as_the_preflight_user",
-        "BootProbe._probe": "test_the_boot_probe_reads_debug_as_the_debug_reader_and_the_boot_root_as_the_preflight_user",
-        "BootProbe._dump": "test_the_boot_probe_reads_debug_as_the_debug_reader_and_the_boot_root_as_the_preflight_user",
+        "BootWindow._dump": "test_the_boot_window_dumps_as_the_debug_reader_and_probes_the_boot_root_as_the_preflight_user",
         "_cmd_memwatch": "test_mem606_and_the_drivers_sampler_read_as_the_debug_reader_and_the_drive_as_scale_users",
         "memwatch": "(helper: reached through _cmd_memwatch)",
         "mem_sample": "(helper: reached through memwatch)",
@@ -188,18 +186,16 @@ def _script(job):
 COMMON = ("--snowplow-url", "http://snowplow:8081", "--authn-url", "http://authn:8082", "--password", "pw")
 
 
-def test_the_boot_probe_reads_debug_as_the_debug_reader_and_the_boot_root_as_the_preflight_user(tmp_path):
-    from tests.test_boot_window import boot_probe_identities
-    boot_probe_identities(tmp_path)
-    # the Job logs the two in by their own flags: the debug reader and the preflight user, nobody else
-    [job] = _job_docs(*COMMON, "--boot-probe-only", "--init", "/call?x", "--boot-bound-s", "60")
-    cmd = job["spec"]["template"]["spec"]["containers"][0]["command"]
-    assert cmd[cmd.index("--debug-user") + 1] == READER and cmd[cmd.index("--preflight-user") + 1] == "scaleuser-0000"
+def test_the_boot_window_dumps_as_the_debug_reader_and_probes_the_boot_root_as_the_preflight_user():
+    from tests.test_boot_window import boot_window_identities
+    boot_window_identities()
 
 
 def test_the_go_runtime_job_reads_as_the_debug_reader():
-    [job] = _job_docs(*COMMON, "--go-runtime-only", "--go-runtime-deadline", "1794812999")
-    assert f'--user "{READER}"' in _script(job) and "scaleuser-0000" not in _script(job)
+    [job] = _job_docs(*COMMON, "--go-runtime-only", "--go-runtime-deadline", "1794812999", "--init", "/call?x")
+    # /debug as the debug reader; the boot window's boot root as the preflight user, its only other identity
+    assert f'--user "{READER}"' in _script(job) and '--preflight-user "scaleuser-0000"' in _script(job)
+    assert _script(job).count("scaleuser-0000") == 1
 
 
 def test_mem606_and_the_drivers_sampler_read_as_the_debug_reader_and_the_drive_as_scale_users():

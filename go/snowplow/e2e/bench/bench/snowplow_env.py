@@ -295,7 +295,7 @@ def effective_text(e: dict | None) -> str:
 
 
 def check(declared: dict[str, str], tracing_path: str, *, arm: str = "", now=time.time,
-          effective_path: str | None = None) -> dict:
+          effective_path: str | None = None, boot_window_path: str | None = None) -> dict:
     """The run's record: what was declared, what the running container's env has, what the PROCESS
     runs with (`effective_path`: the runtime606 Job's output), and whether every declared key is SET
     in the env to the declared value and is the effective one. Fails closed: no reading of the pod,
@@ -308,6 +308,8 @@ def check(declared: dict[str, str], tracing_path: str, *, arm: str = "", now=tim
     rec["effective"] = eff
     # the read's own finding (a boot-window stall), kept apart from the verdict on the settings
     rec["runtime_read"] = read_of(effective_path)
+    # the read's boot window (bench/bootwindow.py, report-only): carried into the record, never judged
+    rec["boot_window"] = boot_window_of(boot_window_path)
     if eff is None:
         rec["mismatches"].append(f"the settings the process runs with could not be read: {eff_why}")
     else:
@@ -449,7 +451,24 @@ def report(path: str | None) -> dict:
         f"INFO snowplow env declared: {declared_text(rec.get('declared') or {})}; "
         + (f"the process and the pod's env have it as declared; undeclared Go runtime keys in the env: {und}"
            if rec.get("verified") else f"NOT verified: {rec.get('why')}"),
-        f"INFO {READ_FINDING}: {read_text(read)}"])
+        f"INFO {READ_FINDING}: {read_text(read)}"] + boot_window_lines(rec.get("boot_window")))
+
+
+def boot_window_of(path: str | None) -> dict | None:
+    """$OUT/boot-window.json (bench/bootwindow.py said), or None when there is none."""
+    try:
+        with open(path) as fh:
+            rec = json.load(fh)
+    except (OSError, TypeError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) and rec.get("kind") == "boot_window" else None
+
+
+def boot_window_lines(bw: dict | None) -> list[str]:
+    """The run report's "boot window" block (report-only)."""
+    if not isinstance(bw, dict):
+        return ["INFO boot window: NO RECORD (boot-window.json: no Go runtime read, or one that predates it)"]
+    return [ln for ln in bw.get("lines") or [] if isinstance(ln, str)]
 
 
 #: the stall's own finding, named so in the record, the report and the run log
@@ -628,6 +647,7 @@ def rehearsal_lines(out_dir: str) -> list[str]:
                  + (f"{effective_text(eff)}; raw: {json.dumps(eff, sort_keys=True)}" if eff is not None
                     else f"NOT READ ({eff_why})"))
     lines.append(f"{READ_FINDING}: {read_text(read_of(os.path.join(out_dir, 'go-runtime.jsonl')))}")
+    lines += boot_window_lines(boot_window_of(os.path.join(out_dir, "boot-window.json")))
     lines.append("the pod's Go runtime env, read before any load: "
                  + (goruntime.reading_text(g) if g is not None else f"NOT READ ({why})"))
     rec = load(os.path.join(out_dir, "snowplow-env.json"))
@@ -674,6 +694,8 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--effective", default=None,
                    help="the runtime606 Job's output (run606: $OUT/go-runtime.jsonl): the settings the snowplow "
                         "process runs with; without it the check fails")
+    c.add_argument("--boot-window", default=None,
+                   help="run606's boot-window.json (bench/bootwindow.py): carried into the record, report-only")
     c.add_argument("--arm", default="")
     c.add_argument("--out", required=True)
     g = sub.add_parser("agree", help="exit 1 when a key no run declared differs between the launch's runs")
@@ -719,7 +741,7 @@ def main(argv: list[str] | None = None) -> int:
         print(("rendered: " if rec["ok"] else "NOT rendered as declared: ") + rec["why"])
         return 0 if rec["ok"] else 1
     if a.cmd == "check":
-        rec = check(declared, a.tracing, arm=a.arm, effective_path=a.effective)
+        rec = check(declared, a.tracing, arm=a.arm, effective_path=a.effective, boot_window_path=a.boot_window)
         _write(a.out, rec)
         print(("verified from the running process: " if rec["verified"] else "NOT as declared: ") + rec["why"])
         return 0 if rec["verified"] else 1

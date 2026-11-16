@@ -346,12 +346,15 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         uf = os.path.join(STATE, "users")
         if who not in (open(uf).read().split() if os.path.exists(uf) else []) and not fail:
             fail = "login"
-        # load606 go-runtime requires --deadline (the step's own): without it argparse exits 2, no line
-        if cmd and not re.search(r"--deadline [0-9]+", cmd):
+        # load606 go-runtime requires --deadline (the step's own), --preflight-user and --init (its boot
+        # window's boot root): without one, argparse exits 2 and prints no line
+        missing = [f for f, pat in (("--deadline", r"--deadline [0-9]+"), ("--preflight-user", r'--preflight-user "[^"]+"'),
+                                    ("--init", r'--init "/call[^"]*"')) if not re.search(pat, cmd)]
+        if cmd and missing:
             if "get" in a:
                 print("1" if any(x.endswith("{.status.failed}") for x in a) else "")
             elif "logs" in a:
-                print("load606.py go-runtime: error: the following arguments are required: --deadline")
+                print("load606.py go-runtime: error: the following arguments are required: " + ", ".join(missing))
             sys.exit(0)
         # snowplow #1365 (every image after 1.12.70): /debug/vars is a NON-RESOURCE request, allowed only
         # by a ClusterRoleBinding of the user (or one of its groups) to a ClusterRole whose rule has
@@ -396,7 +399,7 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             # byte in 30 s), then 200; noanswer: no attempt answered within the step's budget
             no = {"status": 0, "elapsed_ms": 30001.0, "connect_ms": 0.9, "first_byte_ms": None,
                   "error_class": "TimeoutError", "error": "TimeoutError: timed out", "stalled_at": "first_byte"}
-            t = 1794812706.0
+            t = time.time()
             tries = ([dict(no, n=1, t=t, t_end=t + 30.0)] if fail in ("stall", "noanswer") else [])
             if fail == "noanswer":
                 tries += [dict(no, n=k, t=t + 35.0 * (k - 1), t_end=t + 35.0 * (k - 1) + 30.0) for k in range(2, 9)]
@@ -406,8 +409,26 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                               "n": len(tries) + 1, "t": t + 35.0 * len(tries), "t_end": t + 35.0 * len(tries) + 0.012})
             if fail == "login":
                 tries = []
+            # the boot window (load606 BootWindow) beside the attempts: /readyz and the boot root answer at
+            # once every round; with a stall, the window's one goroutine dump, in its log chunks
+            if fail not in ("login", "pending"):
+                print(json.dumps({"kind": "boot_window_start", "t": t, "every_s": 5.0, "stall_s": 5.0,
+                                  "timeout_s": 30.0, "routes": ["readyz", "call", "vars"]}))
             for x in tries:
                 print(json.dumps(dict(x, kind="go_runtime_attempt")))
+                for route in ("readyz", "call"):
+                    print(json.dumps({"kind": "boot_probe", "route": route, "round": x["n"], "t": x["t"], "status": 200,
+                                      "elapsed_ms": 3.0, "connect_ms": 0.5, "first_byte_ms": 2.5}))
+            if fail in ("stall", "noanswer"):
+                import base64, gzip
+                data = base64.b64encode(gzip.compress(b"goroutine 1 [select, 2 minutes]:\\nmain.main()\\n")).decode()
+                print(json.dumps({"kind": "boot_dump", "t": t + 5.3, "trigger": {"route": "vars", "waited_s": 5.3},
+                                  "status": 200, "elapsed_ms": 40.0, "connect_ms": 0.5, "first_byte_ms": 30.0,
+                                  "bytes": 48, "chunks": 1}))
+                print(json.dumps({"kind": "boot_dump_chunk", "i": 0, "n": 1, "data": data}))
+            if fail not in ("login", "pending"):
+                print(json.dumps({"kind": "boot_window_end", "t": t + 40.0, "rounds": len(tries) + 1,
+                                  "dump": fail in ("stall", "noanswer"), "skipped": None}))
             nos = [x for x in tries if not x["status"]]
             ans = next((x for x in tries if x["status"]), None)
             secs = round(ans["t_end"] - tries[0]["t"], 1) if ans else None
@@ -488,9 +509,7 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     # FAKE_INC_POOL=<pool>: the pods land on a node of that pool; FAKE_INC_LEFT=1: data606's pod is
     # still listed when the drivers are applied; FAKE_INC_PENDING=<job>: that Job's pod is never
     # scheduled (Pending, its PodScheduled condition carrying run 24b's FailedScheduling message).
-    # boot606 (BENCH_606_REHEARSAL=bootwindow): load606.py boot-probe, run from the bench's own copy, against
-    # the harness's fake server, as its pod would
-    INC = ("data606", "observe606", "boot606")
+    INC = ("data606", "observe606")
     def inc_dir(job):
         return os.path.join(STATE, "pods", job)
     def inc_alive(job):
@@ -511,12 +530,7 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                 continue
             c = d["spec"]["template"]["spec"]["containers"][0]
             out = os.path.join(inc_dir(job), "out")
-            src = os.path.join(os.environ["PYTHONPATH"].split(os.pathsep)[0], "bench", "load606.py")
-            argv = [out if x == "/out" else src if x == "/opt/load606/load606.py" else x for x in c["command"]]
-            # the Service DNS names a pod resolves are the harness's fake server here
-            for flag in ("--snowplow-url", "--authn-url"):
-                if flag in argv:
-                    argv[argv.index(flag) + 1] = f"http://127.0.0.1:{port}"
+            argv = [out if x == "/out" else x for x in c["command"]]
             argv[argv.index("--linger-s") + 1] = "60"
             env = dict(os.environ, HOME=os.path.join(inc_dir(job)))
             for e in c.get("env", []):
@@ -1850,9 +1864,6 @@ def _fake_server(state: Path):
             q = urllib.parse.parse_qs(u.query)
             if u.path == "/basic/login":
                 return self._send({"accessToken": "fake-jwt"})
-            # bootwindow: STATE/vars-stall holds how long /debug/vars waits before its first byte
-            if u.path == "/debug/vars" and (state / "vars-stall").exists():
-                time.sleep(float((state / "vars-stall").read_text()))
             if u.path == "/call" and q.get("name") == ["bench-fresh-listdep"]:
                 m = state / "marker"
                 marker = m.read_text() if m.exists() else ""

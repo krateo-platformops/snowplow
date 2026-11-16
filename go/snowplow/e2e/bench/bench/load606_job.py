@@ -199,101 +199,22 @@ GO_RUNTIME_JOB = "runtime606"
 
 
 def render_go_runtime(*, snowplow_url: str, authn_url: str, user: str, password: str, deadline: int,
-                      src: str | None = None, job_name: str = GO_RUNTIME_JOB) -> str:
+                      preflight_user: str, init: str, src: str | None = None,
+                      job_name: str = GO_RUNTIME_JOB) -> str:
     """Namespace + ConfigMap + the runtime606 Job: the bench's debug reader logs in and reads
     /debug/vars' snowplow_go_runtime (`load606 go-runtime`): the GC settings the snowplow process
     runs with. No answer is tried again until `deadline` (epoch s, the step's own: run606 GO_RUNTIME_S
-    from the apply), each attempt one line; the record last. On the loadgen pool like the preflight."""
+    from the apply), each attempt one line. Meanwhile its boot window (load606 BootWindow): /readyz
+    (anonymous) and the boot root `init` (the preflight user) every 5 s, and one goroutine dump (the
+    debug reader) when a request passes 5 s without a byte. The record last. On the loadgen pool."""
     script = f"""set -eu
 exec python3 -u /opt/load606/load606.py go-runtime \\
   --snowplow-url {json.dumps(snowplow_url)} --authn-url {json.dumps(authn_url)} \\
-  --user {json.dumps(user)} --password {json.dumps(password)} --deadline {int(deadline)}
+  --user {json.dumps(user)} --password {json.dumps(password)} --deadline {int(deadline)} \\
+  --preflight-user {json.dumps(preflight_user)} --init {json.dumps(init)}
 """
     return _one_shot_job(job_name, script, src)
 
-
-BOOT_PROBE_JOB = "boot606"
-
-
-def render_boot_probe(*, snowplow_url: str, authn_url: str, debug_user: str, preflight_user: str,
-                      password: str, init: str, every_s: float, window_s: float, stall_s: float,
-                      bound_s: float, linger_s: int, src: str | None = None) -> str:
-    """Namespace + ConfigMap + the boot606 Job (BENCH_606_REHEARSAL=bootwindow; load606 boot-probe):
-    every `every_s`, concurrently, /readyz (anonymous), /debug/pprof/goroutine?debug=1 and /debug/vars
-    (the debug reader) and the boot root `init` (the preflight user), from its start (before the
-    reboot) until `window_s` past the new pod's Ready (run606 writes it to /out/ready), at most
-    `bound_s`; a goroutine dump is saved whenever a probe passes `stall_s` without a byte. Its pod turns
-    Ready once /out/done exists and stays up (at most linger_s) for run606 to copy /out."""
-    src = LOAD606_SRC.read_text() if src is None else src
-    cmd = ["python3", "-u", "/opt/load606/load606.py", "boot-probe", "--snowplow-url", snowplow_url,
-           "--authn-url", authn_url, "--debug-user", debug_user, "--preflight-user", preflight_user,
-           "--password", password, "--init", init, "--every-s", f"{every_s:g}", "--window-s", f"{window_s:g}",
-           "--stall-s", f"{stall_s:g}", "--bound-s", f"{bound_s:g}", "--out", "/out",
-           "--linger-s", str(int(linger_s))]
-    return f"""\
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: bench-loadgen
-  labels:
-    app: scaletest
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: load606
-  namespace: bench-loadgen
-data:
-  load606.py: |
-{_indent(src, 4)}
-  identity.py: |
-{_indent(IDENTITY_SRC.read_text(), 4)}
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: {BOOT_PROBE_JOB}
-  namespace: bench-loadgen
-spec:
-  backoffLimit: 0
-  template:
-    metadata:
-      labels:
-        app: {BOOT_PROBE_JOB}
-    spec:
-      restartPolicy: Never
-      nodeSelector:
-        bench.krateo.io/pool: loadgen
-      tolerations:
-      - key: dedicated
-        operator: Equal
-        value: loadgen
-        effect: NoSchedule
-      containers:
-      - name: probe
-        image: {IMAGE}
-        command: {json.dumps(cmd)}
-        readinessProbe:
-          exec:
-            command: ["test", "-f", "/out/done"]
-          periodSeconds: 5
-        volumeMounts:
-        - name: src
-          mountPath: /opt/load606
-        - name: out
-          mountPath: /out
-      volumes:
-      - name: src
-        configMap:
-          name: load606
-          items:
-          - key: load606.py
-            path: load606.py
-          - key: identity.py
-            path: bench/identity.py
-      - name: out
-        emptyDir: {{}}
-"""
 
 
 def _one_shot_job(job_name: str, script: str, src: str | None = None) -> str:
@@ -673,7 +594,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--snowplow-url", required=True)
     p.add_argument("--authn-url", required=True)
     p.add_argument("--password", required=True)
-    p.add_argument("--init", default=None, help="the portal's boot root (required, except with --go-runtime-only)")
+    p.add_argument("--init", default=None, help="the portal's boot root (required)")
     p.add_argument("--composite-route", action="append", default=None)
     p.add_argument("--burst-users", type=int, default=0)
     p.add_argument("--burst-at-s", type=float, default=600.0)
@@ -685,17 +606,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--debug-user", default=rbac_model.DEBUG_READER,
                    help="the ONE identity every /debug read is done as (bench/rbac_model.py THE DEBUG READER)")
     p.add_argument("--go-runtime-only", action="store_true",
-                   help="render only the runtime606 Job: the preflight user reads the GC settings the snowplow "
-                        "process runs with (/debug/vars snowplow_go_runtime)")
+                   help="render only the runtime606 Job: the debug reader reads the GC settings the snowplow "
+                        "process runs with (/debug/vars snowplow_go_runtime); its boot window probes /readyz "
+                        "and the boot root (--init, as --preflight-user) meanwhile")
     p.add_argument("--go-runtime-deadline", type=int, default=None,
                    help="--go-runtime-only (required): epoch s, the step's deadline (run606 GO_RUNTIME_S)")
-    p.add_argument("--boot-probe-only", action="store_true",
-                   help="render only the boot606 Job (BENCH_606_REHEARSAL=bootwindow, load606 boot-probe)")
-    p.add_argument("--boot-every-s", type=float, default=5.0)
-    p.add_argument("--boot-window-s", type=float, default=180.0)
-    p.add_argument("--boot-stall-s", type=float, default=5.0)
-    p.add_argument("--boot-bound-s", type=float, default=None,
-                   help="--boot-probe-only (required): the probe's hard end, s from its start")
     p.add_argument("--preflight-job-name", default="preflight606",
                    help="--preflight-only: the Job's name (a menu class's preflight, run606 s_classes)")
     p.add_argument("--menu-classes", action="store_true",
@@ -739,7 +654,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--browser-snowplow-url", default=None,
                    help="k6: snowplow as the browser reaches it (config SNOWPLOW_API_BASE_URL)")
     a = p.parse_args(argv)
-    if a.init is None and not a.go_runtime_only:
+    if a.init is None:
         p.error("the following arguments are required: --init")
     if a.menu_classes:
         for label in menu_classes_driven(a.users, a.namespaces, a.browser_sessions, a.burst_users, a.dry_run):
@@ -750,16 +665,8 @@ def main(argv: list[str] | None = None) -> int:
             p.error("--go-runtime-only needs --go-runtime-deadline (the step's deadline, epoch s)")
         sys.stdout.write(render_go_runtime(snowplow_url=a.snowplow_url, authn_url=a.authn_url,
                                            user=a.debug_user, password=a.password,
-                                           deadline=a.go_runtime_deadline))
-        return 0
-    if a.boot_probe_only:
-        if a.boot_bound_s is None:
-            p.error("--boot-probe-only needs --boot-bound-s (the probe's hard end)")
-        sys.stdout.write(render_boot_probe(
-            snowplow_url=a.snowplow_url, authn_url=a.authn_url, debug_user=a.debug_user,
-            preflight_user=a.preflight_user, password=a.password, init=a.init, every_s=a.boot_every_s,
-            window_s=a.boot_window_s, stall_s=a.boot_stall_s, bound_s=a.boot_bound_s,
-            linger_s=int(a.linger_s)))
+                                           deadline=a.go_runtime_deadline, preflight_user=a.preflight_user,
+                                           init=a.init))
         return 0
     if a.preflight_only:
         sys.stdout.write(render_preflight(
