@@ -10,6 +10,7 @@ needs a mail-shaped domain (dot-separated labels, a letters-only TLD) and no
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 
@@ -84,6 +85,22 @@ def _script(line):
                           capture_output=True, text=True, timeout=60).stdout
 
 
+def _log_cause(line):
+    """k6's log line for a browser iteration that threw, as k6eval reads a lost session's cause from it."""
+    import tempfile
+
+    from bench import k6eval
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+        fh.write('time="2026-11-16T15:48:02Z" level=error msg="Uncaught (in promise) Error: session s4: '
+                 + line.replace('"', '\\"') + '\\n\\tat runClass (file:///opt/k6/browser.js:1:1)" scenario=ui\n')
+    try:
+        ends, why = k6eval._log_ends([fh.name])
+    finally:
+        os.unlink(fh.name)
+    assert not why and ends[0]["session"] == "s4", (ends, why)
+    return ends[0]["cause"]
+
+
 SITES = {
     "identity.redact_identity": identity.redact_identity,
     "bench/identity.py (run606 kerr_line)": _script,
@@ -104,6 +121,9 @@ SITES = {
     "clusterops.read (a listing's complaint on stderr)": lambda s: clusterops.read(
         gke.default_spec("snowplow-bench-x"), created=0.0,
         run=lambda argv, **kw: (kw["stderr_out"].append("WARNING: " + s), (0, "[]"))[1])["unreadable"],
+
+    # #1508: an uncaught error k6 logged for a browser session (the cause of a session that ended early)
+    "k6eval._log_ends (a lost session's cause)": lambda s: _log_cause(s),
 
     # #1361: a failed gcloud call's cause, in every testvm / vm606 refusal of one
     "gcevm.gcloud_cause (a refused gcloud call's cause)": lambda s: gcevm.gcloud_cause("ERROR: " + s),
@@ -139,7 +159,7 @@ def test_the_call_sites_are_the_ones_swept():
     """A new place that redacts is added to SITES, not left out of the sweep."""
     src = {p.name: p.read_text() for p in (BENCH_DIR / "bench").glob("*.py")}
     users = sorted(n for n, t in src.items() if "redact_identity" in t and n != "identity.py")
-    assert users == ["clusterops.py", "diag606.py", "gcevm.py", "gke.py", "load606.py", "logscrub.py", "sampler.py", "testvm.py",
+    assert users == ["clusterops.py", "diag606.py", "gcevm.py", "gke.py", "k6eval.py", "load606.py", "logscrub.py", "sampler.py", "testvm.py",
                      "vm606.py"]
     assert "bench/identity.py" in (BENCH_DIR / "run606.sh").read_text()
 

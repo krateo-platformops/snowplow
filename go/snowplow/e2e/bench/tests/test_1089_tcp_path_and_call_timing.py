@@ -508,7 +508,7 @@ def test_browser_js_puts_timing_the_load_and_the_vu_in_metadata_never_tags():
         drain.index("delete md.call_timing")
     # the load's id only around its own synchronous adds (#1104 review B2: k6 2.3.0 stamps a
     # Chrome request's sample at its RESPONSE, so a load id held on the VU would mis-book them)
-    rec = src[src.index("function record (r, tags, actionAt, loadId)"):]
+    rec = src[src.index("function record (res, tags, actionAt, loadId)"):]
     rec = rec[:rec.index("\n}\n")]
     assert rec.index("md.load_id = loadId") < rec.index(".add(value, t)") < rec.index("delete md.load_id")
     assert src.count("load_id =") == 1
@@ -518,7 +518,7 @@ def test_browser_js_puts_timing_the_load_and_the_vu_in_metadata_never_tags():
     loop = src[src.index("while (Date.now() < deadline && !switchDue("):]
     loop = loop[:loop.index("  } finally {")]
     assert loop.index("const loadId = nextLoadId()") < loop.index("await item.click()")
-    assert "record(r, Object.assign({ route, visit, method }, base), actionAt, loadId)" in loop
+    assert "record(res, Object.assign({ route, visit, method }, base), actionAt, loadId)" in loop
     assert "loadStart(r, actionAt), loadId)" in loop
     login = src[src.index("const loginAt = Date.now()"):src.index("while (Date.now() < deadline")]
     assert login.index("nextLoadId()") < login.index("submit.click(opts)") < login.index("loginAt, firstId)")

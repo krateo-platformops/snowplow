@@ -207,7 +207,7 @@ def read(spec: gke.ClusterSpec, *, created: float | None, created_why: str = "",
     argv = list_command(spec)
     err: list[str] = []
     try:
-        # CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR=false, as on every compute list (gke.COMPUTE_LIST_ENV): a lister
+        # the compute partial-error property off, as on every compute list (gke.COMPUTE_LIST_ENV): a lister
         # that swallows a failed request answers rc 0 with [] while it is true. This listing is the container
         # API's, so its own fail-open forms are closed here: a complaint on stderr (GKE's missing zones) is
         # UNREADABLE, and a listing that lacks the cluster's own CREATE_CLUSTER (the positive control) is too.

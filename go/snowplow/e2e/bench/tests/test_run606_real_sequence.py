@@ -992,6 +992,18 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     f483 = os.environ.get("FAKE_483", "")          # "", pass, wide
     if a[:3] == ["get", "crd", "alerts.observability.krateo.io"]:
         sys.exit(0 if f483 in ("pass", "wide") else 1)
+    if a[:3] == ["rollout", "restart", "deploy/snowplow"] and os.environ.get("FAKE_GKE_RESIZE_AT_REBOOT") == "1":
+        # #1422: GKE starts resizing the control plane as the measured reboot begins (run 27c N2), and has not
+        # finished at collect: the operation GKE lists for the cluster this context names
+        _, _, region, cname = (resolved or "").split("_", 3)
+        import importlib.util as _ilu
+        _sp = _ilu.spec_from_file_location("fake_gke_ops", os.environ["FAKE_GKE_OPS_PY"])
+        _fo = _ilu.module_from_spec(_sp)
+        _sp.loader.exec_module(_fo)
+        _p = os.path.join(STATE, "operations.json")
+        _ops = json.load(open(_p)) if os.path.exists(_p) else []
+        _ops.append(_fo.operation("RESIZE_CLUSTER", cname, start=time.time(), region=region))
+        json.dump(_ops, open(_p, "w"))
     if a[:3] == ["rollout", "status", "deploy/frontend"] and os.environ.get("FAKE_FRONTEND_ROLLOUT_FAIL") == "1":
         # run 26: the frontend's rollout never completes (a pod still Pending)
         print('error: timed out waiting for the condition', file=sys.stderr)
@@ -1978,6 +1990,7 @@ def harness(tmp_path):
         # stamped 50 min before the call, as a real run's are long before its settle step; the warm-up load has
         # run an hour (the fake kubectl's FAKE_WARMUP_AGO_S default): the settle step settles at its first poll
         "FAKE_OPS_AGO_S": "3000",
+        "FAKE_GKE_OPS_PY": str(Path(fake_gke_ops.__file__).resolve()),
     })
     from datetime import datetime, timezone
     env["BENCH_606_GO"] = datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + RUN_NAME

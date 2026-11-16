@@ -6536,7 +6536,8 @@ def measure_span(recs: list[dict], report: dict, browser: dict | None = None,
                  phases: list | None = None) -> tuple[str, float | None, float | None]:
     """#1422 (2026-11-16): the whole measure, (MEASURE_PHASE, start, end): from the measured reboot (the boot
     window's restart) to the drivers' last record (the latest end of a measured phase, of k6's customer calls,
-    and of a real-browser page load). No boot record: its start is not recorded (an overlap is undecided)."""
+    of a real-browser page load and of a load606 driver navigation). No boot record: its start is not recorded
+    (an overlap is undecided)."""
     from bench import k6eval
     boot = next((float(r["t_restart"]) for r in recs if r.get("kind") == "boot"
                  and isinstance(r.get("t_restart"), (int, float))), None)
@@ -6544,7 +6545,9 @@ def measure_span(recs: list[dict], report: dict, browser: dict | None = None,
     span = (report.get("customer_latency") or {}).get("k6_span")
     if span:
         ends.append(float(span[1]))
-    ends += [n["start"] + n["wall_ms"] / 1000 for n in k6eval.browser_navs(browser)
+    # the real browsers' page loads (k6), or the load606 driver's navigations
+    ends += [n["start"] + float(n.get("wall_ms") or 0) / 1000
+             for n in [*k6eval.browser_navs(browser), *(r for r in recs if r.get("kind") == "nav")]
              if isinstance(n.get("start"), (int, float))]
     return MEASURE_PHASE, boot, (max(ends) if ends else None)
 

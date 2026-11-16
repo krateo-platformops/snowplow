@@ -400,7 +400,7 @@ def test_browser_js_drains_the_calls_after_each_load_and_before_each_click():
     src = (BENCH_DIR / "k6" / "browser.js").read_text()
     loop = src[src.index("while (Date.now() < deadline && !switchDue("):]   # each class's route loop (#935)
     assert loop.index("during: 'between'") < loop.index("await markStart(page)")
-    assert loop.index("const r = await settled(page, route)") < loop.index("during: 'load'")
+    assert loop.index("const res = await settled(page, route, deadline, secrets)") < loop.index("during: 'load'")
     assert "new Trend('browser_call_ms', true)" in src and "browser_call_ms|" in src
     # no url / name system tag: the extras (the user) never reach a point
     assert re.search(r"systemTags: \[([^\]]*)\]", src).group(1).count("'url'") == 0
