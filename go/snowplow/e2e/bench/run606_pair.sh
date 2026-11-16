@@ -280,11 +280,10 @@ runenv() {
   RUNENV=(RUN_NAME="${!name}" SNOWPLOW_TAG="${!tag}" EXPECTED_IMAGE_DIGEST="${!dig}"
           BENCH_606_GO="${!go:-}" BENCH_1004_GO="${!fw:-}" K6_SPAN=churn LOAD_DRIVER=k6 OUT="${!out}"
           FRONTEND_TAG_VAR="FRONTEND_TAG_$1")   # run 26d: its login-contract refusal names this run's variable
-  # the run's declared snowplow env, its label, and where the launch's runs share their pod readings
-  # (run606.sh snowplow_env_gate: a Go runtime key no run declared must read the same on all of them)
+  # the run's declared snowplow env and its label (a Go runtime key no run declared must read the same on
+  # both arms of a pair: compared after the measure, from each run's record, by custlat pair and replica)
   local se="SNOWPLOW_ENV_$1"
-  RUNENV+=(SNOWPLOW_ENV="${!se:-}" BENCH_ARM="$1" SNOWPLOW_ENV_DIR="$PAIR_OUT/snowplow-env"
-           SNOWPLOW_ENV_ARMS="${LABELS[*]}")
+  RUNENV+=(SNOWPLOW_ENV="${!se:-}" BENCH_ARM="$1")
   # run 26: the run's frontend override, only when it has one
   local ft="FRONTEND_TAG_$1" fd="EXPECTED_FRONTEND_DIGEST_$1"
   if [[ -n "${!ft:-}" ]]; then
@@ -447,9 +446,6 @@ while ! all_exited; do
     pid="PID_$x" rc="RC_$x"
     if [[ -z "${!rc}" ]] && ! kill -0 "${!pid}" 2>/dev/null; then
       set +e; wait "${!pid}"; printf -v "$rc" '%s' "$?"; set -e
-      # a run that ended without its pod reading: the others do not wait for it (snowplow_env agree)
-      mkdir -p "$PAIR_OUT/snowplow-env"
-      [[ -f "$PAIR_OUT/snowplow-env/$x.json" ]] || : > "$PAIR_OUT/snowplow-env/$x.gone"
       if completed "$x"; then printf -v "DONE_$x" '%s' 1; fi
       done_x="DONE_$x"
       log "run $x exited ${!rc} ($([[ "${!done_x}" == "1" ]] && echo 'its evaluate step ran' || echo 'it did not complete'))"

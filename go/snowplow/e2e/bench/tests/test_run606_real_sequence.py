@@ -433,6 +433,7 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             ans = next((x for x in tries if x["status"]), None)
             secs = round(ans["t_end"] - tries[0]["t"], 1) if ans else None
             read = {"attempts": len(tries), "no_answer": len(nos), "answered": ans["status"] if ans else None,
+                    "answered_at": ans["t_end"] if ans else None,
                     "seconds_to_answer": secs, "budget_s": 300.0, "timeout_s": 30.0, "poll_s": 5.0,
                     "stall": {"no_answer_attempts": len(nos), "seconds_to_answer": secs,
                               "answered": ans["status"] if ans else None, "first": nos[0], "last": nos[-1]}
@@ -1011,8 +1012,10 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                      "env": [{"name": "HOST_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.hostIP"}}},
                              {"name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://$(HOST_IP):4318"}]}]},
                  "status": {"hostIP": "10.0.0.5", "containerStatuses": [cs],
-                            "conditions": [{"type": "Ready", "status": "True", "lastTransitionTime":
-                                            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}]}}]
+                            # FAKE_NO_READY_TIME=1: its Ready condition carries no lastTransitionTime
+                            "conditions": [{"type": "Ready", "status": "True", **({} if os.environ.get(
+                                "FAKE_NO_READY_TIME") == "1" else {"lastTransitionTime":
+                                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))})}]}}]
         # FAKE_TERMINATING_READS=N: the first N reads also list the old
         # ReplicaSet's Terminating pod (old digest) FIRST; -1 = it never goes.
         tr = int(os.environ.get("FAKE_TERMINATING_READS", "0"))

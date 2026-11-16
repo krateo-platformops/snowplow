@@ -5205,6 +5205,7 @@ def read_summary(attempts: list[dict], *, deadline: float, t_start: float, timeo
     ans = next((a for a in attempts if a.get("status")), None)
     secs = round(ans["t_end"] - attempts[0]["t"], 1) if ans is not None else None
     out = {"attempts": len(attempts), "no_answer": len(no), "answered": ans["status"] if ans else None,
+           "answered_at": ans["t_end"] if ans else None,
            "seconds_to_answer": secs, "budget_s": round(deadline - t_start, 1),
            "timeout_s": timeout_s, "poll_s": poll_s, "stall": None}
     if no:
@@ -6632,6 +6633,14 @@ def _cmd_evaluate(a) -> int:
     result["report"]["snowplow_env"] = env = _report_only(snowplow_env.report, a.snowplow_env)
     for ln in env.get("lines") or []:
         print(ln, file=sys.stderr, flush=True)
+    if a.snowplow_env is not None:
+        # the owner's ruling (2026-11-16): the read runs alongside the load, never before it, so the run
+        # counts only if it answered within its deadline (the new pod's Ready + its budget) as declared
+        chk = snowplow_env.validity(env)
+        result.setdefault("validity", []).append(chk)
+        if chk["result"] == "FAIL":
+            result["verdict"] = "INVALID"
+            result.setdefault("invalid_reasons", []).append(f"{chk['check']}: {chk['why']}")
     if env.get("runtime_read_stall"):
         # the boot-window stall is a finding of its own, whatever the read ended with (runs 26j/27)
         result["report"].setdefault("report_warnings", []).append(

@@ -21,14 +21,17 @@ can READ BACK from the pod; a key it could not verify is refused, not trusted).
   - Rendered before anything is created (`render-check`, in the dry pass too): `helm template` of
     the pulled installer chart with the run's values must carry each declared key, with its value,
     in the Installer CR it would apply (components-patch.json: spec.componentValues.snowplow.env).
-  - Proven from the pod before the measure (`check`): the run's own reading of the live snowplow
+  - Proven from the pod at the measure's start (`check`): the run's own reading of the live snowplow
     container's Go runtime env (bench/tracing.py + bench/goruntime.py: the container's env and the
     ConfigMaps it reads through envFrom, as the API server holds them, never the rendered values)
     must show every declared key SET to the declared value. A mismatch, or a key that cannot be
-    read, fails the arm before any load.
-  - Compared between arms before the measure (`agree`): every Go runtime key NO arm declared
-    (GOMEMLIMIT, GOMAXPROCS, anything the reading finds) must read the same on every arm of the
-    launch that reached its reading; one that differs fails the arm before load. The launcher
+    read, makes the run INVALID, named (evaluate's snowplow_env.verified). The owner's ruling
+    (2026-11-16): start-up is over when the pod is Ready, so the load starts right after Ready and
+    this reading runs alongside it, never before it (its deadline: the new pod's Ready + the read's
+    budget, the same point in every arm).
+  - Compared between arms AFTER the measure (`agreement`, in custlat pair and replica): every Go
+    runtime key NO arm declared (GOMEMLIMIT, GOMAXPROCS, anything the reading finds) must read the
+    same on both arms of a pair; one that differs makes the pair INVALID, named. The launcher
     refuses, before anything is created, a launch whose arms do not declare the same set of keys.
 
 THE EFFECTIVE SETTINGS. What a pod's env says is not what its process runs with: snowplow chart 1.12.70
@@ -36,8 +39,8 @@ sets no GOMEMLIMIT, the pod's env reads "unset (the runtime's default, no limit)
 runs with a soft memory limit all the same (snowplow derives it in-process, 7/8 of the container's
 cgroup limit). So the record's facts are the PROCESS's: snowplow publishes what its Go runtime has
 on /debug/vars (snowplow_go_runtime: gogc, memory_limit_bytes, memory_limit_source,
-cgroup_memory_limit_bytes), read before any load by the bench's own preflight user from a short Job
-on the loadgen node (run606 go_runtime_reading; no credential from outside the cluster). The record
+cgroup_memory_limit_bytes), read alongside the load's start by the bench's debug reader from a short Job
+on the loadgen node (run606 go_runtime_start/finish; no credential from outside the cluster). The record
 holds both the declared env and the effective values, and:
   - the effective GOGC must equal the declared one (a declared GOMEMLIMIT its effective bytes), or
     the arm fails before load; so does an arm whose effective settings could not be read;
@@ -263,6 +266,7 @@ def read_of(path: str | None) -> dict | None:
     ans = next((a for a in tried if a.get("status")), None)
     secs = round(ans["t_end"] - tried[0]["t"], 1) if ans else None
     return {"attempts": len(tried), "no_answer": len(no), "answered": ans["status"] if ans else None,
+            "answered_at": ans["t_end"] if ans else None,
             "seconds_to_answer": secs, "unfinished": True,
             "stall": {"no_answer_attempts": len(no), "seconds_to_answer": secs, "answered": ans["status"] if ans else None,
                       "first": no[0], "last": no[-1]} if no else None}
@@ -295,7 +299,8 @@ def effective_text(e: dict | None) -> str:
 
 
 def check(declared: dict[str, str], tracing_path: str, *, arm: str = "", now=time.time,
-          effective_path: str | None = None, boot_window_path: str | None = None) -> dict:
+          effective_path: str | None = None, boot_window_path: str | None = None,
+          load_start_path: str | None = None) -> dict:
     """The run's record: what was declared, what the running container's env has, what the PROCESS
     runs with (`effective_path`: the runtime606 Job's output), and whether every declared key is SET
     in the env to the declared value and is the effective one. Fails closed: no reading of the pod,
@@ -310,6 +315,9 @@ def check(declared: dict[str, str], tracing_path: str, *, arm: str = "", now=tim
     rec["runtime_read"] = read_of(effective_path)
     # the read's boot window (bench/bootwindow.py, report-only): carried into the record, never judged
     rec["boot_window"] = boot_window_of(boot_window_path)
+    # when the load started (the drivers applied right after the reboot, the digest gate and the pod record:
+    # the owner's ruling, 2026-11-16) and when the read answered, both from the new pod's Ready
+    rec["load_start"] = load_start_of(load_start_path, rec["runtime_read"])
     if eff is None:
         rec["mismatches"].append(f"the settings the process runs with could not be read: {eff_why}")
     else:
@@ -389,40 +397,14 @@ def effective_differences(recs: dict[str, dict]) -> list[str]:
     return out
 
 
-def agree(shared_dir: str, arm: str, arms: list[str], wait_s: float, *, clock=time.monotonic, sleep=time.sleep,
-          poll_s: float = 5.0) -> dict:
-    """Before `arm` starts its load: wait (at most `wait_s`) for the reading of every other arm of the
-    launch in `shared_dir` (<arm>.json, check's record; <arm>.gone: that run ended without one), then
-    compare the undeclared keys. {"ok", "why", "compared", "not_compared"}: not ok only on a difference;
-    an arm with no reading within the wait is NOT compared, and is named (the pair says it again)."""
-    deadline = clock() + wait_s
-    recs: dict[str, dict] = {}
-    pending = list(arms)
-    while True:
-        for x in list(pending):
-            p = os.path.join(shared_dir, f"{x}.json")
-            if os.path.exists(p):
-                try:
-                    with open(p) as fh:
-                        recs[x] = json.load(fh)
-                    pending.remove(x)
-                except ValueError:
-                    pass                         # being written: read again
-            elif os.path.exists(os.path.join(shared_dir, f"{x}.gone")):
-                pending.remove(x)
-        if not pending or clock() >= deadline:
-            break
-        sleep(min(poll_s, max(deadline - clock(), 0.01)))
-    diffs = (effective_differences(recs) + undeclared_differences(recs)) if arm in recs else [
-        f"{arm}'s own reading is not in {shared_dir}"]
-    compared = sorted(x for x in recs if x != arm)
-    absent = sorted(x for x in arms if x not in recs and x != arm)
-    return {"ok": not diffs, "why": "; ".join(diffs), "compared": compared, "not_compared": absent,
-            "line": (f"the processes' memory limit and undeclared Go runtime keys: "
-                     f"{'DIFFER: ' + '; '.join(diffs) if diffs else 'the same'} on "
-                     f"{arm} and {', '.join(compared) or 'no other run'}"
-                     + (f"; NOT compared with {', '.join(absent)} (no reading within {wait_s:g} s, or the run "
-                        f"ended without one)" if absent else ""))}
+def agreement(ra: dict | None, rb: dict | None, labels: tuple[str, str]) -> list[str]:
+    """AFTER the measure, from the two arms' recorded readings (their verdicts' snowplow_env sections): what
+    their processes run with that must be the same and is not (effective_differences, undeclared_differences).
+    [] when they agree, or when an arm has no verified reading (that arm is INVALID on its own)."""
+    if not (isinstance(ra, dict) and ra.get("verified") and isinstance(rb, dict) and rb.get("verified")):
+        return []
+    recs = {labels[0]: ra, labels[1]: rb}
+    return effective_differences(recs) + undeclared_differences(recs)
 
 
 # ─── reported ───────────────────────────────────────────────────────────────
@@ -446,12 +428,61 @@ def report(path: str | None) -> dict:
     und = ", ".join(key_text(k, r) for k, r in (rec.get("undeclared") or {}).items()) or "none"
     read = rec.get("runtime_read")
     return dict(rec, state=state, runtime_read_stall=(read or {}).get("stall"), lines=[
-        f"INFO snowplow Go runtime, effective (read from the running process before the measure): "
+        f"INFO snowplow Go runtime, effective (read from the running process alongside the load's start): "
         f"{effective_text(rec.get('effective'))}",
         f"INFO snowplow env declared: {declared_text(rec.get('declared') or {})}; "
         + (f"the process and the pod's env have it as declared; undeclared Go runtime keys in the env: {und}"
            if rec.get("verified") else f"NOT verified: {rec.get('why')}"),
-        f"INFO {READ_FINDING}: {read_text(read)}"] + boot_window_lines(rec.get("boot_window")))
+        f"INFO {READ_FINDING}: {read_text(read)}"] + load_start_lines(rec.get("load_start"))
+        + boot_window_lines(rec.get("boot_window")))
+
+
+def load_start_of(path: str | None, read: dict | None) -> dict | None:
+    """run606's load-start.json (the drivers applied: ready_at, applied_at, offset_s), with when the Go
+    runtime read answered (its answering attempt's end), both as offsets from the new pod's Ready."""
+    try:
+        with open(path) as fh:
+            ls = json.load(fh)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not isinstance(ls, dict) or ls.get("kind") != "load_start" or not isinstance(ls.get("ready_at"), (int, float)):
+        return None
+    out = dict(ls, read_answered_at=None, read_answered_from_ready_s=None)
+    if isinstance(read, dict) and isinstance(read.get("answered_at"), (int, float)):
+        out["read_answered_at"] = read["answered_at"]
+        out["read_answered_from_ready_s"] = round(read["answered_at"] - ls["ready_at"], 1)
+    return out
+
+
+def load_start_lines(ls: dict | None) -> list[str]:
+    """The run report's load-start lines: Ready, the load start, the read's answer, and the rule."""
+    if not isinstance(ls, dict):
+        return ["INFO load start: NO RECORD (load-start.json: no load was applied, or a run that predates it)"]
+    ans = ls.get("read_answered_from_ready_s")
+    return [f"INFO load start: Ready at {_utc(ls['ready_at'])}; the drivers applied at {_utc(ls['applied_at'])} = "
+            f"Ready + {ls['offset_s']} s; the Go runtime read answered at "
+            + (f"Ready + {ans} s" if ans is not None else "NO TIME (it never answered)"),
+            f"INFO load start: load starts at Ready + {ls['offset_s']} s in this arm, and in every arm right after "
+            f"{ls.get('after') or 'the reboot, the digest gate and the pod record'}: the Go runtime read runs alongside "
+            f"the load and never delays it"]
+
+
+def _utc(t) -> str:
+    return time.strftime("%H:%M:%SZ", time.gmtime(t)) if isinstance(t, (int, float)) else str(t)
+
+
+def validity(env: dict | None) -> dict:
+    """evaluate's snowplow_env.verified validity check: FAIL (the run is INVALID, named) when the process's
+    settings were not read within the read's deadline or are not as declared."""
+    if not isinstance(env, dict) or env.get("state") == "UNKNOWN":
+        why = (env or {}).get("why") or "the run has no snowplow-env record"
+        return {"check": "snowplow_env.verified", "result": "FAIL", "value": "no record", "bar": "verified",
+                "why": f"the run's snowplow env was not checked: {why}"}
+    ok = env.get("state") == "VERIFIED"
+    return {"check": "snowplow_env.verified", "result": "PASS" if ok else "FAIL",
+            "value": env.get("state"), "bar": "VERIFIED",
+            "why": None if ok else f"snowplow env NOT as declared (the Go runtime read's deadline is the new pod's "
+                                   f"Ready + its budget): {env.get('why')}"}
 
 
 def boot_window_of(path: str | None) -> dict | None:
@@ -524,12 +555,30 @@ def pair(va: dict | None, vb: dict | None, labels: tuple[str, str], not_comparab
         only = (" (they differ in GC settings only, not in image)" if eff and da and da == db else
                 " (they differ in image only)" if not eff and da and db and da != db else "")
         out["lines"] = [
-            f"INFO arms: {image}; {what}: {gc}; {mem}{only}; each read from the running process before the measure "
+            f"INFO arms: {image}; {what}: {gc}; {mem}{only}; each read from the running process alongside the load's start "
             f"(declared: {labels[0]} {declared(ea)}; {labels[1]} {declared(eb)})"
             + ("; UNDECLARED env keys differ: " + "; ".join(und) if und else "")]
+    sa, sb = ((x or {}).get("load_start") if isinstance(x, dict) else None for x in (_sec(va), _sec(vb)))
+    oa, ob = ((s_ or {}).get("offset_s") for s_ in (sa, sb))
+    out["load_start_offsets_s"] = {labels[0]: oa, labels[1]: ob}
+    out["lines"].append(
+        f"INFO load start: {labels[0]} at Ready + {oa if oa is not None else 'UNKNOWN'} s, {labels[1]} at Ready + "
+        f"{ob if ob is not None else 'UNKNOWN'} s"
+        + (f": a difference of {round(abs(oa - ob), 1)} s (the bench holds no tolerance for it: reported, not judged)"
+           if oa is not None and ob is not None else ": the difference is UNKNOWN")
+        + "; in every arm the load starts right after the reboot, the digest gate and the pod record")
+    out["disagree"] = agreement(_sec(va), _sec(vb), labels)
+    if out["disagree"]:
+        out["lines"].append("INVALID arms: snowplow env, compared after the measure from each arm's reading: "
+                            + "; ".join(out["disagree"]))
     if not_comparable:
         out["lines"].append(f"INFO not comparable with {not_comparable}")
     return out
+
+
+def _sec(v: dict | None) -> dict | None:
+    sec = ((v or {}).get("report") or {}).get(KIND) if isinstance(v, dict) else None
+    return sec if isinstance(sec, dict) else None
 
 
 # ─── the one-cluster rehearsal's report ─────────────────────────────────────
@@ -696,14 +745,10 @@ def main(argv: list[str] | None = None) -> int:
                         "process runs with; without it the check fails")
     c.add_argument("--boot-window", default=None,
                    help="run606's boot-window.json (bench/bootwindow.py): carried into the record, report-only")
+    c.add_argument("--load-start", default=None,
+                   help="run606's load-start.json: when the drivers were applied, from the new pod's Ready")
     c.add_argument("--arm", default="")
     c.add_argument("--out", required=True)
-    g = sub.add_parser("agree", help="exit 1 when a key no run declared differs between the launch's runs")
-    g.add_argument("--dir", required=True)
-    g.add_argument("--arm", required=True)
-    g.add_argument("--arms", nargs="+", required=True)
-    g.add_argument("--wait-s", type=float, required=True)
-    g.add_argument("--out", required=True)
     h = sub.add_parser("rehearsal-report", help="the one block a rehearsal run prints, from its files")
     h.add_argument("--out-dir", required=True)
     rs = sub.add_parser("read-said", help="the runtime606 read's own finding, one line (run606 logs it)")
@@ -741,14 +786,12 @@ def main(argv: list[str] | None = None) -> int:
         print(("rendered: " if rec["ok"] else "NOT rendered as declared: ") + rec["why"])
         return 0 if rec["ok"] else 1
     if a.cmd == "check":
-        rec = check(declared, a.tracing, arm=a.arm, effective_path=a.effective, boot_window_path=a.boot_window)
+        rec = check(declared, a.tracing, arm=a.arm, effective_path=a.effective, boot_window_path=a.boot_window,
+                    load_start_path=a.load_start)
         _write(a.out, rec)
         print(("verified from the running process: " if rec["verified"] else "NOT as declared: ") + rec["why"])
         return 0 if rec["verified"] else 1
-    res = agree(a.dir, a.arm, a.arms, a.wait_s)
-    _write(a.out, res)
-    print(res["line"])
-    return 0 if res["ok"] else 1
+    return 2
 
 
 if __name__ == "__main__":

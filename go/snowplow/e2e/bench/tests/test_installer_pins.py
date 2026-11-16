@@ -255,15 +255,14 @@ def _budget(env, **extra):
     return m.group(1), int(m.group(2))
 
 
-def test_the_wait_for_the_other_runs_readings_is_a_term_of_the_plans_total(harness):  # noqa: F811
-    """In a launch each run may wait up to 600 s for the other runs' pod readings before its load: the
-    plan's TOTAL holds those seconds (and so the TTL derived from it), not only the line that names them."""
+def test_a_run_of_a_launch_waits_for_no_other_run_and_its_plan_has_no_such_term(harness):  # noqa: F811
+    """The owner's ruling (2026-11-16): every arm's load starts right after its pod's Ready; the arms' readings
+    are compared after the measure (custlat pair and replica), so a run of a launch plans no wait for the
+    others: the same total as a run alone."""
     env, state, _, tmp = harness
     alone_line, alone = _budget(env)
-    line, total = _budget(env, BENCH_ARM="N1", SNOWPLOW_ENV_DIR=str(tmp / "shared"), SNOWPLOW_ENV_ARMS="N1 N2")
-    assert " + env agreement 600 + measure " in line and "env agreement" not in alone_line
-    assert total == alone + 600
-    # the line's own terms add up to its total, with and without the wait
+    line, total = _budget(env, BENCH_ARM="N1")
+    assert "env agreement" not in line and total == alone
     for text, tot in ((alone_line, alone), (line, total)):
         flat = " ".join(re.sub(r"\([^()]*\)", "", text).split())               # a term's breakdown is not a term
         terms = [int(n) * int(k) if n else int(k) for n, k in re.findall(r"(?:(\d+)x)?(\d+)(?= \+|$)", flat)]
