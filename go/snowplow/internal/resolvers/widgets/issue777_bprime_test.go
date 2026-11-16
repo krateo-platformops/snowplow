@@ -290,6 +290,9 @@ var b777Consumers = map[string]string{
 	"mergeExtras":                      "puts the extras into the dict only; the dict reaches the body only through the templates above",
 	"injectSlice":                      "writes ds[slice] from request pagination; reads no extra",
 	"sanitizeUndeclaredIdentityExtras": "strips undeclared identity keys (A-3); emits a subset of its input",
+	// #1477 — the A-3 strip + A2 declared-identity injection Resolve applied
+	// inline before, extracted so ApiRefExtras derives from the same pair.
+	"resolveInputExtras": "strips undeclared identity keys (A-3) and injects the declared identity (A2, from the JWT); emits a subset of its input plus server-side identity values",
 	"resourcesrefstemplate.Resolve":    "spec.resourcesRefsTemplate (inside resolveResourceRefs)",
 	"widgetdatatemplate.Resolve":       "spec.widgetDataTemplate (inside resolveWidgetData)",
 	"apiref.Resolve":                   "spec.apiRef (inside resolveApiRef)",
