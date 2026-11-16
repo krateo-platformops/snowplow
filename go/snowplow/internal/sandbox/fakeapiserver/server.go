@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -75,7 +76,11 @@ const (
 	maxJSONPatchOps = 10000           // apiserver patch.go maxJSONPatchOperations
 )
 
-// New loads the snapshot. It does not re-validate it: bridge.js ran snapshot-rules.js first.
+// New loads the snapshot. It does not re-validate it: bridge.js ran snapshot-rules.js first. What it
+// keeps itself is one reading of the files (strictJSON: no key twice, no key matched by ignoring
+// case) and SNAPSHOT.md §3's rule (isBuiltinGroup): a custom type in discovery has its CRD among
+// the objects, of that group and plural and serving the listed version, since everything the fake
+// knows of a custom type it reads from that CRD.
 func New(o Options) (*Server, error) {
 	if o.Clock == nil {
 		o.Clock = time.Now
@@ -91,8 +96,24 @@ func New(o Options) (*Server, error) {
 	}
 	s := &Server{o: o, gvs: map[string]map[string]metav1.APIResource{}, custom: map[string]bool{}, store: map[string]map[string]map[string]any{},
 		caches: map[string]*watchCache{}, watchers: map[*watcher]struct{}{}, conts: map[string]*continuation{}, selectable: map[string][]string{}, crds: map[string]*crdInfo{}}
+	read, err := strictJSON(o.Snapshot, reflect.TypeOf(s.snap))
+	if err != nil {
+		return nil, fmt.Errorf("snapshot.json: %w", err)
+	}
+	if _, ok := read.(map[string]any); !ok {
+		return nil, errors.New("snapshot.json: is not a JSON object")
+	}
+	listed, problems := listedResources(read)
+	if len(problems) > 0 {
+		return nil, fmt.Errorf("snapshot.json: %s", strings.Join(problems, "; "))
+	}
 	if err := json.Unmarshal(o.Snapshot, &s.snap); err != nil {
 		return nil, fmt.Errorf("snapshot.json: %w", err)
+	}
+	for i, r := range s.snap.Scripted.ApplyStatus {
+		if _, err := strictJSON(r.Target, reflect.TypeOf(ruleTarget{})); len(r.Target) > 0 && err != nil {
+			return nil, fmt.Errorf("snapshot.json: scripted.applyStatus[%d].target: %w", i, err)
+		}
 	}
 	rv, err := strconv.ParseUint(s.snap.ResourceVersion, 10, 64)
 	if err != nil {
@@ -109,6 +130,9 @@ func New(o Options) (*Server, error) {
 	var objects []map[string]any
 	for i, p := range o.Pages {
 		var pg page
+		if _, err := strictJSON(p, reflect.TypeOf(pg)); err != nil {
+			return nil, fmt.Errorf("object page %d: %w", i, err)
+		}
 		if err := json.Unmarshal(p, &pg); err != nil {
 			return nil, fmt.Errorf("object page %d: %w", i, err)
 		}
@@ -122,30 +146,37 @@ func New(o Options) (*Server, error) {
 			objects = append(objects, n)
 		}
 	}
-	for _, obj := range objects {
-		if obj["kind"] == "CustomResourceDefinition" {
-			spec, _ := obj["spec"].(map[string]any)
-			names, _ := spec["names"].(map[string]any)
-			gr := fmt.Sprint(spec["group"]) + "/" + fmt.Sprint(names["plural"])
-			s.custom[gr] = true
-			if _, info, err := loadCRD(obj); err != nil {
-				return nil, fmt.Errorf("CustomResourceDefinition %s: %w", gr, err)
-			} else {
-				s.crds[gr] = info
-			}
-			// spec.versions[].selectableFields[].jsonPath (".spec.color") is the field label "spec.color".
-			versions, _ := spec["versions"].([]any)
-			for _, v := range versions {
-				vm, _ := v.(map[string]any)
-				sf, _ := vm["selectableFields"].([]any)
-				for _, f := range sf {
-					fm, _ := f.(map[string]any)
-					if jp, ok := fm["jsonPath"].(string); ok && !hasString(s.selectable[gr], strings.TrimPrefix(jp, ".")) {
-						s.selectable[gr] = append(s.selectable[gr], strings.TrimPrefix(jp, "."))
-					}
+	// Only a CRD snapshotCRDs passed is registered: one named for its spec.group and
+	// spec.names.plural, the key its schema is kept under, and the only one of that name.
+	crds, crdsByName, problems := snapshotCRDs(objects)
+	if len(problems) > 0 {
+		return nil, fmt.Errorf("objects: %s", strings.Join(problems, "; "))
+	}
+	for _, obj := range crds {
+		spec, _ := obj["spec"].(map[string]any)
+		names, _ := spec["names"].(map[string]any)
+		gr := fmt.Sprint(spec["group"]) + "/" + fmt.Sprint(names["plural"])
+		s.custom[gr] = true
+		if _, info, err := loadCRD(obj); err != nil {
+			return nil, fmt.Errorf("CustomResourceDefinition %s: %w", gr, err)
+		} else {
+			s.crds[gr] = info
+		}
+		// spec.versions[].selectableFields[].jsonPath (".spec.color") is the field label "spec.color".
+		versions, _ := spec["versions"].([]any)
+		for _, v := range versions {
+			vm, _ := v.(map[string]any)
+			sf, _ := vm["selectableFields"].([]any)
+			for _, f := range sf {
+				fm, _ := f.(map[string]any)
+				if jp, ok := fm["jsonPath"].(string); ok && !hasString(s.selectable[gr], strings.TrimPrefix(jp, ".")) {
+					s.selectable[gr] = append(s.selectable[gr], strings.TrimPrefix(jp, "."))
 				}
 			}
 		}
+	}
+	if missing := crdlessTypes(listed, crdsByName); len(missing) > 0 {
+		return nil, fmt.Errorf("snapshot.json discovery.resources: custom types (their group is not built in) without their CRD among the objects: %s", strings.Join(missing, "; "))
 	}
 	for _, obj := range objects {
 		loc, ok := s.locate(obj)
