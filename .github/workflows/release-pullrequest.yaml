@@ -126,3 +126,14 @@ jobs:
       # PE magic), so a tracked shell script (mode 755) stays allowed.
       - name: No tracked executable binaries gate
         run: bash scripts/check_no_tracked_binaries.sh --self-test && bash scripts/check_no_tracked_binaries.sh
+      # The browser build (GOOS=js GOARCH=wasm, the Agentiko sandbox): it compiles and vets, the
+      # bridge's tests pass under Go's wasm runner (Node.js), and the server build contains none
+      # of the browser code.
+      - name: js/wasm browser build gate
+        run: bash scripts/check_js_wasm.sh
+      # The repo root's retracted-versions.yaml, which installer's CI reads to refuse
+      # a pin: well formed, only this repo's charts (helm/*/Chart.yaml names), and
+      # every retracted version and `use` published in the chart registry. A
+      # malformed entry would match nothing in installer and let the pin through.
+      - name: retracted-versions.yaml gate
+        run: bash scripts/check_retracted_versions.sh

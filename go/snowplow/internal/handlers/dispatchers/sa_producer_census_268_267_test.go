@@ -75,6 +75,13 @@ var saProducerAllowlist = map[string]int{
 	"handlers/dispatchers/phase1_pip_seed.go":        2,
 	"handlers/dispatchers/phase1_content_prewarm.go": 2,
 	"handlers/dispatchers/resolve_populate.go":       3, // #574: +1, the impersonating branch (see above)
+	// #1334 — the public identity's request ctx (PublicIdentity.Context): a REAL
+	// identity, neither ServesUnnarrowed nor BackgroundResolve, made safe exactly
+	// as resolve_populate.go's call (3): its rest config is an IMPERSONATING copy
+	// (krateo:public + system:unauthenticated) attached with WithImpersonatedDial,
+	// so branch E impersonates or refuses and MustRegateSADial stands down for the
+	// same reason. Pinned by TestIssue1334_PublicContext_IsImpersonatedNotRegated.
+	"handlers/middleware/public_identity.go": 2,
 }
 
 // countSAProducerCalls returns the number of WithInternalEndpoint( +

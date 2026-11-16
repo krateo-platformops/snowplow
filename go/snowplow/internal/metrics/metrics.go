@@ -532,7 +532,7 @@ func registerInstruments(m metric.Meter, build string) error {
 	// impersonation_fallback_sa is non-zero while a cohort's group is NOT
 	// allowlisted — it reads the defect's condition, not a health zero.
 	impersonation, err := m.Int64ObservableCounter("snowplow_impersonation",
-		metric.WithDescription("Refresher impersonation capability counters (#608), labelled by stat: impersonation_permitted, impersonation_fallback_sa, impersonation_capability_check_error, reviews, memo_*."))
+		metric.WithDescription("Refresher impersonation capability counters (#608), labelled by stat: impersonation_permitted, impersonation_fallback_sa, impersonation_refused_no_fallback (#1334), impersonation_capability_check_error, reviews, memo_*."))
 	if err != nil {
 		return err
 	}
@@ -1484,7 +1484,7 @@ func registerDenialOnlyInstruments(m metric.Meter) error {
 		return err
 	}
 	epoch, err := m.Int64ObservableGauge("snowplow_rbac_subgen_epoch",
-		metric.WithDescription("The process-wide RBAC sub-generation epoch (#682). 0 or 1: it is bumped at most once, at the first bindings-by-GVR index build, iff an RBAC event landed after the first RBAC publish and before that build; the bump rotates every per-identity L1 key."))
+		metric.WithDescription("The process-wide RBAC sub-generation epoch (#682). 0 or 1: it is bumped at most once, when the bindings-by-GVR index becomes ready (the RBAC handlers have been delivered their initial lists), iff an RBAC event landed after the first RBAC publish and before that; the bump rotates every per-identity L1 key."))
 	if err != nil {
 		return err
 	}
@@ -1572,6 +1572,11 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	resolveSkipped, err := m.Int64ObservableCounter("snowplow_prewarm_resolve_skipped_total",
+		metric.WithDescription("Background resolves skipped before they ran, by site (closed set: restaction_seed, widget_seed, walk, content_prewarm) and reason (closed set: needs_request_extras = a templated endpointRef reads a request extra the background resolve does not carry, so no customer key can match its cell, #1477 generalising #113). Every cell is published; its rate is the background work avoided."))
+	if err != nil {
+		return err
+	}
 	extFetch, err := m.Int64ObservableCounter("snowplow_external_fetch_total",
 		metric.WithDescription("LOGICAL external (non-apiserver) fetches issued by the RESTAction resolver, one per stage call, by origin {background, request} and driver (the resolver that dialled: refresher, cohort-seed, prewarm-engine-boot = the discovery walk, prewarm-path = the content prewarm, background-unattributed, serve); retries inside plumbing's RetryClient are NOT counted here (they are in snowplow_endpoint_retries_total, #1088), so this does not compare 1:1 with a server-side attempt log (ClickHouse query_log). background = any non-customer resolve (prewarm engine, content prewarm, refresher). A background rate that does not fall after boot is the #643 re-fetch loop."))
 	if err != nil {
@@ -1639,6 +1644,10 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		for _, c := range dispatchers.PrewarmSkipResumeDoneSnapshot() {
 			o.ObserveInt64(skipResume, int64(c.Count), kindAttr(c.Kind))
 		}
+		for _, c := range dispatchers.BackgroundResolveSkipSnapshot() {
+			o.ObserveInt64(resolveSkipped, int64(c.Count), metric.WithAttributes(
+				attribute.String("site", c.Site), attribute.String("reason", c.Reason)))
+		}
 		// #643 PR-B2 — one series per {origin, driver}: driver determines
 		// origin, so sum-by-origin is the pre-B2 {origin} reading unchanged.
 		for _, c := range restactionsapi.ExternalFetchByDriverSnapshot() {
@@ -1651,7 +1660,7 @@ func registerPrewarmPassInstruments(m metric.Meter) error {
 		}
 		return nil
 	}, passTotal, planned, done, budget, elapsed, rWidgetUnits, rWidgetUS, rRAUnits, rRAUS,
-		skipDeclined, skipResume, extFetch, extAbandoned, declinedMarks, declinedRetired, gvrEpoch,
+		skipDeclined, skipResume, resolveSkipped, extFetch, extAbandoned, declinedMarks, declinedRetired, gvrEpoch,
 		walkSkip, walkUnmarkable)
 	return err
 }
@@ -1758,13 +1767,13 @@ func registerEndpointDialInstruments(m metric.Meter) error {
 }
 
 // registerExternalFetchCacheInstruments hand-wires the external fetch's
-// content-addressed conversion memo (restactions/api/external_fetch_cache.go)
-// onto OTLP (no expvar->OTLP bridge), from the accessors its expvar closures
+// content-addressed conversion memo and its shared in-flight calls (#1320)
+// (restactions/api/external_fetch_cache.go, external_fetch_flight.go) onto OTLP (no expvar->OTLP bridge), from the accessors its expvar closures
 // read. outcome is a closed, code-defined set. Registered only when the cache is
 // on (CFG-1).
 func registerExternalFetchCacheInstruments(m metric.Meter) error {
 	total, err := m.Int64ObservableCounter("snowplow_external_fetch_conversion_total",
-		metric.WithDescription("External api-step reads by what their conversion cost, by outcome: convert_hit (the fetched body's exact bytes were already converted; reused, byte-identical), convert_miss (the body was converted, YAML to JSON). Every read is a full, unconditional fetch: no response is reused, by time or by revalidation. A valid-JSON body is passed through as before and counted in neither."))
+		metric.WithDescription("External api-step reads by what their conversion cost, by outcome: convert_hit (the fetched body's exact bytes were already converted; reused, byte-identical), convert_miss (the body was converted, YAML to JSON). No completed response is reused, by time or by revalidation: a read shares only an identical call still in flight (snowplow_external_fetch_flight_total). A valid-JSON body is passed through as before and counted in neither."))
 	if err != nil {
 		return err
 	}
@@ -1783,16 +1792,30 @@ func registerExternalFetchCacheInstruments(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	flight, err := m.Int64ObservableCounter("snowplow_external_fetch_flight_total",
+		metric.WithDescription("External api-step read attempts by whether they shared a request on the wire (#1320), by outcome: led (an attempt that started a request identical reads may join), joined (an attempt answered by an identical request already on the wire: nothing sent), not_shared (an attempt its own reader sent: a write, an endpoint the key cannot fold exactly, a redirect hop, a retry past the attempt its fetch gave up on). Counted per attempt, not per fetch. Identical means the whole outbound request, credentials and every header included, so identities never share; a request admits joiners only until its first response byte and, when a customer started it, only until that customer's page-budget deadline; it is cancelled when its last waiter leaves and never reused after it completes. Requests sent = led + not_shared; collapse = joined / (led + joined)."))
+	if err != nil {
+		return err
+	}
+	flightPanics, err := m.Int64ObservableCounter("snowplow_external_fetch_flight_unwaited_panics_total",
+		metric.WithDescription("Shared external read requests that panicked after their last waiter had left (#1320): nobody was left to raise the panic in, so it is counted here and logged at ERROR. A panic with a waiter is raised in that waiter and is not counted. Expected 0."))
+	if err != nil {
+		return err
+	}
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		for _, c := range restactionsapi.ExternalFetchCacheSnapshot() {
 			o.ObserveInt64(total, int64(c.Count), metric.WithAttributes(attribute.String("outcome", c.Outcome)))
+		}
+		for _, c := range restactionsapi.ExternalFetchFlightSnapshot() {
+			o.ObserveInt64(flight, int64(c.Count), metric.WithAttributes(attribute.String("outcome", c.Outcome)))
 		}
 		n, b := restactionsapi.ExternalFetchCacheHeld()
 		o.ObserveInt64(entries, int64(n))
 		o.ObserveInt64(bytes, b)
 		o.ObserveInt64(evictions, int64(restactionsapi.ExternalFetchCacheEvictions()))
+		o.ObserveInt64(flightPanics, int64(restactionsapi.ExternalFetchFlightUnwaitedPanics()))
 		return nil
-	}, total, bytes, entries, evictions)
+	}, total, bytes, entries, evictions, flight, flightPanics)
 	return err
 }
 

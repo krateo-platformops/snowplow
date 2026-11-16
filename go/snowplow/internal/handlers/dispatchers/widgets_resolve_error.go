@@ -12,12 +12,14 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/kubeutil"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
-// reasonFailedDependency is the Status reason of a 424 answer. Neither
-// plumbing nor apimachinery names one for 424.
-const reasonFailedDependency response.StatusReason = "FailedDependency"
+// reasonFailedDependency is the Status reason of a 424 answer
+// (statusdetails.ReasonFailedDependency, the one definition).
+const reasonFailedDependency = statusdetails.ReasonFailedDependency
 
 // encodeWidgetResolveError answers a widget /call whose CR was read but whose
 // resolve failed — the apiRef RESTAction, one of its stages, a nested resolve,
@@ -49,6 +51,18 @@ const reasonFailedDependency response.StatusReason = "FailedDependency"
 // One rule for every widget kind and every dependency; it changes the answer
 // only. Nothing on this path is cached: the handler returns before any Put.
 func encodeWidgetResolveError(ctx context.Context, wri http.ResponseWriter, err error) {
+	// #1414, #1429 — a dependency whose TYPE is not installed is already the
+	// answer this function gives for a dependency that is not there: 424, the
+	// reason, the message naming the DEPENDENCY's type, and that type in the
+	// details. It is recognised by the Go type objects.Get alone creates, never
+	// by a status's code, text or details: a status that only looks like it
+	// (client-go builds one from whatever an upstream's body says) is passed
+	// through below like any other, with no reason and no details.
+	var notInstalled *statusdetails.TypeNotInstalledError
+	if errors.As(err, &notInstalled) {
+		response.Encode(wri, notInstalled.Status())
+		return
+	}
 	var statusErr *apierrors.StatusError
 	if !errors.As(err, &statusErr) {
 		response.InternalError(wri, err)
@@ -63,7 +77,10 @@ func encodeWidgetResolveError(ctx context.Context, wri http.ResponseWriter, err 
 		response.Encode(wri, st)
 		return
 	}
-	response.Encode(wri, response.New(code, fmt.Errorf("%s", statusErr.Status().Message)))
+	// #1481 — the reason derived from the code that agrees with it
+	// (credhttp.ReasonForCode): a 502 answers no reason, never plumbing's
+	// InternalError (a 500's), as the stage failure itself records it.
+	response.Encode(wri, credhttp.FailureStatus(code, fmt.Errorf("%s", statusErr.Status().Message)))
 }
 
 // dependencyFailureFallback is the 424 message when the dependency's own

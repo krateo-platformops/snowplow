@@ -246,10 +246,10 @@ func seedExtrasHarnessWithSecrets(t *testing.T, serverURL string, extra ...*core
 		cache.ResetSecretsInformerForTest()
 		cache.ResetSecretsSnapshotForTest()
 	})
-	secrets := []runtime.Object{&corev1.Secret{
+	secrets := []runtime.Object{authnOwned(&corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "usera-clientconfig", Namespace: extrasNS970},
 		Data:       map[string][]byte{"server-url": []byte(serverURL), "token": []byte("token-userA")},
-	}}
+	}, "userA")}
 	for _, sec := range extra {
 		secrets = append(secrets, sec)
 	}

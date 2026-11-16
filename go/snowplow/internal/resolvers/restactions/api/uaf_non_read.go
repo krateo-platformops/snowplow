@@ -50,6 +50,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // refuseUAFOnNonReadVerb refuses stage id when it carries userAccessFilter on
@@ -72,6 +73,10 @@ func (r *resolveRun) refuseUAFOnNonReadVerb(id string, apiCall *templates.API) b
 			Reason: string(response.New(http.StatusInternalServerError, nil).Reason), Message: msg}
 	}
 	recordUAFNonReadVerbRefused(r.opts.Provenance)
+	// audit#22 (a) — denied, uaf_on_write_verb: nothing was planned, so its
+	// target is not resolved (marked target).
+	r.auditStageRefusal(r.ctx, stageRefusal{apiCall: apiCall,
+		outcome: audit.OutcomeDenied, reason: audit.DenialUAFOnWriteVerb})
 	r.log.WarnContext(r.ctx, "stage refused: userAccessFilter on a verb other than GET or HEAD",
 		slog.String("name", id),
 		slog.String("verb", verb),

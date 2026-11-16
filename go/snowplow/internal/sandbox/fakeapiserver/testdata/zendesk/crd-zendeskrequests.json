@@ -1,0 +1,195 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "zendeskrequests.zendesk.ogen.krateo.io"
+  },
+  "spec": {
+    "conversion": {
+      "strategy": "None"
+    },
+    "group": "zendesk.ogen.krateo.io",
+    "names": {
+      "categories": [
+        "zendeskrequest",
+        "restresources",
+        "rr"
+      ],
+      "kind": "ZendeskRequest",
+      "listKind": "ZendeskRequestList",
+      "plural": "zendeskrequests",
+      "singular": "zendeskrequest"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [
+          {
+            "jsonPath": ".metadata.creationTimestamp",
+            "name": "AGE",
+            "type": "date"
+          },
+          {
+            "jsonPath": ".metadata.labels.krateo\\.io/oas-version",
+            "name": "VERSION",
+            "type": "string"
+          }
+        ],
+        "name": "v2",
+        "schema": {
+          "openAPIV3Schema": {
+            "properties": {
+              "apiVersion": {
+                "description": "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+                "type": "string"
+              },
+              "kind": {
+                "description": "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+                "type": "string"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "spec": {
+                "properties": {
+                  "configurationRef": {
+                    "description": "A reference to the Configuration CR that holds all the needed configuration for this resource. OASGen Provider added this field automatically.",
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "namespace": {
+                        "description": "Namespace of the referenced Configuration CR. If not provided, the same namespace will be used.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
+                  "description": {
+                    "description": "Problem description - sent as the request's first comment (comment.body).",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "default": "Bug",
+                    "description": "Request kind, set in the \"Request kind\" custom field (mapped to its tag value at install time). Bug for incident escalations, FeatureRequest otherwise.",
+                    "enum": [
+                      "Bug",
+                      "FeatureRequest"
+                    ],
+                    "type": "string"
+                  },
+                  "krateo_reference": {
+                    "description": "Correlation token - unique per request (e.g. the CR's metadata.uid). Stored in the \"Krateo reference\" custom ticket field and used to find the request again. Changing it files a NEW request. While empty the CR is held and nothing is filed.",
+                    "type": "string"
+                  },
+                  "priority": {
+                    "description": "Requested priority. Applied by Zendesk only when the Priority field is editable by end users; otherwise Zendesk discards it.",
+                    "enum": [
+                      "low",
+                      "normal",
+                      "high",
+                      "urgent"
+                    ],
+                    "type": "string"
+                  },
+                  "subject": {
+                    "description": "Request subject line.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "configurationRef",
+                  "description",
+                  "subject"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "properties": {
+                  "conditions": {
+                    "description": "Conditions of the resource.",
+                    "items": {
+                      "properties": {
+                        "lastTransitionTime": {
+                          "description": "LastTransitionTime is the last time this condition transitioned from one status to another.",
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "message": {
+                          "description": "A Message containing details about this condition's last transition from one status to another, if any.",
+                          "type": "string"
+                        },
+                        "reason": {
+                          "description": "A Reason for this condition's last transition from one status to another.",
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "Status of this condition; is it currently True, False, or Unknown?",
+                          "type": "string"
+                        },
+                        "type": {
+                          "description": "Type of this condition. At most one of each condition type may apply to a resource at any point in time.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "lastTransitionTime",
+                        "reason",
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "created_at": {
+                    "type": "string"
+                  },
+                  "html_url": {
+                    "description": "The request's end-user web page (<instance>/hc/requests/<id>), for \"Open in Zendesk\".",
+                    "type": "string"
+                  },
+                  "id": {
+                    "description": "Zendesk request (ticket) id. (format: int64)",
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "observedGeneration": {
+                    "description": "ObservedGeneration is the metadata.generation the controller last reconciled.",
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "priority": {
+                    "description": "Current priority (agents may change it after creation).",
+                    "type": "string"
+                  },
+                  "status": {
+                    "description": "new, open, pending, hold, solved or closed.",
+                    "type": "string"
+                  },
+                  "updated_at": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "description": "API URL of the request.",
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

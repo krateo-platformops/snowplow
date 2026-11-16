@@ -62,6 +62,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -141,6 +142,11 @@ func withWidgetContentPutSinks(ctx context.Context) context.Context {
 	ctx, _ = cache.WithExternalTouchedSink(ctx)
 	ctx, _ = cache.WithSensitiveTouchedSink(ctx)
 	ctx, _ = cache.WithUAFTouchedSink(ctx)
+	// #1319 — not a Put-gate sink: the collector the widget's apiRef
+	// RESTAction reports its stage outcomes into, read back by
+	// populateWidgetContentL1 (api.StageOutcomesFromContext) and kept on the
+	// shell so a content hit answers with them.
+	ctx, _ = api.WithStageOutcomes(ctx)
 	return ctx
 }
 
@@ -428,11 +434,13 @@ func populateWidgetContentL1(
 	// it (the boot-seed exemption). cache.IsPhase1Done() — the same atomic /readyz
 	// consults — is the authoritative pre/post-readyz boundary (the seed-mode
 	// discriminator freshness-audit ruled; seedScopeMode is not threaded into walk()).
-	// stage-outcomes-waiver: a widgetContent cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
 	// scope-waiver:TTLOverride: widgetContent-class cell — identity-free shared envelope, per-user serve-time filter (gateWidgetEnvelope). 1.12.3 A-1/R-1: it holds no per-user UAF refilter output because a refilter-touched resolve can no longer REACH this Put (the UAFTouchedSink gate immediately above declines it) — previously this rested on isRBACSensitiveApiRefWidget's routing argument alone, which the R-1 finding showed is not a safe basis for a UAF claim (uaf_shortttl.go R-d-4 SITE MAP).
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
+		// #1319 — the outcomes of the resolve that built this shell ("" =
+		// complete), from the collector withWidgetContentPutSinks installed.
+		StageOutcomes: storableStageOutcomes(api.StageOutcomesFromContext(ctx)),
 	}
 	var put cache.PutOutcome
 	if cache.IsPhase1Done() {

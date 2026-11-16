@@ -1,0 +1,107 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "zendeskrequestconfigurations.zendesk.ogen.krateo.io"
+  },
+  "spec": {
+    "conversion": {
+      "strategy": "None"
+    },
+    "group": "zendesk.ogen.krateo.io",
+    "names": {
+      "categories": [
+        "zendeskrequest",
+        "restconfigs",
+        "rc"
+      ],
+      "kind": "ZendeskRequestConfiguration",
+      "listKind": "ZendeskRequestConfigurationList",
+      "plural": "zendeskrequestconfigurations",
+      "singular": "zendeskrequestconfiguration"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [
+          {
+            "jsonPath": ".metadata.creationTimestamp",
+            "name": "AGE",
+            "type": "date"
+          },
+          {
+            "jsonPath": ".metadata.labels.krateo\\.io/oas-version",
+            "name": "VERSION",
+            "type": "string"
+          }
+        ],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "properties": {
+              "apiVersion": {
+                "description": "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+                "type": "string"
+              },
+              "kind": {
+                "description": "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+                "type": "string"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "spec": {
+                "properties": {
+                  "authentication": {
+                    "description": "The authentication methods available for this API.",
+                    "properties": {
+                      "bearer": {
+                        "properties": {
+                          "tokenRef": {
+                            "properties": {
+                              "key": {
+                                "type": "string"
+                              },
+                              "name": {
+                                "type": "string"
+                              },
+                              "namespace": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "name",
+                              "namespace"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "tokenRef"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "type": "object"
+              },
+              "status": {
+                "type": "object",
+                "x-kubernetes-preserve-unknown-fields": true
+              }
+            },
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

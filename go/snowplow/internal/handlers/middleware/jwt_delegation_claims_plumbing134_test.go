@@ -143,8 +143,8 @@ var (
 // there in the informer.
 func TestUserConfig_DelegationClaims_IdentityStaysTheSubject(t *testing.T) {
 	su994Informer(t,
-		su994Secret(credsecret.SessionName(dlgSubject), dlgSubjURL),
-		su994Secret(credsecret.SessionName(dlgActor), dlgActorURL))
+		su994Secret(credsecret.SessionNames(dlgSubject)[0], dlgSubjURL),
+		su994Secret(credsecret.SessionNames(dlgActor)[0], dlgActorURL))
 	asked := su994APIServer(t)
 
 	for _, tc := range dlgAccepted {

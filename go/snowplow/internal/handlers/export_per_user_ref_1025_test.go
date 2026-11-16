@@ -18,7 +18,7 @@ import (
 const victimRAName1025 = "team-rows-victim-1025"
 
 // victimSecret1025 is another user's step-up credential Secret name.
-var victimSecret1025 = credsecret.StepUpName("victim1025")
+var victimSecret1025 = credsecret.StepUpNames("victim1025")[0]
 
 func TestExport1025_PerUserEndpointRefRefusedOnEveryExportLane(t *testing.T) {
 	for _, l := range exportLanes970(victimRAName1025) {

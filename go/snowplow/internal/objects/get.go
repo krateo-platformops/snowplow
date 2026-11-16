@@ -8,6 +8,7 @@ package objects
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,13 +16,16 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/apipath"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -32,14 +36,42 @@ type Result struct {
 	GVR          schema.GroupVersionResource
 	Unstructured *unstructured.Unstructured
 	Err          *response.Status
+	// TypeNotInstalled is set, with Err, when this read decided that its type
+	// is not installed on the cluster (#1414). It is the only place that
+	// decision is made and the only place the error is created; a caller that
+	// turns Err into an error passes THIS on, so the answer is recognised by
+	// its Go type and never by what a Status looks like (#1429).
+	TypeNotInstalled *statusdetails.TypeNotInstalledError
 	// RequesterDialled: the read left snowplow under the requester's own
 	// credential (getFromAPIServer). It also marked the ExternalTouchedSink on
 	// ctx; a caller that installs its sinks only after the read (the dispatcher's
 	// fetch of the dispatched CR) marks them from this.
 	RequesterDialled bool
+	// PerIdentityDenied (#1476): Err is a Forbidden for the ctx identity, not
+	// for snowplow's own credential: the apiserver's 403 refusing THIS read
+	// (its typed details name the requested resource) on a read made with the
+	// requester's credential or impersonating the ctx identity, or the
+	// ServiceAccount read re-gated and denied for the ctx identity. A caller
+	// reports it as an expected per-identity deny (WARN), never as a fault. The
+	// ServiceAccount's own 403, the impersonation refused included, is not one.
+	PerIdentityDenied bool
 }
 
 func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
+	// #1257 / #1414 — THE REFERENCE IS AN APISERVER PATH OR IT IS REFUSED.
+	// A reference reaches this read from a request's query, a nested call's
+	// path, a cache entry's inputs or CR content (an apiRef, a walked child),
+	// and under the requester's credential or snowplow's own. Whatever its
+	// source and credential, its group, version and resource each become one
+	// segment of the apiserver path (apipath.CheckGVR, the one rule), or the
+	// read is refused here with a 400: before the informer, before any
+	// discovery, before any dial.
+	if st := checkReference(ref); st != nil {
+		xcontext.Logger(ctx).ErrorContext(ctx, "reference is not an apiserver path", slog.String("err", st.Message))
+		res.Err = st
+		return res
+	}
+
 	// R5 (0.30.110): resolver-side dep recording. When this Get runs
 	// under a cache.WithL1KeyContext ctx, the fetched object becomes a
 	// dependency of the L1 entry being populated — record the edge so a
@@ -195,6 +227,20 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	return getFromAPIServer(ctx, ref)
 }
 
+// checkReference is nil for a reference whose group, version and resource are
+// each one apiserver path segment, else the 400 that refuses it. A group/version
+// that does not parse is left to the read, which answers its own 400 for it.
+func checkReference(ref templatesv1.ObjectReference) *response.Status {
+	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil {
+		return nil
+	}
+	if err := apipath.CheckGVR(gv.WithResource(ref.Resource), apipath.Reference); err != nil {
+		return response.New(http.StatusBadRequest, err)
+	}
+	return nil
+}
+
 // informerOnlyMiss returns the NotFound-shaped Result an informer-only ctx
 // (#101, cache.WithInformerOnlyReads) yields on a routed-branch fallthrough,
 // WITHOUT touching the apiserver. It fills res.GVR (best-effort parse) so the
@@ -216,6 +262,49 @@ func informerOnlyMiss(ctx context.Context, ref templatesv1.ObjectReference) (res
 	return res
 }
 
+// preDialScopeFn resolves whether a GVR is namespaced, through the process-wide
+// ServiceAccount discovery singleton (shape metadata only), as #677's branch C
+// does. A seam only so the hermetic arms can answer without a cluster;
+// production never reassigns it.
+var preDialScopeFn = dynamic.SharedSAScopeForGVR
+
+// preDialGetDenied reports whether the ctx identity's `get` of (gvr, namespace,
+// name) is denied before any fetch (#1483). It is false, leaving the decision to
+// the dial and the post-fetch re-gate, when it cannot decide: a namespaced GVR
+// (or one whose scope cannot be read) referenced without a namespace is never
+// authorized cluster-wide, and a deny that coincides with an RBAC snapshot not
+// yet published is not trusted (#677's RC1 guard).
+func preDialGetDenied(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) bool {
+	if namespace == "" {
+		namespaced, err := preDialScopeFn(gvr)
+		if err != nil || namespaced {
+			return false
+		}
+	}
+	if authorizeGetOf(ctx, gvr, namespace, name) {
+		return false
+	}
+	return !rbacSnapshotUnpublished()
+}
+
+// rbacSnapshotUnpublished is #677's RC1 signal (internalDispatchRBACSnapshotUnpublished
+// in restactions/api): the RBAC snapshot the evaluator reads is not published
+// yet. With the cache off the evaluator asks the apiserver, so it never applies.
+func rbacSnapshotUnpublished() bool {
+	if cache.Disabled() {
+		return false
+	}
+	return cache.Global() == nil || cache.LiveRBACSnapshot() == nil
+}
+
+// regateForbidden is the 403 a ServiceAccount read re-gated and denied for the
+// ctx identity returns, decided before the dial or after the fetch: one body.
+func regateForbidden(gvr schema.GroupVersionResource, namespace, name string) *response.Status {
+	return response.New(http.StatusForbidden,
+		apierrors.NewForbidden(gvr.GroupResource(), name,
+			fmt.Errorf("user not authorized to get %s/%s", namespace, name)))
+}
+
 func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	log := xcontext.Logger(ctx)
 
@@ -226,7 +315,6 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 		return
 	}
 	res.GVR = gv.WithResource(ref.Resource)
-
 	ep, err := xcontext.UserConfig(ctx)
 	if err != nil {
 		log.ErrorContext(ctx, "unable to get user endpoint", slog.Any("err", err))
@@ -238,13 +326,44 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	// internal-dispatch *rest.Config when an internal/startup driver
 	// (Phase 1's SA-credentialed walk) is in flight, else delegates to
 	// the unchanged kubeconfig.NewClientConfig per-user path. This is
-	// what makes Phase 1's SA fetch work — the SA's raw-PEM CA + bearer
-	// token cannot survive kubeconfig.NewClientConfig (see
-	// cache.WithInternalRESTConfig).
+	// what makes Phase 1's SA fetch work — the SA's raw-PEM CA cannot
+	// survive kubeconfig.NewClientConfig, which base64-decodes it (see
+	// cache.WithInternalRESTConfig). A token-only per-user endpoint (the
+	// sandbox visitor's) does: plumbing v1.68.0 carries its bearer token
+	// (token_only_endpoint_dial_test.go).
 	rc, err := cache.ClientConfigFor(ctx, ep)
 	if err != nil {
 		log.ErrorContext(ctx, "unable to create kubernetes client config", slog.Any("err", err))
 		res.Err = response.New(http.StatusInternalServerError, err)
+		return
+	}
+
+	// #1483 — AUTHORIZE BEFORE THE DIAL, as #677 did for branch C. A ServiceAccount
+	// read for a narrowing identity (rbac.MustRegateSADial) is re-gated below
+	// with the `get` verdict for (identity, GVR, namespace, name), which does not
+	// depend on the object's content. So the verdict is known before the
+	// ServiceAccount fetches anything: a deny returns the same 403 the post-fetch
+	// re-gate returns, with no apiserver round trip. On krateo-057 the cohort
+	// seed fetched ~1,960 RESTActions a day only to discard them.
+	//
+	// Same fall-throughs as #677: the verdict is not decided here, and the dial
+	// and the post-fetch re-gate run as before, when the ref has no namespace for
+	// a GVR that is namespaced or whose scope cannot be read, and when the deny
+	// coincides with an RBAC snapshot not yet published (the RC1 guard).
+	if rbac.MustRegateSADial(ctx) && preDialGetDenied(ctx, res.GVR, ref.Namespace, ref.Name) {
+		log.WarnContext(ctx, "objects.getFromAPIServer: SA-credentialed fetch re-gated and DENIED for the ctx identity; failing closed",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", res.GVR.String()),
+			slog.String("namespace", ref.Namespace),
+			slog.String("name", ref.Name),
+			slog.String("decided", "before_dial"),
+			slog.String("sa_regate_origin", rbac.SARegateOrigin(ctx)),
+			slog.String("sa_regate_trigger", rbac.SARegateTrigger(ctx)),
+			slog.String("sa_regate_scope", rbac.SARegateScope(ctx)),
+			slog.String("key_hash", rbac.SARegateKeyHash(ctx)),
+		)
+		res.Err = regateForbidden(res.GVR, ref.Namespace, ref.Name)
+		res.PerIdentityDenied = true // #1476 — denied for the ctx identity
 		return
 	}
 
@@ -297,6 +416,11 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 			res.Err = st // #1115 — 504 Timeout
 		} else if apierrors.IsForbidden(err) {
 			res.Err = response.New(http.StatusForbidden, err)
+			res.PerIdentityDenied = dialsAsCtxIdentity(ctx, rc) && forbidsRequested(err, res.GVR, ref.Name)
+		} else if dynamic.IsNotServed(err) {
+			// #1414 — 424, before the object's 404.
+			res.TypeNotInstalled = typeNotInstalled(res.GVR)
+			res.Err = res.TypeNotInstalled.Status()
 		} else if apierrors.IsNotFound(err) {
 			res.Err = response.New(http.StatusNotFound, err)
 		}
@@ -323,15 +447,15 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 			slog.String("gvr", res.GVR.String()),
 			slog.String("namespace", ref.Namespace),
 			slog.String("name", ref.Name),
+			slog.String("decided", "after_fetch"),
 			slog.String("sa_regate_origin", rbac.SARegateOrigin(ctx)),
 			slog.String("sa_regate_trigger", rbac.SARegateTrigger(ctx)),
 			slog.String("sa_regate_scope", rbac.SARegateScope(ctx)),
 			slog.String("key_hash", rbac.SARegateKeyHash(ctx)),
 		)
 		res.Unstructured = nil
-		res.Err = response.New(http.StatusForbidden,
-			apierrors.NewForbidden(res.GVR.GroupResource(), ref.Name,
-				fmt.Errorf("user not authorized to get %s/%s", ref.Namespace, ref.Name)))
+		res.Err = regateForbidden(res.GVR, ref.Namespace, ref.Name)
+		res.PerIdentityDenied = true // #1476 — denied for the ctx identity
 		return
 	}
 
@@ -345,6 +469,66 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	res.Unstructured = uns
 	res.Err = nil
 	return
+}
+
+// dialsAsCtxIdentity reports whether a read built from rc presents the ctx
+// identity to the apiserver (#1476): the requester's own credential, or a
+// config that impersonates an identity (the refresher's, #574). A 403 to such
+// a read is that identity's answer; a 403 to the ServiceAccount's own
+// credential is snowplow's.
+func dialsAsCtxIdentity(ctx context.Context, rc *rest.Config) bool {
+	if cache.RequesterCredentialFor(ctx) {
+		return true
+	}
+	if rc == nil {
+		return false
+	}
+	imp := rc.Impersonate
+	return imp.UserName != "" || imp.UID != "" || len(imp.Groups) > 0
+}
+
+// forbidsRequested reports whether a Forbidden's typed Status details name the
+// object the read asked for (#1476): its group, resource AND name, so the
+// apiserver's authorization of THIS read refused it. A Forbidden that names
+// anything else is not an answer about the read: the apiserver refusing the
+// impersonation itself names the impersonated user, group or ServiceAccount
+// (the ServiceAccount's own fault, #608), including when the read is of a
+// serviceaccounts object. By type only, never the message.
+//
+// The one case it cannot tell apart: the read of the very ServiceAccount
+// being impersonated, refused at impersonation, names the same group,
+// resource and name as the read; it is marked as the identity's deny.
+func forbidsRequested(err error, gvr schema.GroupVersionResource, name string) bool {
+	var status apierrors.APIStatus
+	if !errors.As(err, &status) {
+		return false
+	}
+	d := status.Status().Details
+	return d != nil && d.Group == gvr.Group && d.Kind == gvr.Resource && d.Name == name
+}
+
+// ReasonFailedDependency is the Status reason of a 424 answer
+// (statusdetails.ReasonFailedDependency, the one definition).
+const ReasonFailedDependency = statusdetails.ReasonFailedDependency
+
+// typeNotInstalled is the answer to a read whose type the apiserver does not
+// serve (#1414): 424 Failed Dependency, not 404. A 404 says an OBJECT is not
+// there: a reader retries it as a cold start and takes it, on a refetch, as a
+// confirmed delete. Here nothing was deleted and no retry can help: something
+// the read needs is not installed on this cluster.
+//
+// The message is shown to users as it is, so it is built from the type's
+// coordinates alone: no object name or namespace, no identity, none of the
+// apiserver's text. One rule for every type. The body, with the type in its
+// details (#1429), is the error's Status().
+//
+// This is the ONLY constructor of the error in the module
+// (statusdetails/typenotinstalled_fence_test.go).
+func typeNotInstalled(gvr schema.GroupVersionResource) *statusdetails.TypeNotInstalledError {
+	return &statusdetails.TypeNotInstalledError{
+		GVR:     gvr,
+		Message: fmt.Sprintf("The type %s (%s) is not installed on this cluster.", gvr.Resource, gvr.GroupVersion()),
+	}
 }
 
 // recordGetDep registers an exact-object dependency edge for a

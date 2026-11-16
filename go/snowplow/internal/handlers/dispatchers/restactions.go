@@ -13,11 +13,13 @@ import (
 	"github.com/krateo-platformops/snowplow/apis"
 	v1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -220,7 +222,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			}
 			// Depth-8 backstop: bounded 508-class error (never empty, never a
 			// panic), mirroring the in-process depth guard (nested_call.go:114).
-			response.Encode(wri, response.New(http.StatusLoopDetected,
+			response.Encode(wri, credhttp.FailureStatus(http.StatusLoopDetected,
 				fmt.Errorf("nested resolve depth limit exceeded (%d) for %s/%s/%s over HTTP self-loopback",
 					cache.NestedCallMaxDepth(), got.GVR.Resource,
 					got.Unstructured.GetNamespace(), got.Unstructured.GetName())))
@@ -269,14 +271,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			pcs.l1Hit = "hit"
 			// #261 serve-time detector (observability only; the keying FIX is
 			// v7-deferred — this changes NO serving behaviour, RawJSON below is
-			// untouched). Both at-risk carriers of the bounded self-stale-leak
+			// untouched). The at-risk carrier of the bounded self-stale-leak
 			// class — case-2 (winning subject is an implicit group; an RBAC fact)
-			// and case-3 (first-permitting binding's roleRef was unresolved at the
-			// last bindings_by_gvr index build; an index fact) — were computed at
-			// KEY-MINT (dispatchCacheLookupKey) and carried on cacheInputs.
-			// AtRiskClass. Here we merely READ that MARK and bump the matching
-			// counter — never re-evaluating RBAC or the index at the hit (pm
-			// load-bearing #4). Through such a binding a grant/revoke can shift the
+			// — was computed at KEY-MINT (dispatchCacheLookupKey) and carried on
+			// cacheInputs.AtRiskClass. Here we merely READ that MARK and bump the
+			// counter — never re-evaluating RBAC at the hit (pm load-bearing #4).
+			// (Case-3, a binding skipped at the index build, was retired with
+			// that skip: #1449.) Through such a binding a grant/revoke can shift the
 			// serve-time first-match BindingUID with NO sub-gen bump, so a HIT of
 			// the at-risk-keyed cell can serve potentially-stale bytes.
 			// HIT-GATED ONLY: a MISS re-resolves under fresh perms (no stale), so
@@ -294,9 +295,6 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				case cache.AtRiskImplicitGroup:
 					cache.ResolvedCache().BumpServeMissedRotationAtriskImplicitGroup()
 					class = "implicit_group"
-				case cache.AtRiskRolerefUnresolved:
-					cache.ResolvedCache().BumpServeMissedRotationAtriskRolerefUnresolved()
-					class = "roleref_unresolved"
 				}
 				if class != "" {
 					log.Debug("l1.serve_missed_rotation_atrisk",
@@ -523,9 +521,20 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// #709 — a stage that failed without continueOnError is reported with
 		// its upstream status (restactions.Resolve returns it typed), as the
 		// widget handler already does for an apiRef error: a 404 stays a 404.
+		//
+		// #1429 — a `resolve: true` stage whose target's TYPE is not installed
+		// is snowplow's own type-not-installed answer, as on every other route:
+		// recognised by objects.Get's Go type, never by a status's shape.
+		var notInstalled *statusdetails.TypeNotInstalledError
+		if errors.As(err, &notInstalled) {
+			response.Encode(wri, notInstalled.Status())
+			return
+		}
 		var statusErr *apierrors.StatusError
 		if errors.As(err, &statusErr) {
-			response.Encode(wri, response.New(int(statusErr.Status().Code), fmt.Errorf("%s", statusErr.Status().Message)))
+			// #1481 — the reason that agrees with the code
+			// (credhttp.ReasonForCode): a 502 answers none.
+			response.Encode(wri, credhttp.FailureStatus(int(statusErr.Status().Code), fmt.Errorf("%s", statusErr.Status().Message)))
 			return
 		}
 		response.InternalError(wri, err)
@@ -809,7 +818,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 	setRefreshKeyHeaderIfArmable(wri, cacheKey, "restactions", refreshArmable)
-	stampRefreshDigest(wri, func() string { return cache.ContentDigest(encoded) }) // #1324: the stored and written bytes
+	stampRefreshDigest(wri, func() string { return cache.AnswerDigest(encoded, storableStageOutcomes(outcomes)) }) // #1324, #1319: the stored and written answer
 	noteStaleWrite(cacheKey, staleSink.StaleDerived(), refreshArmable)
 	writeResolvedJSON(wri, encoded)
 }

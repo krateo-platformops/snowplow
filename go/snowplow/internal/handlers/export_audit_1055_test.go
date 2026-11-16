@@ -50,8 +50,8 @@ const (
 func helperRecord(t *testing.T, ev audit.Event) map[string]string {
 	t.Helper()
 	rec := logtest.NewRecorder()
-	ctx := xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}}))
+	ctx := audit.WithSessionID(xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Groups: []string{"devs"}, Principal: jwtutil.PrincipalHuman})), "s-443")
 	audit.New(rec.Logger("helper-1055")).Emit(ctx, ev)
 	got := records957(rec)
 	if len(got) != 1 {
@@ -85,8 +85,10 @@ func TestExport1055_M_T_MethodIsTheRequestsAndTheTargetHasGroupAndVersion(t *tes
 			}
 			got := one957(t, rec)
 			want := map[string]string{
-				"krateo.action":         "export",
-				"http.request.method":   c.method,
+				"krateo.action": "export",
+				// F1 (#1379 review): the method of the request the export
+				// SENT, GET for a GET and a POST /export alike (schema v1).
+				"http.request.method":   http.MethodGet,
 				"k8s.resource.group":    group1055,
 				"k8s.resource.version":  version1055,
 				"k8s.resource.resource": "fireworksapps",
@@ -133,7 +135,7 @@ func TestExport1055_P_ExportRecordIsTheCallRecordMinusTheCallsOwnFields(t *testi
 
 	// H: what the helper alone records for this target. The export adds no
 	// attribute of its own, so its record is exactly H.
-	h := helperRecord(t, requestAuditEvent("export", http.MethodGet, target, "success", http.StatusOK))
+	h := helperRecord(t, requestAuditEvent("export", http.MethodGet, target.dialledVerb(), target, "success", http.StatusOK))
 	if got, want := keySet(export), keySet(h); !slices.Equal(got, want) {
 		t.Errorf("export attributes %v, want the helper's %v", got, want)
 	}
@@ -167,7 +169,7 @@ func TestExport1055_P_ExportRecordIsTheCallRecordMinusTheCallsOwnFields(t *testi
 
 	// The target attributes are the keys the target contributes to the
 	// helper's record; both records give them the same values.
-	zero := helperRecord(t, requestAuditEvent("export", http.MethodGet, auditTarget{}, "success", http.StatusOK))
+	zero := helperRecord(t, requestAuditEvent("export", http.MethodGet, auditTarget{}.dialledVerb(), auditTarget{}, "success", http.StatusOK))
 	var targetKeys []string
 	for _, k := range keySet(h) {
 		if _, ok := zero[k]; !ok {
@@ -224,9 +226,9 @@ func TestExport1055_X_EveryAuditedExitStillAudits(t *testing.T) {
 				}
 				rec := recorder957(t)
 				req := httptest.NewRequest(method, fullTarget+e.query, nil)
-				req = req.WithContext(xcontext.BuildContext(req.Context(),
+				req = req.WithContext(audit.WithSessionID(xcontext.BuildContext(req.Context(),
 					xcontext.WithLogger(slog.New(slog.DiscardHandler)),
-					xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice"})))
+					xcontext.WithUserInfo(jwtutil.UserInfo{Username: "alice", Principal: jwtutil.PrincipalHuman})), "s-1055"))
 				Export(e.inner(t)).ServeHTTP(e.writer(), req)
 
 				got := records957(rec)
@@ -235,7 +237,7 @@ func TestExport1055_X_EveryAuditedExitStillAudits(t *testing.T) {
 				}
 				r := got[0]
 				for k, v := range map[string]string{
-					"http.request.method":       method,
+					"http.request.method":       http.MethodGet, // F1: the method sent
 					"k8s.resource.group":        group1055,
 					"k8s.resource.version":      version1055,
 					"k8s.resource.resource":     "fireworksapps",

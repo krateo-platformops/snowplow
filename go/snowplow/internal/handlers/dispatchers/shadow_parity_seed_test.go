@@ -234,7 +234,7 @@ func TestF2E_Identity_CohortDeniedClassifiesDeniedNotSA(t *testing.T) {
 	// #424: the seed resolves the cohort as an AUTHENTICATED identity — its
 	// effective groups are the cohort groups plus system:authenticated
 	// (rbac.WithAuthenticatedGroup), never anything of the SA's.
-	want := rbac.WithAuthenticatedGroup([]string{a1Group})
+	want := rbac.WithAuthenticatedGroup(denied, []string{a1Group})
 	if len(sc.identity.Groups) != len(want) || sc.identity.Groups[0] != want[0] || sc.identity.Groups[1] != want[1] {
 		t.Fatalf("F-2E-IDENTITY: sc.identity.Groups=%v, want the cohort's effective groups %v", sc.identity.Groups, want)
 	}

@@ -7,6 +7,11 @@ metadata:
 data:
   PORT: "{{ .Values.service.port }}"
   AUTHN_NAMESPACE: {{ .Release.Namespace }}
+  {{- /* #1334 — one value decides both the switch and its grant (clusterrole.yaml). */}}
+  {{- if hasKey .Values.env "PUBLIC_IDENTITY_ENABLED" }}
+  {{- fail "env.PUBLIC_IDENTITY_ENABLED is not a value: set publicIdentity.enabled, which also renders the impersonate grant it needs (#1334)" }}
+  {{- end }}
+  PUBLIC_IDENTITY_ENABLED: {{ include "snowplow.publicIdentityEnabled" . | quote }}
   {{- range $key, $value := .Values.env }}
   {{ $key }}: {{ $value | quote }}
   {{- end }}

@@ -684,7 +684,9 @@ func TestDanglingRoleRef947_UnsyncedSnapshotNotTracked(t *testing.T) {
 // flips HasSynced to true as it returns: the initial LIST lands right after the
 // snapshot has read the (still empty) indexer. The synced state must be read
 // BEFORE the indexers; read after them, it would claim a complete snapshot
-// over an incomplete read.
+// over an incomplete read. The flip stays set while the indexer stays empty,
+// so only the rebuild that flipped models a real informer: see
+// syncedReadBeforeIndexers947.
 type flipInformer947 struct {
 	informers.GenericInformer
 	sii *flipSII947
@@ -695,6 +697,8 @@ func (f flipInformer947) Informer() clientcache.SharedIndexInformer { return f.s
 type flipSII947 struct {
 	clientcache.SharedIndexInformer
 	synced atomic.Bool
+	// onFlip, when set, runs once, inside the List() that flips.
+	onFlip func()
 }
 
 func (s *flipSII947) HasSynced() bool { return s.synced.Load() }
@@ -709,7 +713,9 @@ type flipIndexer947 struct {
 
 func (i flipIndexer947) List() []interface{} {
 	out := i.Indexer.List()
-	i.s.synced.Store(true)
+	if i.s.synced.CompareAndSwap(false, true) && i.s.onFlip != nil {
+		i.s.onFlip()
+	}
 	return out
 }
 
@@ -718,22 +724,95 @@ func (i flipIndexer947) List() []interface{} {
 // read an empty ClusterRole set, so it must not claim Synced, and the binding
 // whose role exists must not be reported as dangling.
 func TestDanglingRoleRef947_SyncedReadBeforeIndexers(t *testing.T) {
+	syncedReadBeforeIndexers947(t, false)
+}
+
+// TestDanglingRoleRef947_SyncedReadBeforeIndexers_EventDuringRebuild is the
+// same, with an RBAC event landing during that very rebuild, so the rebuild
+// loop owes one more rebuild before it returns (#1419). The assertions are
+// still about the snapshot of the rebuild the sync landed in.
+func TestDanglingRoleRef947_SyncedReadBeforeIndexers_EventDuringRebuild(t *testing.T) {
+	syncedReadBeforeIndexers947(t, true)
+}
+
+// syncedReadBeforeIndexers947 asserts on the snapshot published by ONE
+// rebuild: the one whose ClusterRole read flipped the informer to synced.
+//
+// #1419 — the flip stays set, and the indexer stays empty (the LIST is held).
+// A rebuild that STARTS after the flip therefore reads "synced" over an empty
+// ClusterRole set: a state the wrapper makes and no informer can be in, and a
+// snapshot that claims Synced and reports both bindings as dangling. Such a
+// rebuild is not hypothetical. The watcher's informers deliver their initial
+// add events to the handlers after HasSynced turns true, and each one marks
+// the rebuild loop dirty; a mark that lands during the test's own rebuild
+// makes RebuildRBACSnapshotForTest rebuild again before it returns. So every
+// rebuild that starts after the flip is held at its top until the test has
+// read what the flipping rebuild published.
+func syncedReadBeforeIndexers947(t *testing.T, eventDuringRebuild bool) {
 	ResetDanglingRoleRefsForTest()
 	t.Cleanup(ResetDanglingRoleRefsForTest)
 	sink := captureLogs947(t)
 	rw, _ := heldListWatcher947(t, "clusterroles")
 
-	rw.mu.Lock()
+	rw.mu.RLock()
 	real := rw.informers[clusterRolesTypedGVR]
-	rw.informers[clusterRolesTypedGVR] = flipInformer947{GenericInformer: real, sii: &flipSII947{SharedIndexInformer: real.Informer()}}
-	rw.mu.Unlock()
-	t.Cleanup(func() {
+	rw.mu.RUnlock()
+	setClusterRoleInformer := func(gi informers.GenericInformer) {
 		rw.mu.Lock()
-		rw.informers[clusterRolesTypedGVR] = real
+		rw.informers[clusterRolesTypedGVR] = gi
 		rw.mu.Unlock()
+	}
+	flip := &flipSII947{SharedIndexInformer: real.Informer()}
+	if eventDuringRebuild {
+		// What an informer handler does. The writer slot is held by the
+		// rebuild this runs in, so it only leaves the dirty mark.
+		flip.onFlip = func() { scheduleRBACRebuild(rw) }
+	}
+
+	// The barrier runs at the top of every rebuild, and rebuilds are serial
+	// (one writer slot). The wrapper goes in there, so no rebuild sees it
+	// appear between its synced read and its indexer read.
+	var install, park sync.Once
+	parked := make(chan struct{})
+	resume := make(chan struct{})
+	SetRebuildBarrierForTest(func() {
+		if flip.synced.Load() {
+			park.Do(func() { close(parked) })
+			<-resume
+			return
+		}
+		install.Do(func() {
+			setClusterRoleInformer(flipInformer947{GenericInformer: real, sii: flip})
+		})
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RebuildRBACSnapshotForTest(rw)
+	}()
+	t.Cleanup(func() {
+		install.Do(func() {}) // the wrapper can no longer go in
+		setClusterRoleInformer(real)
+		close(resume)
+		<-done
+		SetRebuildBarrierForTest(nil)
 	})
 
-	RebuildRBACSnapshotForTest(rw)
+	// Either way the flipping rebuild has returned, so its snapshot is
+	// published, and no later rebuild has got past its top.
+	select {
+	case <-parked: // a later rebuild started and is held
+	case <-done: // no later rebuild started
+		if eventDuringRebuild {
+			t.Fatalf("the event that landed during the rebuild started no further rebuild")
+		}
+	case <-time.After(time.Minute):
+		t.Fatalf("timed out waiting for the rebuild in which the ClusterRole informer synced")
+	}
+	if !flip.synced.Load() {
+		t.Fatalf("no rebuild read the ClusterRole indexer through the wrapper")
+	}
+
 	if s := RBACSnapshotForTest(); s == nil || s.Synced {
 		t.Errorf("snapshot whose ClusterRole read preceded the sync claims Synced: %+v", s)
 	}

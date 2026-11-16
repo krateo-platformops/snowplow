@@ -298,14 +298,22 @@ func stripForServe(uns *unstructured.Unstructured) {
 // Per feedback_no_special_cases.md: uniform over every GVR — no
 // per-resource carve-out.
 func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *unstructured.Unstructured) bool {
-	log := xcontext.Logger(ctx)
-
 	if obj == nil {
 		// Defensive: the caller only reaches here on an indexer HIT
 		// (obj non-nil), but the helper fails closed rather than trust
 		// that invariant blindly.
 		return false
 	}
+	return authorizeGetOf(ctx, gvr, obj.GetNamespace(), obj.GetName())
+}
+
+// authorizeGetOf is filterGetByRBAC's evaluation by coordinates: `get` of
+// (gvr, namespace, name) for the ctx identity. A `get` verdict depends only on
+// (identity, verb, GVR, namespace, name), never on the object's content, so the
+// same call decides an object already in hand (filterGetByRBAC) and one not yet
+// fetched (getFromAPIServer's authorize-before-dial step, #1483).
+func authorizeGetOf(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) bool {
+	log := xcontext.Logger(ctx)
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
@@ -315,8 +323,8 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 		log.WarnContext(ctx, "objects.Get.rbac_get_filter.no_identity",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
-			slog.String("namespace", obj.GetNamespace()),
-			slog.String("name", obj.GetName()),
+			slog.String("namespace", namespace),
+			slog.String("name", name),
 			slog.Any("err", err),
 			slog.String("action", "fallthrough_to_apiserver"),
 		)
@@ -330,7 +338,7 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 	// failing closed).
 	// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller ignores
 	// matchedBindingUID.
-	opts := rbac.ObjectCheck(user.Username, user.Groups, "get", rbac.TargetOfObject(gvr, obj))
+	opts := rbac.ObjectCheck(user.Username, user.Groups, "get", rbac.TargetOf(gvr, namespace, name))
 	// Ship L1 (0.30.252): per-item caller discards matchedBindingUID — skip
 	// the CRB/RB stable-sort.
 	opts.SkipBindingUID = true
@@ -340,8 +348,8 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 		log.WarnContext(ctx, "objects.Get.rbac_get_filter.evaluate_error",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
-			slog.String("namespace", obj.GetNamespace()),
-			slog.String("name", obj.GetName()),
+			slog.String("namespace", namespace),
+			slog.String("name", name),
 			slog.Any("err", err),
 			slog.String("action", "fallthrough_to_apiserver"),
 		)
@@ -351,8 +359,8 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 	log.Debug("objects.Get.rbac_get_filter",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),
-		slog.String("namespace", obj.GetNamespace()),
-		slog.String("name", obj.GetName()),
+		slog.String("namespace", namespace),
+		slog.String("name", name),
 		slog.Bool("allowed", allowed),
 	)
 	return allowed

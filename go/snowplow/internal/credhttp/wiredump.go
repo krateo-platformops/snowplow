@@ -30,6 +30,22 @@ package credhttp
 //
 // A client certificate never reaches a dump: it is TLS handshake material,
 // below the HTTP layer either dump sees.
+//
+// #1481 — WHY THE RULE STAYS after plumbing v1.84.0. plumbing#160 made its
+// debuggingRoundTripper metadata-only: one "http request" line (method, host,
+// path, status, duration_ms) or "http request: failed" (error_type), never a
+// header, query or body. That removes the defect above from plumbing itself,
+// but the round tripper is still installed UNDER plumbing's credential round
+// trippers, so every request it reads carries the endpoint's Authorization
+// header (or Basic, or the AWS signature) and the response its Set-Cookie:
+// that no credential reaches a log would rest on what code snowplow does not
+// own chooses to read, at every future bump. WireDump is outermost on the
+// client and owned here, and it already logs the same metadata (plus which
+// headers are present and the request body's digest), so keeping plumbing's
+// out costs only its duration_ms and error_type, and installing both would log
+// every request twice. The canary arms (credhttp redact_canary_1481_test.go,
+// restactions/api issue1481_redact_canary_test.go) fail if plumbing's line
+// ever appears or a credential, a query value or a body reaches a log.
 
 import (
 	"io"

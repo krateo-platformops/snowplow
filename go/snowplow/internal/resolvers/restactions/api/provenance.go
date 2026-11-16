@@ -31,11 +31,11 @@ func (m *endpointReferenceMapper) resolveOneAsCaller(ctx context.Context, ref *t
 	// ClientConfigFor hand back the SA's config.
 	if _, ok := cache.InternalRESTConfigFromContext(ctx); ok {
 		return endpoints.Endpoint{}, false, fmt.Errorf(
-			"caller-supplied RESTAction resolved on a context carrying an internal rest config; refusing to read endpointRef %q", ref.Name)
+			"%w: a caller-supplied RESTAction resolved on a context carrying an internal rest config; refusing to read endpointRef %q", errInternalIdentityContext, ref.Name)
 	}
 	callerEP, err := xcontext.UserConfig(ctx)
 	if err != nil {
-		return endpoints.Endpoint{}, false, fmt.Errorf("caller-supplied endpointRef %q: no caller endpoint: %w", ref.Name, err)
+		return endpoints.Endpoint{}, false, fmt.Errorf("%w: endpointRef %q: no caller endpoint: %w", errInternalIdentityContext, ref.Name, err)
 	}
 	rc, err := cache.ClientConfigFor(ctx, callerEP)
 	if err != nil {

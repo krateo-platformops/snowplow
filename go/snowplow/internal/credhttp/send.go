@@ -36,11 +36,12 @@ package credhttp
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"log/slog"
-	"math/rand/v2"
+	"math/big"
 	"net/http"
 	"net/http/httptrace"
 	"strconv"
@@ -127,6 +128,7 @@ func sendPolicy(site string, cli *http.Client, req *http.Request) (*http.Respons
 		return sendBudgeted(site, cli, req, b)
 	}
 	if !SafeMethod(req.Method) {
+		// #nosec G107,G704 -- every request leaves through dialguard's destination guard (#1131); the destination is the caller's by design (TestIssue1131_EverySendPathDialsThroughTheGuard)
 		return cli.Do(req)
 	}
 	observed := *cli
@@ -148,6 +150,7 @@ func sendOnceBudgeted(cli *http.Client, req *http.Request, b *pagebudget.Budget)
 		return nil, &pagebudget.ExhaustedError{Result: pagebudget.NotSent}
 	}
 	x, actx := beginBudgetedAttempt(req.Context(), b)
+	// #nosec G107,G704 -- every request leaves through dialguard's destination guard (#1131); the destination is the caller's by design (TestIssue1131_EverySendPathDialsThroughTheGuard)
 	resp, err := cli.Do(req.WithContext(actx))
 	if err != nil {
 		e := x.exhausted(err, 1, "", req.Method)
@@ -240,6 +243,7 @@ func budgetedTry(cli *http.Client, req *http.Request, b *pagebudget.Budget, cutA
 			r.Body = body
 		}
 	}
+	// #nosec G107,G704 -- every request leaves through dialguard's destination guard (#1131); the destination is the caller's by design (TestIssue1131_EverySendPathDialsThroughTheGuard)
 	resp, err := cli.Do(r)
 	x.stopCut()
 	return resp, err, x
@@ -280,18 +284,43 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 //
 // Transcribed from v1.28.1. v1.28.1 → v1.34.0 re-audited: http/util/ (retry.go
 // included) is byte-identical between the two module trees. v1.34.0 → v1.36.0
-// re-audited the same way: http/util/ is byte-identical.
-const retryPolicyTranscribedFrom = "v1.36.0"
+// re-audited the same way: http/util/ is byte-identical. v1.36.0 → v1.52.0
+// re-audited the same way (snowplow#1359): http/util/ is byte-identical.
+// v1.52.0 → v1.54.0 re-audited the same way (plumbing#141): http/util/ is
+// byte-identical. v1.54.0 → v1.61.0 re-audited the same way (snowplow#1382):
+// http/util/ is byte-identical. v1.61.0 → v1.68.0 re-audited the same way
+// (plumbing#159): http/util/ is byte-identical. v1.68.0 → v1.74.0 re-audited
+// by `git diff --stat` of the two tags: http/ (util/retry.go included) has no
+// change at all.
+//
+// v1.74.0 → v1.75.0 (plumbing#173, the release's one commit) re-audited by
+// `git diff --stat` of the two tags: under http/ it changes request/request.go
+// and response/status.go; http/util/ (retry.go included) is byte-identical.
+//
+// v1.75.0 → v1.84.0 (snowplow#1481) re-audited by `git diff --stat` of the two
+// tags: under http/ it changes request/request.go, request/transport.go and
+// response/status.go; http/util/ (retry.go included) is byte-identical.
+//
+// v1.84.0 → v1.85.0 (snowplow#1481): `git diff --stat` changes only dialguard/
+// and the Makefile; http/ is byte-identical.
+const retryPolicyTranscribedFrom = "v1.85.0"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
 // v1.28.1 http/util/retry.go backoff(0, base, max)): base capped at max,
-// jittered into [d/2, d).
+// jittered into [d/2, d). The jitter's random source is crypto/rand where plumbing's is
+// math/rand: the distribution is the same, d/2 plus a draw uniform over [0, d/2).
 func firstBackoff(base, maxB time.Duration) time.Duration {
 	d := min(base, maxB)
 	if d < 2 {
 		return d
 	}
-	return d/2 + time.Duration(rand.Int64N(int64(d)/2))
+	// rand.Int has two failures and neither can happen here. It panics for a bound <= 0, and the
+	// bound d/2 is >= 1 because d >= 2. It returns an error only when its reader does, and since
+	// Go 1.24 crypto/rand's Reader never returns one (a failure to read random data stops the
+	// program instead; nothing in snowplow replaces rand.Reader). So the error is discarded, not
+	// handled.
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(d)/2))
+	return d/2 + time.Duration(n.Int64())
 }
 
 // retryAfter is RetryClient's 429 wait (plumbing's parseRetryAfter): the
@@ -359,9 +388,18 @@ func (o *attemptObserver) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	tr := &attemptTrace{}
 	start := time.Now()
-	resp, err := next.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), tr.hooks())))
+	// tr.shared: an attempt answered by a request already on the wire (#1320)
+	// is classified through it, never measured (shared_attempt.go).
+	resp, err := next.RoundTrip(req.WithContext(httptrace.WithClientTrace(withSharedAttemptSink(req.Context(), tr.shared), tr.hooks())))
 	o.prevMS = time.Since(start).Milliseconds()
 	o.prevCause = tr.cause(resp, err)
+	// #1476 — the status line this attempt got, or none: the dial's answer
+	// keeps the last one (answer.go).
+	if resp != nil {
+		AnswerFrom(req.Context()).attempted(resp.StatusCode)
+	} else {
+		AnswerFrom(req.Context()).attempted(0)
+	}
 	// #1131 — RetryClient has no way to be told an error is final, and it reads
 	// MaxRetries after each attempt, sequentially, so this ends its loop with
 	// this error. TestIssue1131_RefusalIsSentOnce pins that.

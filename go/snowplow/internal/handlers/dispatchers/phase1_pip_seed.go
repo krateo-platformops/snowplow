@@ -85,7 +85,6 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
-	"github.com/krateo-platformops/plumbing/jqutil"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/snowplow/apis"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
@@ -637,11 +636,13 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 		// non-empty username; without the explicit group the seeded body would
 		// lack every grant a real member gets through system:authenticated —
 		// a NARROWER body under the very key that member derives (the binding-set
-		// digest always counts system:authenticated). Every real /call is
-		// authenticated, so this is the member's effective group set.
+		// digest counts the apiserver's implicit group). WithAuthenticatedGroup
+		// is the apiserver's rule (#1334), so this is the member's effective
+		// group set — system:authenticated for an authenticated cohort, none for
+		// a cohort presenting system:unauthenticated.
 		xcontext.WithUserInfo(jwtutil.UserInfo{
 			Username: cohort.Username,
-			Groups:   rbac.WithAuthenticatedGroup(cohort.Groups),
+			Groups:   rbac.WithAuthenticatedGroup(cohort.Username, cohort.Groups),
 		}),
 	}
 	rctx := xcontext.BuildContext(ctx, opts...)
@@ -892,27 +893,21 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 	}
 }
 
-// hasTemplatedEndpointRef reports whether any api-step of cr carries a
-// TEMPLATED endpointRef.name — a jq template (${...}-shaped, jqutil.MaybeQuery)
-// that the resolver evaluates against REQUEST extras to select the dispatch
-// endpoint (#113 hub-spoke). Such a RESTAction cannot be seeded (the boot seed
-// has no request extras → the endpoint resolve misses → a truncated body would
-// be Put under the no-extras key without either GTTL-1 sink bumping, the §4
-// poisoning nuance). Each api-step and its *Reference EndpointRef is nil-guarded
-// (API is a *API, EndpointRef a *templates.Reference; either may be nil).
+// hasTemplatedEndpointRef is #113's predicate as the RESTAction seed asks it:
+// the one #1477 predicate (restactionNeedsRequestExtras) with NO carried extras,
+// because the seed resolves the RESTAction with none. It reports whether an
+// api-step carries a TEMPLATED endpointRef.name (${...}-shaped,
+// jqutil.MaybeQuery) that reads a request extra (a dict key the resolver does
+// not write itself: a stage's output, an errorKey, the pagination block), or
+// whose reads cannot be determined. The resolver evaluates such a template
+// against REQUEST extras to select the dispatch endpoint (#113 hub-spoke). Such
+// a RESTAction cannot be seeded (the boot seed has no request extras → the
+// endpoint resolve misses → a truncated body would be Put under the no-extras
+// key without either GTTL-1 sink bumping, the §4 poisoning nuance). Each
+// api-step and its *Reference EndpointRef is nil-guarded (API is a *API,
+// EndpointRef a *templates.Reference; either may be nil).
 func hasTemplatedEndpointRef(cr *templatesv1.RESTAction) bool {
-	if cr == nil {
-		return false
-	}
-	for _, step := range cr.Spec.API {
-		if step == nil || step.EndpointRef == nil {
-			continue
-		}
-		if _, isTemplate := jqutil.MaybeQuery(step.EndpointRef.Name); isTemplate {
-			return true
-		}
-	}
-	return false
+	return restactionNeedsRequestExtras(cr, nil)
 }
 
 // hasTemplatedEndpointRefFn is the #113 seed-skip PREDICATE seam. Production
@@ -958,36 +953,38 @@ func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, aut
 	// [read, PutIfGen] would be invisible for keepwarm / gvr-discovered. resCtx below
 	// is built from this epoch with the RA's own coordinate pre-declared.
 	selfEpoch := cache.DepGenEpochNow()
-	got := seedObjectsGetFn(ctx, ref)
-	if got.Err != nil {
-		// #158 (design §1.3): preserve the typed status error so the call
-		// site's classifySeedErr sees 403 (RBAC deny) vs 5xx (operational)
-		// instead of an opaque string. statusErrFromResponse lifts the
-		// plumbing *response.Status back into an *apierrors.StatusError
-		// carrying Code+Reason. Wrapped with %w so the RESTAction identity
-		// is visible in logs while errors.As/Is still thread through to the
-		// embedded StatusError.
-		return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResponse(got.Err))
+	// #1483 — THE UNIT'S `get` IS DECIDED BEFORE THE FETCH, as the widget leg
+	// decides it: the key's first-match `get` evaluation (dispatchCacheLookupKey)
+	// reads only the identity and the RESTAction's coordinates, which the ref
+	// carries (the fetch is a GET by name in that namespace). An identity that
+	// may not `get` the RESTAction derives an empty BindingUID and is skipped
+	// here, with no apiserver read; before #1483 the CR was fetched as the
+	// ServiceAccount and then re-gated and discarded, on every keepwarm and
+	// gvr-discovered pass (~1,960 GETs and WARNs a day on krateo-057). A ref
+	// whose apiVersion does not parse keeps the old order: the fetch refuses it.
+	refGV, refGVErr := schema.ParseGroupVersion(ref.APIVersion)
+	if refGVErr != nil {
+		got := seedObjectsGetFn(ctx, ref)
+		if got.Err != nil {
+			return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
+		}
+		return fmt.Errorf("fetch RESTAction %s/%s: apiVersion %q: %w", ref.Namespace, ref.Name, ref.APIVersion, refGVErr)
 	}
-	if got.Unstructured == nil {
-		return fmt.Errorf("fetch RESTAction %s/%s: nil object", ref.Namespace, ref.Name)
-	}
-
 	// Compute the per-user dispatcher key — IDENTICAL shape to
 	// restactions.go:117. ctx already carries the cohort's UserInfo, so
 	// dispatchCacheLookupKey reads it and hashes Username + Groups into
 	// the key.
 	key, handle, inputs := dispatchCacheLookupKey(ctx, "restactions",
-		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
-		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		refGV.Group, refGV.Version, ref.Resource,
+		ref.Namespace, ref.Name,
 		-1, -1, nil)
 	// Ship 0.30.188 — diagnostic slog: emit the seed-side cache key +
 	// its components so it can be diff'd against the dispatcher_get and
 	// per_user_fallback_put log lines at widgets.go / restactions.go.
 	emitDispatchCacheKeyDiag(seedDiagLogger(ctx), "seed", ctx,
 		key, inputs, "restactions",
-		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
-		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		refGV.Group, refGV.Version, ref.Resource,
+		ref.Namespace, ref.Name,
 		-1, -1, nil)
 	if handle == nil || key == "" {
 		// L1 disabled OR no identity on ctx — defensive skip. PIP's
@@ -1014,6 +1011,20 @@ func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, aut
 				"skipping the shared empty-identity cell Put (A4 populate-side guard)"),
 		)
 		return nil
+	}
+	got := seedObjectsGetFn(ctx, ref)
+	if got.Err != nil {
+		// #158 (design §1.3): preserve the typed status error so the call
+		// site's classifySeedErr sees 403 (RBAC deny) vs 5xx (operational)
+		// instead of an opaque string. statusErrFromResponse lifts the
+		// plumbing *response.Status back into an *apierrors.StatusError
+		// carrying Code+Reason. Wrapped with %w so the RESTAction identity
+		// is visible in logs while errors.As/Is still thread through to the
+		// embedded StatusError.
+		return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
+	}
+	if got.Unstructured == nil {
+		return fmt.Errorf("fetch RESTAction %s/%s: nil object", ref.Namespace, ref.Name)
 	}
 
 	// Per-mode seed skip (F.4 boot fresh-skip + keepwarm c2 age-skip, single
@@ -1074,6 +1085,7 @@ func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, aut
 	// cell for it. Greppable skip line mirrors the Class-5 refHasUnresolvedTemplateToken
 	// idiom. Every api-step EndpointRef is nil-guarded (*Reference, may be nil).
 	if hasTemplatedEndpointRefFn(&cr) {
+		bumpBackgroundResolveSkip(bgSkipSiteRestactionSeed, bgSkipReasonNeedsRequestExtras) // #1477
 		slog.Default().Info("phase1.seed.skip.templated_endpointref",
 			slog.String("subsystem", "cache"),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
@@ -1442,6 +1454,16 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	if seedSkipDecision(ctx, mode, handle, key, "widgets", e.W.GetNamespace()+"/"+e.W.GetName()) {
 		return nil
 	}
+	// #1477 — the #113 rule, inherited from the widget's apiRef RESTAction: a
+	// templated endpointRef that reads a request extra this resolve does not
+	// carry (the widget's inline apiRef extras and declared identity ARE
+	// carried) renders a Secret no customer's request selects, so no customer
+	// key can match the cell. Skipped before the admission, like the per-mode
+	// skip above, so it never consumes the #46 bound.
+	if widgetNeedsRequestExtras(ctx, e.W) {
+		logBackgroundResolveSkip(bgSkipSiteWidgetSeed, "widget", e.W.GetNamespace()+"/"+e.W.GetName())
+		return nil
+	}
 	// #394 — capture the terminal-Put guard at seed ENTRY (mirror of
 	// seedOneRestaction): after the skip decision, before the admission and the
 	// resolve. Post-readyz modes → PutIfGen at the terminal Put; boot → plain. Governs ONLY the widget-cell Put below —
@@ -1604,6 +1626,10 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	//     POINTER the gate below holds — bump it there, watch the Put decline.
 	//
 	// Behaviour is unchanged: the seam's production value IS widgets.Resolve.
+	// #1319 — the seed's stage outcomes (its widget's apiRef RESTAction's),
+	// kept on the entry so an L1 hit of the seeded cell answers with the header
+	// a cold resolve would have.
+	resCtx, stageOutcomes := restactionsapi.WithStageOutcomes(resCtx)
 	res, err := widgetsResolveFn(resCtx, widgets.ResolveOptions{
 		In: in,
 		// Ship 0.30.230 fix-at-root: RC is the SA *rest.Config carried
@@ -1668,7 +1694,6 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// seed Put above — HasUAF was stamped from the sink before the Put, so
 	// uafTTLOverrideForEntry yields the short UAF_RESOLVED_TTL_SECONDS for a
 	// narrowed cell and 0 (unchanged, full store TTL) for every other widget.
-	// stage-outcomes-waiver: a widgets cell; only a restactions cell answers a RESTAction /call, whose header the outcomes are.
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
@@ -1682,6 +1707,8 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 		// #841 — the seed class, kept only if this Put INSERTS the cell (the store
 		// keeps a resident cell's own origin on a replace).
 		SeedOrigin: cache.SeedOriginFromContext(resCtx),
+		// #1319 — the widget's apiRef RESTAction's outcomes ("" = complete).
+		StageOutcomes: storableStageOutcomes(stageOutcomes),
 	}
 	// #394 — generation-guarded terminal write for the post-readyz modes (plain
 	// for boot); see seedOneRestaction's tail. A refusal skips the counter, the

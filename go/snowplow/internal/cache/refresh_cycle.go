@@ -42,7 +42,6 @@
 package cache
 
 import (
-	"bytes"
 	"context"
 	"expvar"
 	"strconv"
@@ -271,7 +270,8 @@ func refreshCycleFor(ctx context.Context, key string) *refreshCycle {
 }
 
 // sameBytesPrior is the identical-content test of every refresh Put: key's
-// resident prior if its bytes equal entry's, else nil. It reads the prior
+// resident prior if it answers as entry does (SameAnswer: its bytes, and since
+// #1319 its stored stage outcomes, equal entry's), else nil. It reads the prior
 // under c.mu (a pointer read) and compares outside it, like raLayerEqualPrior
 // (#406), whose compare it replaces on the refresh Put so a body is compared
 // once. The caller confirms under c.mu that the same prior is the one it
@@ -284,7 +284,7 @@ func (c *ResolvedCacheStore) sameBytesPrior(key string, entry *ResolvedEntry) *R
 	c.mu.Lock()
 	prior := c.raLayerResidentEntryLocked(key)
 	c.mu.Unlock()
-	if prior != nil && bytes.Equal(prior.Raw(), entry.Raw()) {
+	if SameAnswer(prior, entry) { // #1319: the body and the stored stage outcomes
 		return prior
 	}
 	return nil

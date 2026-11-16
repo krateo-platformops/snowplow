@@ -272,6 +272,7 @@ func TestIssue618_EveryServeSiteClassifiesTheQuery(t *testing.T) {
 		"stageMessage":                       "#709 (+#729 redirect variant): formats a failed stage's error text from (code, gvr, ns, name) only — never a key, never a served data body; TestIssue709_CanonicalStageMessage_CarriesNoQuery pins that no query reaches it",
 		"noteNarrowServed":                   "#603 PR-2 shadow: maps a served call back to the list edge the edge-3 record keyed on (gvr, ns) — the same query-free key runStage records; serves and keys nothing",
 		"stageAuditEvent":                    "AUDIT-4 (installer#410): labels the audit record of a write-verb stage with the (gvr, ns, name) it addressed, after the dial; the query is stripped first and no path is recorded; serves and keys nothing",
+		"stageTarget":                        "AUDIT-4 (installer#410, audit#22): the audit record's target of a write stage, dialled or refused: the (gvr, ns, name) its path addresses, the query read only for dryRun; serves and keys nothing",
 	}
 	fset := token.NewFileSet()
 	files, err := filepath.Glob("*.go")

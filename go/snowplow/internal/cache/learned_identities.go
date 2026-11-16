@@ -45,6 +45,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	corev1 "k8s.io/api/core/v1"
@@ -162,7 +163,7 @@ func WasLearnedUsername(username string) bool {
 // so records its representative, with system:authenticated added, #424),
 // \x00-separated. Never logged.
 func LearnedClassKey(username string, groups []string) string {
-	g := append([]string(nil), WithAuthenticatedGroup(groups)...)
+	g := append([]string(nil), WithAuthenticatedGroup(username, groups)...)
 	sort.Strings(g)
 	return username + "\x00" + strings.Join(g, "\x00")
 }
@@ -366,10 +367,21 @@ func syncLearnedFromSecrets(items []*corev1.Secret) {
 			// #130 F3: a ServiceAccount never renders the frontend; it is not a
 			// seed class (mirrors the SA-only binding exclusion). It is not
 			// "unparseable" either.
-			_, _, isSA = parseServiceAccountUsername(user)
+			_, _, isSA = ParseServiceAccountUsername(user)
 		}
+		// #1382 — the Secret is learned under its certificate's CN, and only
+		// when it is that user's (endpoints.OwnsSecret): a Secret whose
+		// authn.krateo.io/username annotation names someone else claims a CN
+		// it does not own, and learning it would merge it into, or mint, a
+		// class for a user it does not belong to. It is skipped: no class,
+		// and not unparseable (its certificate parsed).
+		notOwned := ok && !isSA && !endpoints.OwnsSecret(sec, user)
 		if had {
 			detachSecretLocked(sec.Name, prev, now)
+		}
+		if notOwned {
+			learned.secrets[sec.Name] = secretState{rv: sec.ResourceVersion}
+			continue
 		}
 		if !ok || isSA {
 			if !ok {
@@ -423,7 +435,7 @@ func ObserveLiveIdentity(username string, groups []string, exp time.Time) {
 	if Disabled() || username == "" {
 		return
 	}
-	if _, _, isSA := parseServiceAccountUsername(username); isSA {
+	if _, _, isSA := ParseServiceAccountUsername(username); isSA {
 		return
 	}
 	key := LearnedClassKey(username, groups)

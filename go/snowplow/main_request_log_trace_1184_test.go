@@ -96,7 +96,7 @@ func served1184(t *testing.T) (http.Handler, *lines1184) {
 	stub := http.HandlerFunc(ok200)
 	mux.Handle("GET /call", chain.Append(handlers.Dispatcher(dispatchers.All())).Then(stub))
 	mux.Handle("POST /jq", chain.Then(handlers.JQ()))
-	mountTelemetryRoute(mux, chain, debugAuthTestKeys, rum.NewIngest(fwd, rum.RegisteredRoutes(mux)))
+	mountTelemetryRoute(newRouteTable(mux), chain, debugAuthTestKeys, rum.NewIngest(fwd, rum.RegisteredRoutes(mux)))
 	t.Cleanup(cache.ResetRouteScopeRegistryForTest)
 	return newServerHandler(mux), sink
 }

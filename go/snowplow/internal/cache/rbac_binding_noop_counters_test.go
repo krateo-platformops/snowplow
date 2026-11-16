@@ -75,7 +75,7 @@ func activateBindingDeltaHooksForTest(t *testing.T) {
 	t.Helper()
 	ResetBindingsByGVRIndexForTest()
 	PublishRBACSnapshotForTest(buildSnap(nil, nil))
-	BuildBindingsByGVRIndex([]schema.GroupVersionResource{gr("composition.krateo.io", "compositions")})
+	SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{gr("composition.krateo.io", "compositions")})
 	if !BindingsByGVRIndexBuilt() {
 		t.Fatal("setup: index not built — onBindingUpdate would no-op and every arm would be vacuous")
 	}

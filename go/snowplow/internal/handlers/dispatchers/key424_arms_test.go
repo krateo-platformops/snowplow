@@ -426,7 +426,7 @@ func k424SubGenSettled(t *testing.T, user string, groups []string, from uint64) 
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if cache.RBACSubGenForSubject(user, rbac.WithAuthenticatedGroup(groups)) != from {
+		if cache.RBACSubGenForSubject(user, rbac.WithAuthenticatedGroup(user, groups)) != from {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -449,7 +449,7 @@ func TestKey424_RestactionsPut_SubGenOnlyDrift_GrantThenRevokeMidResolve(t *test
 	dyn := psBuildWatcher(t, a)
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target}) // activates the sub-gen deltas
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target}) // activates the sub-gen deltas
 	carolCtx, daveCtx := psUserCtx(a, psCarol), psUserCtx(a, psDave)
 	cKey, cIn := k423RAKey(t, carolCtx)
 	if dKey, _ := k423RAKey(t, daveCtx); cKey != dKey {
@@ -459,7 +459,7 @@ func TestKey424_RestactionsPut_SubGenOnlyDrift_GrantThenRevokeMidResolve(t *test
 	seam := func(ctx context.Context, opts restactions.ResolveOptions) (*templatesv1.RESTAction, error) {
 		body := k424Body(t, ctx, a)
 		if ui, _ := xcontext.UserInfo(ctx); ui.Username == psCarol && armed.CompareAndSwap(false, true) {
-			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psGroups(a)))
+			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psCarol, psGroups(a)))
 			k424Grant(t, dyn, a, psCarol)
 			body = k424Body(t, ctx, a) // read under the transient grant
 			k424Revoke(t, dyn, a, psCarol)
@@ -513,7 +513,7 @@ func TestKey424_RefresherSubGenOnlyDrift_RoleEditMidResolve(t *testing.T) {
 	dyn := psBuildWatcher(t, a, k423PortalReaders(a)...) // Group:portal → target-reader in ns x
 	cache.ResetBindingsByGVRIndexForTest()
 	t.Cleanup(cache.ResetBindingsByGVRIndexForTest)
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{h1RAGVR, a.target})
+	cache.SeedBindingsIndexFromSnapshotForTest([]schema.GroupVersionResource{h1RAGVR, a.target})
 	carolCtx := psUserCtx(a, psCarol)
 	key, in := k423RAKey(t, carolCtx)
 	in.RepresentativeUsername, in.RepresentativeGroups = psCarol, psGroups(a)
@@ -523,7 +523,7 @@ func TestKey424_RefresherSubGenOnlyDrift_RoleEditMidResolve(t *testing.T) {
 	var armed atomic.Bool
 	restore := setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
 		if armed.CompareAndSwap(false, true) {
-			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psGroups(a)))
+			sg0 := cache.RBACSubGenForSubject(psCarol, rbac.WithAuthenticatedGroup(psCarol, psGroups(a)))
 			u, err := dyn.Resource(rGVR).Namespace(psTargetNS).Get(context.Background(), "target-reader", metav1.GetOptions{})
 			if err != nil {
 				t.Fatalf("get role: %v", err)

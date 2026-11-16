@@ -88,9 +88,11 @@ func BuildRequesterProfile(snap *cache.RBACSnapshot, id EvaluateOptions) *Reques
 	// subject matching. This is what makes R request-independent.
 	idOnly := EvaluateOptions{Username: id.Username, Groups: id.Groups}
 
+	who := subjectMatcher(idOnly)
+
 	// Cluster scope — matching ClusterRoleBindings → ClusterRole rules.
 	for _, crb := range selectCRBCandidates(snap, idOnly) {
-		if !anySubjectMatches(crb.Subjects, idOnly) {
+		if !anySubjectMatches(&who, crb.Subjects) {
 			continue
 		}
 		if rules, ok := lookupRoleRefRules(snap, "", crb.RoleRef); ok {
@@ -101,7 +103,7 @@ func BuildRequesterProfile(snap *cache.RBACSnapshot, id EvaluateOptions) *Reques
 	// Namespaced scope — matching RoleBindings across EVERY namespace, bucketed
 	// by each RB's own namespace.
 	for _, rb := range selectRBCandidatesAllNS(snap, idOnly) {
-		if !anySubjectMatches(rb.Subjects, idOnly) {
+		if !anySubjectMatches(&who, rb.Subjects) {
 			continue
 		}
 		if rules, ok := lookupRoleRefRules(snap, rb.Namespace, rb.RoleRef); ok {

@@ -22,7 +22,7 @@ func TestLearnedPrivacy994_StepUpSecretNameIsRedactedWhole(t *testing.T) {
 	groups := []string{"grp-zq994-private", credsecret.StepUpGroup}
 
 	tokens := learnedRedactionTokens(user, groups)
-	for _, want := range []string{credsecret.StepUpName(user), credsecret.SessionName(user)} {
+	for _, want := range []string{credsecret.StepUpNames(user)[0], credsecret.SessionNames(user)[0]} {
 		if !slices.Contains(tokens, want) {
 			t.Fatalf("learnedRedactionTokens lacks the credential Secret name %q: %v", want, tokens)
 		}
@@ -30,9 +30,9 @@ func TestLearnedPrivacy994_StepUpSecretNameIsRedactedWhole(t *testing.T) {
 
 	var buf bytes.Buffer
 	log := learnedRedactingLogger(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})), user, groups)
-	log.Info(`secrets "`+credsecret.StepUpName(user)+`" not found`,
-		slog.String("secret", credsecret.StepUpName(user)),
-		slog.String("session", credsecret.SessionName(user)))
+	log.Info(`secrets "`+credsecret.StepUpNames(user)[0]+`" not found`,
+		slog.String("secret", credsecret.StepUpNames(user)[0]),
+		slog.String("session", credsecret.SessionNames(user)[0]))
 	out := buf.String()
 
 	label := cache.LearnedClassLabel(user, groups)
@@ -51,8 +51,8 @@ func TestLearnedPrivacy994_StepUpSecretNameIsRedactedWhole(t *testing.T) {
 func TestDependencyMessage994_StepUpSecretNameIsAnIdentityShape(t *testing.T) {
 	ctx := psUserCtx(psArm{}, psBob)
 	for _, msg := range []string{
-		`secrets "` + credsecret.StepUpName("dave-zq994") + `" not found`,
-		`GET /api/v1/namespaces/krateo-system/secrets/` + credsecret.StepUpName("dave-zq994"),
+		`secrets "` + credsecret.StepUpNames("dave-zq994")[0] + `" not found`,
+		`GET /api/v1/namespaces/krateo-system/secrets/` + credsecret.StepUpNames("dave-zq994")[0],
 	} {
 		if got := dependencyFailureMessage(ctx, msg); got != dependencyFailureFallback {
 			t.Fatalf("a step-up Secret name reached a widget message: %q -> %q", msg, got)

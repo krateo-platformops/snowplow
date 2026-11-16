@@ -46,7 +46,7 @@ func TestS1020_RUMUploadGetsNoServerSpan(t *testing.T) {
 	fwd.Start(ctx)
 	mux := http.NewServeMux()
 	mux.Handle("GET /call", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
-	mountTelemetryRoute(mux, use.NewChain(), debugAuthTestKeys, rum.NewIngest(fwd, rum.RegisteredRoutes(mux)))
+	mountTelemetryRoute(newRouteTable(mux), use.NewChain(), debugAuthTestKeys, rum.NewIngest(fwd, rum.RegisteredRoutes(mux)))
 	t.Cleanup(cache.ResetRouteScopeRegistryForTest)
 	h := newServerHandler(mux)
 
