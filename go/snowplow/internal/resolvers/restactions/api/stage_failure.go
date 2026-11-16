@@ -207,18 +207,20 @@ func newStageItemFailure(stage string, accumVal any, itemErr error) *stageItemFa
 	// never follows a redirect (#723/#724, internal/credhttp), so a stage that
 	// got one failed because the upstream misbehaved (or is an attack): report
 	// 502 Bad Gateway, never a bare 302 with no Location. The 3xx itself stays
-	// in the canonical message and under the stage's errorKey.
+	// in the canonical message and under the stage's errorKey. #1481: with
+	// snowplow's own reason, RedirectRefused, so the refresher classes the
+	// deterministic refusal as itself (redirect_refused).
 	if f.Code >= 300 && f.Code < 400 {
 		f.redirect = f.Code
 		f.Code = http.StatusBadGateway
-		f.Reason = ""
+		f.Reason = credhttp.RedirectRefusedReason
 	}
 	// #1481 — the reason never names another code than f.Code
-	// (credhttp/reason.go): a 502, whether an upstream's, a redirect's (#729)
-	// or client-go's (its NewGenericServerResponse says InternalError for any
-	// 5xx body that is not a Status), carries no reason, so no classifier reads
-	// it as InternalError. A reason that agrees, or is not a Kubernetes one
-	// (DestinationRefused), is kept; a missing one is derived from the code.
+	// (credhttp/reason.go): an upstream's 502, or client-go's (its
+	// NewGenericServerResponse says InternalError for any 5xx body that is not
+	// a Status), carries no reason, so no classifier reads it as InternalError.
+	// A reason that agrees, or is not a Kubernetes one (DestinationRefused,
+	// RedirectRefused), is kept; a missing one is derived from the code.
 	f.Reason = credhttp.ReasonAgreeing(f.Reason, f.Code)
 	if f.Reason == "" {
 		f.Reason = string(credhttp.ReasonForCode(f.Code))

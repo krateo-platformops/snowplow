@@ -165,11 +165,14 @@ func do(ctx context.Context, opts request.RequestOptions, rc *rest.Config) *resp
 	// #726 — the refused redirect itself. As #729 ruled for the resolver path,
 	// a 3xx is not an answer a client can act on (and carries no Location
 	// here): report a Failure with 502 Bad Gateway; the fixed message names the
-	// redirect's own code and never its target. #1481: with no reason
-	// (FailureStatus): the refusal is deterministic, never plumbing's
-	// InternalError, which a classifier reads as a transient server failure.
+	// redirect's own code and never its target. #1481: its reason is
+	// snowplow's own RedirectRefused, never plumbing's InternalError (a 500's,
+	// which a classifier reads as a transient server failure): the refusal
+	// is deterministic.
 	if respo.StatusCode >= 300 && respo.StatusCode < 400 {
-		return FailureStatus(http.StatusBadGateway, &RedirectRefusedError{StatusCode: respo.StatusCode})
+		st := FailureStatus(http.StatusBadGateway, &RedirectRefusedError{StatusCode: respo.StatusCode})
+		st.Reason = response.StatusReason(RedirectRefusedReason)
+		return st
 	}
 
 	if respo.StatusCode < 200 || respo.StatusCode >= 300 {

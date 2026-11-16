@@ -1276,6 +1276,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if raw, served, ierr := dispatchViaInternalRESTConfig(gctx, call); served || ierr != nil {
 		dispatch := "internal-rest-config"
 		if ierr != nil {
+			// #1481 — a client-go transport error quotes the request's URL,
+			// query included (a *url.Error), and it is logged and recorded
+			// below. redact.ErrorURL keeps the chain (a StatusError, a deny).
+			ierr = redact.ErrorURL(ierr)
 			// #711 — an expected per-identity re-gate deny (classified by its
 			// type) logs at WARN once per cell generation, DEBUG after; every
 			// other failure stays at ERROR. predial_total{denied} counts each.
@@ -1383,6 +1387,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if raw, served, derr := dispatchViaDiscovery(gctx, call); served || derr != nil {
 		dispatch := "discovery"
 		if derr != nil {
+			derr = redact.ErrorURL(derr) // #1481, as for the internal dispatch above
 			r.log.ErrorContext(gctx, "api call response failure", slog.String("name", id),
 				slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 				slog.String("restaction_name", r.opts.RESTActionName),
@@ -1540,9 +1545,9 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		branchEImp, branchE, branchEReason = branchEDecide(gctx, call)
 	}
 	if saEndpointDial && (rbac.MustRegateSADial(gctx) || branchE == branchEFailClosed) {
-		msg := fmt.Sprintf("branch-E SA-endpoint dial re-gated: caller not authorized to read %s (Part 2, #268 site 1)", call.Path)
+		msg := fmt.Sprintf("branch-E SA-endpoint dial re-gated: caller not authorized to read %s (Part 2, #268 site 1)", redact.Path(call.Path))
 		if branchE == branchEFailClosed {
-			msg = fmt.Sprintf("branch-E SA-endpoint dial refused under impersonation: %s (%s, #615)", branchEReason, call.Path)
+			msg = fmt.Sprintf("branch-E SA-endpoint dial refused under impersonation: %s (%s, #615)", branchEReason, redact.Path(call.Path))
 		}
 		// #574 — attribute the refusal to its driver (refresher trigger/trigger-less,
 		// cohort seed + prewarm scope, prewarm, live) and to the cell it was

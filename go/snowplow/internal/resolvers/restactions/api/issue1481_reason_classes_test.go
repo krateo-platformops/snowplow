@@ -11,13 +11,15 @@ package api
 //      budget) and as a background read (none). The stage failure's code and
 //      reason, the refresher's class (cache.ClassifyRefreshError), the stage
 //      outcome header's reason.
-//   X  a redirect the dial refused: reported 502, no reason, not "unavailable".
+//   X  a redirect the dial refused: reported 502 with snowplow's own reason
+//      RedirectRefused, class redirect_refused.
 //   G  client-go's own status for a 5xx answer that is not a Status
 //      (apierrors.NewGenericServerResponse, the internal-rest-config branch):
 //      the same reason and class as E.
 //
 // Every expectation is a literal. Before #1481, with plumbing v1.84.0, a 502
-// read InternalError, so the refresher's class was "unavailable".
+// read InternalError, so the refresher's class was "unavailable"; client-go's
+// generic 502 (G) read InternalError on main too, from client-go itself.
 
 import (
 	"fmt"
@@ -25,6 +27,7 @@ import (
 	"testing"
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -36,7 +39,7 @@ type x1481Want struct {
 }
 
 var x1481Wants = map[int]x1481Want{
-	http.StatusBadGateway:         {"", cache.RefreshErrUnclassified, StageReasonError},
+	http.StatusBadGateway:         {"", cache.RefreshErrBadGateway, StageReasonError},
 	http.StatusServiceUnavailable: {"ServiceUnavailable", cache.RefreshErrUnavailable, StageReasonError},
 	http.StatusGatewayTimeout:     {"Timeout", cache.RefreshErrTimeout, StageReasonTimeout},
 	http.StatusTooManyRequests:    {"TooManyRequests", cache.RefreshErrUnavailable, StageReasonError},
@@ -137,7 +140,7 @@ func TestIssue1481_E_EndpointStageClassPerCode(t *testing.T) {
 	}
 }
 
-func TestIssue1481_X_RefusedRedirectIsAReasonless502(t *testing.T) {
+func TestIssue1481_X_RefusedRedirectIsItsOwn502(t *testing.T) {
 	// A hop to another origin is never followed (#1106): the stage gets the
 	// 3xx itself, which #729 reports as 502.
 	ep := newX1106Srv(t, false, func(rw http.ResponseWriter, r *http.Request) {
@@ -146,7 +149,7 @@ func TestIssue1481_X_RefusedRedirectIsAReasonless502(t *testing.T) {
 	})
 	x1106Env(t, "", map[string]map[string]string{x1106Ref: x1106Secret(ep.srv.URL)})
 	o := x1106Resolve(t, x1106Extras, x1106Stage("read", http.MethodGet, "/zd/tickets/42"))
-	x1481Check(t, o.failure, http.StatusBadGateway, x1481Wants[http.StatusBadGateway])
+	x1481Check(t, o.failure, http.StatusBadGateway, x1481Want{credhttp.RedirectRefusedReason, cache.RefreshErrRedirectRefused, StageReasonError})
 }
 
 func TestIssue1481_G_ClientGoGenericStatusClassPerCode(t *testing.T) {

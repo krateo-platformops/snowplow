@@ -56,7 +56,7 @@ var i1481Cases = []i1481Case{
 	{"504", http.StatusGatewayTimeout, http.StatusGatewayTimeout, "Timeout", http.StatusInternalServerError, cache.RefreshErrUnavailable, true},
 	{"429", http.StatusTooManyRequests, http.StatusTooManyRequests, "TooManyRequests", http.StatusInternalServerError, cache.RefreshErrUnavailable, true},
 	// Never retried: the 502 is snowplow's own, and carries no reason.
-	{"302 refused redirect", http.StatusFound, http.StatusBadGateway, nil, http.StatusBadGateway, cache.RefreshErrUnclassified, false},
+	{"302 refused redirect", http.StatusFound, http.StatusBadGateway, nil, http.StatusBadGateway, cache.RefreshErrRedirectRefused, false},
 }
 
 func i1481Setup(t *testing.T, c i1481Case) (*in443API, map[string]any) {

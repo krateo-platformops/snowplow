@@ -222,7 +222,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			}
 			// Depth-8 backstop: bounded 508-class error (never empty, never a
 			// panic), mirroring the in-process depth guard (nested_call.go:114).
-			response.Encode(wri, response.New(http.StatusLoopDetected,
+			response.Encode(wri, credhttp.FailureStatus(http.StatusLoopDetected,
 				fmt.Errorf("nested resolve depth limit exceeded (%d) for %s/%s/%s over HTTP self-loopback",
 					cache.NestedCallMaxDepth(), got.GVR.Resource,
 					got.Unstructured.GetNamespace(), got.Unstructured.GetName())))

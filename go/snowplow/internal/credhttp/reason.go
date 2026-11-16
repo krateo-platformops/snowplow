@@ -21,16 +21,20 @@ package credhttp
 // (restactions/api upstream_status.go), now applied to a reason derived from
 // the code too. What it gives, per code:
 //   - 502 Bad Gateway: no reason. metav1 has none for 502, and InternalError
-//     documents 500. A 502 is an upstream gateway that failed, or snowplow's
-//     own refusal of a redirect; neither is the server failing internally.
-//     The refresher's class is "unclassified", the seed's verdict operational
-//     (retried), the stage outcome "Error".
+//     documents 500. A 502 is an upstream gateway that failed, not the server
+//     failing internally: the refresher's class is "bad_gateway"
+//     (cache.ClassifyRefreshError reads the code), the seed's verdict
+//     operational (retried), the stage outcome "Error". Snowplow's own 502s
+//     carry their own reason and class: a refused destination
+//     (DestinationRefused, #1131) and a refused redirect (RedirectRefused,
+//     #726/#729).
 //   - 504 Timeout, 429 TooManyRequests, 503 ServiceUnavailable, 500
 //     InternalError: kept. Each names its own code, so it says nothing the
 //     code does not; apierrors.IsTimeout and IsTooManyRequests matched those
 //     codes without a reason before.
-//   - every other 5xx (505, 507, 599, ...) carries none, like 502; and 501 Not
-//     Implemented no longer carries Invalid, which documents 422.
+//   - every other 5xx (501, 505, 507, 508, 599, ...) carries none, like 502
+//     (the refresher's class is "server_error"); 501 Not Implemented no
+//     longer carries Invalid, which documents 422.
 //   - a reason that is not a Kubernetes StatusReason has no documented code
 //     and is kept: snowplow's own DestinationRefused (502), plumbing's
 //     UnprocessableEntity (422).
@@ -39,6 +43,14 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// RedirectRefusedReason is the reason of the 502 snowplow reports for a
+// redirect it refused to follow (#726 on /call, #729 on a stage): snowplow's
+// own decision, deterministic, so the refresher gives it its own class
+// (cache.RefreshErrRedirectRefused). It is not a Kubernetes StatusReason, so
+// #714's trustedReason drops it from an upstream's body: only snowplow records
+// it, as with DestinationRefusedReason.
+const RedirectRefusedReason = "RedirectRefused"
 
 // reasonCodes is each Kubernetes StatusReason's documented HTTP code
 // (k8s.io/apimachinery/pkg/apis/meta/v1/types.go).

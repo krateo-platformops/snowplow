@@ -85,6 +85,15 @@ const (
 	// crdgen/ is byte-identical between v1.82.0 and v1.84.0 (`git diff --quiet
 	// v1.82.0 v1.84.0 -- crdgen`). So coreProviderCrdgenVersion is v1.82.0, and
 	// the invariant holds by code again, not only by output.
+	//
+	// THE TWO CORE-PROVIDER VERSIONS ARE DIFFERENT THINGS. coreProviderVersion
+	// names the status schema in testdata (statusSchemaPath), which the guard
+	// compiles beside the chart because it counts toward the CRD's CEL cost;
+	// coreProviderCrdgenVersion is the crdgen that compiles the chart. Only the
+	// crdgen moved here. core-provider 2.13.105's status schema is not 2.13.71's
+	// (it adds helmOperation and unevaluatedChildren and drops
+	// lastReconcileTime): refreshing the testdata changes the guard's cost
+	// input, so it is its own change (#1488), not part of a plumbing bump.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
 	crdgenVersion       = "v1.84.0"

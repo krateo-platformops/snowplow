@@ -133,8 +133,8 @@ func TestIssue1481_D_DoAnswersEachCodeWithItsOwnReason(t *testing.T) {
 	if st.Status != response.StatusFailure || st.Code != http.StatusBadGateway {
 		t.Fatalf("PRE: the refused redirect answered status %q code %d", st.Status, st.Code)
 	}
-	if st.Reason != "" {
-		t.Errorf("RED: the refused redirect carries reason %q, want none", st.Reason)
+	if st.Reason != RedirectRefusedReason {
+		t.Errorf("RED: the refused redirect carries reason %q, want %q", st.Reason, RedirectRefusedReason)
 	}
 	if in, _, _, _ := x1481Classes(st); in {
 		t.Error("RED: the refused redirect reads IsInternalError")
