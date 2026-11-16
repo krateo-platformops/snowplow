@@ -953,36 +953,38 @@ func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, aut
 	// [read, PutIfGen] would be invisible for keepwarm / gvr-discovered. resCtx below
 	// is built from this epoch with the RA's own coordinate pre-declared.
 	selfEpoch := cache.DepGenEpochNow()
-	got := seedObjectsGetFn(ctx, ref)
-	if got.Err != nil {
-		// #158 (design §1.3): preserve the typed status error so the call
-		// site's classifySeedErr sees 403 (RBAC deny) vs 5xx (operational)
-		// instead of an opaque string. statusErrFromResponse lifts the
-		// plumbing *response.Status back into an *apierrors.StatusError
-		// carrying Code+Reason. Wrapped with %w so the RESTAction identity
-		// is visible in logs while errors.As/Is still thread through to the
-		// embedded StatusError.
-		return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
+	// #1483 — THE UNIT'S `get` IS DECIDED BEFORE THE FETCH, as the widget leg
+	// decides it: the key's first-match `get` evaluation (dispatchCacheLookupKey)
+	// reads only the identity and the RESTAction's coordinates, which the ref
+	// carries (the fetch is a GET by name in that namespace). An identity that
+	// may not `get` the RESTAction derives an empty BindingUID and is skipped
+	// here, with no apiserver read; before #1483 the CR was fetched as the
+	// ServiceAccount and then re-gated and discarded, on every keepwarm and
+	// gvr-discovered pass (~1,960 GETs and WARNs a day on krateo-057). A ref
+	// whose apiVersion does not parse keeps the old order: the fetch refuses it.
+	refGV, refGVErr := schema.ParseGroupVersion(ref.APIVersion)
+	if refGVErr != nil {
+		got := seedObjectsGetFn(ctx, ref)
+		if got.Err != nil {
+			return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
+		}
+		return fmt.Errorf("fetch RESTAction %s/%s: apiVersion %q: %w", ref.Namespace, ref.Name, ref.APIVersion, refGVErr)
 	}
-	if got.Unstructured == nil {
-		return fmt.Errorf("fetch RESTAction %s/%s: nil object", ref.Namespace, ref.Name)
-	}
-
 	// Compute the per-user dispatcher key — IDENTICAL shape to
 	// restactions.go:117. ctx already carries the cohort's UserInfo, so
 	// dispatchCacheLookupKey reads it and hashes Username + Groups into
 	// the key.
 	key, handle, inputs := dispatchCacheLookupKey(ctx, "restactions",
-		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
-		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		refGV.Group, refGV.Version, ref.Resource,
+		ref.Namespace, ref.Name,
 		-1, -1, nil)
 	// Ship 0.30.188 — diagnostic slog: emit the seed-side cache key +
 	// its components so it can be diff'd against the dispatcher_get and
 	// per_user_fallback_put log lines at widgets.go / restactions.go.
 	emitDispatchCacheKeyDiag(seedDiagLogger(ctx), "seed", ctx,
 		key, inputs, "restactions",
-		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
-		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		refGV.Group, refGV.Version, ref.Resource,
+		ref.Namespace, ref.Name,
 		-1, -1, nil)
 	if handle == nil || key == "" {
 		// L1 disabled OR no identity on ctx — defensive skip. PIP's
@@ -1009,6 +1011,20 @@ func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, aut
 				"skipping the shared empty-identity cell Put (A4 populate-side guard)"),
 		)
 		return nil
+	}
+	got := seedObjectsGetFn(ctx, ref)
+	if got.Err != nil {
+		// #158 (design §1.3): preserve the typed status error so the call
+		// site's classifySeedErr sees 403 (RBAC deny) vs 5xx (operational)
+		// instead of an opaque string. statusErrFromResponse lifts the
+		// plumbing *response.Status back into an *apierrors.StatusError
+		// carrying Code+Reason. Wrapped with %w so the RESTAction identity
+		// is visible in logs while errors.As/Is still thread through to the
+		// embedded StatusError.
+		return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResult(got))
+	}
+	if got.Unstructured == nil {
+		return fmt.Errorf("fetch RESTAction %s/%s: nil object", ref.Namespace, ref.Name)
 	}
 
 	// Per-mode seed skip (F.4 boot fresh-skip + keepwarm c2 age-skip, single

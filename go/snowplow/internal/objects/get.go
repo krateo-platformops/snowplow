@@ -262,6 +262,49 @@ func informerOnlyMiss(ctx context.Context, ref templatesv1.ObjectReference) (res
 	return res
 }
 
+// preDialScopeFn resolves whether a GVR is namespaced, through the process-wide
+// ServiceAccount discovery singleton (shape metadata only), as #677's branch C
+// does. A seam only so the hermetic arms can answer without a cluster;
+// production never reassigns it.
+var preDialScopeFn = dynamic.SharedSAScopeForGVR
+
+// preDialGetDenied reports whether the ctx identity's `get` of (gvr, namespace,
+// name) is denied before any fetch (#1483). It is false, leaving the decision to
+// the dial and the post-fetch re-gate, when it cannot decide: a namespaced GVR
+// (or one whose scope cannot be read) referenced without a namespace is never
+// authorized cluster-wide, and a deny that coincides with an RBAC snapshot not
+// yet published is not trusted (#677's RC1 guard).
+func preDialGetDenied(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) bool {
+	if namespace == "" {
+		namespaced, err := preDialScopeFn(gvr)
+		if err != nil || namespaced {
+			return false
+		}
+	}
+	if authorizeGetOf(ctx, gvr, namespace, name) {
+		return false
+	}
+	return !rbacSnapshotUnpublished()
+}
+
+// rbacSnapshotUnpublished is #677's RC1 signal (internalDispatchRBACSnapshotUnpublished
+// in restactions/api): the RBAC snapshot the evaluator reads is not published
+// yet. With the cache off the evaluator asks the apiserver, so it never applies.
+func rbacSnapshotUnpublished() bool {
+	if cache.Disabled() {
+		return false
+	}
+	return cache.Global() == nil || cache.LiveRBACSnapshot() == nil
+}
+
+// regateForbidden is the 403 a ServiceAccount read re-gated and denied for the
+// ctx identity returns, decided before the dial or after the fetch: one body.
+func regateForbidden(gvr schema.GroupVersionResource, namespace, name string) *response.Status {
+	return response.New(http.StatusForbidden,
+		apierrors.NewForbidden(gvr.GroupResource(), name,
+			fmt.Errorf("user not authorized to get %s/%s", namespace, name)))
+}
+
 func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	log := xcontext.Logger(ctx)
 
@@ -292,6 +335,35 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	if err != nil {
 		log.ErrorContext(ctx, "unable to create kubernetes client config", slog.Any("err", err))
 		res.Err = response.New(http.StatusInternalServerError, err)
+		return
+	}
+
+	// #1483 — AUTHORIZE BEFORE THE DIAL, as #677 did for branch C. A ServiceAccount
+	// read for a narrowing identity (rbac.MustRegateSADial) is re-gated below
+	// with the `get` verdict for (identity, GVR, namespace, name), which does not
+	// depend on the object's content. So the verdict is known before the
+	// ServiceAccount fetches anything: a deny returns the same 403 the post-fetch
+	// re-gate returns, with no apiserver round trip. On krateo-057 the cohort
+	// seed fetched ~1,960 RESTActions a day only to discard them.
+	//
+	// Same fall-throughs as #677: the verdict is not decided here, and the dial
+	// and the post-fetch re-gate run as before, when the ref has no namespace for
+	// a GVR that is namespaced or whose scope cannot be read, and when the deny
+	// coincides with an RBAC snapshot not yet published (the RC1 guard).
+	if rbac.MustRegateSADial(ctx) && preDialGetDenied(ctx, res.GVR, ref.Namespace, ref.Name) {
+		log.WarnContext(ctx, "objects.getFromAPIServer: SA-credentialed fetch re-gated and DENIED for the ctx identity; failing closed",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", res.GVR.String()),
+			slog.String("namespace", ref.Namespace),
+			slog.String("name", ref.Name),
+			slog.String("decided", "before_dial"),
+			slog.String("sa_regate_origin", rbac.SARegateOrigin(ctx)),
+			slog.String("sa_regate_trigger", rbac.SARegateTrigger(ctx)),
+			slog.String("sa_regate_scope", rbac.SARegateScope(ctx)),
+			slog.String("key_hash", rbac.SARegateKeyHash(ctx)),
+		)
+		res.Err = regateForbidden(res.GVR, ref.Namespace, ref.Name)
+		res.PerIdentityDenied = true // #1476 — denied for the ctx identity
 		return
 	}
 
@@ -375,15 +447,14 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 			slog.String("gvr", res.GVR.String()),
 			slog.String("namespace", ref.Namespace),
 			slog.String("name", ref.Name),
+			slog.String("decided", "after_fetch"),
 			slog.String("sa_regate_origin", rbac.SARegateOrigin(ctx)),
 			slog.String("sa_regate_trigger", rbac.SARegateTrigger(ctx)),
 			slog.String("sa_regate_scope", rbac.SARegateScope(ctx)),
 			slog.String("key_hash", rbac.SARegateKeyHash(ctx)),
 		)
 		res.Unstructured = nil
-		res.Err = response.New(http.StatusForbidden,
-			apierrors.NewForbidden(res.GVR.GroupResource(), ref.Name,
-				fmt.Errorf("user not authorized to get %s/%s", ref.Namespace, ref.Name)))
+		res.Err = regateForbidden(res.GVR, ref.Namespace, ref.Name)
 		res.PerIdentityDenied = true // #1476 — denied for the ctx identity
 		return
 	}
