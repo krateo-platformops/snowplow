@@ -304,7 +304,7 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 // v1.84.0 → v1.85.0 (snowplow#1481): `git diff --stat` changes only dialguard/
 // and the Makefile; http/ is byte-identical.
 //
-// v1.85.0 → v1.88.0 (the crdgen bump, for core-provider 2.13.107): `git diff
+// v1.85.0 → v1.88.0 (snowplow#1504, for core-provider 2.13.107): `git diff
 // --stat` changes chartinspector/, compositionrbac/, crdgen/, helm/ and go.mod;
 // http/ has no change at all.
 const retryPolicyTranscribedFrom = "v1.88.0"

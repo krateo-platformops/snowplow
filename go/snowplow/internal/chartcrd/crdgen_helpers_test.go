@@ -90,7 +90,7 @@ const (
 	// only dialguard/ and the Makefile; crdgen/ and crdgen/schemas/ are
 	// byte-identical, so v1.85.0's crdgen is still v1.82.0's.
 	//
-	// v1.85.0 → v1.88.0 (snowplow#<this PR>): crdgen/ CHANGES; crdgen/schemas/
+	// v1.85.0 → v1.88.0 (snowplow#1504): crdgen/ CHANGES; crdgen/schemas/
 	// has no change at all (`git diff --stat v1.82.0 v1.88.0 -- crdgen
 	// crdgen/schemas` and the same from v1.85.0 list the same eight files, none
 	// under schemas/, because crdgen/ is identical between v1.82.0 and v1.85.0).

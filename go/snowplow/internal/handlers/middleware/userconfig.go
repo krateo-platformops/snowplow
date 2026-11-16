@@ -191,7 +191,7 @@ import (
 // only dialguard/ and the Makefile; every package this file transcribes is
 // byte-identical.
 //
-// v1.85.0 → v1.88.0 (the crdgen bump, for core-provider 2.13.107): `git diff
+// v1.85.0 → v1.88.0 (snowplow#1504, for core-provider 2.13.107): `git diff
 // --stat` of the two tags changes chartinspector/ and compositionrbac/ (new),
 // crdgen/, helm/ and go.mod; every package snowplow imports, this file's
 // included, has no change at all.
