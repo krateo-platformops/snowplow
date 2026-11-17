@@ -178,6 +178,12 @@ def settings(d: str, stated: dict) -> dict:
     return out
 
 
+def browser_logs(d: str) -> list[str]:
+    """#1508: `--browser-log F` for each browser driver log the run collected (run606 s_evaluate's glob): where
+    k6 logged which session's iteration threw, for a browser.js that recorded no session end."""
+    return [x for p in sorted(glob.glob(os.path.join(d, "driver-k6browser-*.log"))) for x in ("--browser-log", p)]
+
+
 def argv_for(d: str, s: dict) -> list[str]:
     """run606 s_evaluate's argv for run dir `d` with settings `s`."""
     files = [f for g in EVALUATE_GLOBS for f in sorted(glob.glob(os.path.join(d, g)))]
@@ -186,8 +192,12 @@ def argv_for(d: str, s: dict) -> list[str]:
     if s["driver"][0] == "k6":
         argv += ["--k6-out", os.path.join(d, "k6"), "--browser-out", os.path.join(d, "browser"),
                  "--browser-sessions", str(s["browser_sessions"][0]), *([] if s["viewers"][0] else ["--no-viewers"])]
+        argv += browser_logs(d)
+    # #1422: a run with a settle step left settle.json; one from before it had none to judge
+    settle = os.path.join(d, "settle.json")
     argv += ["--tracing", os.path.join(d, "tracing.json"), "--cluster-operations",
-             os.path.join(d, "cluster-operations.json"), "--snowplow-env", os.path.join(d, "snowplow-env.json"),
+             os.path.join(d, "cluster-operations.json"), *(["--settle", settle] if os.path.exists(settle) else []),
+             "--snowplow-env", os.path.join(d, "snowplow-env.json"),
              "--apf", os.path.join(d, "apf.jsonl.gz")]
     if s["frontend"][0] != "none":
         tag, dig = s["frontend"][0]
@@ -222,6 +232,12 @@ def main(argv: list[str] | None = None) -> int:
         with open(rec) as fh:
             ev = ["evaluate", *(x.replace("{OUT}", d) for x in json.load(fh))]
         used = {"argv": {"value": "evaluate-argv.json", "source": "the run's own record of its evaluate argv"}}
+        if "--browser-out" in ev and "--browser-log" not in ev and browser_logs(d):
+            # a run recorded before #1508 passed no browser log; the run collected it
+            ev += browser_logs(d)
+            used["browser_log"] = {"value": [os.path.basename(p) for p in browser_logs(d)[1::2]],
+                                   "source": "the run's collected driver-k6browser-*.log (#1508; its recorded argv "
+                                             "predates the flag)"}
     else:
         stated = {"driver": a.driver, "expect_digest": a.expect_digest,
                   "frontend": ("none" if a.no_frontend else (a.frontend_tag, a.expect_frontend_digest)

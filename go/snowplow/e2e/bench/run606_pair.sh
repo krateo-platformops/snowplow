@@ -440,6 +440,16 @@ compared() {
   return 1
 }
 all_exited() { local x rc; for x in "${LABELS[@]}"; do rc="RC_$x"; [[ -n "${!rc}" ]] || return 1; done; return 0; }
+# settle_invalid <label> (#1422): a run whose control plane did not settle before its measure ends there, INVALID by
+# environment, with its verdict.json (not measured): said so, by its own reason, never as a tooling failure
+settle_invalid() {
+  local out="OUT_$1"
+  python3 -c 'import json, sys
+v = json.load(open(sys.argv[1]))
+r = [x for x in v.get("invalid_reasons") or [] if x.startswith("environment.control_plane_settled:")]
+sys.exit(1) if v.get("verdict") != "INVALID" or not r else print("is INVALID by environment, not measured (" + r[0] + ")")' \
+    "${!out}/verdict.json" 2>/dev/null
+}
 # bash 3.2 (macOS) has no `wait -n`: poll; a run that FAILED as tooling stops each run left in no comparable pair
 while ! all_exited; do
   for x in "${LABELS[@]}"; do
@@ -458,7 +468,7 @@ while ! all_exited; do
           compared "$y" && continue
           # a PAIR STOP (USR1), not a TERM: its measurement stops and its teardown, diagnostics
           # and disk backstop run in full (run 17 attempt 4: the TERM reached B's teardown)
-          log "run $x failed as tooling: stopping run $y (every pair it is in has lost a run, so its cluster feeds no comparison): its measurement stops, its teardown runs in full"
+          log "run $x $(settle_invalid "$x" || echo 'failed as tooling'): stopping run $y (every pair it is in has lost a run, so its cluster feeds no comparison): its measurement stops, its teardown runs in full"
           printf -v "$ost" '%s' 1
           kill -USR1 "${!opid}" 2>/dev/null || true
         done

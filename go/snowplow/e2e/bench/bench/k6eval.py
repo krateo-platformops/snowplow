@@ -74,7 +74,9 @@ _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          # the browser's completed requests: the pair's customer witness reads them
          "browser_http_req_duration", "browser_http_req_failed",
          "browser_call_ms", "browser_request_incomplete_ms", "browser_request_failed_start_unseen",
-         "browser_fresh_class")
+         "browser_fresh_class",
+         # #1508: one per browser session, how it ended (early yes/no, its cause)
+         "browser_session_end")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 # the points whose time is kept too (out["times"], index-aligned with
 # out["points"]): run 12 compares latency inside / outside the CPU profiles;
@@ -588,12 +590,160 @@ def browser_navs(o: dict | None) -> list[dict]:
     # each load's start is its own t0 tag (epoch ms: the page's performance.timeOrigin + navT0, or
     # the driver's clock just before the action for a load that never settled): never the point's
     # time minus its wall time, which lands a QUIET_MS and more after the load (#1043 review B1)
+    # #1508: a load past its bound is no longer censored at it: `completed` True (wall_ms is how long it really
+    # took; `bound_ms` the bound it went past) or False (it never completed while the session watched it, up to
+    # the drive's end or until the page's context went; wall_ms is how long it was watched, `cause` why it
+    # ended). None: not recorded (a browser.js before #1508 stopped watching at the bound and wrote the bound)
     return [{"kind": "nav", "nav": t.get("method"), "page": t.get("route"),
-             "session": t.get("session"), "wall_ms": round(v, 1),
+             "session": t.get("session"), "class": t.get("class"), "wall_ms": round(v, 1),
              "visit": 1 if t.get("visit") == "first" else 2, "calls": 0, "errors": 0,
              "timeout": t.get("timeout") == "yes", "t0": t.get("t0"), "skeleton": t.get("skeleton"),
+             "completed": {"yes": True, "no": False}.get(t.get("completed")),
+             "bound_ms": int(t["bound"]) if str(t.get("bound") or "").isdigit() else None,
+             "cause": t.get("cause"),
              **({"start": int(t["t0"]) / 1000} if str(t.get("t0") or "").isdigit() else {})}
             for v, t in o["points"].get("browser_page_load_ms", [])]
+
+
+# ─── #1508: sign-in failures and sessions that ended early ──────────────────
+
+SIGNIN_METHOD = "login"          # browser.js tags a class's sign-in arrival (its first load) method=login
+
+
+def outcome_kind(n: dict) -> str:
+    """A load past its bound: "completed late", "never completed" or "censored at its bound" (before #1508)."""
+    return {True: "completed late", False: "never completed"}.get(n.get("completed"), "censored at its bound")
+
+
+def load_outcome(n: dict) -> str:
+    """How a load past its bound ended, in words: its real time, never completed, or censored (not known)."""
+    w, b = n.get("wall_ms"), n.get("bound_ms")
+    if n.get("completed") is True:
+        return f"completed after {w:.0f} ms" + (f", {w - b:.0f} ms past its {b} ms bound" if b is not None else "")
+    if n.get("completed") is False:
+        return f"never completed (watched {w:.0f} ms)" + (f": {n['cause']}" if n.get("cause") else "")
+    return (f"stopped at its bound ({w:.0f} ms): how long it really took was not recorded (a browser.js before "
+            f"#1508 stopped watching there)")
+
+
+def split_after_failed_signin(navs: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    """(the page loads judged, the sign-in failures among them, the navigations dropped).
+
+    A sign-in failure is a class's sign-in arrival (method login) past its bound. When it is not known to have
+    completed (it never did, or a browser.js before #1508 stopped watching at the bound), the context never
+    signed in: that class's later navigations (same session and identity class, from the sign-in's start on)
+    are dropped, not page loads of a signed-in user and never page timeouts (run 27c N2: s2's class 2, 10
+    navigations of an unsigned context, each 'timed out' by construction). browser.js from #1508 runs none."""
+    failed: dict[tuple, float] = {}
+    for n in navs:
+        if n.get("nav") == SIGNIN_METHOD and n.get("timeout") and n.get("completed") is not True:
+            k = (n.get("session"), n.get("class"))
+            failed[k] = min(failed.get(k, float("inf")), n.get("start", float("-inf")))
+    kept, dropped = [], []
+    for n in navs:
+        k = (n.get("session"), n.get("class"))
+        if k in failed and n.get("nav") != SIGNIN_METHOD and n.get("start", float("inf")) >= failed[k]:
+            dropped.append(n)
+        else:
+            kept.append(n)
+    return kept, [n for n in kept if n.get("nav") == SIGNIN_METHOD and n.get("timeout")], dropped
+
+
+def signin_failure_check(failures: list[dict], dropped: list[dict]) -> dict:
+    """browser.signin_failures: each sign-in past its bound, once, with how it ended (FAIL: a user who could not
+    sign in had the worst page load there is)."""
+    out = {"check": "browser.signin_failures", "value": len(failures), "bar": "== 0",
+           "result": "PASS" if not failures else "FAIL",
+           "dropped_navigations": len(dropped)}
+    if failures:
+        out["why"] = ("a real-browser sign-in did not complete within its bound: "
+                      + "; ".join(f"session {n.get('session')} class {n.get('class')}: {load_outcome(n)}"
+                                  for n in failures)
+                      + (f" ({len(dropped)} later navigation(s) of a context that never signed in were not page "
+                         f"loads, and are not counted)" if dropped else ""))
+    return out
+
+
+_UNCAUGHT = re.compile(r'level=error msg="Uncaught \(in promise\) ((?:[^"\\]|\\.)*)"')
+_SESSION_OF = re.compile(r"^(?:Error: )?session (\S+?): (.*)$", re.S)
+
+
+def _log_ends(paths: list[str]) -> tuple[list[dict], str]:
+    """(each uncaught error k6 logged for a browser iteration, as {session, cause}; "" or why unread)."""
+    from bench.identity import redact_identity
+    out = []
+    for p in paths:
+        try:
+            with open(p, errors="replace") as fh:
+                text = fh.read()
+        except OSError as e:
+            return [], f"the browser driver's log {os.path.basename(p)} could not be read ({e.strerror})"
+        for m in _UNCAUGHT.finditer(text):
+            msg = m.group(1).replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t").split("\n", 1)[0]
+            s = _SESSION_OF.match(msg)
+            out.append({"session": s.group(1) if s else None,
+                        "cause": redact_identity((s.group(2) if s else msg).strip())[:300]})
+    return out, ""
+
+
+def session_ends(o: dict | None, declared: int | None, logs: list[str] | None = None) -> dict:
+    """#1508: which declared real-browser sessions ran to the drive's end, and each that ended early, with its
+    cause. From browser.js's own browser_session_end points (from #1508: one per session, `early` and `cause`);
+    for a stream without any (a browser.js before #1508), from the uncaught errors k6 logged for the browser's
+    iterations (`logs`, driver-k6browser-*.log): an error naming no session is a session lost all the same.
+    state UNKNOWN: neither (no evidence a session did not end early is ever 'none ended early')."""
+    summ = (o or {}).get("summary") or {}
+    names = summ.get("sessions") if isinstance(summ.get("sessions"), list) else None
+    n_declared = declared if declared is not None else (len(names) if names is not None else None)
+    out: dict = {"declared": n_declared, "names": names, "lost": [], "source": None, "state": "READ", "why": None}
+    pts = ((o or {}).get("points") or {}).get("browser_session_end", [])
+    if o is None:
+        return dict(out, state="UNKNOWN", why="the browser left no output")
+    if pts:
+        out["source"] = "browser.js's browser_session_end points"
+        ended = {}
+        for _, t in pts:
+            ended.setdefault(t.get("session"), t)
+        for name in names or sorted(ended):
+            t = ended.get(name)
+            if t is None:
+                out["lost"].append({"session": name, "cause": "no end recorded: its iteration never finished "
+                                                               "(k6 stopped it, or the stream is cut)"})
+            elif t.get("early") == "yes":
+                out["lost"].append({"session": name, "cause": t.get("cause") or "not said",
+                                    "class": t.get("class")})
+        if names is None and n_declared is not None and len(ended) < n_declared:
+            out["lost"].append({"session": None, "cause": f"{n_declared - len(ended)} declared session(s) recorded "
+                                                          f"no end"})
+        return out
+    if not logs:
+        return dict(out, state="UNKNOWN",
+                    why="the browser recorded no session end (a browser.js before #1508) and no browser driver log "
+                        "was given: whether a session ended early is unknown")
+    ends, why = _log_ends(logs)
+    if why:
+        return dict(out, state="UNKNOWN", why=why)
+    out["source"] = "the uncaught errors k6 logged (" + ", ".join(os.path.basename(p) for p in logs) + ")"
+    out["lost"] = ends
+    return out
+
+
+def sessions_check(ends: dict, loads: int | None = None) -> dict:
+    """environment.browser_sessions: every declared session ran to the drive's end, or the arm is INVALID by
+    environment, each lost session named with its cause (the arm drove fewer sessions than declared)."""
+    base = {"check": "environment.browser_sessions", "bar": "every declared browser session runs to the drive's end"}
+    if ends.get("state") != "READ":
+        return dict(base, value=None, result="FAIL", why="INVALID by environment (undecided): " + str(ends.get("why")))
+    lost = ends.get("lost") or []
+    if not lost:
+        return dict(base, value=0, result="PASS", source=ends.get("source"))
+    n = ends.get("declared")
+    return dict(base, value=len(lost), result="FAIL", lost=lost, source=ends.get("source"),
+                why=(f"INVALID by environment: {len(lost)}" + (f" of {n}" if n else "")
+                     + " declared real-browser session(s) ended before the drive's end: "
+                     + "; ".join(f"{x.get('session') or '(session not named)'}: {x.get('cause')}" for x in lost)
+                     + (f": the arm drove {max(0, n - len(lost))} of {n} sessions to the end" if n else "")
+                     + (f" ({loads} page loads)" if loads is not None else "")))
 
 
 BURST_KINDS = ("first_load", "composite_first_load")

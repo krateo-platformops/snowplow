@@ -377,9 +377,10 @@ _POOL = """      restartPolicy: Never
 
 def render_k6(*, config: dict, authn_url: str, password: str, linger_s: float,
               user_prefix: str = "scaleuser-", cpu: str = K6_CPU,
-              memory: str = K6_MEMORY) -> str:
+              memory: str = K6_MEMORY, name: str = "k6load", configmap: str = "k6") -> str:
     """ConfigMap k6 (scripts + config) + the k6load Job. Uses the load606
-    ConfigMap load606_job.render() creates (the login initContainer)."""
+    ConfigMap load606_job.render() creates (the login initContainer).
+    `name` / `configmap`: another Job of the same load (#1422's warm-up, k6warm)."""
     scripts = {"spa.js": (K6_DIR / "spa.js").read_text(),
                "navigate.js": (K6_DIR / "navigate.js").read_text(),
                "config.json": json.dumps(config, indent=1)}
@@ -424,18 +425,18 @@ def render_k6(*, config: dict, authn_url: str, password: str, linger_s: float,
           readOnly: true
         - name: out
           mountPath: /out""" if viewers else ""
-    return _configmap("k6", scripts) + f"""---
+    return _configmap(configmap, scripts) + f"""---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: k6load
+  name: {name}
   namespace: bench-loadgen
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: k6load
+        app: {name}
       annotations:
         # collect's `kubectl exec cat /out/done` / `cp` reach k6's container
         kubectl.kubernetes.io/default-container: k6
@@ -501,7 +502,7 @@ spec:
           name: load606
       - name: k6
         configMap:
-          name: k6
+          name: {configmap}
       - name: work
         emptyDir: {{}}
       - name: feed

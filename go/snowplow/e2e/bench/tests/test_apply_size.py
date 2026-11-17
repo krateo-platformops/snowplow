@@ -129,6 +129,7 @@ def test_run606_applies_everything_through_one_server_side_apply():
                      'kapply "$mf"',
                      'kapply "$OUT/fresh-classes.yaml" >/dev/null 2>"$KERR" || record_failure "fresh classes FAILED: applying their manifest"',
                      'kapply "$OUT/menu-classes.yaml" >/dev/null 2>"$KERR" \\',
+                     'kapply "$mf"',          # #1422: the warm-up Job (settle)
                      'kapply "$OUT/loadgen-job.yaml"',
                      'kapply "$mf"',
                      'kapply "$f" >/dev/null 2>"$f.err" && { rm -f "$f.err"; return 0; }',

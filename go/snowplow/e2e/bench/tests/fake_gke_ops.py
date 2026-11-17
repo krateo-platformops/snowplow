@@ -37,6 +37,7 @@ Where each shape comes from:
 Knobs (environment):
   FAKE_OPERATIONS_EXTRA      a JSON list of Operation objects the region also lists (operation())
   FAKE_GKE_RESIZES           GKE starts a RESIZE_CLUSTER of a cluster 1 s after its create, still running
+  FAKE_OPS_AGO_S             every operation the fake records is stamped this many seconds in the past
   FAKE_OPERATIONS_RC         the listing exits with this code and gcloud's error text
   FAKE_OPERATIONS_KILLED_RC  the listing prints its list and exits with this code, saying nothing (a gcloud
                              that was killed: 143, or timeout(1)'s 124)
@@ -110,7 +111,9 @@ def ops_note(state: str, kind: str, a: list[str]) -> None:
     cluster = _opt(a, "--cluster") if pool else a[3]
     region = _opt(a, "--region") or _opt(a, "--location") or "europe-west4"
     path = Path(state) / "operations.json"
-    now = time.time()
+    # FAKE_OPS_AGO_S: GKE stamps every operation this long before the call (a run's cluster was made and set up
+    # an hour before its settle step; the fake run takes seconds)
+    now = time.time() - float(os.environ.get("FAKE_OPS_AGO_S") or 0)
     ops = _load(path, [])
     ops.append(operation(kind, cluster, start=now, end=now + 0.5, pool=pool, region=region))
     if kind == "CREATE_CLUSTER" and os.environ.get("FAKE_GKE_RESIZES"):

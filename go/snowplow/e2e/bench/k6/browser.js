@@ -30,8 +30,8 @@ import exec from 'k6/execution'
 import http from 'k6/http'
 import { Counter, Trend } from 'k6/metrics'
 import {
-  LOGIN, OBSERVER, QUIET_MS, callOps, freshClassTags, loadOf, loadStart, recordOps, requestLedger, settledNow,
-  signinBoundMs, switchDue,
+  LOGIN, OBSERVER, QUIET_MS, callOps, freshClassTags, loadOf, loadStart, recordOps, requestLedger, sessionEndTags,
+  settledNow, signinBoundMs, switchDue, watchCause,
 } from './pageload.js'
 
 const CFG = JSON.parse(open(__ENV.BROWSER_CONFIG || '/opt/k6/browser-config.json'))
@@ -73,6 +73,10 @@ const UNSEEN = new Counter('browser_request_failed_start_unseen')
 // #935: one point per fresh identity class: snowplow's learned-class counters
 // around its sign-in (the proof it was cold) and the clock before it
 const FRESH = new Counter('browser_fresh_class')
+// #1508: one point per session when its iteration ends (pageload.sessionEndTags): whether it ended before the
+// drive's end, and why. Run 27c N2 lost 2 of 5 sessions to an uncaught login-form error and the verdict never
+// said so: evaluate makes an arm whose session ended early INVALID by environment, naming it
+const SESSION_END = new Counter('browser_session_end')
 const LEDGER_METRICS = { browser_request_incomplete_ms: INCOMPLETE, browser_request_failed_start_unseen: UNSEEN }
 
 export const options = {
@@ -94,6 +98,7 @@ export const options = {
     bench_frame: ['count>=0'],
     browser_request_failed_start_unseen: ['count>=0'],
     browser_fresh_class: ['count>=0'],
+    browser_session_end: ['count>=0'],
     // the only threshold that can fail: see SIGNIN_BOUND_MS
     browser_first_signins: [{ threshold: 'count>0', abortOnFail: true, delayAbortEval: `${Math.ceil(SIGNIN_BOUND_MS / 1000)}s` }],
   },
@@ -112,39 +117,50 @@ async function markStart (page) {
   })
 }
 
-// Wait until the route is loaded (pageload.settledNow, run in the page);
-// returns pageload.loadOf's record, or null on timeout.
-// The sign-in arrival may wait for authn first: its timeout adds
+// Wait until the route is loaded (pageload.settledNow, run in the page).
+// The sign-in arrival may wait for authn first: its bound adds
 // signinTimeoutMs (the page itself still gets pageTimeoutMs).
-async function settled (page, path) {
+// #1508: the load is watched PAST its bound, until it settles or the drive
+// ends (`deadline`), so a load past the bound is recorded with how long it
+// really took, or as never completed with why the watch ended; never
+// censored at the bound. Returns { load: pageload.loadOf's record or null,
+// bound, ms: from this call to the moment it settled or the watch ended,
+// cause: why it never settled (null when it did) }.
+async function settled (page, path, deadline, secrets) {
   const arg = JSON.stringify({ path, quiet: CFG.quietMs || QUIET_MS })
-  const timeout = CFG.pageTimeoutMs + (path ? 0 : (CFG.signinTimeoutMs || 60000))
+  const bound = CFG.pageTimeoutMs + (path ? 0 : (CFG.signinTimeoutMs || 60000))
+  const from = Date.now()
+  const watch = Math.max(bound, deadline - from)
   try {
     await page.waitForFunction(
       `(${settledNow.toString()})(window.__bench, window.location.pathname, performance.now(), ${arg})`,
-      { polling: 50, timeout })
+      { polling: 50, timeout: watch })
   } catch (e) {
-    console.warn(`page did not settle (${path || 'sign-in'}): ${e}`)
-    return null
+    const ms = Date.now() - from
+    console.warn(`page did not settle (${path || 'sign-in'}) within ${ms} ms (its bound ${bound} ms): ${e}`)
+    return { load: null, bound, ms, cause: watchCause(e, ms, secrets) }
   }
+  const ms = Date.now() - from
+  if (ms > bound) console.warn(`page settled (${path || 'sign-in'}) after ${ms} ms, past its bound of ${bound} ms`)
   // page.evaluate takes only a function: run loadOf's source as an
   // expression (waitForFunction), keep its value on window, read it back
   await page.waitForFunction(
     `(window.__benchLoad = (${loadOf.toString()})(window.__bench, window.location.pathname, ` +
     `Array.from(document.querySelectorAll('[data-testid^="widget-"]')).map((e) => e.getAttribute('data-testid'))), true)`,
     { polling: 'raf', timeout: LOAD_READ_MS })
-  return await page.evaluate(() => window.__benchLoad)
+  return { load: await page.evaluate(() => window.__benchLoad), bound, ms, cause: null }
 }
 
-// `actionAt`: the driver's clock (epoch ms) just before the action, the start of a load that never
-// settled (a settled load carries the page's own start)
+// `res`: settled()'s answer. `actionAt`: the driver's clock (epoch ms) just before the action, the start of a
+// load that never settled (a settled load carries the page's own start)
 // #1089: the load's id rides on its own points' metadata (load_id), set for
 // these synchronous adds only
-function record (r, tags, actionAt, loadId) {
+function record (res, tags, actionAt, loadId) {
   const md = exec.vu.metrics.metadata
   md.load_id = loadId
   try {
-    for (const [metric, value, t] of recordOps(r, tags, CFG.pageTimeoutMs, actionAt)) METRICS[metric].add(value, t)
+    const watch = { ms: res.ms, cause: res.cause }
+    for (const [metric, value, t] of recordOps(res.load, tags, res.bound, actionAt, watch)) METRICS[metric].add(value, t)
   } finally {
     delete md.load_id
   }
@@ -273,13 +289,33 @@ export default async function () {
   // FRESH class (bench/fresh_classes.py); one browser context each, like a
   // new person: its own sign-in, its own app cache, its own first visits
   const users = [s.user].concat(s.fresh || [])
+  const secrets = users.concat([CFG.password])
   let token = null
-  for (let k = 0; k < users.length && Date.now() < deadline; k++) {
-    token = await runClass(s, users[k], k, k === users.length - 1, deadline, token)
+  let k = 0
+  let failed = null          // why the last class's sign-in never completed (#1508), null when it did
+  try {
+    for (; k < users.length && Date.now() < deadline; k++) {
+      const res = await runClass(s, users[k], k, k === users.length - 1, deadline, token, secrets)
+      token = res.token
+      failed = res.signinFailed
+    }
+  } catch (e) {
+    // #1508: the session ends here (k6 logs the error as uncaught): said with its cause, never silently
+    SESSION_END.add(1, sessionEndTags(s.name, k, true, e, secrets))
+    throw e
   }
+  const early = Date.now() < deadline
+  const last = Math.max(0, k - 1)
+  SESSION_END.add(1, sessionEndTags(s.name, last, early, !early ? 'the drive is over'
+    : failed ? `class ${last}'s sign-in never completed (${failed}), and no identity class is left`
+      : 'no identity class left before the drive\'s end', secrets))
 }
 
-async function runClass (s, user, k, last, deadline, prevToken) {
+// One identity class: its own context, its sign-in, then its navigations. Returns { token, signinFailed }:
+// #1508: a sign-in that never completed signed nobody in, so the class's navigations are not run (they
+// would each 'time out' by construction: run 27c N2's s2); signinFailed says why, and the session goes on
+// with its next class
+async function runClass (s, user, k, last, deadline, prevToken, secrets) {
   const context = await browser.newContext()
   await context.addInitScript(OBSERVER)
   const page = await context.newPage()
@@ -287,6 +323,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
   const base = { session: s.name, class: String(k), identity: k === 0 ? 'initial' : 'fresh' }
   let shown = '(none)'     // the route on screen: tags the calls made between loads
   let token = prevToken
+  let signinFailed = null
   // #919 (N7): every request the page makes, until it finishes or fails
   // (k6 emits nothing for a request that failed at network level)
   const ledger = requestLedger()
@@ -311,7 +348,8 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       await page.locator(LOGIN.password).fill(CFG.password, opts)
     } catch (e) {
       // named, and without the identity (k6's error quotes the value it was filling): the
-      // session ends here, as an uncaught error carrying this message only
+      // session ends here; default() records it with this message (browser_session_end, #1508)
+      // and k6 logs it as uncaught
       throw new Error(`session ${s.name}: the login form ${LOGIN.form} (${LOGIN.username}, ${LOGIN.password}) ` +
         `could not be filled: ${String(e).split(user).join('<user>').split(CFG.password).join('<password>')}`)
     }
@@ -335,7 +373,8 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       throw new Error(`session ${s.name}: the ${LOGIN.submit} control of ${LOGIN.form} could not be clicked: ` +
         `${String(e).split(user).join('<user>').split(CFG.password).join('<password>')}`)
     }
-    const first = await settled(page, null)
+    const arrival = await settled(page, null, deadline, secrets)
+    const first = arrival.load
     const landed = first === null ? '(none)' : first.path
     if (first !== null) {
       LOGINS.add(1, { session: s.name })
@@ -343,9 +382,14 @@ async function runClass (s, user, k, last, deadline, prevToken) {
       const signin = await page.evaluate(() => window.__bench.signinMs)
       if (signin !== null) SIGNIN.add(signin, { session: s.name })
     }
-    record(first, Object.assign({ route: landed, visit: 'first', method: 'login' }, base), loginAt, firstId)
+    record(arrival, Object.assign({ route: landed, visit: 'first', method: 'login' }, base), loginAt, firstId)
     await drainCalls(page, Object.assign({ route: landed, visit: 'first', during: 'load' }, base),
       loadStart(first, loginAt), firstId)
+    if (first === null) {
+      // #1508: reported once (the login load above, timed out with its cause); nothing of this class runs on
+      signinFailed = arrival.cause
+      return { token, signinFailed }
+    }
     token = (await tokenOf(page)) || prevToken
     if (k > 0) {
       const after = learnedCounts(token)
@@ -375,9 +419,10 @@ async function runClass (s, user, k, last, deadline, prevToken) {
           window.dispatchEvent(new PopStateEvent('popstate'))
         }, route)
       }
-      const r = await settled(page, route)
+      const res = await settled(page, route, deadline, secrets)
+      const r = res.load
       const visit = visits[route] ? 'warm' : 'first'
-      record(r, Object.assign({ route, visit, method }, base), actionAt, loadId)
+      record(res, Object.assign({ route, visit, method }, base), actionAt, loadId)
       await drainCalls(page, Object.assign({ route, visit, during: 'load' }, base), loadStart(r, actionAt), loadId)
       visits[route] = (visits[route] || 0) + 1
       shown = route
@@ -395,7 +440,7 @@ async function runClass (s, user, k, last, deadline, prevToken) {
     await page.close()
     await context.close()
   }
-  return token
+  return { token, signinFailed }
 }
 
 export function setup () { FRAME.add(1, { frame: 'start' }) }
@@ -404,7 +449,7 @@ export function teardown () { FRAME.add(1, { frame: 'end' }) }
 export function handleSummary (data) {
   const keep = {}
   for (const [name, m] of Object.entries(data.metrics)) {
-    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_states|browser_page_timeouts|browser_logins|browser_signin_ms|browser_sse_opened|browser_call_ms|browser_request_incomplete_ms|browser_request_failed_start_unseen|browser_fresh_class|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
+    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_states|browser_page_timeouts|browser_logins|browser_signin_ms|browser_sse_opened|browser_call_ms|browser_request_incomplete_ms|browser_request_failed_start_unseen|browser_fresh_class|browser_session_end|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
   }
   return { [__ENV.SUMMARY_FILE || '/out/browser-summary.json']: JSON.stringify({
     kind: 'browser_summary', sessions: CFG.sessions.map((x) => x.name),
