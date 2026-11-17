@@ -436,8 +436,10 @@ def test_the_launch_is_refused_before_anything_starts(pairbed, over, refusal):  
 
 
 def test_the_launcher_gives_each_run_its_declaration_and_its_label(pairbed):  # noqa: F811
-    src = (BENCH / "run606_pair.sh").read_text()
-    assert 'RUNENV+=(SNOWPLOW_ENV="${!se:-}" BENCH_ARM="$1")' in src
+    # runenv lives once, in run606_arm.sh, which every launcher of arms sources (run606_pair.sh, run606_single.sh)
+    assert 'RUNENV+=(SNOWPLOW_ENV="${!se:-}" BENCH_ARM="$1")' in (BENCH / "run606_arm.sh").read_text()
+    for launcher in ("run606_pair.sh", "run606_single.sh"):
+        assert 'source "$HERE/run606_arm.sh"' in (BENCH / launcher).read_text()
 
 
 # ─── the pair's one line ────────────────────────────────────────────────────
