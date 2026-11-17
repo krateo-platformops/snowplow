@@ -3978,6 +3978,8 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
     (#1043 review B2) is missing: those outcomes can then not be told the
     browser's from snowplow's, and evaluate() makes them INCONCLUSIVE:
     missing evidence is never a pass."""
+    from collections import Counter
+
     from bench import k6eval             # operator side only (this file also runs alone in Job pods)
     name = "browser.cpu_starvation"
     missing = [w for w, ok in (("its cgroup CPU pressure (cpu.pressure)", st["pressure"]),
@@ -3999,15 +4001,27 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
     uncovered = sum(1 for n in navs if n.get("start") is not None and not k6eval.covered(n["start"], n["wall_ms"], st))
     if uncovered and st["windows"]:
         missing.append(f"the stall of {uncovered} page load(s) outside the sampled windows")
-    value = {"stall_share": st["stall_share"], "saturated_windows": st["saturated_windows"],
+    # the owner's ruling (2026-11-17, "Measure it precisely"): with per-renderer evidence each load is charged only
+    # its own renderer's stall; a load whose renderer is not known is UNKNOWN, never the container's bound
+    rule = st.get("rule") or k6eval.RULE_CONTAINER
+    per_load: list[float] | None = None
+    if rule == k6eval.RULE_RENDERER:
+        got = [k6eval.renderer_delay_ms(n, st) for n in navs]
+        why_unknown = Counter(w for d, w in got if d is None)
+        if why_unknown:
+            missing.append(f"the renderer of {sum(why_unknown.values())} page load(s) ("
+                           + "; ".join(f"{k}: {v}" for k, v in why_unknown.most_common()) + ")")
+        per_load = [d or 0.0 for d, _ in got]
+    value = {"rule": rule, "rule_text": k6eval.RULE_TEXT[rule],
+             "stall_share": st["stall_share"], "saturated_windows": st["saturated_windows"],
              "windows": len(st["windows"]), "node_cpus": st["node_cpus"]}
     if missing or not st["windows"]:
         return {"check": name, "value": value, "bar": "measured: no judged outcome decided by the stall",
                 "result": "UNMEASURED",
                 "why": "UNMEASURED: " + ("; ".join(missing) if missing else "no sample windows")
                        + " was not sampled: whether the load generator slowed a judged page is unknown "
-                         "(unmeasured, not 'not starved')"}
-    delays = [k6eval.possible_delay_ms(n["start"], n["wall_ms"], st) for n in navs]
+                         f"(unmeasured, not 'not starved'; rule: {rule})"}
+    delays = per_load if per_load is not None else [k6eval.possible_delay_ms(n["start"], n["wall_ms"], st) for n in navs]
     fastest = [dict(n, wall_ms=n["wall_ms"] - d) for n, d in zip(navs, delays)]
     shares = sorted(d / n["wall_ms"] for n, d in zip(navs, delays) if n["wall_ms"])
     value.update({"page_delay_ms_max": round(max(delays), 1) if delays else None,
@@ -4044,7 +4058,7 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
                         f"({', '.join(f'{as_seen[c]} as measured, {without[c]} without the stall' for c in decided)}): "
                         f"Chrome stalled {value['stall_share']:.2%} of the drive, the node had no idle CPU in "
                         f"{value['saturated_windows']} window(s); up to {value['page_delay_ms_max']} ms of a page load "
-                        f"may be the load generator's")}
+                        f"may be the load generator's (rule: {k6eval.RULE_TEXT[rule]})")}
     return {"check": name, "value": value, "bar": "no judged outcome decided by the stall", "result": "PASS"}
 
 

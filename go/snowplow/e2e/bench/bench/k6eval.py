@@ -166,11 +166,34 @@ def read_k6_out(d: str, name: str) -> dict | None:
         except (OSError, ValueError):
             pass
     out["cpu"] = {c: read_cpu(d, c) for c in ((name, "viewer") if name == "k6" else (name,))}
+    if name == "browser":
+        # 2026-11-17 ("Measure it precisely"): each renderer's run-queue wait, and which renderer renders each
+        # session's page (None: not recorded, a bench before it)
+        out["renderers"] = _jsonl(os.path.join(d, "browser-renderers.jsonl"))
+        out["renderer_map"] = _jsonl(os.path.join(d, "renderer-map.jsonl"))
     try:
         with open(os.path.join(d, f"{name}-forward.json")) as fh:
             out["forward"] = json.load(fh)   # the browser wrapper's wait for its forwards
     except (OSError, ValueError):
         out["forward"] = None
+    return out
+
+
+def _jsonl(path: str) -> list[dict] | None:
+    """The JSON object lines of `path` (a cut last line skipped); None when there is no such file."""
+    try:
+        with open(path, errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    out = []
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(r, dict):
+            out.append(r)
     return out
 
 
@@ -268,11 +291,85 @@ def starvation(o: dict | None, container: str = "browser") -> dict:
             w["node_busy_share"] = round(db / (db + di), 4) if db + di > 0 else None
         wins.append(w)
     span = sum(w["t1"] - w["t0"] for w in wins)
-    return {"container": container, "pressure": pressure, "node": node, "anchored": anchored,
+    rend = (renderer_state(o, off if anchored else None)
+            if container == "browser" and ((o or {}).get("renderers") is not None
+                                           or (o or {}).get("renderer_map") is not None) else None)
+    return {"rule": RULE_RENDERER if rend is not None else RULE_CONTAINER, "renderer": rend,
+            "container": container, "pressure": pressure, "node": node, "anchored": anchored,
             "end_anchored": a1 is not None, "clock_step_s": step,
             "slack_s": slack, "node_cpus": start.get("node_cpus"), "windows": wins,
             "stall_share": (round(sum(w["stall_s"] for w in wins) / span, 4) if pressure and span else None),
             "saturated_windows": (sum(1 for w in wins if w["saturated"]) if node else None)}
+
+
+#: the two rules a page load's possible delay is judged by (browser.cpu_starvation says which judged a run)
+RULE_RENDERER = "per renderer"
+RULE_CONTAINER = "container window"
+RULE_TEXT = {
+    RULE_RENDERER: ("per renderer (2026-11-17): each load charged its OWN renderer process's run-queue wait "
+                    "(/proc/<pid>/task/*/schedstat run_delay) between the samples that bracket it, the renderer named "
+                    "by Chrome's frame->process record (k6/renderers.js)"),
+    RULE_CONTAINER: ("container window (evidence without per-renderer data, before 2026-11-17): each 5 s window's "
+                     "whole browser-container cgroup stall charged to every load overlapping it"),
+}
+
+
+def renderer_state(o: dict | None, off: float | None) -> dict:
+    """The per-renderer evidence of one browser run: its renderer samples on the epoch (`off`: the CPU samples'
+    realtime - uptime offset; None: not anchored, nothing can be placed), each renderer pid's --user-data-dir, and
+    the renderer reads (k6/renderers.js) that named a pid."""
+    samples, udd = [], {}
+    for r in (o or {}).get("renderers") or []:
+        if r.get("kind") == "renderer_udd" and isinstance(r.get("pid"), int):
+            udd[r["pid"]] = r.get("udd")
+        elif r.get("kind") == "renderer" and isinstance(r.get("t"), (int, float)) and off is not None:
+            samples.append((float(r["t"]) + off, {int(p): int(v) for p, v in (r.get("rd") or {}).items()}))
+    samples.sort(key=lambda s: s[0])
+    maps = [m for m in (o or {}).get("renderer_map") or []
+            if m.get("kind") == "renderer_map" and isinstance(m.get("pid"), int) and m.get("session") is not None
+            and isinstance(m.get("t0"), (int, float)) and isinstance(m.get("t1"), (int, float))]
+    return {"samples": samples, "udd": udd, "maps": sorted(maps, key=lambda m: m["t0"]),
+            "anchored": off is not None, "recorded": {"renderers": (o or {}).get("renderers") is not None,
+                                                     "renderer_map": (o or {}).get("renderer_map") is not None}}
+
+
+def renderer_delay_ms(n: dict, st: dict) -> tuple[float | None, str]:
+    """(at most how much of page load `n` was its OWN renderer waiting for a CPU, "") or (None, why it is UNKNOWN).
+
+    Its renderer: the pid Chrome's frame->process record named for the load's session and identity class in a read
+    that ENDED before the load started and in one that STARTED after it ended, the same pid and page target in
+    both and in every read between them (a renderer that changed, or was not read on both sides, is not known), a
+    pid the renderer sampler saw under the --user-data-dir of the Chrome whose endpoint named it. Its stall: that
+    pid's run_delay between the last sample at or before the load's start and the first at or after its end (each
+    side widened by the anchor's error, st["slack_s"]), capped at the load's own time."""
+    r = st.get("renderer") or {}
+    if not r.get("anchored"):
+        return None, "the renderer samples have no wall-clock anchor"
+    if not (r.get("recorded") or {}).get("renderers"):
+        return None, "no renderer samples were recorded (browser-renderers.jsonl)"
+    if not (r.get("recorded") or {}).get("renderer_map"):
+        return None, "no renderer reads were recorded (renderer-map.jsonl)"
+    if n.get("start") is None:
+        return None, "the load has no start"
+    s0, s1 = n["start"], n["start"] + n["wall_ms"] / 1000
+    slack = st.get("slack_s") or 0.0
+    rows = [m for m in r["maps"] if (m["session"], m.get("class")) == (n.get("session"), n.get("class"))]
+    before = [m for m in rows if m["t1"] <= s0]
+    after = [m for m in rows if m["t0"] >= s1]
+    if not before or not after:
+        return None, "its renderer was not read both before and after it"
+    b, a = max(before, key=lambda m: m["t1"]), min(after, key=lambda m: m["t0"])
+    span = [m for m in rows if m["t0"] >= b["t0"] and m["t1"] <= a["t1"]]
+    if len({m["pid"] for m in span}) != 1 or len({m.get("target") for m in span}) != 1:
+        return None, "its renderer changed while it loaded"
+    pid = b["pid"]
+    if r["udd"].get(pid) != b.get("udd"):
+        return None, "the pid Chrome named is not a renderer the sampler saw under that Chrome's --user-data-dir"
+    lo = [rd[pid] for t, rd in r["samples"] if t <= s0 - slack and pid in rd]
+    hi = [rd[pid] for t, rd in r["samples"] if t >= s1 + slack and pid in rd]
+    if not lo or not hi:
+        return None, "no renderer sample brackets it"
+    return min(n["wall_ms"], max(0, hi[0] - lo[-1]) / 1e6), ""
 
 
 def possible_delay_ms(start: float, wall_ms: float, st: dict) -> float:

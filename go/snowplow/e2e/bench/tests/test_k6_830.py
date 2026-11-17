@@ -1610,7 +1610,7 @@ def test_cpu_sampler_runs_in_the_job_images(tmp_path, image):
 
 
 def _browser_pod_in_docker(tmp_path, *, origin_delay_s, wrapper=True, login_tries=6,
-                           origin_wait_s=60, origin=True):
+                           origin_wait_s=60, origin=True, duration_s=6):
     """The k6browser pod, emulated: the fixture SPA (the portal's origin)
     starts `origin_delay_s` late (run 11: Chrome navigated before what it
     loads the portal through answered); the browser container runs the
@@ -1622,12 +1622,12 @@ def _browser_pod_in_docker(tmp_path, *, origin_delay_s, wrapper=True, login_trie
     out.mkdir(mode=0o777)
     out.chmod(0o777)
     k6dir.mkdir()
-    for n in ("browser.js", "pageload.js"):
+    for n in ("browser.js", "pageload.js", "renderers.js"):
         shutil.copy(BENCH_DIR / "k6" / n, k6dir / n)
     sessions = [{"name": f"s{i}", "user": f"fixture-{i}", "offset": i} for i in (1, 2, 3)]
     cfg = k6_job.browser_config(sessions=[dict(s, cold=True) for s in sessions],
                                 routes=["/dashboard", "/compositions"], password="x",
-                                think_s=0.3, duration_s=6, page_timeout_ms=5000,
+                                think_s=0.3, duration_s=duration_s, page_timeout_ms=5000,
                                 frontend_url=f"http://{spa}:8080", snowplow_url=f"http://{spa}:8080",
                                 authn_url=f"http://{spa}:8080", debug_user="fixture-debug")
     cfg.update(loginTries=login_tries, loginRetryMs=2000, signinTimeoutMs=10000)

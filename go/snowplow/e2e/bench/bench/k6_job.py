@@ -328,6 +328,79 @@ sampler=$!
 """
 
 
+#: the renderer sampler's period (the owner's ruling of 2026-11-17, "Measure it precisely"): a load's stall is its
+#: own renderer's run-queue wait between the samples that bracket it, so the bracket's excess over the load is at
+#: most two periods of that renderer's own runnable time (an idle page's renderer is not runnable: it accrues none).
+#: 1 s: under the judged loads' bars (500 ms warm, 1000 ms cold) and one awk over /proc a second
+RENDERER_SAMPLE_S = 1
+#: how often renderers.js reads which renderer renders each session's page, the CPU windows' own period
+MAP_S = CPU_SAMPLE_S
+#: renderers.js waits for every session's Chrome (its DevToolsActivePort) at most this long: the browser's first
+#: navigation's retries (browser.js GOTO_TRIES x pageTimeout + waits) are well inside it; past it, it starts with
+#: the Chrome it found, and the sessions it does not watch have no renderer (their stall UNKNOWN)
+RENDERER_WAIT_S = 600
+
+
+def _renderer_sampler(sessions: int) -> str:
+    """POSIX sh (busybox, the k6 browser image): every RENDERER_SAMPLE_S, each Chrome renderer process's run-queue
+    wait, /proc/<pid>/task/*/schedstat field 2 (run_delay, ns, summed over the process's threads: the time they
+    were runnable and waited for a CPU), timed by /proc/uptime like the CPU samples (their cpu_start anchor places
+    both), into /out/browser-renderers.jsonl: {"kind": "renderer", "t", "rd": {pid: ns}}, and once per new pid its
+    Chrome's --user-data-dir ({"kind": "renderer_udd", "pid", "udd"}), which the evaluator matches against the
+    CDP endpoint that named it. And renderer_watch: once `sessions` Chrome (one per k6 VU) wrote DevToolsActivePort
+    (or RENDERER_WAIT_S passed), k6/renderers.js on their CDP endpoints, its lines into /out/renderer-map.jsonl."""
+    return f"""rsample() {{
+  # candidates: any process whose command line holds the text; a renderer is a Chromium whose arguments hold the
+  # WORD --type=renderer (this shell's own script holds the text too), decided once per pid and remembered either
+  # way. Chromium rewrites its command line into one space-joined string (read 2026-11-17, Chrome 152): its words
+  # are split on spaces, never on NULs
+  rs=""
+  for p in $(grep -la -- '--type=renderer' /proc/[0-9]*/cmdline 2>/dev/null | cut -d/ -f3); do
+    case " $rknown " in *" $p "*) rs="$rs $p"; continue ;; esac
+    case " $rnot " in *" $p "*) continue ;; esac
+    c=$( {{ tr '\\0' ' ' < /proc/$p/cmdline; }} 2>/dev/null)
+    w1=${{c%% *}}
+    case "$w1 | $c " in */chromium" | "*" --type=renderer "*|*/chrome" | "*" --type=renderer "*)
+      d=; for w in $c; do case "$w" in --user-data-dir=*) d=${{w#--user-data-dir=}}; break ;; esac; done
+      printf '{{"kind": "renderer_udd", "pid": %s, "udd": "%s"}}\\n' "$p" "$d" >> /out/browser-renderers.jsonl
+      rknown="$rknown $p"; rs="$rs $p" ;;
+    *) rnot="$rnot $p" ;;
+    esac
+  done
+  set -- $rs
+  [ $# -gt 0 ] || return 0
+  files=""
+  for p in "$@"; do for f in /proc/$p/task/*/schedstat; do [ -r "$f" ] && files="$files $f"; done; done
+  [ -n "$files" ] || return 0
+  read -r up _ < /proc/uptime
+  # shellcheck disable=SC2086
+  awk -v t="$up" 'FNR == 1 {{ split(FILENAME, a, "/"); p = a[3] }} {{ s[p] += $2 }}
+    END {{ o = ""; for (p in s) o = o (o == "" ? "" : ", ") "\\"" p "\\": " s[p];
+          printf "{{\\"kind\\": \\"renderer\\", \\"t\\": %s, \\"rd\\": {{%s}}}}\\n", t, o }}' \\
+    $files 2>/dev/null >> /out/browser-renderers.jsonl
+}}
+rknown=""; rnot=""
+rsampler_loop() {{ while :; do rsample; sleep {RENDERER_SAMPLE_S}; done; }}
+renderer_watch() {{
+  n=0; w=0
+  while [ "$w" -lt {RENDERER_WAIT_S} ]; do
+    n=$(ls /tmp/k6browser-data-*/DevToolsActivePort 2>/dev/null | wc -l)
+    [ "$n" -ge {sessions} ] && break
+    sleep 1; w=$((w + 1))
+  done
+  ts=""
+  for f in /tmp/k6browser-data-*/DevToolsActivePort; do
+    [ -r "$f" ] || continue
+    port=$(sed -n 1p "$f"); path=$(sed -n 2p "$f")
+    ts="$ts${{ts:+,}}{{\\"udd\\": \\"${{f%/DevToolsActivePort}}\\", \\"url\\": \\"ws://127.0.0.1:$port$path\\"}}"
+  done
+  printf '{{"kind": "renderer_watch", "browsers": %s, "of": {sessions}, "waited_s": %s}}\\n' "$n" "$w" > /out/renderer-watch.json
+  CDP_TARGETS="[$ts]" MAP_S={MAP_S} k6 run --quiet --log-format raw \\
+    --console-output /out/renderer-map.jsonl /opt/k6/renderers.js >/dev/null 2>/out/renderer-watch.err
+}}
+"""
+
+
 def _wrapper(cmd: str, prefix: str, linger_s: float, done: str = "/out/done",
              cpu: tuple[str, str | None] | None = None) -> str:
     """#818's discipline: run, record the exit code into the stream dir,
@@ -556,9 +629,16 @@ def render_browser(*, config: dict, linger_s: float,
     frontendUrl: the platform gateway, as on 057) once that origin answers."""
     files = {"browser.js": (K6_DIR / "browser.js").read_text(),
              "pageload.js": (K6_DIR / "pageload.js").read_text(),
+             "renderers.js": (K6_DIR / "renderers.js").read_text(),
              "browser-config.json": json.dumps(config, indent=1)}
-    run = (_origin_wait([config["frontendUrl"].rstrip("/") + "/"], origin_wait_s) + "wait_origin && "
-           "k6 run --quiet --out json=/out/browser.json.gz /opt/k6/browser.js")
+    # 2026-11-17 ("Measure it precisely"): each renderer's run-queue wait, and which renderer renders each session's
+    # page (renderers.js beside the browser run, stopped with it)
+    run = (_origin_wait([config["frontendUrl"].rstrip("/") + "/"], origin_wait_s)
+           + _renderer_sampler(len(config["sessions"]))
+           + "browser_run() {\n  rsampler_loop &\n  rsampler=$!\n  renderer_watch &\n  rw=$!\n"
+             "  k6 run --quiet --out json=/out/browser.json.gz /opt/k6/browser.js\n  r=$?\n"
+             "  pkill -P \"$rw\" 2>/dev/null; kill \"$rw\" \"$rsampler\" 2>/dev/null\n  return $r\n}\n"
+           + "wait_origin && browser_run")
     return _configmap("k6browser", files) + f"""---
 apiVersion: batch/v1
 kind: Job

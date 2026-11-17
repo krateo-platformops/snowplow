@@ -318,6 +318,9 @@ export default async function () {
 async function runClass (s, user, k, last, deadline, prevToken, secrets) {
   const context = await browser.newContext()
   await context.addInitScript(OBSERVER)
+  // 2026-11-17 ("Measure it precisely"): the page says whose it is, so renderers.js can name the renderer process
+  // that renders this session's page (Chrome's own frame -> process record) and charge each load its own stall
+  await context.addInitScript(`window.__benchSession = ${JSON.stringify({ session: s.name, class: String(k) })}`)
   const page = await context.newPage()
   const visits = {}
   const base = { session: s.name, class: String(k), identity: k === 0 ? 'initial' : 'fresh' }
