@@ -93,14 +93,14 @@ func leavingServer(t *testing.T, s *leavingScript, h2 bool) *httptest.Server {
 }
 
 // h2EndpointClient is a client built the way the stage fetch builds one:
-// client-go's transport, TLS to srv, the owned dialer (endpointDial).
+// NewEndpointTransport (client-go's TLS material, fields and wrappers; the
+// raced owned dialer for the connect and the TLS handshake).
 func h2EndpointClient(t *testing.T, srv *httptest.Server) *http.Client {
 	t.Helper()
 	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
-	rt, err := transport.New(&transport.Config{
-		TLS:        transport.TLSConfig{CAData: ca},
-		Proxy:      http.ProxyFromEnvironment,
-		DialHolder: EndpointDialHolder,
+	rt, err := NewEndpointTransport(&transport.Config{
+		TLS:   transport.TLSConfig{CAData: ca},
+		Proxy: http.ProxyFromEnvironment,
 	})
 	if err != nil {
 		t.Fatal(err)

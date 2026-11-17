@@ -32,10 +32,11 @@ import (
 
 // destinationExempt: (file, enclosing func, what) → reason. Each must still match.
 var destinationExempt = map[[3]string]string{
-	{"internal/credhttp/endpoint_clients.go", "endpointIdle", "http.DefaultTransport"}:                   "reads IdleConnTimeout, the value client-go's transports take from it. No dial.",
-	{"internal/credhttp/do.go", "do", "request.HTTPClientForEndpoint"}:                                   "/call (Do's body, #1334): plumbing's transport dials through dialguard (TestIssue1131_EveryDeniedSpellingIsRefused, plumbing chain).",
-	{"internal/credhttp/plumbing_clients.go", "PlumbingEndpointClient", "request.HTTPClientForEndpoint"}: "the plumbing branch of a stage fetch (restactions/api endpoints_tls.go), the same transport.",
-	{"internal/browserbridge/bridge.go", "", "net.Dialer{} without Control"}:                             "js/wasm build only: the browser bridge's loopback dial to snowplow's own in-process server, never egress. Go's in-process network refuses any dial with a Control hook (ENOTSUP).",
+	{"internal/credhttp/endpoint_clients.go", "endpointIdle", "http.DefaultTransport"}:                                      "reads IdleConnTimeout, the value client-go's transports take from it. No dial.",
+	{"internal/credhttp/do.go", "do", "request.HTTPClientForEndpoint"}:                                                      "/call (Do's body, #1334): plumbing's transport dials through dialguard (TestIssue1131_EveryDeniedSpellingIsRefused, plumbing chain).",
+	{"internal/credhttp/plumbing_clients.go", "PlumbingEndpointClient", "request.HTTPClientForEndpoint"}:                    "the plumbing branch of a stage fetch (restactions/api endpoints_tls.go), the same transport.",
+	{"internal/browserbridge/bridge.go", "", "net.Dialer{} without Control"}:                                                "js/wasm build only: the browser bridge's loopback dial to snowplow's own in-process server, never egress. Go's in-process network refuses any dial with a Control hook (ENOTSUP).",
+	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "transport.Config{} without DialHolder"}: "#1509: the config goes to credhttp.NewEndpointTransport, which refuses a DialHolder and dials itself: its http.Transport's DialContext is endpointDial and its DialTLSContext endpointDialTLS, both raced through endpointDialFn (the guarded dialer). TestIssue1131_EveryDeniedSpellingIsRefused drives that transport (x1131Clients \"owned\").",
 }
 
 const (

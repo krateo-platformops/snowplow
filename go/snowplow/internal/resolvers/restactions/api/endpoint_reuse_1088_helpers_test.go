@@ -124,12 +124,16 @@ func newConnServer1088(t *testing.T, p *pki1088, requireClientCert bool) *connSe
 		srv.TLS.ClientAuth = tls.RequireAndVerifyClientCert
 		srv.TLS.ClientCAs = pool
 	}
-	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
-		if s == http.StateNew {
-			cs.mu.Lock()
-			cs.conns++
-			cs.mu.Unlock()
-		}
+	// A connection is counted when its TLS handshake completes: an https
+	// connection is up then (credhttp connections.go counts opened there too).
+	// #1509: a raced setup the client gives up before its handshake is done was
+	// accepted by TCP but never came up, so it is not one; counting TCP accepts
+	// would count it.
+	srv.TLS.VerifyConnection = func(tls.ConnectionState) error {
+		cs.mu.Lock()
+		cs.conns++
+		cs.mu.Unlock()
+		return nil
 	}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)

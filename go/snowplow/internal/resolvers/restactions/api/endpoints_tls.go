@@ -216,13 +216,12 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 	cfg := &transport.Config{
 		TLS:   tlsCfg,
 		Proxy: http.ProxyFromEnvironment,
-		// #1115 — snowplow's dialer, not client-go's 30 s one: every connect
-		// gives up the page goal (10 s) after it starts, whoever started it
-		// (credhttp/budget.go). One holder for all, so cacheability is as
-		// before; the explicit Proxy still keeps each identity's transport its
-		// own. It is also where the owned branch gets the destination policy
-		// (#1131); the plumbing branch above gets it from plumbing's transport.
-		DialHolder: credhttp.EndpointDialHolder,
+		// No DialHolder: credhttp.NewEndpointTransport (below) dials itself.
+		// Its dialer is snowplow's, not client-go's 30 s one: every connection
+		// setup gives up the page goal (10 s) after it starts, whoever started
+		// it (#1115), a late setup is raced on a new socket, TLS handshake
+		// included (#1509 b), and every connect passes the destination policy
+		// (#1131); the plumbing branch above gets that from plumbing's transport.
 		// js/wasm only: the browser's fetch below the credential wrappers
 		// replaces the dial, as credhttp.Harden installs it (credhttp's package
 		// doc says what that leaves to the browser). nil on a server build,
@@ -302,7 +301,11 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 		cfg.Proxy = http.ProxyURL(u)
 	}
 
-	rt, err := transport.New(cfg)
+	// #1509 (b) — credhttp builds the base transport (client-go's fields, TLS
+	// material and wrappers, credhttp/endpoint_transport_1509.go) so its https
+	// setups go through the raced TLS dialer; one transport per identity, as
+	// the explicit Proxy kept client-go's cache from sharing one before.
+	rt, err := credhttp.NewEndpointTransport(cfg)
 	if err != nil {
 		return nil, false, err
 	}

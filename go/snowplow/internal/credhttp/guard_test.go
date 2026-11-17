@@ -149,8 +149,7 @@ func limiterWrites(n ast.Node) []*ast.SelectorExpr {
 // allowed: (module-relative file, enclosing func, reference) → reason.
 // "http.Client{}" stands for a composite literal of net/http.Client.
 var allowed = map[[3]string]string{
-	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "transport.New"}: "the owned branch of a stage fetch: its single caller httpClientForEndpoint applies credhttp.Client by provenance (SA dial / held credential). A named endpointRef carries its own credential; credhttp.Send, through which every endpoint request leaves, refuses any redirect hop to another origin (#1106). The plumbing branch is credhttp.PlumbingEndpointClient (#1359).",
-	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "http.Client{}"}: "same as above",
+	{"internal/resolvers/restactions/api/endpoints_tls.go", "buildEndpointClient", "http.Client{}"}: "the owned branch of a stage fetch: its single caller httpClientForEndpoint applies credhttp.Client by provenance (SA dial / held credential). A named endpointRef carries its own credential; credhttp.Send, through which every endpoint request leaves, refuses any redirect hop to another origin (#1106). Its transport is credhttp.NewEndpointTransport (#1509); the plumbing branch is credhttp.PlumbingEndpointClient (#1359).",
 }
 
 type ref struct {

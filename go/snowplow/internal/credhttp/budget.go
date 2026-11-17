@@ -23,6 +23,7 @@ package credhttp
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"math"
 	"net"
@@ -316,13 +317,20 @@ func endpointDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	defer cancel()
 	// #1509 (b) — a late connect is raced by another socket (race_1509.go),
 	// every attempt under this same bound and through the same guarded dialer.
-	c, err := raceDial(dctx, network, addr)
-	if err != nil {
-		return nil, err
-	}
-	// #1509 — wrapped so an attempt can tell when its connection closes
-	// (leaving_1509.go).
-	return newEndpointConn(c), nil
+	// The connection is wrapped so an attempt can tell when it closes (#1509 a,
+	// leaving_1509.go).
+	return raceDial(dctx, network, addr)
+}
+
+// endpointDialTLS is endpointDial for an https connection: the connect AND the
+// TLS handshake (cfg), raced as one setup (#1509 b) under the same bound. A
+// connection is usable only once its handshake is done, so a handshake that
+// never answers is raced like a connect that never answers. It returns the
+// *tls.Conn net/http's TLSNextProto (HTTP/2) needs.
+func endpointDialTLS(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+	dctx, cancel := context.WithDeadline(ctx, dialNow().Add(pagebudget.PageMaxGoal))
+	defer cancel()
+	return raceDialTLS(dctx, network, addr, cfg)
 }
 
 // --- the retry reserve -----------------------------------------------------------

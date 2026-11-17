@@ -155,6 +155,13 @@ func sleepCtxOrLeaving(ctx context.Context, d time.Duration, leaving <-chan stru
 	if leaving == nil {
 		return false, sleepCtx(ctx, d)
 	}
+	// A signal that has already fired wins over a wait that is also over (a
+	// zero wait): select would pick between them at random.
+	select {
+	case <-leaving:
+		return true, nil
+	default:
+	}
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {

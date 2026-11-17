@@ -161,7 +161,7 @@ func TestIssue1509_B_LateConnectIsRacedAtTheTrigger(t *testing.T) {
 	resetConnectTimes(t)
 	l := newRaceListener(t)
 	addr := l.ln.Addr().String()
-	seedConnectTimes(addr, 50*time.Millisecond)
+	seedConnectTimes(setupKey(addr, false), 50*time.Millisecond)
 	s := &scriptedRaceDial{script: []string{"hang", "ok"}}
 	s.install(t)
 
@@ -188,7 +188,7 @@ func TestIssue1509_B_RaceThinsOutByDoubling(t *testing.T) {
 	l := newRaceListener(t)
 	addr := l.ln.Addr().String()
 	q := 40 * time.Millisecond
-	seedConnectTimes(addr, q)
+	seedConnectTimes(setupKey(addr, false), q)
 	s := &scriptedRaceDial{script: []string{"hang", "hang", "hang", "ok"}}
 	s.install(t)
 
@@ -237,7 +237,7 @@ func TestIssue1509_B_LosingConnectionIsClosed(t *testing.T) {
 	resetConnectTimes(t)
 	l := newRaceListener(t)
 	addr := l.ln.Addr().String()
-	seedConnectTimes(addr, 30*time.Millisecond)
+	seedConnectTimes(setupKey(addr, false), 30*time.Millisecond)
 	s := &scriptedRaceDial{script: []string{"after:300ms", "ok"}}
 	s.install(t)
 
@@ -268,7 +268,7 @@ func TestIssue1509_B_FailureEndsTheRaceOnlyWhenNoAttemptIsLeft(t *testing.T) {
 	resetConnectTimes(t)
 	l := newRaceListener(t)
 	addr := l.ln.Addr().String()
-	seedConnectTimes(addr, 20*time.Millisecond)
+	seedConnectTimes(setupKey(addr, false), 20*time.Millisecond)
 
 	// attempt 1 connects late, attempt 2 (raced) is refused: attempt 1 wins.
 	s := &scriptedRaceDial{script: []string{"after:150ms", "refuse"}}
@@ -294,7 +294,7 @@ func TestIssue1509_B_NoAttemptAfterTheBound(t *testing.T) {
 	resetConnectTimes(t)
 	l := newRaceListener(t)
 	addr := l.ln.Addr().String()
-	seedConnectTimes(addr, 20*time.Millisecond)
+	seedConnectTimes(setupKey(addr, false), 20*time.Millisecond)
 	s := &scriptedRaceDial{script: []string{"hang"}}
 	s.install(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -316,7 +316,7 @@ func TestIssue1509_B_EndpointDialRaces(t *testing.T) {
 	resetConnectTimes(t)
 	l := newRaceListener(t)
 	addr := l.ln.Addr().String()
-	seedConnectTimes(addr, 30*time.Millisecond)
+	seedConnectTimes(setupKey(addr, false), 30*time.Millisecond)
 	s := &scriptedRaceDial{script: []string{"hang", "ok"}}
 	s.install(t)
 	start := time.Now()
@@ -344,7 +344,7 @@ func TestIssue1509_B_SocketsPerStuckDialAreLogarithmic(t *testing.T) {
 		resetConnectTimes(t)
 		l := newRaceListener(t)
 		addr := l.ln.Addr().String()
-		seedConnectTimes(addr, tc.trigger)
+		seedConnectTimes(setupKey(addr, false), tc.trigger)
 		var live atomic.Int32
 		s := &scriptedRaceDial{script: []string{"hang"}}
 		prev := endpointDialFn

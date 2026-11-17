@@ -21,6 +21,7 @@ package credhttp
 // connection.
 
 import (
+	"context"
 	"encoding/pem"
 	"net"
 	"net/http"
@@ -114,10 +115,9 @@ func TestIssue1509_RideThroughAReplicaChange(t *testing.T) {
 	addr := gl.Addr().String()
 
 	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
-	rt, err := transport.New(&transport.Config{
-		TLS:        transport.TLSConfig{CAData: ca},
-		Proxy:      http.ProxyFromEnvironment,
-		DialHolder: EndpointDialHolder, // the owned dialer: endpointDial → raceDial → the guarded dialer
+	rt, err := NewEndpointTransport(&transport.Config{
+		TLS:   transport.TLSConfig{CAData: ca},
+		Proxy: http.ProxyFromEnvironment,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -162,7 +162,24 @@ func TestIssue1509_RideThroughAReplicaChange(t *testing.T) {
 	}
 
 	// 3. The customer request; the server comes back 3.3 s after it started.
+	// Every connect the client starts is recorded (the real guarded dialer
+	// still dials), so a failure says which sockets existed when.
 	start := time.Now()
+	var startsMu sync.Mutex
+	var starts []time.Duration
+	prevDial := endpointDialFn
+	endpointDialFn = func(ctx context.Context, network, a string) (net.Conn, error) {
+		startsMu.Lock()
+		starts = append(starts, time.Since(start).Round(time.Millisecond))
+		startsMu.Unlock()
+		return prevDial(ctx, network, a)
+	}
+	t.Cleanup(func() { endpointDialFn = prevDial })
+	defer func() {
+		startsMu.Lock()
+		t.Logf("connect attempts started at %v after the request", starts)
+		startsMu.Unlock()
+	}()
 	const comeback = 3300 * time.Millisecond
 	go func() {
 		time.Sleep(comeback)

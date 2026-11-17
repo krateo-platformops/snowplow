@@ -35,7 +35,9 @@ import (
 // builds them.
 func x1131Clients(t *testing.T) map[string]*http.Client {
 	t.Helper()
-	owned, err := transport.New(&transport.Config{Proxy: http.ProxyFromEnvironment, DialHolder: EndpointDialHolder})
+	// #1509: the owned branch's transport (NewEndpointTransport), whose http://
+	// and https:// setups are both raced through the guarded dialer.
+	owned, err := NewEndpointTransport(&transport.Config{Proxy: http.ProxyFromEnvironment})
 	if err != nil {
 		t.Fatal(err)
 	}
