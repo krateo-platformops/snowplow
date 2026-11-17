@@ -93,6 +93,11 @@ type connServer1088 struct {
 	ids   map[string]map[string]bool // remote addr → identities seen on it
 	h2    atomic.Int32
 	reqs  atomic.Int32
+	// holdNth, hold: the holdNth connection accepted (1-based; 0: none) has
+	// its handshake held for hold before the server reads its ClientHello, as
+	// a destination that is slow to answer one setup.
+	accepted, holdNth int
+	hold              time.Duration
 }
 
 // serverConn1088 is one connection the server accepted.
@@ -118,9 +123,14 @@ type rawConn1088 struct {
 	net.Conn
 	cs           *connServer1088
 	serverClosed atomic.Bool
+	hold         time.Duration // before the first read
+	held         atomic.Bool
 }
 
 func (c *rawConn1088) Read(b []byte) (int, error) {
+	if c.hold > 0 && !c.held.Swap(true) {
+		time.Sleep(c.hold)
+	}
 	n, err := c.Conn.Read(b)
 	if (errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET)) && !c.serverClosed.Load() {
 		c.cs.mu.Lock()
@@ -148,8 +158,13 @@ func (l rawListener1088) Accept() (net.Conn, error) {
 	}
 	l.cs.mu.Lock()
 	l.cs.connLocked(c.RemoteAddr().String())
+	l.cs.accepted++
+	var hold time.Duration
+	if l.cs.accepted == l.cs.holdNth {
+		hold = l.cs.hold
+	}
 	l.cs.mu.Unlock()
-	return &rawConn1088{Conn: c, cs: l.cs}, nil
+	return &rawConn1088{Conn: c, cs: l.cs, hold: hold}, nil
 }
 
 func (cs *connServer1088) connLocked(addr string) *serverConn1088 {

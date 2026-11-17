@@ -352,6 +352,46 @@ func TestReuse1088_TwoIdentities_NeverShareConnectionOrCredential(t *testing.T) 
 	})
 }
 
+// ARM 2b (#1509): the same properties when a setup IS raced, on every run.
+// Identity a's fetch measures the destination's setup time; identity b's
+// first setup is then held by the server well past it, so b's setup is raced
+// on a new socket (the production trigger, nothing seeded), which wins. The
+// held attempt is the raced loser: it must carry no request and be closed by
+// the client, and neither identity's requests may leave its own connection.
+func TestReuse1088_RacedSetup_LoserClosedUnusedIdentitiesApart(t *testing.T) {
+	p := newPKI1088(t)
+	cs := newConnServer1088(t, p, false)
+	ca := base64.StdEncoding.EncodeToString(p.caPEM)
+	a := &endpoints.Endpoint{ServerURL: cs.srv.URL, CertificateAuthorityData: ca, Token: "token-a"}
+	b := &endpoints.Endpoint{ServerURL: cs.srv.URL, CertificateAuthorityData: ca, Token: "token-b"}
+	ctx := credhttp.WithHeldCredential(context.Background())
+	before := stageOpened1088()
+	if err := fetch1088(t, ctx, a, http.MethodGet); err != nil {
+		t.Fatal(err)
+	}
+	cs.mu.Lock()
+	cs.holdNth, cs.hold = cs.accepted+1, 300*time.Millisecond
+	cs.mu.Unlock()
+	start := time.Now()
+	for i := 0; i < 10; i++ {
+		for _, ep := range []*endpoints.Endpoint{b, a} {
+			if err := fetch1088(t, ctx, ep, http.MethodGet); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if took := time.Since(start); took >= 300*time.Millisecond {
+		t.Errorf("the fetches took %v: b's setup waited out the held attempt (300 ms) instead of being raced", took)
+	}
+	cs.mu.Lock()
+	accepted := cs.accepted
+	cs.mu.Unlock()
+	if accepted < 3 {
+		t.Fatalf("the server accepted %d connections; want at least 3 (a's, b's held attempt, b's raced one)", accepted)
+	}
+	assertConnections1088(t, cs, 2, before)
+}
+
 // ARM 4: a genuinely external endpoint (a named endpointRef: token-auth, no
 // CA, no held mark) reuses its transport across fetches.
 func TestReuse1088_ExternalEndpoint_ReusesTransport(t *testing.T) {

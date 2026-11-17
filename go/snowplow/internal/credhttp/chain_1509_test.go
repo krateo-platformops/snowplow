@@ -309,6 +309,11 @@ func TestIssue1509_Chain_RacedLoserThatCameUpIsCountedOpened(t *testing.T) {
 	if got := egressConnections.cell(SendSiteStage, ConnProtocolHTTP1).opened.Load() - before; got != 2 {
 		t.Fatalf("opened moved by %d; want 2: the winner (its ConnectDone) and the loser that came up (noteRacedConnectionUp)", got)
 	}
+	// The winner is still open (closed at return), so the one close the
+	// server saw is the loser's: a raced loser that came up is closed, unused.
+	if a, cl := l.accepted.Load(), l.closed.Load(); a != 2 || cl != 1 {
+		t.Fatalf("the server accepted %d connections and saw %d closed; want 2 and 1: the loser that came up must be closed", a, cl)
+	}
 }
 
 // A busy destination stalls a SECOND time (#1521 review): it answers, a
