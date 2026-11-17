@@ -455,6 +455,16 @@ def covered(start: float, wall_ms: float, st: dict) -> bool:
 SPREAD_WINDOW_S = 60.0
 
 
+def _quantile(vals: list[float], q: float) -> float | None:
+    """The q-quantile, interpolated, at the cores' own resolution (_pct rounds to 0.1: milliseconds')."""
+    if not vals:
+        return None
+    v = sorted(vals)
+    k = (len(v) - 1) * q
+    lo, hi = int(k), min(int(k) + 1, len(v) - 1)
+    return round(v[lo] + (v[hi] - v[lo]) * (k - lo), 4)
+
+
 def container_cpu_report(recs: list[dict] | None) -> dict | None:
     """One container's own cgroup over the drive (k6_job._cpu_sampler's record): its mean cores (usage over the
     whole record), the p95 of its sample windows, its throttled time and its PSI some / full per second; and the
@@ -482,7 +492,7 @@ def container_cpu_report(recs: list[dict] | None) -> dict | None:
     n = len(wins)
     sd = (sum((x - sum(wins) / n) ** 2 for x in wins) / (n - 1)) ** 0.5 if n >= 2 else None
     return {"request_m": start.get("request_m"), "limit_m": start.get("limit_m"), "seconds": round(span, 1),
-            "cores_mean": rate("usage_usec", a, b, 1e6), "cores_p95": _pct(per, 95) if per else None,
+            "cores_mean": rate("usage_usec", a, b, 1e6), "cores_p95": _quantile(per, 0.95),
             "throttled_s_per_s": rate("throttled_usec", a, b, 1e6),
             "psi_some_s_per_s": rate("pressure_some_usec", a, b, 1e6),
             "psi_full_s_per_s": rate("pressure_full_usec", a, b, 1e6),

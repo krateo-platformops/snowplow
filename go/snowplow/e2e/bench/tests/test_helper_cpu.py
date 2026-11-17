@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from bench import k6_job, k6eval
-from tests.test_k6_830 import _cpu_file
+from tests.test_k6_830 import _browser_points, _browser_summary, _cpu_file, _write_out
 from tests.test_renderer_stall import _case
 
 #: the fixture's sidecar: 0.04 cores for a minute, 0.06 for a minute, ..., 5 minutes (tests/test_renderer_stall.py)
@@ -41,7 +41,7 @@ def test_the_rendered_sidecar_samples_its_own_cgroup_with_the_browsers_sampler()
     sampler = k6_job._cpu_sampler("renderers", k6_job.RENDERERS_CPU, k6_job.RENDERERS_CPU)
     assert sampler in script and k6_job._cpu_end("renderers") in script
     assert '"container": "renderers", "request_m": 250, "limit_m": 250' in script
-    assert script.index("( while :; do cpu_sample;") < script.index("rsampler_loop &")
+    assert script.index("while :; do cpu_sample; sleep") < script.index("rsampler_loop &")
     assert script.index('"kind": "cpu_end"') < script.index("echo 0 > /out/renderers-done")
     assert side["resources"]["requests"]["cpu"] == side["resources"]["limits"]["cpu"] == "250m"
 
@@ -75,7 +75,7 @@ def test_the_sidecars_script_records_its_cpu_from_its_start_to_the_browsers_end(
 
 def test_the_sidecars_record_is_read_with_the_browsers(tmp_path):
     """read_k6_out("browser") holds both containers' records (mutation: the sidecar's not read turns this RED)."""
-    _cpu_file(tmp_path, "browser", 3000, [1.0] * 4)
+    _write_out(tmp_path, "browser", _browser_points(), _browser_summary(63), 0)
     _cpu_file(tmp_path, "renderers", 250, [0.05] * 4, limit_m=250)
     o = k6eval.read_k6_out(str(tmp_path), "browser")
     assert o["cpu"]["browser"] and o["cpu"]["renderers"]

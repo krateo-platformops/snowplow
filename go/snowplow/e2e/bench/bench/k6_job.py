@@ -337,7 +337,9 @@ anchor() {{
 }}
 anchor
 printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}, "node_cpus": %s, "epoch": %s, "uptime": %s, "uptime_lo": %s}}\\n' "$cg" "$nc" "$an_ep" "$an_up" "$an_lo" > {f}
-( while :; do cpu_sample; sleep {CPU_SAMPLE_S}; done ) &
+# the loop waits on its sleep, so _cpu_end's TERM stops the sleep with it (none outlives the record)
+( trap 'kill "$zz" 2>/dev/null; exit 0' TERM; zz=
+  while :; do cpu_sample; sleep {CPU_SAMPLE_S} & zz=$!; wait "$zz"; done ) &
 sampler=$!
 """
 
