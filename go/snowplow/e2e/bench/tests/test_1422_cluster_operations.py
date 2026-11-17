@@ -883,10 +883,11 @@ def test_run606_says_unreadable_when_the_listing_fails(harness):  # noqa: F811
     log = (out / "run.log").read_text()
     assert p.returncode != 0 and "=== step reboot ===" not in log, log[-3000:]
     rec = json.loads((out / "settle.json").read_text())
-    assert rec["state"] == clusterops.UNSETTLED and rec["operations"] is None
+    assert rec["state"] == clusterops.NOT_READ and rec["operations"] is None
     assert all(x["state"] == clusterops.NOT_READ for x in rec["polls"]) and "could not be read" in rec["why"]
     v = json.loads((out / "verdict.json").read_text())
-    assert v["verdict"] == "INVALID" and v["invalid_reasons"][0].startswith("environment.control_plane_settled: ")
+    assert v["verdict"] == "INVALID" and v["invalid_reasons"][0].startswith(
+        "environment.control_plane_settled: INVALID by environment (undecided): ")
     assert "no operation overlapped" not in log
 
 

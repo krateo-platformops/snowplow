@@ -292,7 +292,7 @@ def test_a_run_directory_is_evaluated_again_its_evidence_as_it_is(harness, tmp_p
     assert p.returncode == 0, (out / "run.log").read_text()[-3000:]
     from tests.test_run606_real_sequence import FAKE_DIGEST
     copy = _check_reevaluation(out, tmp_path, expect={"driver": "load606", "expect_digest": FAKE_DIGEST,
-                                                      "frontend": "none", "run8": True})
+                                                      "frontend": "none", "run8": True, "settle": True})
     # never over the run's own verdict
     assert _reevaluate(copy, copy / "verdict.json").returncode == 2
     # what the evidence cannot decide is refused, named, unless stated; a statement it contradicts too
@@ -321,7 +321,7 @@ def test_a_k6_run_with_a_frontend_override_three_sessions_no_viewers_no_run8_is_
     assert "run8" not in v["report"]
     copy = _check_reevaluation(out, tmp_path, expect={
         "driver": "k6", "expect_digest": FAKE_DIGEST, "frontend": [FTAG, FD], "run8": False,
-        "browser_sessions": 3, "viewers": False})
+        "browser_sessions": 3, "viewers": False, "settle": True})
     # a statement the evidence contradicts is refused, naming the setting
     r = _reevaluate(copy, tmp_path / "v5.json", "--browser-sessions", "5", "--viewers", "on", "--no-frontend",
                     "--run8", "on")
@@ -346,6 +346,7 @@ def _k6_run_dir(d, *, browser_config=True, frontend_digest=False, frontend_tag=N
         docs.insert(0, {"kind": "ConfigMap", "metadata": {"name": "k6browser"},
                         "data": {"browser-config.json": json.dumps({"sessions": [{"name": f"s{i}"} for i in range(4)]})}})
     (d / "loadgen-job.yaml").write_text(yaml.safe_dump_all(docs))
+    (d / "run.log").write_text("[10:00:00] === step settle ===\n[10:40:00] === step reboot ===\n")   # a bench from #1511
     (d / "image-digest.jsonl").write_text(json.dumps({"kind": "image_digest", "expected": "sha256:" + "ab" * 32}) + "\n")
     (d / "verdict.json").write_text(json.dumps({"verdict": "PASS", "report": {"run8": {}}}))
     vals = {"componentValues": {"snowplow": {"image": {"tag": "1.12.70"}}}}
@@ -363,7 +364,7 @@ def test_reevaluate_derives_a_k6_run_dirs_settings(tmp_path):
     s = reevaluate.settings(str(_k6_run_dir(tmp_path)), {})
     assert {k: v for k, (v, _) in s.items()} == {"driver": "k6", "expect_digest": "sha256:" + "ab" * 32,
                                                  "frontend": "none", "run8": True, "browser_sessions": 4,
-                                                 "viewers": True}
+                                                 "viewers": True, "settle": True}
     (tmp_path / "f").mkdir()
     s = reevaluate.settings(str(_k6_run_dir(tmp_path / "f", frontend_digest=True, frontend_tag="1.8.44")), {})
     assert s["frontend"][0] == ("1.8.44", "sha256:" + "1a" * 32)
