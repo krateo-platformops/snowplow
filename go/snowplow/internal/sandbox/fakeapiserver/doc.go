@@ -32,6 +32,21 @@
 // reference cluster answered it (snapshot.json capturedFrom.selfSubjectRulesReview): on a GKE cluster,
 // whose IAM webhook authorizer follows RBAC, it is incomplete with the webhook's message.
 //
+// TWO OBJECTS ARE SYNTHESISED, not served from the snapshot (SNAPSHOT.md §8), each because a
+// cluster's copy would carry what the sandbox must not hold, and each from what the sandbox itself
+// gives (bridge.js's host config), in the snapshot identity's authn namespace:
+//
+//   - the visitor's clientconfig Secret: a bearer-token credential under the visitor's own name,
+//     its token the one bridge.js generated (Options.VisitorToken). A cluster's would hold a real
+//     credential;
+//   - the frontend ConfigMap Phase 1 reads its navigation roots from (dispatchers phase1_roots.go),
+//     under Phase 1's own name (internal/frontendconfig ConfigMapName), its config.json exactly the
+//     text bridge.js hands the SPA (Options.FrontendConfig). A cluster's would describe that
+//     cluster's portal, not the sandbox's.
+//
+// A snapshot that holds the frontend ConfigMap is refused: a synthesised object is never one a
+// cluster supplied. Readers reach both through the snapshot's RBAC alone, as any other object.
+//
 // Every request is logged as one line (Options.Log) in SNAPSHOT.md §4's format; the js main sends
 // the lines to the worker's console.
 //

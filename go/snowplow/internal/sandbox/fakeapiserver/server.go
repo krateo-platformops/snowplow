@@ -40,10 +40,10 @@ type Options struct {
 	// config (boot's buildPortalConfig): the synthesised frontend ConfigMap's data (§8). Required,
 	// and JSON.
 	FrontendConfig []byte
-	Clock        func() time.Time
-	AfterFunc    func(d time.Duration, f func()) (stop func() bool)
-	Log          func(line map[string]any)
-	NewUID       func() string
+	Clock          func() time.Time
+	AfterFunc      func(d time.Duration, f func()) (stop func() bool)
+	Log            func(line map[string]any)
+	NewUID         func() string
 }
 
 // Server is the fake apiserver: an http.Handler.
@@ -194,7 +194,8 @@ func New(o Options) (*Server, error) {
 	s.sa = serviceAccountIdentity(id.ServiceAccount.Namespace, id.ServiceAccount.Name)
 	s.sa.Label = labelSA
 	s.visitor = identity{User: id.Visitor.Username, Groups: append(append([]string{}, id.Visitor.Groups...), "system:authenticated"), Label: labelVisitor}
-	// §8: the one Secret, synthesised; the snapshot holds none. It is a bearer-token credential
+	// §8: two objects are synthesised, never served from the snapshot (doc.go): this Secret and the
+	// frontend ConfigMap below. The one Secret, synthesised; the snapshot holds none. It is a bearer-token credential
 	// under the visitor's exact name (credsecret.For's first, preferred name: the session name, or
 	// the step-up one for a step-up identity), owned through the username annotation
 	// (plumbing endpoints.OwnsSecret's annotation arm), so snowplow's own-credential readers serve

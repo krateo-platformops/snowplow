@@ -42,6 +42,18 @@ func TestFrontendConfigMapFollowsPhase1sName(t *testing.T) {
 	eq(t, h.do("GET", frontendCM, req{as: "sa"}).code, 404, "the default name holds nothing")
 }
 
+// The namespace is the snapshot identity's AuthnNamespace (Phase 1's AUTHN_NAMESPACE, the clientconfig
+// Secret's namespace), never a literal (mutation: a fixed namespace turns this RED).
+func TestFrontendConfigMapIsInTheIdentitysAuthnNamespace(t *testing.T) {
+	h := newHarness(t, opts{edit: func(snap map[string]any) {
+		snap["identity"].(map[string]any)["authnNamespace"] = "tenant-authn"
+	}})
+	g := h.do("GET", "/api/v1/namespaces/tenant-authn/configmaps/"+frontendconfig.Default, req{as: "sa"})
+	eq(t, g.code, 200, "in the identity's authn namespace")
+	eq(t, get(g.body, "data", frontendconfig.DataKey), frontendConfigText, "config.json")
+	eq(t, h.do("GET", frontendCM, req{as: "sa"}).code, 404, "nothing in krateo-system")
+}
+
 // Its readers' access is the snapshot's RBAC over configmaps, as for any other ConfigMap: with
 // configmaps out of the role that grants them, neither the ServiceAccount nor the visitor reads it
 // (mutation: a rule of its own for the synthesised object turns this RED).
@@ -90,8 +102,8 @@ func TestNewRefusesAMissingOrInvalidFrontendConfig(t *testing.T) {
 func TestNewRefusesASnapshotHoldingTheFrontendConfigMap(t *testing.T) {
 	_, err := loadHarness(t, opts{extra: []map[string]any{{
 		"apiVersion": "v1", "kind": "ConfigMap",
-		"metadata":   map[string]any{"name": frontendconfig.Default, "namespace": "krateo-system", "uid": "u-1", "resourceVersion": "1"},
-		"data":       map[string]any{frontendconfig.DataKey: `{"api":{}}`},
+		"metadata": map[string]any{"name": frontendconfig.Default, "namespace": "krateo-system", "uid": "u-1", "resourceVersion": "1"},
+		"data":     map[string]any{frontendconfig.DataKey: `{"api":{}}`},
 	}}})
 	if err == nil || !strings.Contains(err.Error(), "ConfigMap krateo-system/"+frontendconfig.Default+" is in the snapshot, and the fake env synthesises it") {
 		t.Fatal(err)
