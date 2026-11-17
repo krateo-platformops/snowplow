@@ -258,3 +258,112 @@ func TestIssue1509_RideThroughAHungTLSHandshake(t *testing.T) {
 		t.Fatalf("held %d, closed %d; every losing connection must be closed", h, hc)
 	}
 }
+
+// paceListener paces the server's handshake on chosen accepted connections
+// (1-based): delay[n] before its first byte; pause[n] after its first chunk
+// (the client has started reading the handshake) before the rest.
+type paceListener struct {
+	net.Listener
+	accepted atomic.Int32
+	delay    map[int32]time.Duration
+	pause    map[int32]time.Duration
+}
+
+const paceChunk = 64
+
+func (l *paceListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	n := l.accepted.Add(1)
+	return &pacedConn{Conn: c, delay: l.delay[n], pause: l.pause[n]}, nil
+}
+
+type pacedConn struct {
+	net.Conn
+	delay, pause time.Duration
+	started      bool // only the server's handshake goroutine writes first
+}
+
+func (c *pacedConn) Write(b []byte) (int, error) {
+	if c.started {
+		return c.Conn.Write(b)
+	}
+	c.started = true
+	time.Sleep(c.delay)
+	if c.pause == 0 || len(b) <= paceChunk {
+		return c.Conn.Write(b)
+	}
+	n, err := c.Conn.Write(b[:paceChunk])
+	if err != nil {
+		return n, err
+	}
+	time.Sleep(c.pause)
+	m, err := c.Conn.Write(b[paceChunk:])
+	return n + m, err
+}
+
+// Once a destination answers, a waiter's setup is its own attempt: it is not
+// raced in the interval in which the destination answered (that answer is
+// the fresh evidence), even if it is slower than the trigger. Two setups
+// join one chain; the first comes up (answered), and the second's handshake
+// starts at once but takes 1.5 trigger intervals. The server must see exactly
+// two connections. With the race still armed while answering (M-i), the
+// interval's timer starts another socket.
+func TestIssue1509_Chain_AnsweredIntervalIsNotRaced(t *testing.T) {
+	resetConnectTimes(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const trigger = 100 * time.Millisecond
+	pl := &paceListener{
+		Listener: ln,
+		// The first setup takes a little while, so both waiters join its chain.
+		delay: map[int32]time.Duration{1: 15 * time.Millisecond},
+		// The second answers at once, then completes 1.5 intervals later:
+		// after the answered interval's timer, before the next one.
+		pause: map[int32]time.Duration{2: trigger * 3 / 2},
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.Listener = pl
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	addr := ln.Addr().String()
+	seedConnectTimes(setupKey(addr, true), trigger)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEMOf(srv))
+	cfg := &tls.Config{RootCAs: pool, NextProtos: []string{"h2"}}
+
+	type result struct {
+		c   net.Conn
+		err error
+		at  time.Duration
+	}
+	results := make(chan result, 2)
+	start := time.Now()
+	for range 2 {
+		go func() {
+			c, err := endpointDialTLS(context.Background(), "tcp", addr, cfg)
+			results <- result{c, err, time.Since(start)}
+		}()
+	}
+	var last time.Duration
+	for range 2 {
+		r := <-results
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		defer r.c.Close()
+		last = max(last, r.at)
+	}
+	time.Sleep(trigger) // a late raced attempt would be accepted by now
+	if n := pl.accepted.Load(); n != 2 {
+		t.Fatalf("the server accepted %d connections for 2 setups of a destination that answered; want 2 (the answered interval is not raced; second setup up at %v)", n, last)
+	}
+	if last < trigger {
+		t.Fatalf("the second setup came up after %v; the arm needs it slower than the trigger (%v)", last, trigger)
+	}
+}
