@@ -91,6 +91,7 @@ def test_the_report_states_the_mean_and_its_resolution_from_the_arms_own_spread(
     assert sp["windows"] == 5 and sp["sd_cores"] == pytest.approx(0.011, abs=1e-3)
     assert sp["resolution_cores"] == pytest.approx(2 * sp["sd_cores"] / 5 ** 0.5, abs=1e-4)
     short = tmp_path / "s"
+    short.mkdir()
     _cpu_file(short, "renderers", 250, [0.05] * 12, limit_m=250)     # one window: no spread, said
     assert k6eval.container_cpu_report(k6eval.read_cpu(str(short), "renderers"))["spread"]["resolution_cores"] is None
 
