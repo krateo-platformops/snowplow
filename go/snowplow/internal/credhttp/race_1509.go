@@ -157,6 +157,9 @@ type setupChains struct {
 	chains map[chainKey]*setupChain
 }
 
+// dialFunc is a connect, as endpointDialFn.
+type dialFunc = func(ctx context.Context, network, addr string) (net.Conn, error)
+
 // connectChains is the process-wide connect level (a connect has no identity).
 var connectChains = &setupChains{chains: map[chainKey]*setupChain{}}
 
@@ -165,7 +168,7 @@ var tlsChains = &setupChains{chains: map[chainKey]*setupChain{}}
 
 // raceDial is the plain (connect-only) raced setup of addr, bounded by ctx.
 func raceDial(ctx context.Context, network, addr string) (net.Conn, error) {
-	return connectChains.dial(ctx, chainKey{network: network, addr: addr})
+	return connectChains.dial(ctx, chainKey{network: network, addr: addr}, endpointDialFn)
 }
 
 // raceDialTLS is the raced connect + TLS handshake setup of addr, with cfg
@@ -174,16 +177,18 @@ func raceDialTLS(ctx context.Context, network, addr string, cfg *tls.Config) (ne
 	if cfg == nil {
 		cfg = &tls.Config{}
 	}
-	return tlsChains.dial(ctx, chainKey{network: network, addr: addr, tlsCfg: cfg})
+	return tlsChains.dial(ctx, chainKey{network: network, addr: addr, tlsCfg: cfg}, endpointDialFn)
 }
 
 // dial waits on k's chain (starting it if none runs) until a connection comes
-// up for this waiter, the chain fails, or ctx ends.
-func (s *setupChains) dial(ctx context.Context, k chainKey) (net.Conn, error) {
+// up for this waiter, the chain fails, or ctx ends. connect is the connect a
+// chain started here uses (endpointDialFn, read by the caller): attempts run
+// on goroutines of their own and never read the package-level seam.
+func (s *setupChains) dial(ctx context.Context, k chainKey, connect dialFunc) (net.Conn, error) {
 	s.mu.Lock()
 	c := s.chains[k]
 	if c == nil || c.isDone() {
-		c = newSetupChain(s, k)
+		c = newSetupChain(s, k, connect)
 		s.chains[k] = c
 	}
 	w := c.join(ctx)
@@ -246,6 +251,7 @@ type setupChain struct {
 	owner   *setupChains
 	k       chainKey
 	ringKey string
+	dial    dialFunc // the connect its attempts use (endpointDialFn when the chain began)
 
 	ctx    context.Context // ended when the chain ends: its attempts stop
 	cancel context.CancelFunc
@@ -269,9 +275,9 @@ type setupChain struct {
 	countCtx  context.Context // a waiter's ctx: its connection counting (connections.go)
 }
 
-func newSetupChain(s *setupChains, k chainKey) *setupChain {
+func newSetupChain(s *setupChains, k chainKey, connect dialFunc) *setupChain {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &setupChain{owner: s, k: k, ringKey: setupKey(k.addr, k.tlsCfg != nil), ctx: ctx, cancel: cancel}
+	return &setupChain{owner: s, k: k, ringKey: setupKey(k.addr, k.tlsCfg != nil), ctx: ctx, cancel: cancel, dial: connect}
 }
 
 func (c *setupChain) isDone() bool {
@@ -422,7 +428,7 @@ func (c *setupChain) startAttemptLocked() {
 // race left to bound.
 func (c *setupChain) attempt(ctx context.Context, answered bool) (net.Conn, error, bool) {
 	if c.k.tlsCfg == nil || answered {
-		raw, err := endpointDialFn(ctx, c.k.network, c.k.addr)
+		raw, err := c.dial(ctx, c.k.network, c.k.addr)
 		if err != nil {
 			return nil, err, false
 		}
@@ -433,7 +439,7 @@ func (c *setupChain) attempt(ctx context.Context, answered bool) (net.Conn, erro
 		}
 		return c.handshake(ctx, conn)
 	}
-	conn, err := connectChains.dial(ctx, chainKey{network: c.k.network, addr: c.k.addr})
+	conn, err := connectChains.dial(ctx, chainKey{network: c.k.network, addr: c.k.addr}, c.dial)
 	if err != nil {
 		return nil, err, false
 	}
