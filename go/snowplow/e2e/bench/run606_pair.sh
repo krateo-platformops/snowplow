@@ -112,6 +112,8 @@ refuse() { echo "refusing: $*" >&2; exit 2; }
 # #1390: the statistics stage (and its helpers: is_replica, verdict_file, pair_cmd, replica_cmd, stat_step), one file
 # this launcher and an offline re-run from the durable copy (bench.durable rejudge) both run
 source "$HERE/run606_stats.sh"
+# one arm's steps (runenv, durable_copy, durable_fetch), the same for run606_single.sh
+source "$HERE/run606_arm.sh"
 read -r -a LABELS <<< "${RUNS:-A B}"
 read -r -a PAIR_LIST <<< "${PAIRS:-A:B}"
 (( ${#LABELS[@]} >= 2 )) || refuse "RUNS names ${#LABELS[@]} run(s): a comparison needs two or more"
@@ -249,6 +251,7 @@ if [[ -n "$REPLICA_PAIR" ]]; then
 fi
 PAIR_EVIDENCE="$(python3 -m bench.evidence dest "$PAIR_NAME")"
 PAIR_RUN_ID="${PAIR_NAME}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+LAUNCH_ID="$PAIR_RUN_ID"            # run606_arm.sh's durable_copy / durable_fetch
 # #1390: the evidence bucket every arm's run directory is copied to (bench/durable.py; vm606 up ensures it)
 EVIDENCE_BUCKET="$(python3 -m bench.durable bucket ${PROJECT:+"$PROJECT"})"
 if [[ "$DRY" != "1" ]]; then
@@ -273,23 +276,6 @@ publish_pair() {
       --stage "$stage" --require pair.json "$@"
 }
 
-# runenv <L>: RUNENV = that run's per-run variables, for `env`
-runenv() {
-  local name="RUN_NAME_$1" tag="SNOWPLOW_TAG_$1" dig="EXPECTED_IMAGE_DIGEST_$1" go="BENCH_606_GO_$1"
-  local out="OUT_$1" fw="BENCH_1004_GO_$1"
-  RUNENV=(RUN_NAME="${!name}" SNOWPLOW_TAG="${!tag}" EXPECTED_IMAGE_DIGEST="${!dig}"
-          BENCH_606_GO="${!go:-}" BENCH_1004_GO="${!fw:-}" K6_SPAN=churn LOAD_DRIVER=k6 OUT="${!out}"
-          FRONTEND_TAG_VAR="FRONTEND_TAG_$1")   # run 26d: its login-contract refusal names this run's variable
-  # the run's declared snowplow env and its label (a Go runtime key no run declared must read the same on
-  # both arms of a pair: compared after the measure, from each run's record, by custlat pair and replica)
-  local se="SNOWPLOW_ENV_$1"
-  RUNENV+=(SNOWPLOW_ENV="${!se:-}" BENCH_ARM="$1")
-  # run 26: the run's frontend override, only when it has one
-  local ft="FRONTEND_TAG_$1" fd="EXPECTED_FRONTEND_DIGEST_$1"
-  if [[ -n "${!ft:-}" ]]; then
-    RUNENV+=(FRONTEND_TAG="${!ft}" EXPECTED_FRONTEND_DIGEST="${!fd}")
-  fi
-}
 runs_line=""
 for x in "${LABELS[@]}"; do
   nm="RUN_NAME_$x" tg="SNOWPLOW_TAG_$x" ft="FRONTEND_TAG_$x" fd="EXPECTED_FRONTEND_DIGEST_$x" se="SNOWPLOW_ENV_$x"
@@ -394,18 +380,6 @@ if ! msg="$(python3 -m bench.durable upload --bucket "$EVIDENCE_BUCKET" --launch
 fi
 log "$msg"
 DURABLE_FAILED=0
-# durable_copy <label>: the run's directory to the bucket, verified (DURABLE_<label> = 1), or said loudly
-durable_copy() {
-  local out="OUT_$1" msg
-  if msg="$(python3 -m bench.durable upload --bucket "$EVIDENCE_BUCKET" --launch "$PAIR_RUN_ID" --src "${!out}" 2>&1)"; then
-    printf -v "DURABLE_$1" '%s' 1
-    log "run $1: ${msg}"
-  else
-    printf -v "DURABLE_$1" '%s' 0
-    DURABLE_FAILED=1
-    log "EVIDENCE NOT DURABLE (run $1): ${msg}: its run directory is only on this machine"
-  fi
-}
 for x in "${LABELS[@]}"; do printf -v "PID_$x" '%s' ""; printf -v "RC_$x" '%s' ""; printf -v "DONE_$x" '%s' 0
                            printf -v "FAILED_$x" '%s' 0; printf -v "STOPPED_$x" '%s' 0; done
 stop_all() {
@@ -482,19 +456,7 @@ trap - INT TERM HUP
 # directory on this machine: $PAIR_OUT.durable/<run dir> (run606_stats.sh's SRC_<L>). A run with no verified copy
 # has no statistics: each pair of it is INVALID, saying so.
 STATS_DIR="${PAIR_OUT}.durable"
-for x in "${LABELS[@]}"; do
-  out="OUT_$x" dur="DURABLE_$x"
-  printf -v "SRC_$x" '%s' ""
-  [[ "${!dur:-0}" == "1" ]] || continue
-  if msg="$(python3 -m bench.durable download --bucket "$EVIDENCE_BUCKET" --launch "$PAIR_RUN_ID" \
-              --name "${!out##*/}" --dest "$STATS_DIR" 2>&1)"; then
-    printf -v "SRC_$x" '%s' "$STATS_DIR/${!out##*/}"
-    log "run $x: ${msg}"
-  else
-    DURABLE_FAILED=1
-    log "EVIDENCE NOT DURABLE (run $x): its durable copy could not be downloaded and verified: ${msg}"
-  fi
-done
+for x in "${LABELS[@]}"; do durable_fetch "$x" "$STATS_DIR"; done
 stats_main
 vrc="$STATS_VRC"
 required=("${STATS_REQUIRED[@]}")
