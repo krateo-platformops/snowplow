@@ -312,9 +312,13 @@ def test_the_sampler_keys_each_renderer_by_pid_and_starttime_and_reads_its_run_d
     finally:
         fake.kill()
         other.kill()
-    udd = [r for r in rows if r["kind"] == "renderer_udd"]
+    # judged on this test's own two processes only: the host's /proc holds whatever else runs beside it (a shared
+    # build VM: another job's fake renderers), where the pod's own process namespace would not
+    mine = (fake.pid, other.pid)
+    udd = [r for r in rows if r["kind"] == "renderer_udd" and r["pid"] in mine]
     assert [(r["pid"], str(r["start"]), r["udd"]) for r in udd] == [(fake.pid, start, "/tmp/k6browser-data-t1")], rows
-    samples = [r for r in rows if r["kind"] == "renderer"]
+    samples = [dict(r, rd={k: v for k, v in r["rd"].items() if int(k.split(":")[0]) in mine})
+               for r in rows if r["kind"] == "renderer"]
     assert len(samples) == 2 and all(list(s["rd"]) == [f"{fake.pid}:{start}"] for s in samples), samples
     key = f"{fake.pid}:{start}"
     assert samples[1]["rd"][key] >= samples[0]["rd"][key] >= 0
