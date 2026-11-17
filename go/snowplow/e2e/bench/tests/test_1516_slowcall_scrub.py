@@ -17,20 +17,28 @@ import pytest
 from bench import logscrub
 from tests.test_run606_real_sequence import BENCH_DIR
 
-# a snapshot as snapshot.go's snapshotAttrs logs it (renderGroup / writeRequestLine shapes)
+# a snapshot exactly as snowplow renders it (main 5dc927ff): renderGroup's "<count> {<keptLabels>}" header (the
+# allowlisted labels sorted, each "k=v"; the fill's GVR label is gvr.String(), apistage.go:1005), its frames
+# "fn file:line" (frameOf), and writeRequestLine's request lines, whose waits name a GVR as
+# schema.GroupVersionResource.String() ("<group>/<version>, Resource=<resource>"; the GVR strings of slowcall's
+# own tests, slowcall_1054_test.go:185 and review2_1059_test.go:376, and the core group's "/v1, Resource=...")
 STACKS = ("== request stacks ==\n"
           "41 {snowplow_work=customer}\n"
           "  sync.runtime_notifyListWait sema.go:597\n"
           "  github.com/krateo-platformops/snowplow/internal/cache.(*flight).wait flight.go:212\n"
           "  net/http.(*conn).serve server.go:2102\n"
           "== background stacks ==\n"
-          "3 {apistage_fill_gvr=composition.krateo.io/v1-2-2/githubscaffoldingwithcompositionpages,snowplow_work=refresher}\n"
-          "  github.com/krateo-platformops/snowplow/internal/refresher.(*worker).run worker.go:88\n")
-REQUESTS = ("GET /call class:customer age_ms:8173 open:stage_dial:1 wait{stage_dial dial wait:3f9a0c1d2e4b "
-            "composition.krateo.io/v1-2-2/githubscaffoldingwithcompositionpages informer get attempts:2 status:0 "
-            "age_ms:8102}\n"
+          "3 {apistage_fill_gvr=composition.krateo.io/v1, Resource=fsas,apistage_fill_reason=miss,"
+          "snowplow_work=refresh}\n"
+          "  github.com/krateo-platformops/snowplow/internal/refresher.(*worker).run worker.go:88\n"
+          "2 {apistage_fill_gvr=/v1, Resource=configmaps,snowplow_work=customer}\n"
+          "  github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api.dispatch internal_dispatch.go:477\n")
+REQUESTS = ("GET /call class:customer age_ms:8173 open:stage_dial:1 wait{stage_dial dial g/v1, Resource=long "
+            "internal_rest_config list attempts:2 status:0 age_ms:8102}\n"
             "GET /call class:customer age_ms:8170 open:flight_wait:1 wait{flight_wait content_flight wait:77aa00bb11cc "
-            "leader:customer age_ms:8090}\n")
+            "composition.krateo.io/v1, Resource=fsas leader:refresh age_ms:8090}\n"
+            "GET /call class:background age_ms:6000 lead{flight_wait content_flight wait:0a1b2c3d4e5f "
+            "/v1, Resource=configmaps age_ms:5990}\n")
 
 
 def _snapshot(**over):
@@ -63,6 +71,14 @@ def test_a_stall_snapshot_names_its_blocked_frames():
     # the stacks and requests, whole, in clear: the blocked frames are named
     assert out["stacks"] == STACKS and out["requests"] == REQUESTS
     assert "internal/cache.(*flight).wait flight.go:212" in out["stacks"]
+    # the lines that say what a stalled request waited on, in the GVR shape snowplow renders: a fill-labelled
+    # stack header, a dial and a flight wait naming their GVR, a lead on the core group
+    assert "3 {apistage_fill_gvr=composition.krateo.io/v1, Resource=fsas,apistage_fill_reason=miss," in out["stacks"]
+    assert "2 {apistage_fill_gvr=/v1, Resource=configmaps,snowplow_work=customer}" in out["stacks"]
+    assert "wait{stage_dial dial g/v1, Resource=long internal_rest_config list attempts:2" in out["requests"]
+    assert "content_flight wait:77aa00bb11cc composition.krateo.io/v1, Resource=fsas leader:refresh" in out["requests"]
+    assert "/v1, Resource=configmaps age_ms:5990}" in out["requests"]
+    assert not any(ln.startswith("h:") for ln in out["stacks"].split("\n") + out["requests"].split("\n"))
     # every other string value is judged as before: wait_key (a digest) and route are not KEEP fields
     assert out["wait_key"].startswith("h:") and out["route"].startswith("h:")
 
@@ -80,6 +96,13 @@ def test_a_stall_snapshot_names_its_blocked_frames():
      "bench/identity.py"),
     # an e-mail in a frame's place
     ("stacks", "  alice@example.com x.go:1", "the grammar and an identity pattern"),
+    # a GVR is admitted as its own production, and a RESTAction can template its stage path from request data:
+    # a requester-chosen GVR still goes through every identity guard
+    ("requests", "GET /call class:customer age_ms:9 wait{flight_wait content_flight scaleuser-0042.io/v1, "
+                 "Resource=things age_ms:9}", "an identity pattern in an admitted GVR"),
+    ("stacks", "4 {apistage_fill_gvr=benchuser-7.example/v1, Resource=things}", "a --deny literal in an admitted GVR"),
+    ("requests", "GET /call class:customer age_ms:9 wait{flight_wait content_flight g/v1, Resource=workforcePools/"
+                 "acme age_ms:9}", "a GVR shape that is not one (its resource holds a '/')"),
 ])
 def test_a_line_that_names_an_identity_is_still_hashed_and_the_others_stay_readable(attr, line, why):
     """The allowlist cannot leak: each guard alone hashes the line (mutation: dropping that guard turns its case
@@ -95,10 +118,24 @@ def test_a_line_that_names_an_identity_is_still_hashed_and_the_others_stay_reada
 def test_only_slowcalls_own_records_are_allowlisted():
     """A record that is not slowcall's (another msg, or no slowcall subsystem) keeps today's rule: an unknown key
     name is hashed and its text is hashed whole."""
-    other, fake = _scrub({"msg": "something.else", "stacks": STACKS, "inflight": 3},
-                         _snapshot(subsystem="other"))
+    other, fake, same_subsystem = _scrub({"msg": "something.else", "stacks": STACKS, "inflight": 3},
+                                         _snapshot(subsystem="other"), _snapshot(msg="slowcall.other"))
     assert "stacks" not in other and "inflight" not in other
     assert any(v == logscrub._h(STACKS) for v in other.values())
-    assert "stacks" not in fake and "inflight" not in fake
-    assert not any(isinstance(v, str) and "flight.go" in v for v in fake.values())
+    for rec in (fake, same_subsystem):     # slowcall's subsystem without one of its two messages is not one of them
+        assert "stacks" not in rec and "inflight" not in rec, rec
+        assert not any(isinstance(v, str) and "flight.go" in v for v in rec.values())
+
+
+def test_a_key_name_slowcall_never_writes_is_hashed_even_in_its_records():
+    """Only slowcall's own key names are written as they are: any other key of a slowcall record is hashed."""
+    (out,) = _scrub(_snapshot(tenant_acme_ms=5))
+    assert "tenant_acme_ms" not in out and 5 in out.values()
+
+
+def test_a_slowcall_key_name_that_carries_a_deny_literal_is_hashed():
+    """A --deny literal vetoes even one of slowcall's own key names (run606 passes the bench's user prefix and the
+    test password)."""
+    (out,) = _scrub(_snapshot(), deny=("wait_kind",))
+    assert "wait_kind" not in out and "inflight" in out
 

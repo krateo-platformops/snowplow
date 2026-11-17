@@ -79,9 +79,10 @@ DENY = re.compile(
 # #1516: snowplow's slowcall records ("slowcall.request", and "slowcall.goroutines", the snapshot taken while a
 # customer request is past its bound) read as hashes, so a stall's blocked frames could not be read from a run's
 # evidence (run 28 N1, #1515). slowcall restricts them itself (internal/slowcall/slowcall.go:28-40, verified in
-# snapshot.go / monitor.go at main 24253666): `stacks` holds, per aggregated stack, its count, the pprof labels
+# snapshot.go / monitor.go at main 5dc927ff): `stacks` holds, per aggregated stack, its count, the pprof labels
 # on an allowlist (snowplow_work and the fill's apistage_fill_gvr / apistage_fill_reason: a closed class, a GVR,
-# a closed reason) and frames as `function file-basename:line` (frameOf, keptLabels, renderGroup), never an
+# a closed reason; the fill also sets apistage_fill_ra, which is not allowlisted, so slowcall drops it) and
+# frames as `function file-basename:line` (frameOf, keptLabels, renderGroup), never an
 # argument or a pc; `requests` holds, per in-flight slow request, its ServeMux route, work class, ages, open phases
 # and waits (a phase, a mechanism, the waited key only as its redact digest `wait:<hex>`, a GVR, a dial branch and
 # verb, a leader's work class, attempts and status: writeRequestLine). So these records' KEY names (each a code
@@ -112,12 +113,20 @@ SLOWCALL_KEYS = frozenset({
     "cfs_throttled_periods", "cfs_throttled_ms",
 }) | {f"{p}{s}" for p in _SLOWCALL_PHASES for s in ("_ms", "_n", "_max_ms", "_open")} | {
     f"{pre}{k}" for pre in ("wait_", "dial_", "lead_") for k in _SLOWCALL_INFO}
-_STACK_LABELS = ("snowplow_work", "apistage_fill_gvr", "apistage_fill_reason")
-_LABEL = r"(?:%s)=[A-Za-z0-9_./-]*" % "|".join(_STACK_LABELS)
+# A GVR as snowplow renders it everywhere slowcall shows one: schema.GroupVersionResource.String(),
+# "<group>/<version>, Resource=<resource>" (the core group empty: "/v1, Resource=pods"): the fill's label
+# (apistage.go:1005 beginContentFill(..., gvr.String(), ...)), a lead (apistage.go:980), a dial
+# (internal_dispatch.go:477 / 690), a wait (informer_dispatch.go:621), as slowcall's own tests write it
+# (slowcall_1054_test.go:185 / 198). Admitted as its OWN production, never by widening the token's characters
+# (no ',', ' ' nor '=' anywhere else). NOTE: the GVR comes from a RESTAction stage's path, which a RESTAction can
+# template from request data, so an admitted GVR string can be requester-chosen: it is kept only through every
+# identity guard (DENY's identity patterns, the --deny literals and patterns, bench/identity.py), as any line is.
+_GVR = r"[a-z0-9.-]*/[A-Za-z0-9.-]+, Resource=[A-Za-z0-9.-]+"
+_LABEL = (r"(?:apistage_fill_gvr=" + _GVR + r"|(?:snowplow_work|apistage_fill_reason)=[A-Za-z0-9_./-]*)")
 _STACKS_LINE = re.compile(
     r"^(?:== (?:request|background) stacks ==|\d+(?: \{" + _LABEL + r"(?:," + _LABEL + r")*\})?"
     r"|  [A-Za-z0-9_./()*\[\],{}-]+(?: [A-Za-z0-9_.-]+\.(?:go|s):\d+)?)$")
-_TOKEN = r"[A-Za-z0-9_:./{}*-]+"
+_TOKEN = r"(?:" + _GVR + r"|[A-Za-z0-9_:./{}*-]+)"
 _REQUESTS_LINE = re.compile(r"^[A-Z]+ /" + r"[A-Za-z0-9_./{}*-]*" + r" class:[A-Za-z0-9_-]+ age_ms:\d+"
                             r"(?: " + _TOKEN + r")*$")
 # DENY's identity alternatives alone (its "=" and '"' are a concatenated message's marks, not identities, and the
