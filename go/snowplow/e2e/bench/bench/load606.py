@@ -4184,10 +4184,20 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
                                   + "): the worst page load there is"})})
         checks.append(k6eval.signin_failure_check(signin_failed, after_failed))
         checks.append(k6eval.widget_error_check(k6.get("browser"), k6.get("thresholds")))
-        # #1508: a session that ended before the drive's end drove fewer loads than declared: INVALID by environment
-        validity.append(k6eval.sessions_check(
+        # #1508, judged by cause (the owner's ruling, 2026-11-17): a session lost while a recorded environment event
+        # overlapped its last stretch is INVALID by environment; one lost with none is a product FAIL
+        last_act: dict = {}
+        for n in navs + after_failed:
+            if isinstance(n.get("start"), (int, float)):
+                e = n["start"] + float(n.get("wall_ms") or 0) / 1000
+                last_act[n.get("session")] = max(last_act.get(n.get("session"), e), e)
+        events, events_why = k6.get("env_events") if k6.get("env_events") is not None else (None, "not given")
+        sess, lost_check = k6eval.sessions_check(
             k6eval.session_ends(k6.get("browser"), k6.get("sessions"), k6.get("logs")),
-            len(navs) + len(after_failed)))
+            len(navs) + len(after_failed), events, events_why, last_act)
+        validity.append(sess)
+        if lost_check is not None:
+            checks.append(lost_check)
     else:
         _check("driver.sched_lag_p95_ms",
                pct([n.get("sched_lag_ms", 0) for n in navs], 95), "<=",
@@ -6569,6 +6579,46 @@ def cluster_operations_report(path: str | None, recs: list[dict], report: dict, 
     return sec
 
 
+def measured_users_known_at_boot(settle_path: str | None) -> dict:
+    """report["measured_users_known_at_boot"]: whether the measure's k6 users were signed in before the measured boot
+    (the settle step's warm-up drives them, #1511). A run with no settle step (a bench before #1511) did not; one
+    whose settle record is missing is not known."""
+    if settle_path is None:
+        return {"value": False, "line": "measured users NOT known at boot: no warm-up (a bench before #1511)"}
+    try:
+        with open(settle_path) as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        rec = None
+    if not isinstance(rec, dict) or not (rec.get("load") or {}).get("started_at"):
+        return {"value": None, "line": "measured users known at boot: UNKNOWN (no settle record of a warm-up that ran)"}
+    return {"value": True, "warmup_started_at": rec["load"]["started_at"],
+            "line": "measured users known at boot (warm-up signed them in, from "
+                    f"{rec['load']['started_at']}): not comparable as cold with a run before #1511; the fresh "
+                    "never-signed-in identity classes are the cold path"}
+
+
+def recorded_env_events(path: str | None) -> tuple[list[dict] | None, str]:
+    """([{t0, t1, what}], "") the environment events the run recorded, or (None, why they are not known): every
+    operation of the run's cluster in its cluster-operations record (one still running at the read lasts to the
+    read). A missing or unreadable record is not "no event"."""
+    from bench import clusterops
+    if path is None:
+        return None, "no cluster-operations record was given"
+    rec, why = clusterops.load(path)
+    if rec is None:
+        return None, why
+    if not rec.get("readable") or not isinstance(rec.get("operations"), list):
+        return None, str(rec.get("unreadable") or "the record holds no operations")
+    out = []
+    for o in rec["operations"]:
+        if o.get("start_t") is None:
+            return None, f"operation {o.get('id')} has no start time"
+        out.append({"t0": o["start_t"], "t1": o.get("end_t") if o.get("end_t") is not None else rec.get("read_at"),
+                    "what": clusterops.op_text(o)})
+    return out, ""
+
+
 def _cmd_evaluate(a) -> int:
     recs = []
     streams = []
@@ -6598,7 +6648,10 @@ def _cmd_evaluate(a) -> int:
               "viewer": k6eval.read_viewer_out(a.k6_out) if a.k6_out else None,
               "viewers": not a.no_viewers,
               "sessions": a.browser_sessions,
-              "logs": a.browser_log}
+              "logs": a.browser_log,
+              # the owner's ruling (2026-11-17): a lost session is judged by the RECORDED environment events
+              # that overlapped it: the cluster's control-plane operations (cluster-operations.json)
+              "env_events": recorded_env_events(a.cluster_operations)}
         navs = k6eval.browser_navs(k6["browser"])
     fresh = [r for r in recs if r.get("kind") == "fresh"]
     vs = sorted((r for r in recs if r.get("kind") == "vars"
@@ -6719,6 +6772,10 @@ def _cmd_evaluate(a) -> int:
         if chk["result"] == "FAIL":
             result["verdict"] = "INVALID"
             result.setdefault("invalid_reasons", []).append(f"{chk['check']}: {chk['why']}")
+    # the owner's ruling (2026-11-17): the warm-up signs the measure's users in before the measured boot; accepted,
+    # and said, so no one compares this run's measured users as cold with a run before #1511
+    result["report"]["measured_users_known_at_boot"] = known = measured_users_known_at_boot(a.settle)
+    print(f"INFO {known['line']}", file=sys.stderr, flush=True)
     # the run's declared snowplow env and what its pod had before the measure (bench/snowplow_env.py,
     # snowplow-env.json): INFO; the pair states from it what its arms differ in
     from bench import snowplow_env

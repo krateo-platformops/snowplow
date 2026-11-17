@@ -209,7 +209,7 @@ def read(spec: gke.ClusterSpec, *, created: float | None, created_why: str = "",
     try:
         # the compute partial-error property off, as on every compute list (gke.COMPUTE_LIST_ENV): a lister
         # that swallows a failed request answers rc 0 with [] while it is true. This listing is the container
-        # API's, so its own fail-open forms are closed here: a complaint on stderr (GKE's missing zones) is
+        # API's, so its own fail-open forms are closed here: a gcloud ERROR: / WARNING: line on stderr (GKE's missing zones; other stderr text is not read as one) is
         # UNREADABLE, and a listing that lacks the cluster's own CREATE_CLUSTER (the positive control) is too.
         rc, out = run(argv, dry_run=False, log=lambda _m: None, stderr_out=err, timeout=timeout,
                       env=dict(os.environ, **gke.COMPUTE_LIST_ENV))
@@ -675,8 +675,9 @@ def _write(path: str, doc: dict) -> None:
 def settle_verdict(rec: dict) -> dict:
     """The verdict of an arm whose control plane did not settle by its deadline: INVALID by environment,
     named, not measured (custlat reads it as any arm's verdict: it voids the arm's pair)."""
+    # every poll unreadable: undecided (the bench could not read GKE), never a finding "by environment"
     chk = {"check": SETTLE_CHECK, "value": rec.get("state"), "bar": SETTLED, "result": "FAIL",
-           "why": BY_ENV + str(rec.get("why"))}
+           "why": (UNDECIDED if rec.get("state") == NOT_READ else BY_ENV) + str(rec.get("why"))}
     return {"verdict": "INVALID", "invalid_reasons": [f"{SETTLE_CHECK}: {chk['why']}"], "checks": [],
             "validity": [chk], "economics": None, "thresholds": {},
             "report": {"control_plane_settle": rec, "measured": False,
@@ -695,7 +696,12 @@ def settle(spec: gke.ClusterSpec, *, created: float | None, created_why: str = "
     evidence, sha = load_evidence(evidence_path)
     cad = cadence(evidence)
     rec: dict = {"kind": SETTLE_KIND, "cluster": spec.name, "region": spec.region, "state": WAITING, "why": None,
-                 "load": {"job": job, "container": container, "started_at": None},
+                 "load": {"job": job, "container": container, "started_at": None,
+                          # the owner's ruling (2026-11-17): accepted, and recorded: the warm-up drives the measure's
+                          # own users, so they are known to snowplow at the measured boot (never comparable as cold
+                          # with a run before #1511); the fresh never-signed-in identity classes stay the cold path
+                          "signs_in": "the measure's k6 users (measured users known at boot); the fresh identity "
+                                      "classes are not driven"},
                  "evidence": {"file": os.path.basename(evidence_path or EVIDENCE_FILE), "sha256": sha, **cad},
                  "deadline_at": None, "settled_at": None, "polls": [], "operations": None}
 
@@ -748,11 +754,18 @@ def settle(spec: gke.ClusterSpec, *, created: float | None, created_why: str = "
             return finish(SETTLED, f"{why} (read at {stamp(t)}, {t - at:.0f} s after the load started)",
                           EXIT_SETTLED)
         if t >= deadline:
+            span = (f"within {cad['deadline_s']:g} s of the warm-up load's start ({stamp(at)}..{stamp(deadline)}; "
+                    f"two windows of {cad['window_s']:g} s and the longest burst in the evidence, {cad['burst_s']:g} s)")
+            if all(p["state"] == NOT_READ for p in rec["polls"]):
+                # never read at all: nothing is known of the control plane, so this is no finding about it
+                return finish(NOT_READ, f"GKE's operations could not be read on any of {len(rec['polls'])} poll(s) "
+                                        f"{span}: whether the control plane settled is unknown (the last: {why}). The "
+                                        f"arm is not measured", EXIT_UNSETTLED)
+            load_note = rec["polls"][-1].get("load")
             return finish(UNSETTLED,
-                          f"GKE's control plane did not settle within {cad['deadline_s']:g} s of the warm-up load's "
-                          f"start ({stamp(at)}..{stamp(deadline)}; two windows of {cad['window_s']:g} s and the "
-                          f"longest burst in the evidence, {cad['burst_s']:g} s); at the last read: {why}. The arm "
-                          f"is not measured", EXIT_UNSETTLED)
+                          f"GKE's control plane did not settle {span}; at the last read: {why}"
+                          + (f" (the warm-up pod: {load_note})" if load_note else "") + ". The arm is not measured",
+                          EXIT_UNSETTLED)
         sleep(cad["poll_s"])
 
 
@@ -770,7 +783,8 @@ def settle_check(path: str | None) -> dict:
                                    f"before the measured reboot is unknown"}
     if rec.get("state") != SETTLED:
         return {"check": SETTLE_CHECK, "value": rec.get("state"), "bar": SETTLED, "result": "FAIL",
-                "why": BY_ENV + f"the control plane was {rec.get('state')} before the measure: {rec.get('why')}"}
+                "why": (UNDECIDED if rec.get("state") == NOT_READ else BY_ENV)
+                       + f"the control plane was {rec.get('state')} before the measure: {rec.get('why')}"}
     return {"check": SETTLE_CHECK, "value": SETTLED, "bar": SETTLED, "result": "PASS",
             "settled_at": rec.get("settled_at"), "load_started_at": (rec.get("load") or {}).get("started_at")}
 

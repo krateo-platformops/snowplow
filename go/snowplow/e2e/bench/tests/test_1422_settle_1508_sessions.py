@@ -145,10 +145,15 @@ class World:
     def pods(self):
         if self.pod == "never" or self.t < self.load_at:
             return {"items": []}, ""
+        # "unread": every read of the pod from the load's start + 900 s on fails (the API did not answer)
+        if self.pod == "unread" and self.t > self.load_at + 900:
+            return None, "listing the warm-up pod did not answer within 60 s"
         st = ({"terminated": {"exitCode": 1, "reason": "Error"}} if self.pod == "ended" and self.t > self.load_at + 900
               else {"running": {"startedAt": clusterops.stamp(self.load_at)}})
+        # "restarted": from the load's start + 900 s on, its container is running again after a restart
+        restarts = 1 if self.pod == "restarted" and self.t > self.load_at + 900 else 0
         return {"items": [{"metadata": {"name": "warmup606-0"}, "status": {
-            "phase": "Running", "containerStatuses": [{"name": "k6", "state": st, "restartCount": 0}]}}]}, ""
+            "phase": "Running", "containerStatuses": [{"name": "k6", "state": st, "restartCount": restarts}]}}]}, ""
 
 
 def _settle(tmp_path, w, **kw):
@@ -210,6 +215,12 @@ def test_an_unreadable_listing_is_never_settled(tmp_path, listing):
     assert rc == clusterops.EXIT_UNSETTLED and v["verdict"] == "INVALID", rec
     assert all(p["state"] == clusterops.NOT_READ for p in rec["polls"])
     assert "could not be read" in rec["why"] and rec["operations"] is None
+    # every poll unreadable is no finding about the control plane: undecided, never "by environment: did not settle"
+    # (mutation: settle_verdict's or finish's NOT_READ naming dropped turns this RED)
+    assert rec["state"] == clusterops.NOT_READ
+    assert v["invalid_reasons"][0].startswith("environment.control_plane_settled: INVALID by environment (undecided): "
+                                              "GKE's operations could not be read on any of "), v["invalid_reasons"]
+    assert "did not settle" not in v["invalid_reasons"][0]
 
 
 def test_a_cluster_with_no_operation_settles_after_two_checks_of_load(tmp_path):
@@ -224,6 +235,27 @@ def test_a_warm_up_that_does_not_run_is_a_tooling_failure_never_a_settle(tmp_pat
     w = World([("RESIZE_CLUSTER", T0 + 3700, None)], pod=pod)
     rc, rec, v, _ = _settle(tmp_path, w, start_within=120.0)
     assert rc == clusterops.EXIT_TOOLING and rec["state"] == state and v is None, rec
+
+
+def test_no_poll_settles_while_the_warm_up_pod_cannot_be_read(tmp_path):
+    """Z5: the listing reads settled, but the warm-up pod's own read failed at that poll: that the load ran through
+    the window is not known, so it is not settled (mutation: dropping `and pods is not None` turns this RED)."""
+    load = T0 + 3600
+    w = World([("RESIZE_CLUSTER", load + 100, load + 400)], load_at=load, pod="unread")
+    rc, rec, v, _ = _settle(tmp_path, w)
+    assert rc == clusterops.EXIT_UNSETTLED and rec["state"] == clusterops.UNSETTLED, rec
+    late = [p for p in rec["polls"] if gke.rfc3339_epoch(p["t"]) > load + 900]
+    assert late and all(p.get("load", "").startswith("not read: ") for p in late), late
+
+
+def test_a_restarted_warm_up_container_is_a_cut_load_never_a_window_it_ran_through(tmp_path):
+    """Z6: a restartCount >= 1 is a load that was cut: the warm-up did not run through the window (mutation:
+    dropping the restartCount check turns this RED)."""
+    load = T0 + 3600
+    w = World([("RESIZE_CLUSTER", load + 100, load + 400)], load_at=load, pod="restarted")
+    rc, rec, v, _ = _settle(tmp_path, w)
+    assert rc == clusterops.EXIT_TOOLING and rec["state"] == clusterops.LOAD_ENDED, rec
+    assert "restarted (1): the load was cut" in rec["why"]
 
 
 # ─── B. evaluate: the overlap and the settle record ─────────────────────────
@@ -387,7 +419,7 @@ def _n2_browser(d: Path, *, new_format: bool, lost=("s4", "s5")):
     _cpu_file(d, "browser", 3000, [1.0] * 20)
     log = d.parent / "driver-k6browser-x1.log"
     log.write_text("".join(
-        f'time="2026-11-16T15:48:02Z" level=error msg="Uncaught (in promise) Error: session {s}: the login form '
+        f'time="{clusterops.stamp(T_POINTS + 2)}" level=error msg="Uncaught (in promise) Error: session {s}: the login form '
         f'form#login_basic (#login_basic_username, #login_basic_password) could not be filled: filling '
         f'\\"#login_basic_username\\" with \\"<user>\\": timed out\\n\\tat runClass (file:///opt/k6/browser.js:315:13(175))'
         f'\\n" executor=per-vu-iterations scenario=ui\n' for s in lost)
@@ -396,7 +428,9 @@ def _n2_browser(d: Path, *, new_format: bool, lost=("s4", "s5")):
     return log
 
 
-def _n2_evaluate(tmp_path, *, new_format, with_log=True, lost=("s4", "s5")):
+def _n2_evaluate(tmp_path, *, new_format, with_log=True, lost=("s4", "s5"), resize=(-60.0, 100.0)):
+    """`resize`: a RESIZE_CLUSTER of the run's cluster, (start, end) seconds from the points' time (N2: its s4 / s5
+    were lost at 15:48:02Z inside the 15:45:25-15:49:55Z resize), or None: the record holds no operation then."""
     k6dir, bdir = tmp_path / "k6", tmp_path / "browser"
     _write_out(k6dir, "k6", _k6_points(20), _k6_summary(20), 0)
     _write_viewer(k6dir)
@@ -404,8 +438,13 @@ def _n2_evaluate(tmp_path, *, new_format, with_log=True, lost=("s4", "s5")):
     fresh = tmp_path / "fresh.jsonl"
     fresh.write_text(json.dumps({"kind": "fresh", "label": "list_dep@1", "converged": True, "latency_ms": 100,
                                  "polls": 1, "poll_ms": 100}) + "\n")
+    ops = _rec(*([("RESIZE_CLUSTER", T_POINTS + resize[0], T_POINTS + resize[1])] if resize else []))["operations"]
+    (tmp_path / "cluster-operations.json").write_text(json.dumps({
+        "kind": "cluster_operations", "cluster": NAME, "region": "europe-west4", "read_at": T_POINTS + 3600,
+        "readable": True, "unreadable": None, "operations": ops}))
     p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", str(fresh), "--k6-out", str(k6dir),
                         "--browser-out", str(bdir), "--browser-sessions", "5",
+                        "--cluster-operations", str(tmp_path / "cluster-operations.json"),
                         *(["--browser-log", str(log)] if with_log else [])],
                        capture_output=True, text=True, cwd=BENCH_DIR, timeout=300)
     return json.loads(p.stdout)
@@ -424,12 +463,41 @@ def test_n2s_timeouts_read_as_one_sign_in_failure_and_two_lost_sessions(tmp_path
     assert "session s2 class 2: stopped at its bound (60000 ms)" in si["why"]
     ses = _check(v["validity"], "environment.browser_sessions")
     assert ses["result"] == "FAIL" and ses["value"] == 2, ses
+    # judged by cause (2026-11-17): both were lost while the recorded resize overlapped their last stretch
     assert ses["why"].startswith("INVALID by environment: 2 of 5 declared real-browser session(s) ended before the "
-                                 "drive's end: s4: ") and "the arm drove 3 of 5 sessions to the end" in ses["why"]
-    assert "could not be filled" in ses["why"] and "<user>" in ses["why"] or "the login form" in ses["why"]
+                                 "drive's end while a recorded environment event overlapped them: s4: "), ses["why"]
+    assert "(during RESIZE_CLUSTER " in ses["why"] and "the arm drove 3 of 5 sessions to the end" in ses["why"]
+    assert "the login form" in ses["why"]
     assert v["verdict"] == "INVALID"
     assert _check(v["validity"], "browser.cpu_starvation")["result"] == "PASS"
     assert not any(r.startswith("browser.cpu_starvation") for r in v["invalid_reasons"]), v["invalid_reasons"]
+
+
+@pytest.mark.parametrize("new_format", [False, True])
+def test_a_session_lost_with_no_recorded_environment_event_is_a_product_fail(tmp_path, new_format):
+    """The owner's ruling (2026-11-17): the same two losses, and the cluster's only operation ended an hour before
+    them: no recorded environment event in their window, so a product FAIL named with its cause, never INVALID
+    (mutation: judging every lost session INVALID by environment again turns this RED)."""
+    v = _n2_evaluate(tmp_path, new_format=new_format, resize=(-4000.0, -3700.0))
+    ses = _check(v["validity"], "environment.browser_sessions")
+    assert ses["result"] == "PASS" and "judged a product failure" in ses["note"], ses
+    lost = _check(v["checks"], "browser.sessions_lost")
+    assert lost["result"] == "FAIL" and lost["value"] == 2, lost
+    for s in ("s4", "s5"):
+        part = lost["why"].split(f"{s}: ", 1)[1].split("; ", 1)[0]
+        assert "the login form form#login_basic" in part and "could not be filled" in part and part.endswith(
+            "timed out, no environment event in its window") or part.endswith("no environment event in its window: "
+                                                                              "the arm drove 3 of 5 sessions to the end "
+                                                                              f"({116 if new_format else 116} page loads)"), part
+    assert not any(r.startswith("environment.browser_sessions") for r in v["invalid_reasons"]), v["invalid_reasons"]
+
+
+def test_a_lost_session_without_readable_environment_events_is_undecided():
+    """No readable cluster-operations record: whether an event overlapped is unknown, never "none"."""
+    ends ={"state": "READ", "declared": 5, "lost": [{"session": "s4", "cause": "x", "at": 10.0}]}
+    sess, lost = k6eval.sessions_check(ends, 3, None, "the record could not be read", {"s4": 5.0})
+    assert sess["result"] == "FAIL" and sess["why"].startswith("INVALID by environment (undecided): s4: x (the "
+                                                               "environment's events could not be read") and lost is None
 
 
 def test_sessions_that_all_ran_to_the_end_pass(tmp_path):
@@ -587,3 +655,39 @@ def test_run606_fails_the_step_when_the_warm_up_does_not_run_or_does_not_go(harn
     p = _run606(env, FAKE_WARMUP=mode, PREFLIGHT_TIMEOUT_S="5")
     log = (tmp / "out" / "run.log").read_text()
     assert p.returncode != 0 and said in log and "=== step reboot ===" not in log, log[-3000:]
+
+
+# ─── #1511's follow-ups: the warm-up's users at the boot, and reevaluate's settle ─────────────────────────────
+
+def test_the_report_says_the_measured_users_were_known_at_boot(tmp_path):
+    """The owner's ruling (2026-11-17): accepted, and recorded."""
+    rec = tmp_path / "settle.json"
+    rec.write_text(json.dumps({"kind": clusterops.SETTLE_KIND, "state": clusterops.SETTLED,
+                               "load": {"started_at": "2026-11-17T09:00:00Z"}}))
+    got = load606.measured_users_known_at_boot(str(rec))
+    assert got["value"] is True and got["line"].startswith("measured users known at boot (warm-up signed them in")
+    assert "the fresh never-signed-in identity classes are the cold path" in got["line"]
+    assert load606.measured_users_known_at_boot(None)["value"] is False
+    assert load606.measured_users_known_at_boot(str(tmp_path / "missing.json"))["value"] is None
+
+
+@pytest.mark.parametrize("log,want", [
+    ("[10:00:00] === step settle ===\n[10:40:00] === step reboot ===\n", True),
+    ("[10:00:00] === step data ===\n[10:40:00] === step reboot ===\n", False),
+    (None, None),
+])
+def test_reevaluate_decides_the_settle_check_from_the_runs_own_log_never_from_the_files_presence(tmp_path, log, want):
+    """A run whose own run.log names the settle step is judged with --settle even when its settle.json is lost (it
+    then reads INVALID, undecided); one with no such step has none to judge; no run.log: not decided (mutation:
+    deciding from settle.json's presence turns the first case RED)."""
+    from bench import reevaluate
+    if log is not None:
+        (tmp_path / "run.log").write_text(log)
+    got, _ = reevaluate.derive(str(tmp_path))["settle"]
+    assert got is want
+    if want:
+        s = {"run8": (False, ""), "expect_digest": ("sha256:" + "ab" * 32, ""), "driver": ("load606", ""),
+             "frontend": ("none", ""), "settle": (True, "")}
+        argv = reevaluate.argv_for(str(tmp_path), s)
+        assert argv[argv.index("--settle") + 1] == str(tmp_path / "settle.json")
+        assert not (tmp_path / "settle.json").exists()
