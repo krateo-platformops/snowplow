@@ -103,6 +103,11 @@ def test_a_stall_snapshot_names_its_blocked_frames():
     ("stacks", "4 {apistage_fill_gvr=benchuser-7.example/v1, Resource=things}", "a --deny literal in an admitted GVR"),
     ("requests", "GET /call class:customer age_ms:9 wait{flight_wait content_flight g/v1, Resource=workforcePools/"
                  "acme age_ms:9}", "a GVR shape that is not one (its resource holds a '/')"),
+    # S11: a character outside the GVR's own alphabet (a resource name is a DNS label: no ':') is not a GVR, in a
+    # request's wait and in a fill label (mutation: widening _GVR's alphabet admits both)
+    ("requests", "GET /call class:customer age_ms:9 wait{flight_wait content_flight g/v1, Resource=a:b age_ms:9}",
+     "a GVR holding a character outside the GVR alphabet"),
+    ("stacks", "4 {apistage_fill_gvr=g/v1, Resource=a:b}", "a fill label's GVR holding a character outside its alphabet"),
 ])
 def test_a_line_that_names_an_identity_is_still_hashed_and_the_others_stay_readable(attr, line, why):
     """The allowlist cannot leak: each guard alone hashes the line (mutation: dropping that guard turns its case
