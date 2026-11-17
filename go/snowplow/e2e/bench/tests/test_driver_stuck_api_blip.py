@@ -105,7 +105,9 @@ def test_an_empty_pod_listing_answered_rc_0_is_unknown_too(harness):  # noqa: F8
     p, _, out = _run606_k6(harness, FAKE_API_EMPTY_PODS="3", FAKE_DRIVER_RUNNING="k6load",
                            DRIVE_POLL_S="1", MEASURE_WAIT_S="4")
     log = _log(out)
-    assert "never started" not in log, log[-3000:]
+    # #1519: the step's own "never started" failure line, never the bare words (a collect that reads an empty
+    # listing says, rightly, "... how it ended is unknown — not that it never started")
+    assert "driver never started:" not in log, log[-3000:]
     assert "measure FAILED: k6load not done within 4s" in log      # the deadline, not the empty read
 
 

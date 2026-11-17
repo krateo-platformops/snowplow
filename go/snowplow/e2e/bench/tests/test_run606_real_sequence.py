@@ -933,8 +933,10 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     if (a[:1] == ["wait"] and "job/fresh606" in a) or (a[:2] == ["get", "job/fresh606"] and "name" in a):
         api_blip("FAKE_API_DOWN_WAITS", "api_down_waits")
     # FAKE_API_EMPTY_PODS=N: the first N driver pod listings answer rc 0 with
-    # an empty body (a proxy in between, a cut stream): proves nothing either
-    if a[:2] == ["get", "pods"] and any(x in (f"job-name={d}" for d in drivers) for x in a) and "json" in a:
+    # an empty body (a proxy in between, a cut stream): proves nothing either. Counted in the MEASURE only (#1519):
+    # what collect reads never depends on how many of them the measure's polls happened to use
+    if (a[:2] == ["get", "pods"] and any(x in (f"job-name={d}" for d in drivers) for x in a) and "json" in a
+            and not os.path.exists(collect_started)):
         n_max = int(os.environ.get("FAKE_API_EMPTY_PODS", "0"))
         cnt = os.path.join(STATE, "api_empty_pods")
         n = int(open(cnt).read()) if os.path.exists(cnt) else 0
