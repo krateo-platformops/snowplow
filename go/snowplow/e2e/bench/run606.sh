@@ -3074,8 +3074,10 @@ s_evaluate() {
   fi
   [[ "$RUN8_REPORT" == "1" ]] && r8=(--run8)
   # #830: the page loads are the real browsers'; k6 is the load
+  # #1525 review: and the run's own loadgen manifest: the renderer watch it was configured with decides how its
+  # browser's loads are judged and which records it owes
   [[ "$LOAD_DRIVER" == "k6" ]] && k6args=(--k6-out "$OUT/k6" --browser-out "$OUT/browser"
-                                          --browser-sessions "$BROWSER_SESSIONS")
+                                          --browser-sessions "$BROWSER_SESSIONS" --loadgen-job "$OUT/loadgen-job.yaml")
   [[ "$LOAD_DRIVER" == "k6" && "$VIEWERS" != "1" ]] && k6args+=(--no-viewers)
   # #1508: the browser driver's log, where k6 says which session's iteration threw (a session that ended early)
   local blog
