@@ -687,6 +687,7 @@ def pairbed(tmp_path):
     repo.mkdir()
     shutil.copy(BENCH / "run606_pair.sh", repo)
     shutil.copy(BENCH / "run606_stats.sh", repo)          # #1390: the statistics stage it sources
+    shutil.copy(BENCH / "run606_arm.sh", repo)            # one arm's steps it sources (as run606_single.sh)
     shutil.copy(BENCH / "customer_latency_replica_runs12_13.json", repo)
     (repo / "run606.sh").write_text(FAKE_RUN606)
     fake = tmp_path / "fake"

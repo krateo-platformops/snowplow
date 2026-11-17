@@ -154,6 +154,22 @@ roots, HOME, PATH, KUBECONFIG, GHCR_PULL_ENV_FILE, any value that is an absolute
 token's own keys (GHCR_PULL_*: it travels only as the file), the test hooks (BENCH_606_DRY_RUN,
 BENCH_606_FAIL_AT, BENCH_606_HOST_LOAD) and gcloud overrides (CLOUDSDK_*).
 
+ONE ARM (Diego 2026-11-17, "Add a single-arm VM mode first"): the one-cluster rehearsal runs off the laptop
+as ONE full measuring arm. The launch's shape is decided once, from the env file (launch_shape): an env file
+whose RUNS names exactly one arm L, with no PAIRS and no REPLICA_PAIR, AND `--single L` on up / launch, is the
+single shape: a paid single launch is stated twice (#1522 review); a one-arm env file without --single, or a
+--single that disagrees with RUNS, refuses. Two or more is a pair; a one-arm env file that also names PAIRS or
+REPLICA_PAIR refuses, never guessed. The single shape runs run606_single.sh in place of
+run606_pair.sh: the arm's steps a pair takes for each of its arms (run606_arm.sh, shared by both: its dry pass
+in $SINGLE_OUT/dry-L, the pair's layout, so its TTL and planned k6 seconds are read from that run.log as a
+pair's are; the quota and host-load reads; the launch's record, single.json, copied to the evidence bucket
+before the run starts; the run's directory copied there, verified and read back once it exits, #1390) and
+none of a comparison's. Its launch directory is single-<RUN_NAME_L> (launch_name), where the pin manifest
+goes. The TTL it must outlive has no statistics term (no pair, no statistics stage); the started-check reads
+the one arm's run.log; the record carries shape and launch_dir; fetch brings back the record's runs and its
+launch directory, whatever its shape; status and down are the same. BENCH_606_REHEARSAL (run606.sh's no-load
+test hook) stays refused: this arm measures.
+
 FETCH. Once the launcher has exited (refused while it runs): one tar on the VM of every run's
 directory and evidence directory and the pair's, its sha256 checked after the copy, unpacked beside
 the laptop's trees, every evidence directory verified against its own MANIFEST.json
@@ -1475,7 +1491,7 @@ def cmd_up(a) -> int:
     check_storage_roles(roles)
     # #1395: what the launch will install, checked on the laptop before anything is made or resumed
     env = read_env_file(a.env_file)
-    for line in chart_check(env, check_env(env)):
+    for line in chart_check(env, launch_shape(env, a.single)[1]):
         _say(line)
     if resumable(st, run):
         return resume_up(run, st, a, roles)
@@ -1665,8 +1681,54 @@ def read_env_file(path: str) -> dict[str, str]:
     return env
 
 
+#: the two launch shapes (Diego 2026-11-17, "Add a single-arm VM mode first"), decided ONCE from the env file
+#: (launch_shape): every step after that reads the shape, never the env again
+PAIR, SINGLE = "pair", "single"
+#: each shape's launcher on the VM, and the variable that moves its own directory (its dry pass's)
+LAUNCHER = {PAIR: "run606_pair.sh", SINGLE: "run606_single.sh"}
+LAUNCHER_OUT = {PAIR: "PAIR_OUT", SINGLE: "SINGLE_OUT"}
+
+
+def launch_shape(env: dict[str, str], single: str | None = None) -> tuple[str, list[str]]:
+    """(the launch's shape, the labels of its runs), from the env file, once: SINGLE when its RUNS names exactly one
+    arm and --single names that arm too (`single`: stated twice), PAIR when it names two or more. Refused, never
+    guessed: a one-arm env file without --single; --single with an env file whose RUNS is not exactly that arm; a one-arm env file that also names PAIRS or REPLICA_PAIR
+    (a launch that states a comparison is not run as one arm); a pair env file without PAIRS."""
+    labels = check_env(env)
+    if single is not None and labels != [single]:
+        raise Refused(f"--single {single}: the env file's RUNS is {env.get('RUNS')!r}, not that one arm (a single-arm "
+                      f"launch states its one arm in RUNS too; it is never one arm picked out of a pair's)")
+    if len(labels) == 1:
+        # #1522 review: a paid single launch is STATED twice, in the env file and on the command line
+        if single is None:
+            raise Refused(f"the env file names one run ({labels[0]}): a single-arm launch is stated on the command "
+                          f"line too: pass --single {labels[0]}")
+        for k in ("PAIRS", "REPLICA_PAIR"):
+            if env.get(k):
+                raise Refused(f"the env file names one run ({labels[0]}) and {k}={env[k]}: a single arm compares "
+                              f"nothing, and a launch that names a pair is not run as one arm: unset {k}, or name "
+                              f"the pair's runs in RUNS")
+        return SINGLE, labels
+    if not env.get("PAIRS"):
+        raise Refused("the env file lacks PAIRS")
+    return PAIR, labels
+
+
+SINGLE_HELP = ("launch ONE measuring arm, L (run606_single.sh: the one-cluster rehearsal off the laptop): the env "
+               "file's RUNS must be exactly L, with no PAIRS (required for one arm: a single launch is stated twice)")
+
+
+def launch_name(env: dict[str, str], shape: str) -> str:
+    """The launch's own directory name: run606_pair.sh's PAIR_NAME (pair_name), or run606_single.sh's SINGLE_NAME,
+    "single-<RUN_NAME_L>" (its `SINGLE_NAME="single-${!nm}"` line; tests/test_vm606.py holds them to it)."""
+    if shape == SINGLE:
+        return "single-" + env["RUN_NAME_" + env["RUNS"].split()[0]]
+    return pair_name(env)
+
+
 def check_env(env: dict[str, str]) -> list[str]:
-    """The labels of the runs (RUNS); raises Refused on what cannot travel to the VM."""
+    """The labels of the runs (RUNS); raises Refused on what cannot travel to the VM (launch_shape decides the
+    launch's shape from them)."""
     bad = []
     for k, v in env.items():
         if SECRET_KEYS.match(k):
@@ -1680,9 +1742,11 @@ def check_env(env: dict[str, str]) -> list[str]:
     if bad:
         raise Refused("the env file cannot be launched on the VM:\n  " + "\n  ".join(bad))
     labels = (env.get("RUNS") or "").split()
-    if len(labels) < 2:
-        raise Refused("the env file's RUNS names fewer than two runs (run606_pair.sh's own default is not taken: "
-                      "the VM launches what the laptop launched, stated)")
+    if not labels:
+        raise Refused("the env file's RUNS names no run (a launcher's own default is not taken: the VM launches "
+                      "what the laptop launched, stated)")
+    if len(set(labels)) != len(labels):
+        raise Refused(f"RUNS names a run twice ({env['RUNS']!r})")
     for x in labels:
         if not re.fullmatch(r"[A-Z][A-Z0-9]*", x):
             raise Refused(f"RUNS: {x!r} is not a label")
@@ -1691,8 +1755,6 @@ def check_env(env: dict[str, str]) -> list[str]:
                 raise Refused(f"the env file lacks {v}_{x} (one per run of RUNS)")
     if not env.get("INSTALLER_VERSION"):
         raise Refused("the env file lacks INSTALLER_VERSION")
-    if not env.get("PAIRS"):
-        raise Refused("the env file lacks PAIRS")
     return labels
 
 
@@ -1760,7 +1822,10 @@ def _bench_vars(sha: str) -> str:
 
 
 def prepare_script(run: str, sha: str, repo: str, env: dict[str, str], pin_name: str, pin_sha: str,
-                   pair: str) -> str:
+                   name: str, shape: str = PAIR) -> str:
+    """The checkout, the venv, the pin manifest into the launch's own directory (`name`: the pair's, or the single
+    arm's), and the shape's launcher's own dry pass (its directory in $R/dry: each arm's dry pass in dry-<L>/, the
+    same layout for both launchers), whose arms' run.log hand the TTL and the planned k6 seconds."""
     q = shlex.quote
     return remote(run, _bench_vars(sha) + f"""\
 test -s {q(BOOTSTRAP_MARKER)} || refuse "the VM's bootstrap has not finished"
@@ -1780,11 +1845,11 @@ echo "vm606: bench checkout at $head"
 "$V/bin/pip" install -q -r "$B/requirements.txt" pyyaml jsonschema
 export PATH="$V/bin:$PATH" USE_GKE_GCLOUD_AUTH_PLUGIN=True
 {_exports(env)}cd "$B"
-PO="$(python3 -m bench.evidence run-dir {q(pair)})"
+PO="$(python3 -m bench.evidence run-dir {q(name)})"
 mkdir -p "$PO"
 cp "$R/pin/"{q(pin_name)} "$PO/"{q(pin_name)}
 rm -rf "$R/dry"
-if ! BENCH_606_DRY_RUN=1 PAIR_OUT="$R/dry" bash run606_pair.sh > "$R/dry.log" 2>&1; then
+if ! BENCH_606_DRY_RUN=1 {LAUNCHER_OUT[shape]}="$R/dry" bash {LAUNCHER[shape]} > "$R/dry.log" 2>&1; then
   tail -20 "$R/dry.log"
   refuse "the launcher's dry pass was refused ($R/dry.log)"
 fi
@@ -1805,32 +1870,50 @@ echo "VM606_PAIR_OUT=$PO"
 
 
 def launch_script(run: str, sha: str, env: dict[str, str], labels: list[str], pin_name: str, pin_sha: str,
-                  pair: str, started_timeout_s: int) -> str:
+                  name: str, started_timeout_s: int, shape: str = PAIR) -> str:
+    """The shape's launcher, detached, and the started-check: every arm's run.log holds its "run budget:" line
+    (each arm of a pair, or the single arm: the same check), or an arm's console in the launch's directory
+    (`name`) says "refusing:", or the launcher exited."""
     q = shlex.quote
     outs = "".join(f'OUT_{x}="$(python3 -m bench.evidence run-dir {q(env["RUN_NAME_" + x])})"\n' for x in labels)
     return remote(run, _bench_vars(sha) + f"""\
 [ -d "$B" ] || refuse "no checkout at $B: the prepare step did not run"
 export PATH="$V/bin:$PATH" USE_GKE_GCLOUD_AUTH_PLUGIN=True
 cd "$B"
-PO="$(python3 -m bench.evidence run-dir {q(pair)})"
+PO="$(python3 -m bench.evidence run-dir {q(name)})"
 got="$({_HASH_PY} "$PO/"{q(pin_name)})"
 [ "$got" = {q(pin_sha)} ] || refuse "the pin manifest in $PO has sha256 $got, not {pin_sha}"
 (umask 077; cat > "$R/launch-env.sh" <<'ENV'
 {_exports(env)}ENV
 )
-{_exports(env)}{outs}python3 -m bench.detach --log "$R/launch.log" --pidfile "$R/launch.pid" -- bash run606_pair.sh
+{_exports(env)}{outs}# #1522 review: only what THIS launch writes counts. Each file the check reads may hold an earlier launch's lines
+# (a run.log of the same RUN_NAME, a console, launch.log, which detach appends to): its size now is where this
+# launch's own lines begin, and only the bytes after it are read (by process substitution: under pipefail a grep
+# that stops early would fail the pipeline it reads)
+size() {{ if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else echo 0; fi; }}
+since() {{ if [ -f "$1" ]; then tail -c +"$(( $2 + 1 ))" "$1"; fi; }}
+L0="$(size "$R/launch.log")"
+for x in {" ".join(labels)}; do
+  o="OUT_$x"
+  printf -v "B0_$x" '%s' "$(size "${{!o}}/run.log")"
+  printf -v "C0_$x" '%s' "$(size "$PO/$x.console")"
+done
+python3 -m bench.detach --log "$R/launch.log" --pidfile "$R/launch.pid" -- bash {LAUNCHER[shape]}
 pid="$(cat "$R/launch.pid")"
 deadline=$(( $(date +%s) + {int(started_timeout_s)} ))
 while :; do
   ok=0; refused=""
+  r="$(grep -m1 '^refusing: ' <(since "$R/launch.log" "$L0") || true)"
+  if [ -n "$r" ]; then refused="launcher: $r;"; fi
   for x in {" ".join(labels)}; do
-    o="OUT_$x"
-    if grep -q "run budget: " "${{!o}}/run.log" 2>/dev/null; then ok=$((ok + 1)); fi
-    r="$(grep -h -m1 '^refusing: ' "$PO/$x.console" 2>/dev/null || true)"
+    o="OUT_$x" b0="B0_$x" c0="C0_$x"
+    if grep -q "run budget: " <(since "${{!o}}/run.log" "${{!b0}}"); then ok=$((ok + 1)); fi
+    r="$(grep -m1 '^refusing: ' <(since "$PO/$x.console" "${{!c0}}") || true)"
     if [ -n "$r" ]; then refused="$refused run $x: $r;"; fi
   done
-  if [ "$ok" -eq {len(labels)} ]; then echo "VM606_STARTED=ok"; break; fi
+  # a refusal anywhere is not a start; started is EVERY arm's run budget, written by this launch
   if [ -n "$refused" ]; then echo "VM606_STARTED=refused"; echo "vm606: $refused"; break; fi
+  if [ "$ok" -eq {len(labels)} ]; then echo "VM606_STARTED=ok"; break; fi
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "VM606_STARTED=exited"; tail -n 15 "$R/launch.log" | sed 's/^/vm606: launcher: /'; break
   fi
@@ -1847,11 +1930,13 @@ def statistics_records() -> list[str]:
     return sorted(str(p) for p in root.rglob("statistics.jsonl")) if root.exists() else []
 
 
-def statistics_budget(k6_seconds: str | None, pairs: str) -> tuple[float, str]:
+def statistics_budget(k6_seconds: str | None, pairs: str, shape: str = PAIR) -> tuple[float, str]:
     """#1390 item 3: the launch's statistics budget, measured (bench.statstime.budget over every recorded step and
     the committed measurement), for its planned k6 seconds per arm (the dry pass) and its steps (each pair of
     PAIRS: the replica's and every other pair's). Unknown refuses: a VM that cannot be shown to outlive its
-    statistics is not launched."""
+    statistics is not launched. A single arm has no pair, so no statistics stage: no term."""
+    if shape == SINGLE:
+        return 0.0, "no statistics stage (one arm, no pair)"
     if not (k6_seconds or "").isdigit():
         raise Refused("the dry pass logged no planned k6 seconds (run606.sh's `k6 customers: K6_SPAN=..., DRIVE_S=N s`):"
                       " the statistics budget is unknown")
@@ -1871,7 +1956,7 @@ def cmd_launch(a) -> int:
     if not HEX64.fullmatch(a.pin_sha256 or ""):
         raise Refused("--pin-sha256: 64 lowercase hex")
     env = read_env_file(a.env_file)
-    labels = check_env(env)
+    shape, labels = launch_shape(env, a.single)          # decided once: every step below reads it
     for line in chart_check(env, labels):      # #1395: before any SSH (the env file may differ from up's)
         _say(line)
     if env.get("ZONE", a.bench_zone) != a.bench_zone:
@@ -1884,21 +1969,22 @@ def cmd_launch(a) -> int:
     if got != a.pin_sha256:
         raise Refused(f"{pin} has sha256 {got}, not {a.pin_sha256}")
     _say(f"pin manifest {pin.name}: sha256 {got} (verified on the laptop)")
-    pair = pair_name(env)
+    lname = launch_name(env, shape)
     names = [env[f"RUN_NAME_{x}"] for x in labels]
     st, project, zone = _recorded(run)
     _bootstrapped(st, run)
     remote_pin = f"{vm_dir(run)}/pin/{pin.name}"
-    prep = prepare_script(run, a.bench_sha, a.repo_url, env, pin.name, got, pair)
-    go = launch_script(run, a.bench_sha, env, labels, pin.name, got, pair, a.started_timeout_s)
+    prep = prepare_script(run, a.bench_sha, a.repo_url, env, pin.name, got, lname, shape)
+    go = launch_script(run, a.bench_sha, env, labels, pin.name, got, lname, a.started_timeout_s, shape)
     if not a.yes:
         _say(f"DRY: on {name}: mkdir {vm_dir(run)}/pin")
         scp(str(pin), f"{name}:{remote_pin}", project, zone, dry=True)
         _say(f"DRY: on {name}: clone {a.repo_url} at {a.bench_sha}, venv, the launcher's dry pass; then, if the VM "
              f"outlives the run's TTL + {LAUNCH_MARGIN_S} s: python3 -m bench.detach --log {vm_dir(run)}/launch.log "
-             f"--pidfile {vm_dir(run)}/launch.pid -- bash run606_pair.sh, with {len(env)} variables: "
+             f"--pidfile {vm_dir(run)}/launch.pid -- bash {LAUNCHER[shape]}, with {len(env)} variables: "
              f"{', '.join(sorted(env))}; launched once every run logs its run budget")
-        _say(f"DRY: runs {', '.join(names)}; pair {pair}; clusters in ZONE={a.bench_zone}; nothing was started")
+        _say(f"DRY: {'one arm, no pair' if shape == SINGLE else 'runs'} {', '.join(names)}; "
+             f"{'launch' if shape == SINGLE else 'pair'} {lname}; clusters in ZONE={a.bench_zone}; nothing was started")
         return 0
     _parents(project, zone, st)
     _trusted(run, st, _present(name, project, zone))
@@ -1919,7 +2005,7 @@ def cmd_launch(a) -> int:
     if not (ttl or "").isdigit():
         raise Refused("the dry pass handed gke-up no --ttl-hours (no `bench.gke gke-up ... --ttl-hours N` in any "
                       f"dry-*/run.log under {vm_dir(run)}/dry): how long the run lasts is unknown")
-    stats_s, stats_how = statistics_budget(_marker(out, "VM606_RUN_K6_SECONDS"), env["PAIRS"])
+    stats_s, stats_how = statistics_budget(_marker(out, "VM606_RUN_K6_SECONDS"), env.get("PAIRS", ""), shape)
     inst = _trusted(run, st, _present(name, project, zone))
     left = _time_left_s(inst, time.time())
     need = int(ttl) * 3600 + stats_s + LAUNCH_MARGIN_S
@@ -1936,8 +2022,9 @@ def cmd_launch(a) -> int:
     if rc != 0:
         raise _failed("the detached launch", rc, out, err)
     started = _marker(out, "VM606_STARTED") or "unknown"
-    _save_state(run, launched_at=time.time(), bench_sha=a.bench_sha, bench_zone=a.bench_zone, runs=names, pair=pair,
-                pair_out=pair_out,
+    _save_state(run, launched_at=time.time(), bench_sha=a.bench_sha, bench_zone=a.bench_zone, runs=names,
+                shape=shape, launch_dir=lname, launch_out=pair_out,
+                **({"pair": lname, "pair_out": pair_out} if shape == PAIR else {}),
                 pin_manifest=pin.name, pin_sha256=got, run_ttl_hours=int(ttl), started=started, fetched=False,
                 statistics_budget_s=round(stats_s), statistics_budget=stats_how)
     if started != "ok":
@@ -2024,7 +2111,8 @@ def cmd_fetch(a) -> int:
     run = check_run(a.run)
     name = vm_name(run)
     st, project, zone = _recorded(run)
-    names = [*st.get("runs", []), st["pair"]] if st.get("pair") else []
+    launch_dir = st.get("launch_dir") or st.get("pair")
+    names = [*st.get("runs", []), launch_dir] if launch_dir else []
     if not names:
         raise Refused(f"no launch of {run} is recorded on this laptop ({state_dir(run) / 'state.json'})")
     if st.get("fetched"):
@@ -2280,13 +2368,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--env-file", required=True,
                    help="the env file the launch will take (#1395: the installer chart it installs is checked "
                         "on the laptop before anything is made)")
+    p.add_argument("--single", default=None, metavar="L", help=SINGLE_HELP)
     p.set_defaults(func=cmd_up)
 
     p = sub.add_parser("push-secret", help="copy the ghcr pull-token file to the VM (never read)")
     common(p)
     p.set_defaults(func=cmd_push_secret)
 
-    p = sub.add_parser("launch", help="clone at the bench SHA and start the paired launch, detached")
+    p = sub.add_parser("launch", help="clone at the bench SHA and start the launch (a pair, or one arm), detached")
+    p.add_argument("--single", default=None, metavar="L", help=SINGLE_HELP)
     common(p)
     p.add_argument("--bench-sha", required=True)
     p.add_argument("--bench-zone", required=True, type=_zone,

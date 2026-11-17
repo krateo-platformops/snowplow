@@ -453,6 +453,14 @@ case "${STUB_MODE:-ok}" in
   dirty) echo "refusing: uncommitted changes under the bench: every run must be one commit" >&2; exit 2 ;;
   refuse) echo "refusing: BENCH_606_GO must be '20261111-$RUN_NAME_N1' (Diego's explicit go for THIS run)" > "$PO/N1.console"
           sleep 30; exit 1 ;;
+  # #1522 review: the launcher refuses into launch.log (its stderr) and has not exited yet
+  launcher-refuse) echo "refusing: OUT_N1 already holds a run (run.log): use a new RUN_NAME_N1 or OUT_N1" >&2
+                   sleep 30; exit 2 ;;
+  # it runs on and writes no run budget (an arm that has not passed its paid-only checks)
+  quiet) sleep 30; exit 0 ;;
+  # X4: one arm logs its run budget, the other never does
+  half) o="$(python3 -m bench.evidence run-dir "$RUN_NAME_N1")"; mkdir -p "$o"
+        echo "[07:00:01] run budget: up 1800 + ...; fits TTL_HOURS=13" >> "$o/run.log"; sleep 30; exit 0 ;;
 esac
 for n in "$RUN_NAME_N1" "$RUN_NAME_N2"; do
   o="$(python3 -m bench.evidence run-dir "$n")"; mkdir -p "$o"
@@ -591,7 +599,8 @@ def test_launch_says_launched_only_once_every_run_passed_its_paid_only_checks(fa
     rc, out, err = _run(capsys, *_launch_args(tmp_path, repo, sha, pin, pin_sha, _env_file(tmp_path, STUB_MODE=mode)))
     assert rc == 2 and why in out and "did not get every run past its paid-only checks" in err, out + err
     assert "launched on" not in out
-    assert _state()["started"] == ("refused" if mode == "refuse" else "exited")
+    # a launcher refusing on its own stderr (launch.log) is a refusal, as an arm's console's is (#1522 review)
+    assert _state()["started"] == "refused"
 
 
 def test_launch_refuses_a_checkout_that_is_not_the_sha_asked(fake, capsys, tmp_path):
