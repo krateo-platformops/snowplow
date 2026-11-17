@@ -233,6 +233,20 @@ def test_watch_of_reads_the_flag_from_the_runs_own_manifest(tmp_path):
     assert k6eval.renderer_watch_of(str(tmp_path / "missing.yaml"))[0] == k6eval.WATCH_UNREADABLE
 
 
+def test_evaluate_refuses_a_browser_without_its_runs_manifest(tmp_path):
+    """#1525 review: without the run's loadgen-job.yaml a browser would be judged as old evidence by silence:
+    refused, named (mutation: the refusal dropped turns this RED)."""
+    _write_out(tmp_path / "browser", "browser", _browser_points(), _browser_summary(63), 0)
+    fresh = tmp_path / "fresh.jsonl"
+    fresh.write_text(json.dumps({"kind": "fresh", "label": "list_dep@1", "converged": True, "latency_ms": 100,
+                                 "polls": 1, "poll_ms": 100}) + "\n")
+    p = subprocess.run(["python3", "-m", "bench.load606", "evaluate", str(fresh), "--browser-out",
+                        str(tmp_path / "browser"), "--browser-sessions", "3"], cwd=BENCH, capture_output=True,
+                       text=True, timeout=120)
+    assert p.returncode == 2 and "refusing: --browser-out needs --loadgen-job" in p.stderr, p.stderr[-2000:]
+    assert p.stdout == ""
+
+
 def test_run606_and_reevaluate_pass_the_runs_own_manifest():
     """The bench's own evaluate calls state the config, so a post-#1517 run is never judged without it."""
     from bench import reevaluate
