@@ -4192,9 +4192,10 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
                 e = n["start"] + float(n.get("wall_ms") or 0) / 1000
                 last_act[n.get("session")] = max(last_act.get(n.get("session"), e), e)
         events, events_why = k6.get("env_events") if k6.get("env_events") is not None else (None, "not given")
+        starts = [t for t in ((k6.get("browser") or {}).get("frame_times") or {}).get("start", []) if t is not None]
         sess, lost_check = k6eval.sessions_check(
             k6eval.session_ends(k6.get("browser"), k6.get("sessions"), k6.get("logs")),
-            len(navs) + len(after_failed), events, events_why, last_act)
+            len(navs) + len(after_failed), events, events_why, last_act, min(starts) if starts else None)
         validity.append(sess)
         if lost_check is not None:
             checks.append(lost_check)

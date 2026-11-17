@@ -153,6 +153,10 @@ def read_k6_out(d: str, name: str) -> dict | None:
                     tags = tagsets.setdefault(tuple(sorted(tags.items())), tags)
                     if r["metric"] == "bench_frame":
                         out["frames"][tags.get("frame")] += 1
+                        # #1520 review: when the drive started (setup's start frame), a lost session's window's
+                        # earliest start
+                        out.setdefault("frame_times", {}).setdefault(tags.get("frame"), []).append(
+                            epoch(data.get("time")))
                     else:
                         out["points"][r["metric"]].append((data.get("value"), tags))
                         if r["metric"] in _TIMED:
@@ -683,7 +687,9 @@ def _log_ends(paths: list[str]) -> tuple[list[dict], str]:
         for m in _UNCAUGHT.finditer(text):
             msg = m.group(2).replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t").split("\n", 1)[0]
             s = _SESSION_OF.match(msg)
-            out.append({"session": s.group(1) if s else None, "at": epoch(m.group(1)) if m.group(1) else None,
+            at = epoch(m.group(1)) if m.group(1) else None
+            # k6's log time is cut to the second: the end lies in [at, at + 1 s)
+            out.append({"session": s.group(1) if s else None, "at": at, "at_until": None if at is None else at + 1.0,
                         "cause": redact_identity((s.group(2) if s else msg).strip())[:300]})
     return out, ""
 
@@ -735,11 +741,13 @@ def session_ends(o: dict | None, declared: int | None, logs: list[str] | None = 
 
 
 def sessions_check(ends: dict, loads: int | None = None, events: list[dict] | None = None,
-                   events_why: str = "", last_activity: dict | None = None) -> tuple[dict, dict | None]:
+                   events_why: str = "", last_activity: dict | None = None,
+                   drive_start: float | None = None) -> tuple[dict, dict | None]:
     """(environment.browser_sessions, browser.sessions_lost): every declared session ran to the drive's end; one
     that did not is judged by CAUSE (the owner's ruling, 2026-11-17), from evidence the bench records only:
 
-      - a lost session whose last stretch (its last recorded activity, `last_activity`, to its end, `at`) a recorded
+      - a lost session whose last stretch (its last recorded activity, `last_activity`, any class's last load, else
+        the drive's start, `drive_start`; to the latest its end can be, `at_until`, else `at`) a recorded
         environment event overlaps (`events`: each {t0, t1, what}: a control-plane operation of the cluster's
         cluster-operations record) is INVALID by environment, named with the event;
       - one that no recorded event overlaps is a FAIL (a product failure: browser.sessions_lost), named with its
@@ -765,9 +773,17 @@ def sessions_check(ends: dict, loads: int | None = None, events: list[dict] | No
         if events is None:
             undecided.append(dict(x, why=f"the environment's events could not be read ({events_why})"))
             continue
-        w0 = min(at, (last_activity or {}).get(x.get("session"), at))
-        hit = [e for e in events if e["t0"] <= at and (e["t1"] is None or e["t1"] >= w0)]
-        (env if hit else product).append(dict(x, window=[w0, at], events=[e["what"] for e in hit]))
+        # #1520 review: the window opens at the session's last recorded activity (any class's last load: a fresh
+        # class lost at its sign-in opens at the class before it), else at the drive's start, never at the loss
+        # itself; it closes at the latest the end could be (`at_until`: k6's log times are cut to the second)
+        w0 = (last_activity or {}).get(x.get("session"), drive_start)
+        if w0 is None:
+            undecided.append(dict(x, why="no activity of it and no start of the drive is recorded: its window is "
+                                         "not known"))
+            continue
+        w0, w1 = min(w0, at), max(at, x.get("at_until") or at)
+        hit = [e for e in events if e["t0"] <= w1 and (e["t1"] is None or e["t1"] >= w0)]
+        (env if hit else product).append(dict(x, window=[w0, w1], events=[e["what"] for e in hit]))
     tail = ((f": the arm drove {max(0, n - len(lost))} of {n} sessions to the end" if n else "")
             + (f" ({loads} page loads)" if loads is not None else ""))
     named = lambda xs: "; ".join(f"{x.get('session') or '(session not named)'}: {x.get('cause')}" for x in xs)  # noqa: E731
