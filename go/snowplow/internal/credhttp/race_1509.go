@@ -114,12 +114,32 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 )
 
-// racesFired counts the race's own attempts, at both levels: each one an
-// attempt started because the setups before it ran past the trigger with no
-// evidence (onTimer). Every other attempt is a waiter's own (the chain's first,
-// or one covering a waiter once the destination answered). So the setups a
-// destination sees beyond one per waiting request are at most the races fired.
-var racesFired atomic.Uint64
+// raceCounts counts the race's own attempts per destination window (setupKey:
+// the address and the level), each one an attempt started because the setups
+// before it ran past the trigger with no evidence (onTimer). Every other
+// attempt is a waiter's own (the chain's first, or one covering a waiter once
+// the destination answered). So the setups a destination sees beyond one per
+// waiting request are at most the races fired AT THAT DESTINATION
+// (racesFiredAt); a count across destinations would let another
+// destination's races excuse this one's extra setups.
+var raceCounts sync.Map // setupKey → *atomic.Uint64
+
+func noteRaceFired(key string) {
+	v, _ := raceCounts.LoadOrStore(key, new(atomic.Uint64))
+	v.(*atomic.Uint64).Add(1)
+}
+
+// racesFiredAt is how many race attempts addr's chains have fired, connect
+// and TLS levels together.
+func racesFiredAt(addr string) uint64 {
+	var n uint64
+	for _, key := range []string{setupKey(addr, false), setupKey(addr, true)} {
+		if v, ok := raceCounts.Load(key); ok {
+			n += v.(*atomic.Uint64).Load()
+		}
+	}
+	return n
+}
 
 // connectTimes is the per-destination setup-time window.
 var connectTimes = &destinationConnectTimes{rings: map[string]*reserveRing{}}
@@ -603,7 +623,7 @@ func (c *setupChain) onTimer() {
 		c.answered = false
 		c.wait = trigger
 	}
-	racesFired.Add(1)
+	noteRaceFired(c.ringKey)
 	c.startAttemptLocked()
 	c.wait *= 2
 	c.timer.Reset(c.wait)

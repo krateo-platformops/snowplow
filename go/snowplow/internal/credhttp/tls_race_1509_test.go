@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -553,16 +554,38 @@ func TestIssue1509_Chain_ALiveAttemptStillCoversAcrossAReRace(t *testing.T) {
 
 // A healthy burst opens one setup per request (#1521 review; the #1088
 // idle-bound subtest's shape): 25 concurrent HTTP/1.1 TLS requests through
-// NewEndpointTransport start exactly 25 connects, and the server accepts
-// exactly 25 connections — to a new destination (an empty window: the cold
+// NewEndpointTransport, to a new destination (an empty window: the cold
 // default trigger) and to a warm one (a full window of a realistic mix: solo
 // setups and a concurrent burst's, so the trigger is measured).
 func TestIssue1509_Chain_AHealthyBurstOpensOneSetupPerRequest(t *testing.T) {
-	t.Run("cold destination", func(t *testing.T) { healthyBurst1521(t, false) })
-	t.Run("warm destination", func(t *testing.T) { healthyBurst1521(t, true) })
+	t.Run("cold destination", func(t *testing.T) {
+		if err := healthyBurst1521(t, false, false); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("warm destination", func(t *testing.T) {
+		if err := healthyBurst1521(t, true, false); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
-func healthyBurst1521(t *testing.T, warm bool) {
+// The bound above reads the races fired AT THE BURST'S DESTINATION. Its own
+// check: while another destination's chain fires races, three deliberate extra
+// connects to the burst's destination must still be flagged. A count across
+// destinations would let the other destination's races excuse it.
+func TestIssue1509_Chain_ABurstsExtraConnectIsNotExcusedByAnotherDestinationsRaces(t *testing.T) {
+	err := healthyBurst1521(t, true, true)
+	if err == nil {
+		t.Fatal("three deliberate extra connects to the burst's destination passed the bound while another destination fired races: the race accounting is not per destination")
+	}
+	t.Logf("flagged as it must be: %v", err)
+}
+
+// healthyBurst1521 runs the burst and returns the bound's verdict. inject:
+// during the burst, another destination's chain fires races and three extra
+// connects go to the burst's destination outside any chain.
+func healthyBurst1521(t *testing.T, warm, inject bool) error {
 	resetConnectTimes(t) // a reused port must not bring another test's samples
 	const n = 25
 	var accepted, arrived atomic.Int32
@@ -585,7 +608,8 @@ func healthyBurst1521(t *testing.T, warm bool) {
 	}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
-	key := setupKey(srv.Listener.Addr().String(), true)
+	addr := srv.Listener.Addr().String()
+	key := setupKey(addr, true)
 	newRT := func() http.RoundTripper {
 		rt, err := NewEndpointTransport(&transport.Config{TLS: transport.TLSConfig{CAData: caPEMOf(srv)}, Proxy: http.ProxyFromEnvironment})
 		if err != nil {
@@ -593,7 +617,7 @@ func healthyBurst1521(t *testing.T, warm bool) {
 		}
 		return rt
 	}
-	burst := func(rt http.RoundTripper) {
+	burst := func(rt http.RoundTripper, during func()) {
 		arrived.Store(0)
 		release = make(chan struct{})
 		barrier.Store(true)
@@ -612,6 +636,9 @@ func healthyBurst1521(t *testing.T, warm bool) {
 				}
 				_ = resp.Body.Close()
 			}()
+		}
+		if during != nil {
+			during()
 		}
 		wg.Wait()
 		close(errs)
@@ -634,7 +661,7 @@ func healthyBurst1521(t *testing.T, warm bool) {
 		for range 5 {
 			solo()
 		}
-		burst(newRT())
+		burst(newRT(), nil)
 		for range 5 {
 			solo()
 		}
@@ -648,40 +675,73 @@ func healthyBurst1521(t *testing.T, warm bool) {
 	trigger, _ := connectTimes.trigger(key)
 	acceptedBefore := accepted.Load()
 
+	var during func()
+	var otherAddr string
+	if inject {
+		// Another destination whose handshakes hang, with a measured 1 ms
+		// trigger: its chain races every few milliseconds while it waits.
+		other, sl := stallTLSServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		otherAddr = sl.Addr().String()
+		seedConnectTimes(setupKey(otherAddr, true), time.Millisecond)
+		sl.stallFor(time.Minute)
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(caPEMOf(other))
+		otherCfg := &tls.Config{RootCAs: pool}
+		during = func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			_, _ = endpointDialTLS(ctx, "tcp", otherAddr, otherCfg) // hangs, raced, gives up
+			// Three connects to the burst's destination outside any chain:
+			// more than a race at that destination could ever excuse (a race
+			// fires in about 1 % of warm bursts, and adds at most one).
+			for range 3 {
+				if c, err := endpointDialFn(context.Background(), "tcp", addr); err == nil {
+					_ = c.Close()
+				}
+			}
+		}
+	}
+
 	var mu sync.Mutex
 	var starts []time.Duration
 	t0 := time.Now()
 	prev := endpointDialFn
 	endpointDialFn = func(ctx context.Context, network, a string) (net.Conn, error) {
-		mu.Lock()
-		starts = append(starts, time.Since(t0))
-		mu.Unlock()
+		if a == addr { // the burst's destination only
+			mu.Lock()
+			starts = append(starts, time.Since(t0))
+			mu.Unlock()
+		}
 		return prev(ctx, network, a)
 	}
 	defer func() { endpointDialFn = prev }()
-	racesBefore := racesFired.Load()
-	burst(newRT())
+	racesBefore := racesFiredAt(addr)
+	burst(newRT(), during)
 	time.Sleep(20 * time.Millisecond) // a late attempt would have started by now
-	races := int(racesFired.Load() - racesBefore)
+	races := int(racesFiredAt(addr) - racesBefore)
+	if inject && racesFiredAt(otherAddr) == 0 {
+		t.Fatal("the other destination fired no race: the check below would prove nothing")
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	// One setup per request; every connect beyond that is a race the chain
-	// fired (a setup ran past the measured trigger: the design's ~5 %), never
-	// an extra of its own. Doubling (a waiter's attempt replaced while alive)
-	// would add connects no race accounts for.
 	d, a := len(starts), int(accepted.Load()-acceptedBefore)
 	if !warm && (races != 0 || d != n || a != n) {
 		// A new destination's trigger is the cold default (3 s), which a
 		// burst of milliseconds never reaches: no race can fire, and the
-		// count is exact, independent of the race accounting above.
-		t.Fatalf("a healthy burst of %d requests to a new destination started %d connects, the server accepted %d, and %d races fired; want exactly %d, %d and 0 (trigger %v; connect starts %v)",
+		// count is exact, independent of the race accounting below.
+		return fmt.Errorf("a healthy burst of %d requests to a new destination started %d connects, the server accepted %d, and %d races fired; want exactly %d, %d and 0 (trigger %v; connect starts %v)",
 			n, d, a, races, n, n, trigger, starts)
 	}
+	// One setup per request; every connect beyond that is a race this
+	// destination's chains fired (a setup ran past the measured trigger: the
+	// design's ~5 %), never an extra of its own. Doubling (a waiter's attempt
+	// replaced while alive) adds connects no race accounts for.
 	if d < n || d-n > races || a-n > races {
-		t.Fatalf("a healthy burst of %d requests started %d connects and the server accepted %d, with %d races fired; want %d each plus at most one per race (trigger %v; connect starts %v)",
+		return fmt.Errorf("a healthy burst of %d requests started %d connects and the server accepted %d, with %d races fired at its destination; want %d each plus at most one per race (trigger %v; connect starts %v)",
 			n, d, a, races, n, trigger, starts)
 	}
 	if races > 0 {
 		t.Logf("%d races fired (connects %d, accepted %d)", races, d, a)
 	}
+	return nil
 }
