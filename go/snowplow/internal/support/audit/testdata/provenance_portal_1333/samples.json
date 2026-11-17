@@ -1,0 +1,66 @@
+{
+  "source": "krateo-platformops/frontend#695 at d9b251f5bcb7a9b9965a30edcb52a54d92ceef42, ui/src/hooks/callProvenance.ts confirmedWriteOf(...).headerFor(op); crypto.randomUUID stubbed; all ids and names are fake",
+  "samples": [
+    {
+      "name": "1. Confirmed set, 3 ops, mixed irreversible — header for op 1",
+      "header": "v1.eyJzb3VyY2UiOiJwb3J0YWwiLCJjb25maXJtYXRpb25JZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsImNvbmZpcm1lZFNldCI6eyJjb3VudCI6MywiaXJyZXZlcnNpYmxlIjp0cnVlLCJzaGEyNTYiOiJhY2JmYWQzMGE1MDRkNzBkZWExODQ5MDlmNjIwMmVjYTMyMTYwZDNmMTg3MWNkMmIzYjNkMjM5MjI3MzNlNDM2In0sIm9wIjoxLCJyZXF1ZXN0ZWRBdCI6IjIwMjYtMTEtMTFUMTA6MjA6MzAuNDU2WiJ9",
+      "headerBytes": 331,
+      "decodedJSON": "{\"source\":\"portal\",\"confirmationId\":\"00000000-0000-4000-8000-000000000001\",\"confirmedSet\":{\"count\":3,\"irreversible\":true,\"sha256\":\"acbfad30a504d70dea184909f6202eca32160d3f1871cd2b3b3d23922733e436\"},\"op\":1,\"requestedAt\":\"2026-11-11T10:20:30.456Z\"}",
+      "canonicalSet": "[{\"group\":\"composition.krateo.io\",\"irreversible\":false,\"name\":\"test-a\",\"namespace\":\"test-ns\",\"resource\":\"examplecatalogs\",\"verb\":\"POST\",\"version\":\"v1-2-0\"},{\"group\":\"\",\"irreversible\":true,\"name\":\"test-b\",\"namespace\":\"test-ns\",\"resource\":\"configmaps\",\"verb\":\"DELETE\",\"version\":\"v1\"},{\"group\":\"apps\",\"irreversible\":false,\"name\":\"test-c\",\"namespace\":\"test-ns\",\"resource\":\"deployments\",\"verb\":\"PATCH\",\"version\":\"v1\"}]",
+      "wantClientKeys": {
+        "krateo.audit.client.source": "portal",
+        "krateo.audit.client.confirmation_id": "00000000-0000-4000-8000-000000000001",
+        "krateo.audit.client.confirmed_set.count": "3",
+        "krateo.audit.client.confirmed_set.irreversible": "true",
+        "krateo.audit.client.confirmed_set.sha256": "acbfad30a504d70dea184909f6202eca32160d3f1871cd2b3b3d23922733e436",
+        "krateo.audit.client.confirmed_set.op": "1",
+        "krateo.audit.client.requested_at": "2026-11-11T10:20:30.456Z"
+      }
+    },
+    {
+      "name": "2. Agent write, single op (scalar runRest)",
+      "header": "v1.eyJzb3VyY2UiOiJwb3J0YWwiLCJhZ2VudFNlc3Npb25JZCI6InNfdGVzdC0wMDAwLTAwMDIiLCJjb25maXJtYXRpb25JZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImNvbmZpcm1lZFNldCI6eyJjb3VudCI6MSwiaXJyZXZlcnNpYmxlIjpmYWxzZSwic2hhMjU2IjoiNWFiMDRkMmQ0MTJhNzNhN2IyNDg1YmQ2ZWVmYjI5ZDcwOTkzYTQ1MTE3YmZlOGFhMzlmZmY3OWI5ODA5OTZkOSJ9LCJvcCI6MCwicmVxdWVzdGVkQXQiOiIyMDI2LTExLTExVDEwOjIxOjAwLjAwMFoifQ",
+      "headerBytes": 381,
+      "decodedJSON": "{\"source\":\"portal\",\"agentSessionId\":\"s_test-0000-0002\",\"confirmationId\":\"00000000-0000-4000-8000-000000000002\",\"confirmedSet\":{\"count\":1,\"irreversible\":false,\"sha256\":\"5ab04d2d412a73a7b2485bd6eefb29d70993a45117bfe8aa39fff79b980996d9\"},\"op\":0,\"requestedAt\":\"2026-11-11T10:21:00.000Z\"}",
+      "canonicalSet": "[{\"group\":\"composition.krateo.io\",\"irreversible\":false,\"name\":\"test-app\",\"namespace\":\"test-ns\",\"resource\":\"fireworksapps\",\"verb\":\"PATCH\",\"version\":\"v1alpha1\"}]",
+      "wantClientKeys": {
+        "krateo.audit.client.source": "portal",
+        "krateo.audit.client.agent_session_id": "s_test-0000-0002",
+        "krateo.audit.client.confirmation_id": "00000000-0000-4000-8000-000000000002",
+        "krateo.audit.client.confirmed_set.count": "1",
+        "krateo.audit.client.confirmed_set.irreversible": "false",
+        "krateo.audit.client.confirmed_set.sha256": "5ab04d2d412a73a7b2485bd6eefb29d70993a45117bfe8aa39fff79b980996d9",
+        "krateo.audit.client.confirmed_set.op": "0",
+        "krateo.audit.client.requested_at": "2026-11-11T10:21:00.000Z"
+      }
+    },
+    {
+      "name": "3. Sandbox-confined preview (no confirm shown) — source + agentSessionId + requestedAt only",
+      "header": "v1.eyJzb3VyY2UiOiJwb3J0YWwiLCJhZ2VudFNlc3Npb25JZCI6InNfdGVzdC0wMDAwLTAwMDMiLCJyZXF1ZXN0ZWRBdCI6IjIwMjYtMTEtMTFUMTA6MjI6MTUuNzg5WiJ9",
+      "headerBytes": 131,
+      "decodedJSON": "{\"source\":\"portal\",\"agentSessionId\":\"s_test-0000-0003\",\"requestedAt\":\"2026-11-11T10:22:15.789Z\"}",
+      "canonicalSet": null,
+      "wantClientKeys": {
+        "krateo.audit.client.source": "portal",
+        "krateo.audit.client.agent_session_id": "s_test-0000-0003",
+        "krateo.audit.client.requested_at": "2026-11-11T10:22:15.789Z"
+      }
+    },
+    {
+      "name": "4. Confirmed set whose requestedAt carries a +02:00 offset — header for op 0",
+      "header": "v1.eyJzb3VyY2UiOiJwb3J0YWwiLCJjb25maXJtYXRpb25JZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNCIsImNvbmZpcm1lZFNldCI6eyJjb3VudCI6MiwiaXJyZXZlcnNpYmxlIjp0cnVlLCJzaGEyNTYiOiJkYmIwZTE4MTBkMGIzZDk2YTBiM2JiMDA1MTVhNTVhMDU0YzRkM2E3ZDg3ZmRlZDljNjQ0OWM3ODg5Nzc1OTg4In0sIm9wIjowLCJyZXF1ZXN0ZWRBdCI6IjIwMjYtMTEtMTFUMTI6MjA6MzAuNDU2KzAyOjAwIn0",
+      "headerBytes": 338,
+      "decodedJSON": "{\"source\":\"portal\",\"confirmationId\":\"00000000-0000-4000-8000-000000000004\",\"confirmedSet\":{\"count\":2,\"irreversible\":true,\"sha256\":\"dbb0e1810d0b3d96a0b3bb00515a55a054c4d3a7d87fded9c6449c7889775988\"},\"op\":0,\"requestedAt\":\"2026-11-11T12:20:30.456+02:00\"}",
+      "canonicalSet": "[{\"group\":\"\",\"irreversible\":true,\"name\":\"test-d\",\"namespace\":\"test-ns\",\"resource\":\"secrets\",\"verb\":\"DELETE\",\"version\":\"v1\"},{\"group\":\"\",\"irreversible\":false,\"name\":\"test-e\",\"namespace\":\"test-ns\",\"resource\":\"configmaps\",\"verb\":\"POST\",\"version\":\"v1\"}]",
+      "wantClientKeys": {
+        "krateo.audit.client.source": "portal",
+        "krateo.audit.client.confirmation_id": "00000000-0000-4000-8000-000000000004",
+        "krateo.audit.client.confirmed_set.count": "2",
+        "krateo.audit.client.confirmed_set.irreversible": "true",
+        "krateo.audit.client.confirmed_set.sha256": "dbb0e1810d0b3d96a0b3bb00515a55a054c4d3a7d87fded9c6449c7889775988",
+        "krateo.audit.client.confirmed_set.op": "0",
+        "krateo.audit.client.requested_at": "2026-11-11T10:20:30.456Z"
+      }
+    }
+  ]
+}

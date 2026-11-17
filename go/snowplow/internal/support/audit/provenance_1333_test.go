@@ -42,6 +42,14 @@ func encode1333(js string) string {
 // bs1333 is a backslash, so a JSON escape in a raw string reads as one.
 const bs1333 = `\`
 
+// cid1333 is the confirmationId member every confirmed-set fixture carries,
+// so each arm breaks only its own rule.
+const cid1333 = `"confirmationId":"` + uuid1333 + `",`
+
+// setOp1333 completes a confirmation after a confirmationId, so an arm on the
+// id's format breaks only that rule.
+const setOp1333 = `,"confirmedSet":{"count":1,"irreversible":false,"sha256":"` + sha1333 + `"},"op":0`
+
 const (
 	sha1333  = "0a08bb91090b111f15a045b6061bccc4d0b8488d85f99ba57d8632e17061c277"
 	uuid1333 = "6f1d2c3b-4a5e-4f60-8b7a-9c0d1e2f3a4b"
@@ -67,9 +75,9 @@ func TestProvenance1333_A_ValidHeaderIsReadExactly(t *testing.T) {
 			`","confirmedSet":{"count":1,"irreversible":false,"sha256":"` + sha1333 + `"},"op":0}`,
 			ClientProvenance{Source: "portal", ConfirmationID: uuid1333,
 				ConfirmedSet: &krateoaudit.ConfirmedSet{Count: 1, SHA256: sha1333}}},
-		{"whitespace and key order are JSON's", " {\n \"op\" : 0 , \"confirmedSet\":{\"sha256\":\"" + sha1333 +
+		{"whitespace and key order are JSON's", " {\n \"op\" : 0 , \"confirmationId\" :\"" + uuid1333 + "\", \"confirmedSet\":{\"sha256\":\"" + sha1333 +
 			"\",\"irreversible\":false,\"count\":1},\"source\":\"portal\"}\t",
-			ClientProvenance{Source: "portal", ConfirmedSet: &krateoaudit.ConfirmedSet{Count: 1, SHA256: sha1333}}},
+			ClientProvenance{Source: "portal", ConfirmationID: uuid1333, ConfirmedSet: &krateoaudit.ConfirmedSet{Count: 1, SHA256: sha1333}}},
 		{"a JSON escape is its character", `{"source":"` + bs1333 + `u0070ortal"}`, ClientProvenance{Source: "portal"}},
 		{"requestedAt at year 0000", `{"source":"portal","requestedAt":"0000-01-01T00:00:00.000-00:01"}`,
 			ClientProvenance{Source: "portal", RequestedAt: time.Date(0, 1, 1, 0, 1, 0, 0, time.UTC)}},
@@ -136,7 +144,7 @@ var rejections1333 = []struct {
 	{"a bare string", encode1333(`"portal"`), "schema"},
 	{"null", encode1333(`null`), "schema"},
 	{"empty object: no source", encode1333(`{}`), "schema"},
-	{"no source", encode1333(`{"confirmationId":"` + uuid1333 + `"}`), "schema"},
+	{"no source", encode1333(`{"confirmationId":"` + uuid1333 + `"` + setOp1333 + `}`), "schema"},
 	{"another source", encode1333(`{"source":"agentiko"}`), "schema"},
 	{"source null", encode1333(`{"source":null}`), "schema"},
 	{"source a number", encode1333(`{"source":1}`), "schema"},
@@ -144,26 +152,29 @@ var rejections1333 = []struct {
 	{"agentSessionId 129", encode1333(`{"source":"portal","agentSessionId":"` + strings.Repeat("a", 129) + `"}`), "schema"},
 	{"agentSessionId a dot", encode1333(`{"source":"portal","agentSessionId":"a.b"}`), "schema"},
 	{"agentSessionId null", encode1333(`{"source":"portal","agentSessionId":null}`), "schema"},
-	{"confirmationId upper case", encode1333(`{"source":"portal","confirmationId":"` + strings.ToUpper(uuid1333) + `"}`), "schema"},
-	{"confirmationId no hyphens", encode1333(`{"source":"portal","confirmationId":"` + strings.ReplaceAll(uuid1333, "-", "") + `"}`), "schema"},
-	{"confirmationId braces", encode1333(`{"source":"portal","confirmationId":"{` + uuid1333 + `}"}`), "schema"},
-	{"confirmedSet without op", encode1333(`{"source":"portal","confirmedSet":{"count":1,"irreversible":false,"sha256":"` + sha1333 + `"}}`), "schema"},
-	{"op without confirmedSet", encode1333(`{"source":"portal","op":0}`), "schema"},
-	{"op equal to count", encode1333(`{"source":"portal","confirmedSet":{"count":3,"irreversible":false,"sha256":"` + sha1333 + `"},"op":3}`), "schema"},
-	{"op negative", encode1333(`{"source":"portal","confirmedSet":{"count":3,"irreversible":false,"sha256":"` + sha1333 + `"},"op":-1}`), "schema"},
-	{"op a fraction", encode1333(`{"source":"portal","confirmedSet":{"count":3,"irreversible":false,"sha256":"` + sha1333 + `"},"op":1.0}`), "schema"},
-	{"op a string", encode1333(`{"source":"portal","confirmedSet":{"count":3,"irreversible":false,"sha256":"` + sha1333 + `"},"op":"1"}`), "schema"},
-	{"count zero", encode1333(`{"source":"portal","confirmedSet":{"count":0,"irreversible":false,"sha256":"` + sha1333 + `"},"op":0}`), "schema"},
-	{"count an exponent", encode1333(`{"source":"portal","confirmedSet":{"count":1e1,"irreversible":false,"sha256":"` + sha1333 + `"},"op":0}`), "schema"},
-	{"count past int64", encode1333(`{"source":"portal","confirmedSet":{"count":9223372036854775808,"irreversible":false,"sha256":"` + sha1333 + `"},"op":0}`), "schema"},
-	{"irreversible a string", encode1333(`{"source":"portal","confirmedSet":{"count":1,"irreversible":"true","sha256":"` + sha1333 + `"},"op":0}`), "schema"},
-	{"irreversible null", encode1333(`{"source":"portal","confirmedSet":{"count":1,"irreversible":null,"sha256":"` + sha1333 + `"},"op":0}`), "schema"},
-	{"sha256 upper case", encode1333(`{"source":"portal","confirmedSet":{"count":1,"irreversible":false,"sha256":"` + strings.ToUpper(sha1333) + `"},"op":0}`), "schema"},
-	{"sha256 short", encode1333(`{"source":"portal","confirmedSet":{"count":1,"irreversible":false,"sha256":"` + sha1333[1:] + `"},"op":0}`), "schema"},
-	{"confirmedSet without sha256", encode1333(`{"source":"portal","confirmedSet":{"count":1,"irreversible":false},"op":0}`), "schema"},
-	{"confirmedSet with another key", encode1333(`{"source":"portal","confirmedSet":{"count":1,"irreversible":false,"sha256":"` + sha1333 + `","ops":[]},"op":0}`), "schema"},
-	{"confirmedSet a key twice", encode1333(`{"source":"portal","confirmedSet":{"count":1,"count":1,"irreversible":false,"sha256":"` + sha1333 + `"},"op":0}`), "schema"},
-	{"confirmedSet null", encode1333(`{"source":"portal","confirmedSet":null,"op":0}`), "schema"},
+	{"confirmationId upper case", encode1333(`{"source":"portal","confirmationId":"` + strings.ToUpper(uuid1333) + `"` + setOp1333 + `}`), "schema"},
+	{"confirmationId no hyphens", encode1333(`{"source":"portal","confirmationId":"` + strings.ReplaceAll(uuid1333, "-", "") + `"` + setOp1333 + `}`), "schema"},
+	{"confirmationId braces", encode1333(`{"source":"portal","confirmationId":"{` + uuid1333 + `}"` + setOp1333 + `}`), "schema"},
+	{"confirmedSet without op", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":1,"irreversible":false,"sha256":"` + sha1333 + `"}}`), "schema"},
+	{"op without confirmedSet", encode1333(`{"source":"portal",` + cid1333 + `"op":0}`), "schema"},
+	// A confirmation is all three or none (#1333 ruling).
+	{"confirmationId alone", encode1333(`{"source":"portal",` + strings.TrimSuffix(cid1333, ",") + `}`), "schema"},
+	{"confirmedSet and op without confirmationId", encode1333(`{"source":"portal","confirmedSet":{"count":1,"irreversible":false,"sha256":"` + sha1333 + `"},"op":0}`), "schema"},
+	{"op equal to count", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":3,"irreversible":false,"sha256":"` + sha1333 + `"},"op":3}`), "schema"},
+	{"op negative", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":3,"irreversible":false,"sha256":"` + sha1333 + `"},"op":-1}`), "schema"},
+	{"op a fraction", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":3,"irreversible":false,"sha256":"` + sha1333 + `"},"op":1.0}`), "schema"},
+	{"op a string", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":3,"irreversible":false,"sha256":"` + sha1333 + `"},"op":"1"}`), "schema"},
+	{"count zero", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":0,"irreversible":false,"sha256":"` + sha1333 + `"},"op":0}`), "schema"},
+	{"count an exponent", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":1e1,"irreversible":false,"sha256":"` + sha1333 + `"},"op":0}`), "schema"},
+	{"count past int64", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":9223372036854775808,"irreversible":false,"sha256":"` + sha1333 + `"},"op":0}`), "schema"},
+	{"irreversible a string", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":1,"irreversible":"true","sha256":"` + sha1333 + `"},"op":0}`), "schema"},
+	{"irreversible null", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":1,"irreversible":null,"sha256":"` + sha1333 + `"},"op":0}`), "schema"},
+	{"sha256 upper case", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":1,"irreversible":false,"sha256":"` + strings.ToUpper(sha1333) + `"},"op":0}`), "schema"},
+	{"sha256 short", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":1,"irreversible":false,"sha256":"` + sha1333[1:] + `"},"op":0}`), "schema"},
+	{"confirmedSet without sha256", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":1,"irreversible":false},"op":0}`), "schema"},
+	{"confirmedSet with another key", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":1,"irreversible":false,"sha256":"` + sha1333 + `","ops":[]},"op":0}`), "schema"},
+	{"confirmedSet a key twice", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":{"count":1,"count":1,"irreversible":false,"sha256":"` + sha1333 + `"},"op":0}`), "schema"},
+	{"confirmedSet null", encode1333(`{"source":"portal",` + cid1333 + `"confirmedSet":null,"op":0}`), "schema"},
 	{"requestedAt seconds only", encode1333(`{"source":"portal","requestedAt":"2026-11-11T10:20:30Z"}`), "schema"},
 	{"requestedAt microseconds", encode1333(`{"source":"portal","requestedAt":"2026-11-11T10:20:30.456789Z"}`), "schema"},
 	{"requestedAt no zone", encode1333(`{"source":"portal","requestedAt":"2026-11-11T10:20:30.456"}`), "schema"},
@@ -368,7 +379,7 @@ func TestProvenance1333_G_GoldenVector(t *testing.T) {
 
 	// The header carrying it: snowplow records the client's sha256 as sent.
 	h := http.Header{}
-	h.Set(ProvenanceHeader, encode1333(`{"source":"portal","confirmedSet":{"count":3,"irreversible":true,"sha256":"`+sha1333+`"},"op":1}`))
+	h.Set(ProvenanceHeader, encode1333(`{"source":"portal",`+cid1333+`"confirmedSet":{"count":3,"irreversible":true,"sha256":"`+sha1333+`"},"op":1}`))
 	c := ProvenanceOf(h)
 	if c.ConfirmedSet == nil || *c.ConfirmedSet != (krateoaudit.ConfirmedSet{Count: 3, Irreversible: true, SHA256: sha1333, Op: 1}) {
 		t.Fatalf("decoded set %+v", c.ConfirmedSet)
