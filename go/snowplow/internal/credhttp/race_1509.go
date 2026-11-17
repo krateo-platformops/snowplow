@@ -29,14 +29,19 @@ package credhttp
 //     destination sees at most log2(bound / trigger) + 1 attempts per attempt
 //     bound, however many requests wait on it;
 //   - each connection that comes up goes to ONE waiter, the longest waiting;
-//   - once a connection has come up, the destination is ANSWERING and the race
-//     is over for this chain (#1521): every waiter left, and every one that
-//     joins, gets an attempt of its own, at once, exactly as net/http dials one
-//     connection per waiting request without a race. No timer adds attempts
-//     then, so a healthy destination sees one connection per waiter and no
-//     surplus (a 25-request burst opens 25), and many waiters are served in
-//     parallel, not one after another. The race guards the phase it is for: a
-//     destination that has not answered since the chain began;
+//   - once a connection has come up, the destination is ANSWERING (#1521):
+//     every waiter left, and every one that joins, gets an attempt of its own,
+//     at once, exactly as net/http dials one connection per waiting request
+//     without a race, and no extra attempt is added. So a healthy destination
+//     sees one connection per waiter and no surplus (a 25-request burst opens
+//     25), and many waiters are served in parallel, not one after another;
+//   - "answering" holds only on FRESH evidence: within every trigger interval
+//     some attempt must come up or show progress (a TLS attempt reading its
+//     server's handshake bytes). An interval with neither means the destination
+//     stalled again — a busy destination's later control-plane change, with
+//     waiters that never let the chain empty — and the chain returns to racing
+//     for the waiters still waiting, with the same bound, from the trigger. No
+//     new number: the interval is the measured trigger;
 //   - each waiter leaves at its own deadline or cancellation, whatever the
 //     chain does; a connection that comes up with nobody waiting is closed
 //     (counted as opened, noteRacedConnectionUp); and when the last waiter
@@ -252,7 +257,8 @@ type setupChain struct {
 	wait        time.Duration
 	timer       *time.Timer
 	connected   bool // some attempt's connect came up
-	answered    bool // a setup completed: the race is over, attempts follow demand
+	answered    bool // a setup completed recently: attempts follow demand, no race
+	progress    bool // since the last check: an attempt came up or read handshake bytes
 	firstConn   error
 	firstTLS    error
 	countCtx    context.Context // a waiter's ctx: its connection counting (connections.go)
@@ -429,6 +435,10 @@ func (c *setupChain) attempt(ctx context.Context, answered bool) (net.Conn, erro
 
 // handshake runs the TLS handshake of a TLS chain's attempt on conn.
 func (c *setupChain) handshake(ctx context.Context, conn net.Conn) (net.Conn, error, bool) {
+	if ec, ok := conn.(*endpointConn); ok {
+		ec.watchRead(c.onProgress)
+		defer ec.watchRead(nil)
+	}
 	cfg := c.k.tlsCfg.Clone()
 	if cfg.ServerName == "" {
 		if host, _, herr := net.SplitHostPort(c.k.addr); herr == nil {
@@ -455,11 +465,13 @@ func (c *setupChain) result(r racedConn) {
 			return
 		}
 		c.deliverLocked(w, r)
-		// The destination answered: the race is over (no timer adds attempts
-		// any more), and every waiter left gets an attempt of its own.
+		// The destination answered: every waiter left gets an attempt of its
+		// own, and the timer now watches for fresh evidence (onTimer).
 		c.answered = true
+		c.progress = true
 		if c.timer != nil {
-			c.timer.Stop()
+			trigger, _ := connectTimes.trigger(c.ringKey)
+			c.timer.Reset(trigger)
 		}
 		if len(c.waiters) == 0 {
 			c.finishLocked()
@@ -495,12 +507,33 @@ func (c *setupChain) result(r racedConn) {
 func (c *setupChain) onTimer() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.done || c.answered || len(c.waiters) == 0 {
+	if c.done || len(c.waiters) == 0 {
 		return
+	}
+	if c.answered {
+		trigger, _ := connectTimes.trigger(c.ringKey)
+		if c.progress {
+			// Fresh evidence in the last interval: still answering.
+			c.progress = false
+			c.timer.Reset(trigger)
+			return
+		}
+		// An interval with no attempt up and no progress while waiters wait:
+		// the destination stalled again. Back to racing, from the trigger.
+		c.answered = false
+		c.wait = trigger
 	}
 	c.startAttemptLocked()
 	c.wait *= 2
 	c.timer.Reset(c.wait)
+}
+
+// onProgress records a TLS attempt reading its server's handshake bytes: the
+// destination answers even if no setup has completed yet.
+func (c *setupChain) onProgress() {
+	c.mu.Lock()
+	c.progress = true
+	c.mu.Unlock()
 }
 
 // finishLocked ends the chain: its attempts are cancelled, and the next setup

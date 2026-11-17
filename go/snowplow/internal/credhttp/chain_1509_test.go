@@ -273,3 +273,93 @@ func TestIssue1509_Chain_RacedLoserThatCameUpIsCountedOpened(t *testing.T) {
 		t.Fatalf("opened moved by %d; want 2: the winner (its ConnectDone) and the loser that came up (noteRacedConnectionUp)", got)
 	}
 }
+
+// A busy destination stalls a SECOND time (#1521 review): it answers, a
+// continuous stream of joiners keeps the chain from ever emptying, then it
+// stops answering (connects started now never complete, as a SYN in backoff)
+// and comes back. The waiters that joined after the stall must be raced: a
+// connection attempt started after the comeback serves them. With "answering
+// until the chain empties" every attempt they get started during the stall
+// and never completes: they wait out their deadlines (RED).
+func TestIssue1509_Chain_ABusyDestinationsSecondStallIsRaced(t *testing.T) {
+	resetConnectTimes(t)
+	l := newRaceListener(t)
+	addr := l.ln.Addr().String()
+	seedConnectTimes(setupKey(addr, false), 20*time.Millisecond)
+
+	var stalled atomic.Bool
+	prev := endpointDialFn
+	endpointDialFn = func(ctx context.Context, network, a string) (net.Conn, error) {
+		if stalled.Load() {
+			<-ctx.Done() // started during the stall: never completes
+			return nil, ctx.Err()
+		}
+		select {
+		case <-time.After(10 * time.Millisecond): // a connect that takes 10 ms
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, a)
+	}
+	t.Cleanup(func() { endpointDialFn = prev })
+
+	type result struct {
+		joined, took time.Duration
+		err          error
+	}
+	var mu sync.Mutex
+	var results []result
+	var wg sync.WaitGroup
+	t0 := time.Now()
+	join := func() {
+		defer wg.Done()
+		joined := time.Since(t0)
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		defer cancel()
+		c, err := raceDial(ctx, "tcp", addr)
+		if c != nil {
+			_ = c.Close()
+		}
+		mu.Lock()
+		results = append(results, result{joined, time.Since(t0), err})
+		mu.Unlock()
+	}
+
+	const stallAt, joinUntil, comeback = 300 * time.Millisecond, 340 * time.Millisecond, 900 * time.Millisecond
+	for time.Since(t0) < joinUntil {
+		if time.Since(t0) >= stallAt {
+			stalled.Store(true)
+		}
+		wg.Add(1)
+		go join()
+		time.Sleep(2 * time.Millisecond) // joiners overlap: the chain never empties
+	}
+	time.Sleep(time.Until(t0.Add(comeback)))
+	stalled.Store(false)
+	wg.Wait()
+
+	after := 0
+	for _, r := range results {
+		if r.joined < stallAt+15*time.Millisecond {
+			continue // before the stall, or served by an attempt started before it
+		}
+		after++
+		if r.err != nil {
+			t.Errorf("a waiter that joined %v (after the stall) failed: %v — it was not raced after the comeback", r.joined, r.err)
+			continue
+		}
+		if r.took > comeback+500*time.Millisecond {
+			t.Errorf("a waiter that joined %v got its connection at %v; want by comeback + 500ms (%v)", r.joined, r.took, comeback+500*time.Millisecond)
+		}
+	}
+	if after == 0 {
+		t.Fatal("SETUP: no waiter joined after the stall")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && l.accepted.Load() != l.closed.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if a, c := l.accepted.Load(), l.closed.Load(); a != c {
+		t.Fatalf("accepted %d, closed %d: a connection leaked", a, c)
+	}
+}

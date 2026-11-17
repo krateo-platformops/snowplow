@@ -68,6 +68,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
@@ -79,6 +80,28 @@ type endpointConn struct {
 	net.Conn
 	once   sync.Once
 	closed chan struct{}
+	// onRead, while set, is called on the first read that returns bytes (a
+	// raced TLS setup's progress, race_1509.go); one atomic load per read.
+	onRead atomic.Pointer[func()]
+}
+
+// watchRead sets (f) or clears (nil) the progress callback.
+func (c *endpointConn) watchRead(f func()) {
+	if f == nil {
+		c.onRead.Store(nil)
+		return
+	}
+	c.onRead.Store(&f)
+}
+
+func (c *endpointConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		if f := c.onRead.Swap(nil); f != nil {
+			(*f)()
+		}
+	}
+	return n, err
 }
 
 func newEndpointConn(c net.Conn) *endpointConn {
