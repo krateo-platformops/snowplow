@@ -28,6 +28,7 @@ import pytest
 import yaml
 
 from bench import fresh_classes, k6_job, rbac_model
+from tests.manifests import old_evidence_manifest
 from tests.test_k6_830 import _point, _run606_k6, _write_out
 from tests.test_run606_real_sequence import BENCH_DIR, _calls, harness  # noqa: F401  (fixture)
 
@@ -180,7 +181,8 @@ def _evaluate(d, scale=1.0, churn=None):
         (d / "fresh-fresh606-0.jsonl").write_text(json.dumps(churn) + "\n")
         files.append(str(d / "fresh-fresh606-0.jsonl"))
     p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", *files,
-                        "--browser-out", str(d / "browser"), "--browser-sessions", "3"],
+                        "--browser-out", str(d / "browser"), "--browser-sessions", "3",
+                        "--loadgen-job", old_evidence_manifest(d)],
                        cwd=BENCH_DIR, capture_output=True, text=True, timeout=300)
     assert p.stdout.strip().startswith("{"), p.stderr[-3000:]
     return json.loads(p.stdout)

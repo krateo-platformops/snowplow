@@ -173,7 +173,9 @@ def read_k6_out(d: str, name: str) -> dict | None:
                 out[key] = json.load(fh)
         except (OSError, ValueError):
             pass
-    out["cpu"] = {c: read_cpu(d, c) for c in ((name, "viewer") if name == "k6" else (name,))}
+    # the browser pod's renderers sidecar records its own cgroup too (Diego 2026-11-17: the helper measured directly)
+    out["cpu"] = {c: read_cpu(d, c) for c in {"k6": ("k6", "viewer"), "browser": ("browser", "renderers")}.get(
+        name, (name,))}
     if name == "browser":
         # 2026-11-17 ("Measure it precisely"): each renderer's run-queue wait, and which renderer renders each
         # session's page (None: not recorded, a bench before it)
@@ -299,9 +301,11 @@ def starvation(o: dict | None, container: str = "browser") -> dict:
             w["node_busy_share"] = round(db / (db + di), 4) if db + di > 0 else None
         wins.append(w)
     span = sum(w["t1"] - w["t0"] for w in wins)
+    # #1525 review: the per-renderer rule is decided by what the run was CONFIGURED to do (its recorded browser
+    # config's renderer watch, o["renderer_watch"]: renderer_watch_of), never by which of its files exist: a pod
+    # with the watch whose sidecar wrote nothing is judged per renderer, its loads UNKNOWN, never as old evidence
     rend = (renderer_state(o, off if anchored else None)
-            if container == "browser" and ((o or {}).get("renderers") is not None
-                                           or (o or {}).get("renderer_map") is not None) else None)
+            if container == "browser" and (o or {}).get("renderer_watch") == WATCH_ON else None)
     return {"rule": RULE_RENDERER if rend is not None else RULE_CONTAINER, "renderer": rend,
             "container": container, "pressure": pressure, "node": node, "anchored": anchored,
             "end_anchored": a1 is not None, "clock_step_s": step,
@@ -446,6 +450,155 @@ def covered(start: float, wall_ms: float, st: dict) -> bool:
         return False
     slack = st.get("slack_s") or 0.0
     return st["windows"][0]["t0"] - slack <= start and start + wall_ms / 1000 <= st["windows"][-1]["t1"] + slack
+
+
+#: the windows a container's cores are averaged over for their spread: long enough to hold several samples
+#: (CPU_SAMPLE_S apart), short enough for an arm to hold several of them
+SPREAD_WINDOW_S = 60.0
+
+
+def _quantile(vals: list[float], q: float) -> float | None:
+    """The q-quantile, interpolated, at the cores' own resolution (_pct rounds to 0.1: milliseconds')."""
+    if not vals:
+        return None
+    v = sorted(vals)
+    k = (len(v) - 1) * q
+    lo, hi = int(k), min(int(k) + 1, len(v) - 1)
+    return round(v[lo] + (v[hi] - v[lo]) * (k - lo), 4)
+
+
+def container_cpu_report(recs: list[dict] | None) -> dict | None:
+    """One container's own cgroup over the drive (k6_job._cpu_sampler's record): its mean cores (usage over the
+    whole record), the p95 of its sample windows, its throttled time and its PSI some / full per second; and the
+    RESOLUTION of that mean, from the arm's own spread: the record cut into SPREAD_WINDOW_S windows, the SD of
+    their cores, and 2 SD / sqrt(n) (n the windows). Fewer than two windows: no spread, so no resolution (None,
+    said). None when the record holds fewer than two samples."""
+    if not recs:
+        return None
+    start = next((r for r in recs if r.get("kind") == "cpu_start"), {})
+    pts = [r for r in recs if r.get("kind") == "cpu" and r.get("usage_usec") is not None]
+    if len(pts) < 2 or float(pts[-1]["t"]) <= float(pts[0]["t"]):
+        return None
+    a, b = pts[0], pts[-1]
+    span = float(b["t"]) - float(a["t"])
+
+    def rate(k: str, x: dict, y: dict, scale: float) -> float | None:
+        return (round((y[k] - x[k]) / scale / (float(y["t"]) - float(x["t"])), 4)
+                if x.get(k) is not None and y.get(k) is not None else None)
+    per = [rate("usage_usec", x, y, 1e6) for x, y in pairwise(pts) if float(y["t"]) > float(x["t"])]
+    wins, w0 = [], a
+    for p in pts[1:]:
+        if float(p["t"]) - float(w0["t"]) >= SPREAD_WINDOW_S:
+            wins.append(rate("usage_usec", w0, p, 1e6))
+            w0 = p
+    return {"request_m": start.get("request_m"), "limit_m": start.get("limit_m"), "seconds": round(span, 1),
+            "cores_mean": rate("usage_usec", a, b, 1e6), "cores_p95": _quantile(per, 0.95),
+            "throttled_s_per_s": rate("throttled_usec", a, b, 1e6),
+            "psi_some_s_per_s": rate("pressure_some_usec", a, b, 1e6),
+            "psi_full_s_per_s": rate("pressure_full_usec", a, b, 1e6),
+            "spread": spread(wins)}
+
+
+def spread(wins: list[float]) -> dict:
+    """The resolution of a mean over SPREAD_WINDOW_S windows (#1525 review): load is correlated from one minute
+    to the next, so the windows are not n independent samples. x the windows' cores, x-bar their mean:
+    rho = sum_{i=1..n-1} (x_i - x-bar)(x_{i+1} - x-bar) / sum_{i=1..n} (x_i - x-bar)^2 (the mean-centred lag-1
+    estimator over the full sum of squares, not a Pearson correlation of x[:-1] against x[1:]), clipped to
+    [0, 0.99]; n_eff = n (1 - rho) / (1 + rho); SD the windows' sample SD (n - 1); resolution = 2 SD /
+    sqrt(n_eff). n_eff under 2: unresolved, said so (no resolution stated)."""
+    n = len(wins)
+    out = {"window_s": SPREAD_WINDOW_S, "windows": n, "sd_cores": None, "rho": None, "n_eff": None,
+           "resolution": None}
+    if n < 2:
+        return dict(out, why=f"{n} window(s) of {SPREAD_WINDOW_S:g} s: unresolved (no spread)")
+    m = sum(wins) / n
+    ss = sum((x - m) ** 2 for x in wins)
+    sd = (ss / (n - 1)) ** 0.5
+    raw = sum((x - m) * (y - m) for x, y in pairwise(wins)) / ss if ss > 0 else 0.0
+    rho = min(0.99, max(0.0, raw))
+    n_eff = n * (1 - rho) / (1 + rho)
+    out.update(sd_cores=round(sd, 4), rho=round(rho, 4), n_eff=round(n_eff, 3))
+    if n_eff < 2:
+        return dict(out, why=f"{n} window(s) of {SPREAD_WINDOW_S:g} s with lag-1 autocorrelation {rho:.2f}: "
+                             f"{n_eff:.2f} effective, under 2: unresolved")
+    return dict(out, resolution=round(2 * sd / n_eff ** 0.5, 4))
+
+
+#: the renderer watch a run was configured with (renderer_watch_of): on; off (a bare fixture's config: a measured
+#: pod refuses it); absent (a recorded browser config from before #1517: no such flag); unreadable
+WATCH_ON, WATCH_OFF, WATCH_ABSENT, WATCH_UNREADABLE = "on", "off", "absent", "unreadable"
+
+
+def renderer_watch_of(manifest: str | None) -> tuple[str, str]:
+    """(the renderer watch the run was CONFIGURED with, from its own recorded config, why) (#1525 review): the
+    k6browser ConfigMap's browser-config.json in the run's loadgen-job.yaml, its `rendererWatch` (k6_job
+    browser_config; render_browser refuses a pod without it on). WATCH_ABSENT when the config has no such key (a
+    bench before #1517) or no manifest is given; WATCH_UNREADABLE when a manifest is given but its browser config
+    cannot be read: what the run was configured to do is then unknown."""
+    if manifest is None:
+        return WATCH_ABSENT, "no loadgen manifest given"
+    import yaml
+    try:
+        with open(manifest) as fh:
+            docs = [d for d in yaml.safe_load_all(fh) if isinstance(d, dict)]
+        cm = next(d for d in docs if d.get("kind") == "ConfigMap" and (d.get("metadata") or {}).get("name") == "k6browser")
+        cfg = json.loads(cm["data"]["browser-config.json"])
+    except (OSError, ValueError, StopIteration, KeyError, TypeError, yaml.YAMLError) as e:
+        return WATCH_UNREADABLE, f"the run's browser config ({os.path.basename(manifest)}, ConfigMap k6browser) could " \
+                                 f"not be read ({type(e).__name__})"
+    if "rendererWatch" not in cfg:
+        return WATCH_ABSENT, "the run's browser config states no renderer watch (a bench before #1517)"
+    return (WATCH_ON if cfg["rendererWatch"] is True else WATCH_OFF), \
+        f"the run's browser config: rendererWatch {cfg['rendererWatch']!r}"
+
+
+def renderer_records_check(o: dict | None) -> dict | None:
+    """loadgen.renderer_records (#1525 review): a run CONFIGURED with the renderer watch must hold every record
+    the per-renderer rule reads: the renderer reads (renderer-map.jsonl, at least one read) and the renderer
+    samples (browser-renderers.jsonl, at least one sample); each one missing or empty FAILS, named: INVALID
+    (undecided), never judged as old evidence. A config that cannot be read FAILS too. None for a run whose
+    recorded config states no watch (old evidence: the container rule)."""
+    w = (o or {}).get("renderer_watch")
+    base = {"check": "loadgen.renderer_records", "bar": "a run with the renderer watch holds its renderer records"}
+    if w == WATCH_UNREADABLE:
+        return dict(base, value=None, result="FAIL",
+                    why="INVALID (undecided): " + str((o or {}).get("renderer_watch_why")) + ": whether the run had "
+                        "the renderer watch, and so which rule judges its loads, is unknown")
+    if w != WATCH_ON:
+        return None
+    missing = []
+    if not any(m.get("kind") == "renderer_map" for m in o.get("renderer_map") or []):
+        missing.append("renderer-map.jsonl (the renderer reads): " + ("absent" if o.get("renderer_map") is None
+                                                                      else "no read"))
+    if not any(r.get("kind") == "renderer" for r in o.get("renderers") or []):
+        missing.append("browser-renderers.jsonl (the renderer samples): " + ("absent" if o.get("renderers") is None
+                                                                            else "no sample"))
+    if missing:
+        return dict(base, value={"missing": missing}, result="FAIL",
+                    why="INVALID (undecided): the run had the renderer watch and lacks " + "; ".join(missing)
+                        + ": its loads' renderers are unknown, never judged as old evidence")
+    return dict(base, value={"missing": []}, result="PASS")
+
+
+def helper_cpu_check(o: dict | None) -> dict | None:
+    """loadgen.renderers_cpu (Diego 2026-11-17: the helper's cost is measured, directly): a browser run CONFIGURED
+    with the renderer watch (its recorded config, #1525 review: never inferred from which files exist) must hold
+    the renderers sidecar's own CPU record with samples; missing or empty FAILS (a missing measure is never a zero
+    cost). None for a run whose recorded config states no watch (a bench before #1517): no helper to measure."""
+    if o is None or o.get("renderer_watch") != WATCH_ON:
+        return None
+    base = {"check": "loadgen.renderers_cpu", "bar": "the renderers sidecar's own CPU record, with samples"}
+    recs = (o.get("cpu") or {}).get("renderers")
+    rep = container_cpu_report(recs)
+    if recs is None:
+        return dict(base, value=None, result="FAIL",
+                    why="INVALID (undecided): the renderers sidecar left no CPU record (renderers-cpu.jsonl): its "
+                        "cost is unknown, never zero")
+    if rep is None:
+        return dict(base, value=None, result="FAIL",
+                    why="INVALID (undecided): the renderers sidecar's CPU record holds fewer than two samples: its "
+                        "cost is unknown, never zero")
+    return dict(base, value=rep, result="PASS")
 
 
 def cpu_check(o: dict | None, container: str, th: dict | None = None) -> dict:

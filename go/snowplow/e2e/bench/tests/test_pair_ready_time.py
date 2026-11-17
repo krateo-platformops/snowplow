@@ -47,6 +47,7 @@ import pytest
 
 from bench import custlat, load606
 from tests import fake_region
+from tests.manifests import old_evidence_manifest
 from tests.test_run15_customer_latency import (BENCH, FIX, NA, NB, P14, REPLICA, _iso, _launch,  # noqa: F401
                                                _write_run, pairbed)
 
@@ -97,7 +98,7 @@ def _evaluate15(d: Path, arm: dict) -> dict:
     files = _write15(d, arm)
     p = subprocess.run(["python3", "-m", "bench.load606", "evaluate", *files, "--expect-digest", arm["digest"],
                         "--k6-out", str(d / "k6"), "--browser-out", str(d / "browser"),
-                        "--browser-sessions", "5", "--no-viewers"],
+                        "--browser-sessions", "5", "--no-viewers", "--loadgen-job", old_evidence_manifest(d, 5)],
                        cwd=BENCH, capture_output=True, text=True, check=False)
     v = json.loads(p.stdout)
     v["verdict"] = arm["verdict"]
@@ -372,7 +373,8 @@ def _verdict(d: Path, doc, digest, *, scale=lambda t, v: v, restarts_check=True)
     buf = io.StringIO()
     with redirect_stdout(buf):
         load606.main(["evaluate", *files, "--k6-out", str(d / "k6"), "--browser-out", str(d / "browser"),
-                      "--browser-sessions", "5", "--no-viewers", "--expect-digest", digest])
+                      "--browser-sessions", "5", "--no-viewers", "--expect-digest", digest,
+                      "--loadgen-job", old_evidence_manifest(d, 5)])
     v = json.loads(buf.getvalue())
     n = doc.get("_restarts") or 0
     v["validity"] = ([{"check": custlat.RESTART_CHECK, "result": "FAIL", "value": n,

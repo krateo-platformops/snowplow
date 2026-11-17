@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import yaml
 
 from bench import k6eval, load606
 from tests.test_k6_830 import (T_POINTS, _browser_points, _browser_pod_in_docker, _browser_summary, _check,
@@ -31,14 +32,16 @@ def _uptime(epoch: float) -> float:
 
 
 def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, stall=None, lost=(), idle=None,
-          ops=None, node=True):
+          ops=None, node=True, helper_cpu=True, watch=None, omit=()):
     """Warm loads at 600 ms (over the 500 ms bar) for 3 sessions, inside 20 s of browser-container stall (every
     window stalled 5 s: the container rule explains the FAIL away). `renderer`: the run also recorded per-renderer
     evidence: each session's renderer (PIDS) read by renderers.js before and (`map_after`) after its loads, and
     sampled every second; the renderers of `stalled` sessions waited for a CPU all through their loads, the others
     none (an idle page's renderer). `lost`: those sessions ended early (at the points' time, a login-form timeout);
     `idle`: the node's idle ticks per CPU window (0 = no idle CPU); `ops`: the cluster's operations record (none
-    recorded by default: every lost session is judged on its renderer alone)."""
+    recorded by default: every lost session is judged on its renderer alone). The run's recorded loadgen manifest
+    states the renderer watch (#1525 review): `watch` True (default: as `renderer`), or False (absent: a bench
+    before #1517); `omit`: those per-renderer files removed after they were written."""
     k6dir, bdir = tmp_path / "k6", tmp_path / "browser"
     _write_out(k6dir, "k6", _k6_points(20), _k6_summary(20), 0)
     _write_viewer(k6dir)
@@ -52,6 +55,10 @@ def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, s
     _write_out(bdir, "browser", pts, _browser_summary(63), 0)
     _cpu_file(bdir, "browser", 3000, [1.0] * 20, stall=stall if stall is not None else [5.0] * 20, idle=idle,
               node=node)
+    if renderer and helper_cpu:
+        # the renderers sidecar's own cgroup (Diego 2026-11-17: the helper measured directly): 0.04 then 0.06
+        # cores, a minute each, over 5 minutes
+        _cpu_file(bdir, "renderers", 250, ([0.04] * 12 + [0.06] * 12) * 2 + [0.04] * 12, limit_m=250)
     if renderer:
         loads = [p["data"]["tags"] for p in pts if p["metric"] == "browser_page_load_ms"]
         first, last = min(int(t["t0"]) for t in loads) / 1000, max(int(t["t0"]) for t in loads) / 1000 + 1
@@ -74,13 +81,20 @@ def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, s
                 maps.append({"kind": "renderer_map", "t0": last + 2, "t1": last + 2.1, "udd": udd[s],
                              "target": "T" + s, "session": s, "class": "0", "pid": PIDS[s]})
         (bdir / "renderer-map.jsonl").write_text("".join(json.dumps(m) + "\n" for m in maps))
+    for f in omit:
+        (bdir / f).unlink()
+    watch = renderer if watch is None else watch
+    cfg = {"sessions": [{"name": s} for s in SESSIONS], **({"rendererWatch": True} if watch else {})}
+    mf = tmp_path / "loadgen-job.yaml"
+    mf.write_text(yaml.safe_dump({"kind": "ConfigMap", "metadata": {"name": "k6browser"},
+                                  "data": {"browser-config.json": json.dumps(cfg)}}))
     if not lost:
-        return _evaluate_cli(tmp_path, k6dir, bdir)
+        return _evaluate_cli(tmp_path, k6dir, bdir, "--loadgen-job", str(mf))
     rec = tmp_path / "cluster-operations.json"
     rec.write_text(json.dumps({"kind": "cluster_operations", "cluster": "c", "region": "europe-west4",
                                "read_at": T_POINTS + 3600, "readable": True, "unreadable": None,
                                "operations": ops or []}))
-    return _evaluate_cli(tmp_path, k6dir, bdir, "--cluster-operations", str(rec))
+    return _evaluate_cli(tmp_path, k6dir, bdir, "--cluster-operations", str(rec), "--loadgen-job", str(mf))
 
 
 def test_the_container_rule_still_judges_evidence_without_per_renderer_data(tmp_path):
@@ -207,6 +221,7 @@ def test_in_chrome_each_sessions_page_maps_to_a_renderer_of_its_own_chrome(tmp_p
     watch = json.loads((out / "renderer-watch.json").read_text())
     assert watch["browsers"] == 3 and watch["of"] == 3, watch
     o = k6eval.read_k6_out(str(out), "browser")
+    o["renderer_watch"] = k6eval.WATCH_ON                          # the pod's config (render_browser: always on)
     udd = {(r["pid"], str(r["start"])): r["udd"] for r in o["renderers"] if r["kind"] == "renderer_udd"}
     samples = [r for r in o["renderers"] if r["kind"] == "renderer"]
     reads = [m for m in o["renderer_map"] if m.get("kind") == "renderer_map" and m.get("pid") is not None]

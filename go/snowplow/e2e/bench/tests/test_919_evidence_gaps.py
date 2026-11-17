@@ -37,6 +37,7 @@ from pathlib import Path
 import pytest
 
 from bench import identity, load606, logscrub
+from tests.manifests import old_evidence_manifest
 from tests.test_k6_830 import _point, _write_out
 from tests.test_review823 import LEAKS
 from tests.test_run606_real_sequence import BENCH_DIR, _calls, harness  # noqa: F401  (fixture)
@@ -417,7 +418,8 @@ def test_the_calls_report_through_evaluate(tmp_path):
                                                      call_name="ra", call_namespace="ns", call_status="0"))]
     _write_out(tmp_path / "browser", "browser", pts, None, 0)
     v = _evaluate(tmp_path, {"preflight.jsonl": [{"kind": "preflight"}]},
-                  "--browser-out", str(tmp_path / "browser"), "--browser-sessions", "1")
+                  "--browser-out", str(tmp_path / "browser"), "--browser-sessions", "1",
+                  "--loadgen-job", old_evidence_manifest(tmp_path, 1))
     c = v["report"]["browser"]["calls_report_only"]
     assert c["status"] == "present" and c["calls"] == 3
     assert c["by_call"]["tables/krateo-system/compositions-list"]["n"] == 2
@@ -547,7 +549,8 @@ def test_the_incomplete_requests_report_through_evaluate(tmp_path):
                   method="click", skeleton="yes", timeout="no")] + _incomplete_points(base)
     _write_out(tmp_path / "browser", "browser", pts, None, 0)
     v = _evaluate(tmp_path, {"preflight.jsonl": [{"kind": "preflight"}]},
-                  "--browser-out", str(tmp_path / "browser"), "--browser-sessions", "1")
+                  "--browser-out", str(tmp_path / "browser"), "--browser-sessions", "1",
+                  "--loadgen-job", old_evidence_manifest(tmp_path, 1))
     r = v["report"]["browser"]["incomplete_requests_report_only"]
     assert r["status"] == "present" and r["requests"] == 3
     assert r["by_outcome"] == {"failed": 1, "never_completed": 2}

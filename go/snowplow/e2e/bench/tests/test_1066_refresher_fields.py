@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from bench import load606
+from tests.manifests import old_evidence_manifest
 from tests.test_k6_830 import (T_POINTS, _browser_points, _browser_summary, _k6_summary, _point,
                                _write_out, _write_viewer)
 
@@ -85,7 +86,7 @@ def _cli(tmp_path, *, mems=(), viewer="synthetic", viewer_kw=None, extra_args=()
                                  "polls": 1, "poll_ms": 100}) + "\n")
     p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", str(fresh), *map(str, mems), "--run8",
                         "--k6-out", str(k6dir), "--browser-out", str(bdir), "--browser-sessions", "3",
-                        *extra_args],
+                        "--loadgen-job", old_evidence_manifest(bdir.parent), *extra_args],
                        capture_output=True, text=True, cwd=BENCH_DIR, timeout=600)
     assert p.stdout, p.stderr[-3000:]
     return json.loads(p.stdout)["report"]

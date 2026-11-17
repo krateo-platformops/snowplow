@@ -4218,6 +4218,14 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         validity.append(sess)
         if lost_check is not None:
             checks.append(lost_check)
+        # the renderers sidecar's own CPU record: a pod that had the helper must have measured it
+        helper = k6eval.helper_cpu_check(k6.get("browser"))
+        if helper is not None:
+            validity.append(helper)
+        # and every per-renderer record a run configured with the watch owes
+        records = k6eval.renderer_records_check(k6.get("browser"))
+        if records is not None:
+            validity.append(records)
     else:
         _check("driver.sched_lag_p95_ms",
                pct([n.get("sched_lag_ms", 0) for n in navs], 95), "<=",
@@ -4386,6 +4394,11 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         report["viewer_report_only"] = k6eval.viewer_report(k6.get("viewer"))
         report["load_generator_cpu_report_only"] = {
             c: k6eval.cpu_stats(((k6.get("k6") or {}).get("cpu") or {}).get(c)) for c in ("k6", "viewer")}
+        # the browser pod's two containers, each its own cgroup: Chrome's, and the renderers sidecar's (Diego
+        # 2026-11-17: the helper's cost measured directly, its resolution from the arm's own spread)
+        report["browser_pod_cpu"] = {
+            c: k6eval.container_cpu_report(((k6.get("browser") or {}).get("cpu") or {}).get(c))
+            for c in ("browser", "renderers")}
         # the paired gate's input (custlat pair reads it from both runs'
         # verdicts); in one run's verdict it is report only
         from bench import custlat
@@ -6640,6 +6653,13 @@ def recorded_env_events(path: str | None) -> tuple[list[dict] | None, str]:
 
 
 def _cmd_evaluate(a) -> int:
+    # #1525 review: a real browser is judged by what its pod was configured to do, read from the run's own
+    # manifest: without it the judgment would silently fall back to the old (container) rule. Every k6 run's
+    # evidence holds its loadgen-job.yaml (run606 writes it before it applies the Jobs; reevaluate passes it)
+    if a.browser_out is not None and a.loadgen_job is None:
+        print("refusing: --browser-out needs --loadgen-job (the run's loadgen-job.yaml): the renderer watch its "
+              "browser pod was configured with decides how its loads are judged", file=sys.stderr)
+        return 2
     recs = []
     streams = []
     mem_streams = []
@@ -6672,6 +6692,11 @@ def _cmd_evaluate(a) -> int:
               # the owner's ruling (2026-11-17): a lost session is judged by the RECORDED environment events
               # that overlapped it: the cluster's control-plane operations (cluster-operations.json)
               "env_events": recorded_env_events(a.cluster_operations)}
+        # #1525 review: what the browser pod was CONFIGURED to do (its recorded config's renderer watch) decides
+        # which rule judges its loads and which records it owes, never which files happen to exist
+        if k6["browser"] is not None:
+            k6["browser"]["renderer_watch"], k6["browser"]["renderer_watch_why"] = \
+                k6eval.renderer_watch_of(a.loadgen_job)
         navs = k6eval.browser_navs(k6["browser"])
     fresh = [r for r in recs if r.get("kind") == "fresh"]
     vs = sorted((r for r in recs if r.get("kind") == "vars"
@@ -7057,6 +7082,9 @@ def main(argv: list[str] | None = None) -> int:
                         "iteration threw, for a browser.js that recorded no session end (before #1508)")
     e.add_argument("--no-viewers", action="store_true",
                    help="#830: the run had no open tabs (VIEWERS=0): no viewer checks")
+    e.add_argument("--loadgen-job", default=None,
+                   help="#1525 review: the run's loadgen-job.yaml (its k6browser ConfigMap's browser config): the "
+                        "renderer watch it was configured with decides the per-renderer rule and its records")
     e.add_argument("--run8", action="store_true",
                    help="add the #710 run-8 memory-risk / stale_to_push report and checks")
     e.add_argument("--profile-dir", default=None,

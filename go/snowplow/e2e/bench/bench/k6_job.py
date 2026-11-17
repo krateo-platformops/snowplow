@@ -337,7 +337,9 @@ anchor() {{
 }}
 anchor
 printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}, "node_cpus": %s, "epoch": %s, "uptime": %s, "uptime_lo": %s}}\\n' "$cg" "$nc" "$an_ep" "$an_up" "$an_lo" > {f}
-( while :; do cpu_sample; sleep {CPU_SAMPLE_S}; done ) &
+# the loop waits on its sleep, so _cpu_end's TERM stops the sleep with it (none outlives the record)
+( trap 'kill "$zz" 2>/dev/null; exit 0' TERM; zz=
+  while :; do cpu_sample; sleep {CPU_SAMPLE_S} & zz=$!; wait "$zz"; done ) &
 sampler=$!
 """
 
@@ -447,9 +449,12 @@ renderer_watch() {{
 def renderers_script(sessions: int, linger_s: float) -> str:
     """The renderers sidecar's command: the sampler and the watcher from the browser container's start until its run
     is over (/out/done), then /out/renderers-done (its readiness: the Job's pod is Ready when both are over), then it
-    lingers for collect like the browser container."""
+    lingers for collect like the browser container. And its OWN cost, measured (Diego 2026-11-17: the rehearsal
+    checks the helper by measuring it directly): the sidecar's own cgroup, by the browser container's sampler
+    (_cpu_sampler / _cpu_end: one implementation), into /out/renderers-cpu.jsonl (collected with the rest of
+    /out), from the sidecar's start to /out/done, ended before /out/renderers-done."""
     return f"""set -u
-{_renderer_sampler(sessions)}# the clock ticks a starttime counts (each series' process start on the node's uptime: a process that started
+{_cpu_sampler("renderers", RENDERERS_CPU, RENDERERS_CPU)}{_renderer_sampler(sessions)}# the clock ticks a starttime counts (each series' process start on the node's uptime: a process that started
 # before a read and was sampled after it held its pid through the read)
 hz=$(getconf CLK_TCK 2>/dev/null) || hz=
 printf '{{"kind": "renderer_clock", "hz": %s}}\\n' "${{hz:-null}}" >> /out/browser-renderers.jsonl
@@ -459,9 +464,21 @@ renderer_watch &
 rw=$!
 while [ ! -f /out/done ]; do sleep 1; done
 pkill -P "$rw" 2>/dev/null; kill "$rw" "$rsampler" 2>/dev/null
-echo 0 > /out/renderers-done
+{_cpu_end("renderers")}echo 0 > /out/renderers-done
 echo "renderers: over with the browser's run; holding {linger_s:g}s for collect"
 sleep {linger_s:g}
+"""
+
+
+def _cpu_end(prefix: str) -> str:
+    """The end of _cpu_sampler's record: its loop stopped, one last sample, and cpu_end, which carries the same
+    anchor again: a realtime step during the drive shows as the two anchors' offsets disagreeing past their
+    brackets (#1043 review, round 2). Every container that samples its CPU ends the record with this, after
+    _cpu_sampler started it (the wrapper's, the renderers sidecar's): one implementation."""
+    return f"""kill "$sampler" 2>/dev/null
+cpu_sample
+anchor
+printf '{{"kind": "cpu_end", "epoch": %s, "uptime": %s, "uptime_lo": %s}}\\n' "$an_ep" "$an_up" "$an_lo" >> /out/{prefix}-cpu.jsonl
 """
 
 
@@ -471,13 +488,7 @@ def _wrapper(cmd: str, prefix: str, linger_s: float, done: str = "/out/done",
     mark `done` (Ready = results final), linger for kubectl cp. `cpu` =
     (request, limit): sample the container's CPU while `cmd` runs."""
     head = _cpu_sampler(prefix, *cpu) if cpu else ""
-    # cpu_end carries the same anchor again: a realtime step during the drive shows as the two
-    # anchors' offsets disagreeing past their brackets (#1043 review, round 2)
-    tail = (f"""kill "$sampler" 2>/dev/null
-cpu_sample
-anchor
-printf '{{"kind": "cpu_end", "epoch": %s, "uptime": %s, "uptime_lo": %s}}\\n' "$an_ep" "$an_up" "$an_lo" >> /out/{prefix}-cpu.jsonl
-""" if cpu else "")
+    tail = _cpu_end(prefix) if cpu else ""
     return f"""set -u
 {head}rc=0
 {cmd} || rc=$?

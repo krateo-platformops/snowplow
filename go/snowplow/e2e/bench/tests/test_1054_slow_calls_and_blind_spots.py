@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from bench import custlat, k6eval, load606, slowcall
+from tests.manifests import old_evidence_manifest
 from tests.test_k6_830 import (T_POINTS, _browser_points, _browser_summary, _k6_summary, _point,
                                _write_out, _write_viewer)
 
@@ -87,7 +88,8 @@ def _evaluate(tmp_path, *, extras=None, viewer_kw=None, two_stats=False):
     mem = tmp_path / "mem-x.jsonl"
     mem.write_text("".join(json.dumps(r) + "\n" for r in _mem(extras if extras is not None else [{}, {}])))
     p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", str(fresh), str(mem), "--run8",
-                        "--k6-out", str(k6dir), "--browser-out", str(bdir), "--browser-sessions", "3"],
+                        "--k6-out", str(k6dir), "--browser-out", str(bdir), "--browser-sessions", "3",
+                        "--loadgen-job", old_evidence_manifest(bdir.parent)],
                        capture_output=True, text=True, cwd=BENCH_DIR, timeout=180)
     assert p.stdout, p.stderr[-3000:]
     return json.loads(p.stdout)
