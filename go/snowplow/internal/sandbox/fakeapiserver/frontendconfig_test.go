@@ -87,7 +87,11 @@ func TestFrontendConfigMapAccessIsTheSnapshotsRBAC(t *testing.T) {
 func TestNewRefusesAMissingOrInvalidFrontendConfig(t *testing.T) {
 	for _, c := range []struct{ cfg, why string }{
 		{"", "Options.FrontendConfig is empty"},
-		{"{not json", "Options.FrontendConfig is not JSON"},
+		{"{not json", "Options.FrontendConfig is not a JSON object"},
+		// JSON, and not an object: config.json is the object Phase 1 unmarshals (json.Valid takes these)
+		{"null", "Options.FrontendConfig is not a JSON object"},
+		{`[{"api":{}}]`, "Options.FrontendConfig is not a JSON object"},
+		{`"x"`, "Options.FrontendConfig is not a JSON object"},
 	} {
 		cfg := c.cfg
 		_, err := loadHarness(t, opts{frontend: &cfg})
@@ -136,7 +140,10 @@ func TestListenRefusesAMissingOrInvalidFrontendConfig(t *testing.T) {
 		want string
 	}{
 		{func(js.Value) {}, HostConfig + ".frontendConfig must be a non-empty string"},
-		{func(o js.Value) { o.Set("frontendConfig", "{not json") }, HostConfig + ".frontendConfig is not JSON"},
+		{func(o js.Value) { o.Set("frontendConfig", "{not json") }, HostConfig + ".frontendConfig is not a JSON object"},
+		{func(o js.Value) { o.Set("frontendConfig", "null") }, HostConfig + ".frontendConfig is not a JSON object"},
+		{func(o js.Value) { o.Set("frontendConfig", `[{"api":{}}]`) }, HostConfig + ".frontendConfig is not a JSON object"},
+		{func(o js.Value) { o.Set("frontendConfig", `"x"`) }, HostConfig + ".frontendConfig is not a JSON object"},
 	} {
 		o := js.Global().Get("Object").New()
 		o.Set("snapshot", snap)

@@ -23,7 +23,7 @@ import (
 //
 // bridge.js has validated the snapshot (snapshot-rules.js) and generated both tokens; they exist
 // only in this worker's memory. frontendConfig is the synthesised frontend ConfigMap's config.json
-// (server.go §8): required, and JSON; a missing or invalid one is refused here, naming it, never
+// (server.go §8): required, and a JSON object; a missing or invalid one is refused here, naming it, never
 // defaulted.
 const HostConfig = "snowplowFakeApiserver"
 
@@ -58,8 +58,8 @@ func Listen() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !json.Valid([]byte(frontend)) {
-		return "", errors.New(HostConfig + ".frontendConfig is not JSON: it is the config.json text bridge.js hands the SPA")
+	if !isJSONObject([]byte(frontend)) {
+		return "", errors.New(HostConfig + ".frontendConfig is not a JSON object: it is the config.json text bridge.js hands the SPA")
 	}
 	pv := cfg.Get("pages")
 	if pv.Type() != js.TypeObject || pv.Length() == 0 {

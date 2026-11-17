@@ -38,7 +38,7 @@ type Options struct {
 	VisitorToken string   // the visitor's bearer token (the synthesised clientconfig, §8)
 	// FrontendConfig is the frontend's config.json text, exactly as bridge.js hands the SPA its
 	// config (boot's buildPortalConfig): the synthesised frontend ConfigMap's data (§8). Required,
-	// and JSON.
+	// and a JSON object.
 	FrontendConfig []byte
 	Clock          func() time.Time
 	AfterFunc      func(d time.Duration, f func()) (stop func() bool)
@@ -236,14 +236,14 @@ func New(o Options) (*Server, error) {
 
 // frontendConfigMap synthesises the frontend ConfigMap (§8) at <namespace>/<frontendconfig
 // ConfigMapName>, its data[frontendconfig.DataKey] exactly Options.FrontendConfig. Refused: no
-// config, a config that is not JSON (the text the SPA parses), and a snapshot that also holds an
+// config, a config that is not a JSON object (the config the SPA and Phase 1 parse), and a snapshot that also holds an
 // object under that key (a synthesised object is never one a cluster's snapshot supplied).
 func (s *Server) frontendConfigMap(namespace string) error {
 	if len(s.o.FrontendConfig) == 0 {
 		return errors.New("Options.FrontendConfig is empty: the frontend ConfigMap is synthesised from the config the SPA gets, and there is none")
 	}
-	if !json.Valid(s.o.FrontendConfig) {
-		return errors.New("Options.FrontendConfig is not JSON: the frontend ConfigMap's " + frontendconfig.DataKey + " is the config the SPA parses")
+	if !isJSONObject(s.o.FrontendConfig) {
+		return errors.New("Options.FrontendConfig is not a JSON object: the frontend ConfigMap's " + frontendconfig.DataKey + " is the config object the SPA and Phase 1 parse")
 	}
 	name := frontendconfig.ConfigMapName()
 	key := namespace + "/" + name
@@ -261,6 +261,14 @@ func (s *Server) frontendConfigMap(namespace string) error {
 	}
 	s.bucket("/configmaps")[key] = cm
 	return nil
+}
+
+// isJSONObject says whether b is one JSON object: config.json is an object (Phase 1 unmarshals it into
+// its frontendConfig struct, the SPA reads its fields). json.Valid would also take null, an array or a
+// string; a nil map after decoding is the JSON null.
+func isJSONObject(b []byte) bool {
+	var m map[string]json.RawMessage
+	return json.Unmarshal(b, &m) == nil && m != nil
 }
 
 func newUID() string {
