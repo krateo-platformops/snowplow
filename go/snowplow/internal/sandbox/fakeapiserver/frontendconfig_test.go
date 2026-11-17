@@ -110,6 +110,20 @@ func TestNewRefusesASnapshotHoldingTheFrontendConfigMap(t *testing.T) {
 	}
 }
 
+// The same rule for the other synthesised object: a snapshot that holds the visitor's clientconfig
+// Secret is refused, naming its key, never overwritten (mutation: the overwrite restored turns this
+// RED).
+func TestNewRefusesASnapshotHoldingTheClientconfigSecret(t *testing.T) {
+	_, err := loadHarness(t, opts{extra: []map[string]any{{
+		"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+		"metadata": map[string]any{"name": "sandbox-visitor-clientconfig", "namespace": "krateo-system", "uid": "u-2", "resourceVersion": "1"},
+		"data":     map[string]any{"token": "Y2x1c3Rlci10b2tlbg=="},
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "Secret krateo-system/sandbox-visitor-clientconfig is in the snapshot, and the fake env synthesises it") {
+		t.Fatal(err)
+	}
+}
+
 // Listen reads frontendConfig from the host config and refuses it missing or not JSON, naming the
 // field, before it listens (mutations: either check dropped turns its case RED).
 func TestListenRefusesAMissingOrInvalidFrontendConfig(t *testing.T) {

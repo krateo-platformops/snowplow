@@ -203,6 +203,10 @@ func New(o Options) (*Server, error) {
 	// browser's fetch cannot present a client certificate, so the fake authenticates the visitor by
 	// the token.
 	name := credsecret.For(id.Visitor.Username, id.Visitor.Groups)[0]
+	// one rule for both synthesised objects: a snapshot that holds one is refused, never overwritten
+	if _, ok := s.bucket("/secrets")[id.AuthnNamespace+"/"+name]; ok {
+		return nil, fmt.Errorf("objects: Secret %s/%s is in the snapshot, and the fake env synthesises it (§8, the visitor's clientconfig): the snapshot must not hold it", id.AuthnNamespace, name)
+	}
 	s.bucket("/secrets")[id.AuthnNamespace+"/"+name] = map[string]any{
 		"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
 		"metadata": map[string]any{"name": name, "namespace": id.AuthnNamespace, "uid": o.NewUID(), "resourceVersion": s.snap.ResourceVersion, "creationTimestamp": s.now(),

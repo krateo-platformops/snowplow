@@ -44,8 +44,8 @@
 //     text bridge.js hands the SPA (Options.FrontendConfig). A cluster's would describe that
 //     cluster's portal, not the sandbox's.
 //
-// A snapshot that holds the frontend ConfigMap is refused: a synthesised object is never one a
-// cluster supplied. Readers reach both through the snapshot's RBAC alone, as any other object.
+// A snapshot that holds either one is refused, naming its key: a synthesised object is never one a
+// cluster supplied (one rule for both, not left to bridge.js's snapshot rules alone). Readers reach both through the snapshot's RBAC alone, as any other object.
 //
 // Every request is logged as one line (Options.Log) in SNAPSHOT.md §4's format; the js main sends
 // the lines to the worker's console.
