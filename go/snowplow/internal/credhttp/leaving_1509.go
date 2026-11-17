@@ -82,8 +82,10 @@ type endpointConn struct {
 	net.Conn
 	once   sync.Once
 	closed chan struct{}
-	// onRead, while set, is called on the first read that returns bytes (a
-	// raced TLS setup's progress, race_1509.go); one atomic load per read.
+	// onRead, while set, is called on every read that returns bytes: a TLS
+	// setup's handshake progress (race_1509.go), which counts for the trigger
+	// interval it falls in. It is set only while a handshake runs; one atomic
+	// load per read.
 	onRead atomic.Pointer[func()]
 }
 
@@ -99,7 +101,7 @@ func (c *endpointConn) watchRead(f func()) {
 func (c *endpointConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
-		if f := c.onRead.Swap(nil); f != nil {
+		if f := c.onRead.Load(); f != nil {
 			(*f)()
 		}
 	}

@@ -367,3 +367,120 @@ func TestIssue1509_Chain_AnsweredIntervalIsNotRaced(t *testing.T) {
 		t.Fatalf("the second setup came up after %v; the arm needs it slower than the trigger (%v)", last, trigger)
 	}
 }
+
+// trickleListener sends the handshake of its trickleNth accepted connection
+// (1-based) a few bytes at a time, every gap: a handshake that keeps
+// receiving bytes, slowly. The others are not paced, except delayFirst (the
+// first connection's first byte, so a second setup joins its chain).
+type trickleListener struct {
+	net.Listener
+	accepted   atomic.Int32
+	trickleNth int32
+	gap        time.Duration
+	delayFirst time.Duration
+}
+
+const trickleChunk = 32
+
+func (l *trickleListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	n := l.accepted.Add(1)
+	tc := &trickledConn{Conn: c}
+	if n == 1 {
+		tc.delay = l.delayFirst
+	}
+	if n == l.trickleNth {
+		tc.gap = l.gap
+	}
+	return tc, nil
+}
+
+type trickledConn struct {
+	net.Conn
+	delay, gap time.Duration
+	started    bool // only the server's handshake goroutine writes first
+}
+
+func (c *trickledConn) Write(b []byte) (int, error) {
+	if !c.started {
+		c.started = true
+		time.Sleep(c.delay)
+	}
+	if c.gap == 0 {
+		return c.Conn.Write(b)
+	}
+	written := 0
+	for len(b) > 0 {
+		k := min(trickleChunk, len(b))
+		n, err := c.Conn.Write(b[:k])
+		written += n
+		if err != nil {
+			return written, err
+		}
+		b = b[k:]
+		time.Sleep(c.gap)
+	}
+	return written, nil
+}
+
+// On an answering destination, a handshake that keeps receiving bytes is
+// fresh evidence in every trigger interval it receives them, so it is never
+// raced again (#1521 review; Diego's ruling: answering holds on an attempt
+// up or TLS bytes read, per trigger interval). Two setups join one chain:
+// the first comes up (answered), and the second's handshake trickles in a
+// few bytes every fifth of an interval for more than 3 intervals. The server
+// must see exactly 2 connections. With progress counted on a handshake's
+// first read only (M-progress1), the second interval after its first bytes
+// has no evidence and the chain races it.
+func TestIssue1509_Chain_AHandshakeStillReceivingBytesIsNotRaced(t *testing.T) {
+	resetConnectTimes(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const trigger = 50 * time.Millisecond
+	tl := &trickleListener{Listener: ln, trickleNth: 2, gap: trigger / 5, delayFirst: 15 * time.Millisecond}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.Listener = tl
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	addr := ln.Addr().String()
+	seedConnectTimes(setupKey(addr, true), trigger)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEMOf(srv))
+	cfg := &tls.Config{RootCAs: pool, NextProtos: []string{"h2"}}
+
+	type result struct {
+		c   net.Conn
+		err error
+		at  time.Duration
+	}
+	results := make(chan result, 2)
+	start := time.Now()
+	for range 2 {
+		go func() {
+			c, err := endpointDialTLS(context.Background(), "tcp", addr, cfg)
+			results <- result{c, err, time.Since(start)}
+		}()
+	}
+	var last time.Duration
+	for range 2 {
+		r := <-results
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		defer r.c.Close()
+		last = max(last, r.at)
+	}
+	time.Sleep(trigger) // a late raced attempt would be accepted by now
+	if n := tl.accepted.Load(); n != 2 {
+		t.Fatalf("the server accepted %d connections; want 2: the second setup's handshake kept receiving bytes (up at %v), so it must not be raced again", n, last)
+	}
+	if last < 3*trigger {
+		t.Fatalf("the trickled setup came up after %v; the arm needs its handshake to last over 3 trigger intervals (%v)", last, 3*trigger)
+	}
+}

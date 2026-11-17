@@ -37,9 +37,11 @@ package credhttp
 //     25), and many waiters are served in parallel, not one after another;
 //   - "answering" holds only on FRESH evidence: within every trigger interval
 //     some attempt must come up or show progress (a TLS attempt reading its
-//     server's handshake bytes). An interval with neither means the destination
-//     stalled again — a busy destination's later control-plane change, with
-//     waiters that never let the chain empty — and the chain returns to racing
+//     server's handshake bytes in that interval: a handshake still receiving
+//     bytes is evidence in every interval it receives them, #1521 review).
+//     An interval with neither means the destination stalled again — a busy
+//     destination's later control-plane change, with waiters that never let
+//     the chain empty — and the chain returns to racing
 //     for the waiters still waiting, with the same bound, from the trigger. No
 //     new number: the interval is the measured trigger;
 //   - each waiter leaves at its own deadline or cancellation, whatever the
@@ -552,8 +554,8 @@ func (c *setupChain) onTimer() {
 	c.timer.Reset(c.wait)
 }
 
-// onProgress records a TLS attempt reading its server's handshake bytes: the
-// destination answers even if no setup has completed yet.
+// onProgress records a TLS attempt reading its server's handshake bytes (each
+// read): the destination answers even if no setup has completed yet.
 func (c *setupChain) onProgress() {
 	c.mu.Lock()
 	c.progress = true
