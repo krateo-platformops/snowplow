@@ -8,6 +8,7 @@ run606.sh, the fake region and Cloud Storage), so the arm runs as a pair's arm d
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import signal
 import subprocess
@@ -140,6 +141,50 @@ def test_evidence_that_is_not_safely_off_the_machine_is_exit_5_whatever_the_verd
     log = (tmp / "single" / "single.log").read_text()
     assert p.returncode == 5 and why in log, log[-3000:]
     assert "the launch is NOT finished: its evidence is not safe (exit 5)" in log
+
+
+def test_a_launch_directory_that_cannot_be_published_at_its_end_is_exit_5(singlebed):
+    """X6: the run's copy is safe in the bucket, but the launch's own directory cannot be published at its final
+    stage (its evidence destination went read-only during the run): exit 5, whatever the verdict (mutation:
+    the final publish's failure not counted turns this RED)."""
+    repo, fake, env, tmp = singlebed
+    _verdict(fake, "PASS")
+    (fake / f"{NA}.sleep").write_text("3")
+    dest = subprocess.run(["python3", "-m", "bench.evidence", "dest", f"single-{NA}"], env=env, cwd=repo,
+                          capture_output=True, text=True, check=True).stdout.strip()
+    proc = subprocess.Popen(["bash", str(repo / "run606_single.sh")], env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    log = tmp / "single" / "single.log"
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and " pid " not in (log.read_text() if log.exists() else ""):
+            time.sleep(0.05)
+        os.chmod(dest, 0o500)                              # the disk under the launch's evidence went bad
+        rc = proc.wait(timeout=90)
+    finally:
+        os.chmod(dest, 0o700)
+    text = log.read_text()
+    assert rc == 5 and "EVIDENCE NOT SAFE (launch): " in text, text[-3000:]
+    assert "run A: durable copy downloaded and verified" in text      # the run's own copy was fine
+    assert "the launch is NOT finished: its evidence is not safe (exit 5)" in text
+
+
+@pytest.mark.parametrize("held, why", [
+    ("A/run.log", "OUT_A ({out}) already holds a run (run.log): use a new RUN_NAME_A or OUT_A"),
+    ("A/verdict.json", "OUT_A ({out}) already holds a run (verdict.json)"),
+    ("single/single.json", "SINGLE_OUT ({single}) already holds a launch (single.json): it is never written over"),
+])
+def test_a_directory_that_already_holds_a_run_or_a_launch_is_never_written_over(singlebed, held, why):
+    """X10 (#1194 / #1220): the arm's OUT holding a run, or SINGLE_OUT a launch, refuses before anything runs
+    (mutation: dropping the guard turns its case RED)."""
+    repo, fake, env, tmp = singlebed
+    f = tmp / held
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("an earlier run's\n")
+    p = _single(repo, env)
+    assert p.returncode == 2 and why.format(out=tmp / "A", single=tmp / "single") in p.stderr, p.stderr[-2000:]
+    assert _calls(fake) == []
+    assert f.read_text() == "an earlier run's\n"
 
 
 def test_a_launch_whose_record_cannot_leave_the_machine_runs_nothing(singlebed):

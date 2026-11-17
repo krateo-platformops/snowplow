@@ -156,9 +156,10 @@ BENCH_606_FAIL_AT, BENCH_606_HOST_LOAD) and gcloud overrides (CLOUDSDK_*).
 
 ONE ARM (Diego 2026-11-17, "Add a single-arm VM mode first"): the one-cluster rehearsal runs off the laptop
 as ONE full measuring arm. The launch's shape is decided once, from the env file (launch_shape): an env file
-whose RUNS names exactly one arm L, with no PAIRS and no REPLICA_PAIR, is the single shape (`--single L` on
-up / launch states it; one that disagrees with RUNS refuses), two or more is a pair; a one-arm env file that
-also names PAIRS or REPLICA_PAIR refuses, never guessed. The single shape runs run606_single.sh in place of
+whose RUNS names exactly one arm L, with no PAIRS and no REPLICA_PAIR, AND `--single L` on up / launch, is the
+single shape: a paid single launch is stated twice (#1522 review); a one-arm env file without --single, or a
+--single that disagrees with RUNS, refuses. Two or more is a pair; a one-arm env file that also names PAIRS or
+REPLICA_PAIR refuses, never guessed. The single shape runs run606_single.sh in place of
 run606_pair.sh: the arm's steps a pair takes for each of its arms (run606_arm.sh, shared by both: its dry pass
 in $SINGLE_OUT/dry-L, the pair's layout, so its TTL and planned k6 seconds are read from that run.log as a
 pair's are; the quota and host-load reads; the launch's record, single.json, copied to the evidence bucket
@@ -1690,14 +1691,18 @@ LAUNCHER_OUT = {PAIR: "PAIR_OUT", SINGLE: "SINGLE_OUT"}
 
 def launch_shape(env: dict[str, str], single: str | None = None) -> tuple[str, list[str]]:
     """(the launch's shape, the labels of its runs), from the env file, once: SINGLE when its RUNS names exactly one
-    arm (or --single names that arm: `single`), PAIR when it names two or more. Refused, never guessed: --single
-    with an env file whose RUNS is not exactly that arm; a one-arm env file that also names PAIRS or REPLICA_PAIR
+    arm and --single names that arm too (`single`: stated twice), PAIR when it names two or more. Refused, never
+    guessed: a one-arm env file without --single; --single with an env file whose RUNS is not exactly that arm; a one-arm env file that also names PAIRS or REPLICA_PAIR
     (a launch that states a comparison is not run as one arm); a pair env file without PAIRS."""
     labels = check_env(env)
     if single is not None and labels != [single]:
         raise Refused(f"--single {single}: the env file's RUNS is {env.get('RUNS')!r}, not that one arm (a single-arm "
                       f"launch states its one arm in RUNS too; it is never one arm picked out of a pair's)")
     if len(labels) == 1:
+        # #1522 review: a paid single launch is STATED twice, in the env file and on the command line
+        if single is None:
+            raise Refused(f"the env file names one run ({labels[0]}): a single-arm launch is stated on the command "
+                          f"line too: pass --single {labels[0]}")
         for k in ("PAIRS", "REPLICA_PAIR"):
             if env.get(k):
                 raise Refused(f"the env file names one run ({labels[0]}) and {k}={env[k]}: a single arm compares "
@@ -1710,7 +1715,7 @@ def launch_shape(env: dict[str, str], single: str | None = None) -> tuple[str, l
 
 
 SINGLE_HELP = ("launch ONE measuring arm, L (run606_single.sh: the one-cluster rehearsal off the laptop): the env "
-               "file's RUNS must be exactly L, with no PAIRS; an env file whose RUNS names one arm is that already")
+               "file's RUNS must be exactly L, with no PAIRS (required for one arm: a single launch is stated twice)")
 
 
 def launch_name(env: dict[str, str], shape: str) -> str:
@@ -1881,19 +1886,34 @@ got="$({_HASH_PY} "$PO/"{q(pin_name)})"
 (umask 077; cat > "$R/launch-env.sh" <<'ENV'
 {_exports(env)}ENV
 )
-{_exports(env)}{outs}python3 -m bench.detach --log "$R/launch.log" --pidfile "$R/launch.pid" -- bash {LAUNCHER[shape]}
+{_exports(env)}{outs}# #1522 review: only what THIS launch writes counts. Each file the check reads may hold an earlier launch's lines
+# (a run.log of the same RUN_NAME, a console, launch.log, which detach appends to): its size now is where this
+# launch's own lines begin, and only the bytes after it are read (by process substitution: under pipefail a grep
+# that stops early would fail the pipeline it reads)
+size() {{ if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else echo 0; fi; }}
+since() {{ if [ -f "$1" ]; then tail -c +"$(( $2 + 1 ))" "$1"; fi; }}
+L0="$(size "$R/launch.log")"
+for x in {" ".join(labels)}; do
+  o="OUT_$x"
+  printf -v "B0_$x" '%s' "$(size "${{!o}}/run.log")"
+  printf -v "C0_$x" '%s' "$(size "$PO/$x.console")"
+done
+python3 -m bench.detach --log "$R/launch.log" --pidfile "$R/launch.pid" -- bash {LAUNCHER[shape]}
 pid="$(cat "$R/launch.pid")"
 deadline=$(( $(date +%s) + {int(started_timeout_s)} ))
 while :; do
   ok=0; refused=""
+  r="$(grep -m1 '^refusing: ' <(since "$R/launch.log" "$L0") || true)"
+  if [ -n "$r" ]; then refused="launcher: $r;"; fi
   for x in {" ".join(labels)}; do
-    o="OUT_$x"
-    if grep -q "run budget: " "${{!o}}/run.log" 2>/dev/null; then ok=$((ok + 1)); fi
-    r="$(grep -h -m1 '^refusing: ' "$PO/$x.console" 2>/dev/null || true)"
+    o="OUT_$x" b0="B0_$x" c0="C0_$x"
+    if grep -q "run budget: " <(since "${{!o}}/run.log" "${{!b0}}"); then ok=$((ok + 1)); fi
+    r="$(grep -m1 '^refusing: ' <(since "$PO/$x.console" "${{!c0}}") || true)"
     if [ -n "$r" ]; then refused="$refused run $x: $r;"; fi
   done
-  if [ "$ok" -eq {len(labels)} ]; then echo "VM606_STARTED=ok"; break; fi
+  # a refusal anywhere is not a start; started is EVERY arm's run budget, written by this launch
   if [ -n "$refused" ]; then echo "VM606_STARTED=refused"; echo "vm606: $refused"; break; fi
+  if [ "$ok" -eq {len(labels)} ]; then echo "VM606_STARTED=ok"; break; fi
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "VM606_STARTED=exited"; tail -n 15 "$R/launch.log" | sed 's/^/vm606: launcher: /'; break
   fi

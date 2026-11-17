@@ -43,6 +43,9 @@ case "${STUB_MODE:-ok}" in
   refuse) echo "refusing: BENCH_606_GO_N1 must be '20261111-$RUN_NAME_N1' (Diego's go for run N1)" > "$PO/N1.console"
           sleep 30; exit 1 ;;
   exit) echo "refusing: uncommitted changes under the bench: the run must be one commit" >&2; exit 2 ;;
+  launcher-refuse) echo "refusing: OUT_N1 already holds a run (run.log): use a new RUN_NAME_N1 or OUT_N1" >&2
+                   sleep 30; exit 2 ;;
+  quiet) sleep 30; exit 0 ;;
 esac
 o="$(python3 -m bench.evidence run-dir "$RUN_NAME_N1")"; mkdir -p "$o"
 echo "[07:00:01] run budget: up 1800 + ...; fits TTL_HOURS=9" >> "$o/run.log"
@@ -79,21 +82,22 @@ def _env_file(tmp_path, **more) -> str:
 def _args(tmp_path, repo, sha, pin, pin_sha, *extra, env_file=None):
     return ["launch", "--run", RUN, "--bench-sha", sha, "--env-file", env_file or _env_file(tmp_path),
             "--pin-manifest", str(pin), "--pin-sha256", pin_sha, "--repo-url", repo, "--yes",
-            "--started-timeout-s", "60", "--bench-zone", "europe-west1-b", *extra]
+            "--started-timeout-s", "60", "--bench-zone", "europe-west1-b", "--single", "N1", *extra]
 
 
 # ─── the shape, decided once ────────────────────────────────────────────────
 
 def test_one_arm_and_no_pairs_is_the_single_shape_and_a_pair_stays_a_pair():
-    assert vm606.launch_shape(dict(ONE)) == (vm606.SINGLE, ["N1"])
     assert vm606.launch_shape(dict(ONE), "N1") == (vm606.SINGLE, ["N1"])
     assert vm606.launch_shape(dict(ENV)) == (vm606.PAIR, ["N1", "N2"])
     assert SINGLE == f"single-{ENV['RUN_NAME_N1']}"
 
 
 @pytest.mark.parametrize("env, single, why", [
-    ({**ONE, "PAIRS": "N1:N2"}, None, "the env file names one run (N1) and PAIRS=N1:N2: a single arm compares nothing"),
-    ({**ONE, "REPLICA_PAIR": "N1:N2"}, None, "the env file names one run (N1) and REPLICA_PAIR=N1:N2"),
+    (dict(ONE), None, "the env file names one run (N1): a single-arm launch is stated on the command line too: pass "
+                      "--single N1"),
+    ({**ONE, "PAIRS": "N1:N2"}, "N1", "the env file names one run (N1) and PAIRS=N1:N2: a single arm compares nothing"),
+    ({**ONE, "REPLICA_PAIR": "N1:N2"}, "N1", "the env file names one run (N1) and REPLICA_PAIR=N1:N2"),
     (dict(ENV), "N1", "--single N1: the env file's RUNS is 'N1 N2', not that one arm"),
     ({**{k: v for k, v in ENV.items() if k != "PAIRS"}, "RUNS": "N2"}, "N1",
      "--single N1: the env file's RUNS is 'N2', not that one arm"),
@@ -154,7 +158,8 @@ def test_launch_one_arm_refuses_a_vm_that_dies_before_the_arm_ends(fake, capsys,
 
 @pytest.mark.parametrize("mode, why, started", [
     ("refuse", "run N1: refusing: BENCH_606_GO_N1 must be", "refused"),
-    ("exit", "vm606: launcher: refusing: uncommitted changes under the bench", "exited"),
+    ("exit", "vm606: launcher: refusing: uncommitted changes under the bench", "refused"),
+    ("launcher-refuse", "vm606: launcher: refusing: OUT_N1 already holds a run", "refused"),
 ])
 def test_launch_one_arm_says_launched_only_once_its_run_passed_its_paid_only_checks(fake, capsys, tmp_path,  # noqa: F811
                                                                                     mode, why, started):
@@ -170,7 +175,7 @@ def test_launch_one_arm_dry_says_the_single_launcher_and_starts_nothing(fake, ca
     _record(bootstrap=BOOT)
     pin, pin_sha = _pin(tmp_path)
     args = [a for a in _args(tmp_path, "unused", "a" * 40, pin, pin_sha) if a != "--yes"]
-    rc, out, err = _run(capsys, *args, "--single", "N1")
+    rc, out, err = _run(capsys, *args)
     assert rc == 0, err
     assert "-- bash run606_single.sh, with " in out and f"one arm, no pair {ONE['RUN_NAME_N1']}; launch {SINGLE}" in out
     assert fake_vm606.calls(fake) == []
@@ -225,7 +230,7 @@ def test_down_of_a_single_arm_is_the_same_down(fake, capsys):  # noqa: F811
 def _up_single(capsys, monkeypatch, env_file, run=RUN):
     monkeypatch.setenv("FAKE_BOOTSTRAP", json.dumps(BOOT))
     return _run(capsys, "up", "--env-file", env_file, "--run", run, "--ttl-hours", "15", "--yes", "--poll-s", "0",
-                "--zone", ZONE)
+                "--zone", ZONE, "--single", "N1")
 
 
 def test_up_takes_a_single_arm_env_file_and_refuses_one_that_also_names_pairs(fake, capsys, tmp_path,  # noqa: F811
@@ -244,3 +249,59 @@ def test_status_of_a_single_arm_is_the_same_status(fake, capsys):  # noqa: F811
     (srv / RUN / "launch.pid").write_text(f"{os.getpid()}\n")
     rc, out, err = _run(capsys, "status", "--run", RUN)
     assert rc == 0 and "one arm, no pair" in out, err
+
+
+# ─── the started-check reads only this launch's own lines (#1522 review), both shapes ──
+
+def _stale_run_log(r, name):
+    """An earlier launch's run.log of the same RUN_NAME, its run budget logged, on the VM."""
+    o = r / "home" / ".local" / "share" / "snowplow-bench" / "runs" / "606" / name
+    o.mkdir(parents=True, exist_ok=True)
+    (o / "run.log").write_text("[05:00:00] run budget: up 1800 + ...; fits TTL_HOURS=9\n")
+
+
+def test_an_old_run_log_of_the_same_run_name_is_never_this_launchs_start(fake, capsys, tmp_path):  # noqa: F811
+    """One arm: its OUT already holds an earlier launch's run budget, and this launch's arm never logs one: not
+    started (timeout), never "ok" from the old line (mutation: reading the whole run.log turns this RED)."""
+    repo, sha = _repo(tmp_path)
+    r = _vm_ready(fake, hours=12)
+    _stale_run_log(r, ONE["RUN_NAME_N1"])
+    pin, pin_sha = _pin(tmp_path)
+    args = _args(tmp_path, repo, sha, pin, pin_sha, env_file=_env_file(tmp_path, STUB_MODE="quiet"))
+    args[args.index("--started-timeout-s") + 1] = "4"
+    rc, _out, err = _run(capsys, *args)
+    assert rc == 2 and "(timeout;" in err, err
+    assert _state()["started"] == "timeout"
+
+
+def test_a_launcher_refusing_on_its_own_log_is_said_at_once_not_waited_out(fake, capsys, tmp_path):  # noqa: F811
+    """The launcher refuses into launch.log and has not exited yet: refused, named, before the timeout (mutation:
+    not reading launch.log leaves it to the timeout, RED)."""
+    repo, sha = _repo(tmp_path)
+    r = _vm_ready(fake, hours=12)
+    (r / "launch.log").write_text("refusing: an EARLIER launch's refusal: never this one's\n")
+    pin, pin_sha = _pin(tmp_path)
+    args = _args(tmp_path, repo, sha, pin, pin_sha, env_file=_env_file(tmp_path, STUB_MODE="launcher-refuse"))
+    args[args.index("--started-timeout-s") + 1] = "20"
+    rc, out, err = _run(capsys, *args)
+    assert rc == 2 and _state()["started"] == "refused", out + err
+    assert "vm606: launcher: refusing: OUT_N1 already holds a run" in out and "EARLIER" not in out
+
+
+@pytest.mark.parametrize("mode, started", [("half", "timeout"), ("quiet", "timeout")])
+def test_a_pair_is_started_only_once_every_arm_logged_its_budget_in_this_launch(fake, capsys, tmp_path, mode,  # noqa: F811
+                                                                                started):
+    """X4: one arm of the pair logs its run budget, the other never does (half), or each holds only an earlier
+    launch's (quiet, stale run.logs): never "ok" (mutations: ok on one arm; reading the whole run.log)."""
+    from tests.test_vm606 import _launch_args, _repo as _pair_repo
+    from tests.test_vm606 import _env_file as _pair_env
+    repo, sha, _tag = _pair_repo(tmp_path)
+    r = _vm_ready(fake, hours=15)
+    if mode == "quiet":
+        for n in (ENV["RUN_NAME_N1"], ENV["RUN_NAME_N2"]):
+            _stale_run_log(r, n)
+    pin, pin_sha = _pin(tmp_path)
+    args = _launch_args(tmp_path, repo, sha, pin, pin_sha, _pair_env(tmp_path, STUB_MODE=mode))
+    args[args.index("--started-timeout-s") + 1] = "4"
+    rc, _out, err = _run(capsys, *args)
+    assert rc == 2 and _state()["started"] == started, err
