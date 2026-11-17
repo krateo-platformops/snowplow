@@ -4207,9 +4207,14 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
                 last_act[n.get("session")] = max(last_act.get(n.get("session"), e), e)
         events, events_why = k6.get("env_events") if k6.get("env_events") is not None else (None, "not given")
         starts = [t for t in ((k6.get("browser") or {}).get("frame_times") or {}).get("start", []) if t is not None]
+        # #1517: with per-renderer evidence, the starvation of a lost session's own renderer is an environment event
+        # too; evidence without it has the control-plane operations only (the owner's ruling, 2026-11-17)
+        bst = k6eval.starvation(k6.get("browser"), "browser")
         sess, lost_check = k6eval.sessions_check(
             k6eval.session_ends(k6.get("browser"), k6.get("sessions"), k6.get("logs")),
-            len(navs) + len(after_failed), events, events_why, last_act, min(starts) if starts else None)
+            len(navs) + len(after_failed), events, events_why, last_act, min(starts) if starts else None,
+            (lambda s, a, b: k6eval.renderer_starvation_events(bst, s, a, b))
+            if bst["rule"] == k6eval.RULE_RENDERER else None)
         validity.append(sess)
         if lost_check is not None:
             checks.append(lost_check)

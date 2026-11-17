@@ -880,9 +880,48 @@ def session_ends(o: dict | None, declared: int | None, logs: list[str] | None = 
     return out
 
 
+def renderer_starvation_events(st: dict, session: str | None, w0: float, w1: float) -> tuple[list[dict] | None, str]:
+    """#1517 (the owner's ruling, 2026-11-17: a session lost while the load generator measurably starved it is
+    INVALID by environment): the windows inside [w0, w1] in which the session's OWN renderer was starved, from two
+    measured signals and no threshold of the bench's making: the loadgen node had not one idle CPU tick in the
+    window (starvation()'s `saturated`), and the session's renderer (its last read at or before w1, resolved to its
+    (pid, starttime) series) waited for a CPU across that same window (its run_delay advanced). (events, "") or
+    (None, why) when the renderer or the node cannot be measured there: never read as "not starved"."""
+    r = st.get("renderer") or {}
+    if not st.get("node"):
+        return None, "the loadgen node's CPU was not measured"
+    if not r.get("anchored"):
+        return None, "the renderer samples have no wall-clock anchor"
+    reads = [m for m in r.get("reads") or [] if m.get("session") == session and isinstance(m.get("pid"), int)
+             and m["t0"] <= w1]
+    if not reads:
+        return None, "its renderer was never read"
+    m = max(reads, key=lambda x: x["t0"])
+    key, why = _series_of(r, m["pid"], m["t0"], m["t1"])
+    if key is None:
+        return None, why
+    s = r["series"][key]
+    out, unjudged = [], 0
+    for win in st.get("windows") or []:
+        if win["t1"] < w0 or win["t0"] > w1 or not win.get("saturated"):
+            continue
+        lo = [v for t, v in s if t <= win["t0"]]
+        hi = [v for t, v in s if t >= win["t1"]]
+        if not lo or not hi:
+            unjudged += 1
+            continue
+        if hi[0] > lo[-1]:
+            out.append({"t0": win["t0"], "t1": win["t1"],
+                        "what": f"the loadgen node had no idle CPU and {session}'s renderer (pid {m['pid']}) waited "
+                                f"{(hi[0] - lo[-1]) / 1e6:.0f} ms for one"})
+    if not out and unjudged:
+        return None, f"{unjudged} saturated window(s) in it are not bracketed by samples of its renderer"
+    return out, ""
+
+
 def sessions_check(ends: dict, loads: int | None = None, events: list[dict] | None = None,
                    events_why: str = "", last_activity: dict | None = None,
-                   drive_start: float | None = None) -> tuple[dict, dict | None]:
+                   drive_start: float | None = None, renderer_events=None) -> tuple[dict, dict | None]:
     """(environment.browser_sessions, browser.sessions_lost): every declared session ran to the drive's end; one
     that did not is judged by CAUSE (the owner's ruling, 2026-11-17), from evidence the bench records only:
 
@@ -894,8 +933,10 @@ def sessions_check(ends: dict, loads: int | None = None, events: list[dict] | No
         cause and "no environment event in its window";
       - one whose end is not recorded, or a run whose events could not be read (`events` None: `events_why`), is
         INVALID (undecided): its cause cannot be told.
-    Evidence without per-renderer data has only the control-plane operations as environment events; a
-    load-generator CPU starvation measured per renderer (#1517) is one more once that evidence exists."""
+    Evidence without per-renderer data has only the control-plane operations as environment events; with it
+    (#1517), `renderer_events(session, w0, w1)` -> (events, "") or (None, why unmeasured) adds the load generator's
+    CPU starvation of that session's own renderer (renderer_starvation_events), and a renderer it cannot measure
+    leaves the loss undecided."""
     base = {"check": "environment.browser_sessions", "bar": "every declared browser session runs to the drive's end"}
     if ends.get("state") != "READ":
         return dict(base, value=None, result="FAIL",
@@ -923,6 +964,14 @@ def sessions_check(ends: dict, loads: int | None = None, events: list[dict] | No
             continue
         w0, w1 = min(w0, at), max(at, x.get("at_until") or at)
         hit = [e for e in events if e["t0"] <= w1 and (e["t1"] is None or e["t1"] >= w0)]
+        if not hit and renderer_events is not None:
+            # #1517: the session's own renderer, measured starved in the window, is an environment event too;
+            # an unmeasured renderer leaves the loss undecided, never "no event"
+            got, why = renderer_events(x.get("session"), w0, w1)
+            if got is None:
+                undecided.append(dict(x, window=[w0, w1], why=why))
+                continue
+            hit = got
         (env if hit else product).append(dict(x, window=[w0, w1], events=[e["what"] for e in hit]))
     tail = ((f": the arm drove {max(0, n - len(lost))} of {n} sessions to the end" if n else "")
             + (f" ({loads} page loads)" if loads is not None else ""))
