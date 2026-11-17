@@ -17,10 +17,14 @@ import (
 //
 //	{snapshot: <snapshot.json text>, pages: [<objects/<n>.json text>, ...],
 //	 saToken: <the ServiceAccount token it also puts in the token file>,
-//	 visitorToken: <the synthesised clientconfig's token>, port: <number>}
+//	 visitorToken: <the synthesised clientconfig's token>,
+//	 frontendConfig: <the config.json text it hands the SPA (boot's buildPortalConfig)>,
+//	 port: <number>}
 //
 // bridge.js has validated the snapshot (snapshot-rules.js) and generated both tokens; they exist
-// only in this worker's memory.
+// only in this worker's memory. frontendConfig is the synthesised frontend ConfigMap's config.json
+// (server.go §8): required, and a JSON object; a missing or invalid one is refused here, naming it, never
+// defaulted.
 const HostConfig = "snowplowFakeApiserver"
 
 // Listen starts the fake apiserver from HostConfig on the in-process loopback network and returns
@@ -50,6 +54,13 @@ func Listen() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	frontend, err := str("frontendConfig")
+	if err != nil {
+		return "", err
+	}
+	if !isJSONObject([]byte(frontend)) {
+		return "", errors.New(HostConfig + ".frontendConfig is not a JSON object: it is the config.json text bridge.js hands the SPA")
+	}
 	pv := cfg.Get("pages")
 	if pv.Type() != js.TypeObject || pv.Length() == 0 {
 		return "", errors.New(HostConfig + ".pages must be a non-empty array")
@@ -68,7 +79,7 @@ func Listen() (string, error) {
 	console := js.Global().Get("console")
 	jsonParse := js.Global().Get("JSON").Get("parse")
 	s, err := New(Options{
-		Snapshot: []byte(snap), Pages: pages, SAToken: sa, VisitorToken: visitor,
+		Snapshot: []byte(snap), Pages: pages, SAToken: sa, VisitorToken: visitor, FrontendConfig: []byte(frontend),
 		Log: func(line map[string]any) {
 			if b, err := json.Marshal(line); err == nil {
 				console.Call("debug", "fake-env", jsonParse.Invoke(string(b)))
