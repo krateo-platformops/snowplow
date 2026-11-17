@@ -151,6 +151,10 @@ func TestIssue1509_SYNDrop_RaceRidesThroughADroppingDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The destination's windows hold enough setups for a measured trigger
+	// (#1521: below that, the cold default applies and nothing is raced
+	// within the stall): triggerMinSamples real setups, asserted.
+	requireWarm1521(t, srv)
 	cli := &http.Client{Transport: rt}
 	warm, err := Send(SendSiteStage, cli, getReq(t, budgetLeft(9*time.Second), srv.URL))
 	if err != nil {

@@ -385,10 +385,21 @@ func (r *reserveRing) reserve() (d time.Duration, measured bool) {
 		return pagebudget.PageP95Goal, false
 	}
 	slices.Sort(s)
-	// The quantile's sample: skip the share above it (rounded down, so a
-	// partial window reads its maximum).
-	above := int(math.Floor(float64(n)*(1-reserveQuantile) + 1e-9))
-	return s[n-1-above], true
+	return s[n-1-quantileAbove(n)], true
+}
+
+// quantileAbove is how many of n sorted samples lie above the goal quantile's
+// sample: the share above it, rounded down, so a partial window reads its
+// maximum.
+func quantileAbove(n int) int {
+	return int(math.Floor(float64(n)*(1-reserveQuantile) + 1e-9))
+}
+
+// count is how many samples the ring holds (at most reserveWindow).
+func (r *reserveRing) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.n
 }
 
 func (r *reserveRing) resetForTest() {

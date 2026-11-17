@@ -223,6 +223,9 @@ func TestIssue1509_RideThroughAHungTLSHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The destination's windows hold enough setups for a measured trigger
+	// (#1521): triggerMinSamples real setups, asserted.
+	requireWarm1521(t, srv)
 	cli := &http.Client{Transport: rt}
 	warm, err := Send(SendSiteStage, cli, getReq(t, budgetLeft(9*time.Second), srv.URL))
 	if err != nil {
@@ -482,5 +485,203 @@ func TestIssue1509_Chain_AHandshakeStillReceivingBytesIsNotRaced(t *testing.T) {
 	}
 	if last < 3*trigger {
 		t.Fatalf("the trickled setup came up after %v; the arm needs its handshake to last over 3 trigger intervals (%v)", last, 3*trigger)
+	}
+}
+
+// A live attempt keeps covering its waiter when the chain flips out of
+// answering and back (#1521 review: dropping every earlier attempt as cover
+// on the flip back doubled a healthy burst's setups). Cover is per attempt,
+// by its own evidence. Trigger T = 50 ms:
+//
+//	0       W1, W2 join; attempt 1 (conn 1) comes up at 15 ms: W1 served,
+//	        answered; attempt 2 (conn 2) starts for W2, its handshake held.
+//	65      interval check: the success is fresh evidence; still answering.
+//	90      W3 joins: attempt 3 (conn 3) starts for it, held too.
+//	115     interval check: nothing came up and no bytes were read: the chain
+//	        races (attempt 4, conn 4, answers at once). Attempt 2 has shown no
+//	        evidence for an interval: it stops covering. Attempt 3 started in
+//	        the interval: it still covers W3.
+//	~116    attempt 4 comes up: W2 served, answered again. W3 is covered by
+//	        attempt 3: no new attempt.
+//
+// The server must accept exactly 4 connections. Dropping every earlier
+// attempt as cover on the flip back (M-epoch) starts a fifth for W3.
+func TestIssue1509_Chain_ALiveAttemptStillCoversAcrossAReRace(t *testing.T) {
+	resetConnectTimes(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const trigger = 50 * time.Millisecond
+	pl := &paceListener{
+		Listener: ln,
+		delay:    map[int32]time.Duration{1: 15 * time.Millisecond, 2: 3 * trigger, 3: 3 * trigger},
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.Listener = pl
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	addr := ln.Addr().String()
+	seedConnectTimes(setupKey(addr, true), trigger)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEMOf(srv))
+	cfg := &tls.Config{RootCAs: pool, NextProtos: []string{"h2"}}
+
+	errs := make(chan error, 3)
+	dial := func() {
+		c, err := endpointDialTLS(context.Background(), "tcp", addr, cfg)
+		if err == nil {
+			t.Cleanup(func() { _ = c.Close() })
+		}
+		errs <- err
+	}
+	go dial()
+	go dial()
+	time.Sleep(90 * time.Millisecond)
+	go dial()
+	for range 3 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(2 * trigger) // a late attempt would be accepted by now
+	if n := pl.accepted.Load(); n != 4 {
+		t.Fatalf("the server accepted %d connections; want 4 (attempts 1-3 and the one race): a live attempt must keep covering its waiter when the chain answers again", n)
+	}
+}
+
+// A healthy burst opens one setup per request (#1521 review; the #1088
+// idle-bound subtest's shape): 25 concurrent HTTP/1.1 TLS requests through
+// NewEndpointTransport start exactly 25 connects, and the server accepts
+// exactly 25 connections — to a new destination (an empty window: the cold
+// default trigger) and to a warm one (a full window of a realistic mix: solo
+// setups and a concurrent burst's, so the trigger is measured).
+func TestIssue1509_Chain_AHealthyBurstOpensOneSetupPerRequest(t *testing.T) {
+	t.Run("cold destination", func(t *testing.T) { healthyBurst1521(t, false) })
+	t.Run("warm destination", func(t *testing.T) { healthyBurst1521(t, true) })
+}
+
+func healthyBurst1521(t *testing.T, warm bool) {
+	resetConnectTimes(t) // a reused port must not bring another test's samples
+	const n = 25
+	var accepted, arrived atomic.Int32
+	var barrier atomic.Bool
+	var release chan struct{}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if barrier.Load() {
+			if arrived.Add(1) == n {
+				close(release)
+			}
+			<-release
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	srv.TLS = &tls.Config{NextProtos: []string{"http/1.1"}}
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			accepted.Add(1)
+		}
+	}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	key := setupKey(srv.Listener.Addr().String(), true)
+	newRT := func() http.RoundTripper {
+		rt, err := NewEndpointTransport(&transport.Config{TLS: transport.TLSConfig{CAData: caPEMOf(srv)}, Proxy: http.ProxyFromEnvironment})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rt
+	}
+	burst := func(rt http.RoundTripper) {
+		arrived.Store(0)
+		release = make(chan struct{})
+		barrier.Store(true)
+		defer barrier.Store(false)
+		cli := &http.Client{Transport: rt}
+		var wg sync.WaitGroup
+		errs := make(chan error, n)
+		for range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				resp, err := cli.Get(srv.URL)
+				if err != nil {
+					errs <- err
+					return
+				}
+				_ = resp.Body.Close()
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatal(err)
+		}
+	}
+	solo := func() {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := newRT().RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+	if warm {
+		for range 5 {
+			solo()
+		}
+		burst(newRT())
+		for range 5 {
+			solo()
+		}
+		srv.CloseClientConnections()
+		if _, measured := connectTimes.trigger(key); !measured {
+			t.Fatalf("the warm destination's window holds %d setups; its trigger is not measured", connectTimes.ring(key).count())
+		}
+	} else if _, measured := connectTimes.trigger(key); measured {
+		t.Fatal("the new destination's trigger is measured already")
+	}
+	trigger, _ := connectTimes.trigger(key)
+	acceptedBefore := accepted.Load()
+
+	var mu sync.Mutex
+	var starts []time.Duration
+	t0 := time.Now()
+	prev := endpointDialFn
+	endpointDialFn = func(ctx context.Context, network, a string) (net.Conn, error) {
+		mu.Lock()
+		starts = append(starts, time.Since(t0))
+		mu.Unlock()
+		return prev(ctx, network, a)
+	}
+	defer func() { endpointDialFn = prev }()
+	racesBefore := racesFired.Load()
+	burst(newRT())
+	time.Sleep(20 * time.Millisecond) // a late attempt would have started by now
+	races := int(racesFired.Load() - racesBefore)
+	mu.Lock()
+	defer mu.Unlock()
+	// One setup per request; every connect beyond that is a race the chain
+	// fired (a setup ran past the measured trigger: the design's ~5 %), never
+	// an extra of its own. Doubling (a waiter's attempt replaced while alive)
+	// would add connects no race accounts for.
+	d, a := len(starts), int(accepted.Load()-acceptedBefore)
+	if !warm && (races != 0 || d != n || a != n) {
+		// A new destination's trigger is the cold default (3 s), which a
+		// burst of milliseconds never reaches: no race can fire, and the
+		// count is exact, independent of the race accounting above.
+		t.Fatalf("a healthy burst of %d requests to a new destination started %d connects, the server accepted %d, and %d races fired; want exactly %d, %d and 0 (trigger %v; connect starts %v)",
+			n, d, a, races, n, n, trigger, starts)
+	}
+	if d < n || d-n > races || a-n > races {
+		t.Fatalf("a healthy burst of %d requests started %d connects and the server accepted %d, with %d races fired; want %d each plus at most one per race (trigger %v; connect starts %v)",
+			n, d, a, races, n, trigger, starts)
+	}
+	if races > 0 {
+		t.Logf("%d races fired (connects %d, accepted %d)", races, d, a)
 	}
 }

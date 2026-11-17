@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -353,11 +354,13 @@ func TestReuse1088_TwoIdentities_NeverShareConnectionOrCredential(t *testing.T) 
 }
 
 // ARM 2b (#1509): the same properties when a setup IS raced, on every run.
-// Identity a's fetch measures the destination's setup time; identity b's
-// first setup is then held by the server well past it, so b's setup is raced
-// on a new socket (the production trigger, nothing seeded), which wins. The
-// held attempt is the raced loser: it must carry no request and be closed by
-// the client, and neither identity's requests may leave its own connection.
+// Twenty other identities' fetches measure the destination's setup time (the
+// trigger is measured only once its window holds enough setups, #1521);
+// identity b's first setup is then held by the server well past it, so b's
+// setup is raced on a new socket (the production trigger, nothing seeded),
+// which wins. The held attempt is the raced loser: it must carry no request
+// and be closed by the client, and no identity's requests may leave its own
+// connection.
 func TestReuse1088_RacedSetup_LoserClosedUnusedIdentitiesApart(t *testing.T) {
 	p := newPKI1088(t)
 	cs := newConnServer1088(t, p, false)
@@ -366,10 +369,18 @@ func TestReuse1088_RacedSetup_LoserClosedUnusedIdentitiesApart(t *testing.T) {
 	b := &endpoints.Endpoint{ServerURL: cs.srv.URL, CertificateAuthorityData: ca, Token: "token-b"}
 	ctx := credhttp.WithHeldCredential(context.Background())
 	before := stageOpened1088()
+	const warm = 20 // ≥ credhttp's trigger threshold (20 for its 0.95 quantile)
+	for i := range warm {
+		w := &endpoints.Endpoint{ServerURL: cs.srv.URL, CertificateAuthorityData: ca, Token: fmt.Sprintf("token-warm-%d", i)}
+		if err := fetch1088(t, ctx, w, http.MethodGet); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := fetch1088(t, ctx, a, http.MethodGet); err != nil {
 		t.Fatal(err)
 	}
 	cs.mu.Lock()
+	acceptedBefore := cs.accepted
 	cs.holdNth, cs.hold = cs.accepted+1, 300*time.Millisecond
 	cs.mu.Unlock()
 	start := time.Now()
@@ -384,12 +395,12 @@ func TestReuse1088_RacedSetup_LoserClosedUnusedIdentitiesApart(t *testing.T) {
 		t.Errorf("the fetches took %v: b's setup waited out the held attempt (300 ms) instead of being raced", took)
 	}
 	cs.mu.Lock()
-	accepted := cs.accepted
+	accepted := cs.accepted - acceptedBefore
 	cs.mu.Unlock()
-	if accepted < 3 {
-		t.Fatalf("the server accepted %d connections; want at least 3 (a's, b's held attempt, b's raced one)", accepted)
+	if accepted < 2 {
+		t.Fatalf("the server accepted %d connections for b; want at least 2 (b's held attempt, b's raced one)", accepted)
 	}
-	assertConnections1088(t, cs, 2, before)
+	assertConnections1088(t, cs, warm+2, before)
 }
 
 // ARM 4: a genuinely external endpoint (a named endpointRef: token-auth, no

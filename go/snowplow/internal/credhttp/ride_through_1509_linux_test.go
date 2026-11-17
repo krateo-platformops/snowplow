@@ -125,6 +125,9 @@ func TestIssue1509_RideThroughAGatedAccept(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The destination's windows hold enough setups for a measured trigger
+	// (#1521): triggerMinSamples real setups, asserted.
+	requireWarm1521(t, srv)
 	cli := &http.Client{Transport: rt}
 
 	// 1. Warm: a pooled HTTP/2 connection, and this destination's connect time measured.

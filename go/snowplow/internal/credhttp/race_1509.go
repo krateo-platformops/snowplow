@@ -44,6 +44,15 @@ package credhttp
 //     the chain empty — and the chain returns to racing
 //     for the waiters still waiting, with the same bound, from the trigger. No
 //     new number: the interval is the measured trigger;
+//   - demand is covered per ATTEMPT, by evidence: an outstanding attempt
+//     covers a waiter while it shows fresh evidence of its own — started, or
+//     read handshake bytes, within the last trigger interval. One with no
+//     evidence for an interval (a connect stuck in SYN backoff through a
+//     stall) stops covering, and the waiters it covered get attempts of their
+//     own once the destination answers again. A live attempt keeps covering
+//     whatever state the chain passes through (#1521 review: a burst's 24
+//     live handshakes must not be dropped as cover when the chain flips out of
+//     answering and back, which doubled a healthy burst's setups);
 //   - each waiter leaves at its own deadline or cancellation, whatever the
 //     chain does; a connection that comes up with nobody waiting is closed
 //     (counted as opened, noteRacedConnectionUp); and when the last waiter
@@ -69,9 +78,19 @@ package credhttp
 // THE TRIGGER, measured, never tuned: the goal quantile (PageGoalQuantile) of
 // the destination's recent successful setup times (connect, or connect + TLS),
 // over the same window and by the same rule as the retry reserve (budget.go
-// reserveRing). A destination with no sample yet uses the goal's typical bound
-// (PageP95Goal), as the reserve does before it has one; a partial window reads
-// its maximum.
+// reserveRing) — once the window holds enough setups to estimate that
+// quantile (owner ruling on #1521, "after enough samples"). Until then the
+// goal's typical bound (PageP95Goal) applies, as for a destination never
+// measured. Enough is set by the quantile itself: the fewest samples n in
+// which the q-quantile is not simply the window's maximum, i.e. at least one
+// sample lies above it: floor(n·(1−q)) ≥ 1, n = ⌈1/(1−q)⌉ = 20 for q = 0.95
+// (triggerMinSamples, computed with the reserve's own rounding, quantileAbove).
+// Fewer samples are not a quantile: one solo setup (≈2.5 ms on the build VM)
+// read as the trigger raced every handshake of a 25-request burst, whose
+// concurrent setups take 2–3× a solo one (#1521 review: p50 7.4 ms, p95 10 ms
+// vs a solo p50 3.0 ms), and doubled the burst's setups. The window holds
+// reserveWindow samples, derived from the same quantile, so a full window is
+// exactly enough (an init check fails the build's tests otherwise).
 //
 // WHAT THE REQUEST'S TRACE SEES: one setup, not one per attempt. The attempts
 // run without the request's httptrace, and the chain reports to each waiter:
@@ -89,10 +108,18 @@ import (
 	"net"
 	"net/http/httptrace"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 )
+
+// racesFired counts the race's own attempts, at both levels: each one an
+// attempt started because the setups before it ran past the trigger with no
+// evidence (onTimer). Every other attempt is a waiter's own (the chain's first,
+// or one covering a waiter once the destination answered). So the setups a
+// destination sees beyond one per waiting request are at most the races fired.
+var racesFired atomic.Uint64
 
 // connectTimes is the per-destination setup-time window.
 var connectTimes = &destinationConnectTimes{rings: map[string]*reserveRing{}}
@@ -117,8 +144,23 @@ func (d *destinationConnectTimes) ring(key string) *reserveRing {
 // the goal quantile of key's recent setup times, or the goal's typical bound
 // when none is measured (measured false).
 func (d *destinationConnectTimes) trigger(key string) (time.Duration, bool) {
-	return d.ring(key).reserve()
+	r := d.ring(key)
+	if r.count() < triggerMinSamples {
+		return pagebudget.PageP95Goal, false
+	}
+	return r.reserve()
 }
+
+// triggerMinSamples is the fewest setups in a destination's window from which
+// its trigger is measured (see the file comment): the smallest n at which the
+// quantile's sample is not the window's maximum (quantileAbove(n) ≥ 1).
+var triggerMinSamples = func() int {
+	n := 1
+	for quantileAbove(n) < 1 {
+		n++
+	}
+	return n
+}()
 
 func (d *destinationConnectTimes) record(key string, took time.Duration) {
 	d.ring(key).record(took)
@@ -262,11 +304,10 @@ type setupChain struct {
 	done        bool
 	waiters     []*chainWaiter
 	outstanding int
-	// fresh counts the outstanding attempts started in the current answering
-	// period (epoch): demand is covered by those, not by attempts started
-	// while the destination was not answering, which may be stuck for good.
-	epoch     int
-	fresh     int
+	// attempts are the outstanding attempts; covering counts those that cover
+	// a waiter (attemptState.covers).
+	attempts  map[*attemptState]struct{}
+	covering  int
 	wait      time.Duration
 	timer     *time.Timer
 	connected bool // some attempt's connect came up
@@ -279,7 +320,15 @@ type setupChain struct {
 
 func newSetupChain(s *setupChains, k chainKey, connect dialFunc) *setupChain {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &setupChain{owner: s, k: k, ringKey: setupKey(k.addr, k.tlsCfg != nil), ctx: ctx, cancel: cancel, dial: connect}
+	return &setupChain{owner: s, k: k, ringKey: setupKey(k.addr, k.tlsCfg != nil), ctx: ctx, cancel: cancel, dial: connect,
+		attempts: map[*attemptState]struct{}{}}
+}
+
+// attemptState is one outstanding attempt's evidence (see the file comment):
+// evidence is whether it started or read handshake bytes since the chain's
+// last interval check; covers is whether it counts as a waiter's cover.
+type attemptState struct {
+	evidence, covers bool
 }
 
 func (c *setupChain) isDone() bool {
@@ -313,7 +362,7 @@ func (c *setupChain) join(ctx context.Context) *chainWaiter {
 // coverDemandLocked gives every waiter an attempt of its own, once the
 // destination has answered (see the file comment).
 func (c *setupChain) coverDemandLocked() {
-	for !c.done && c.fresh < len(c.waiters) {
+	for !c.done && c.covering < len(c.waiters) {
 		c.startAttemptLocked()
 	}
 }
@@ -406,19 +455,19 @@ func (c *setupChain) onConnected() {
 
 func (c *setupChain) startAttemptLocked() {
 	c.outstanding++
-	answered, epoch := c.answered, c.epoch
-	if answered {
-		c.fresh++
-	}
+	a := &attemptState{evidence: true, covers: true}
+	c.attempts[a] = struct{}{}
+	c.covering++
+	answered := c.answered
 	actx, acancel := context.WithDeadline(c.ctx, dialNow().Add(pagebudget.PageMaxGoal))
 	go func() {
 		defer acancel()
 		start := dialNow()
-		conn, err, tlsErr := c.attempt(actx, answered)
+		conn, err, tlsErr := c.attempt(actx, answered, a)
 		if err == nil {
 			connectTimes.record(c.ringKey, dialNow().Sub(start))
 		}
-		c.result(racedConn{c: conn, err: err, tlsErr: tlsErr}, answered, epoch)
+		c.result(racedConn{c: conn, err: err, tlsErr: tlsErr}, a)
 	}()
 }
 
@@ -428,7 +477,7 @@ func (c *setupChain) startAttemptLocked() {
 // (answered: the attempt serves demand, not the race), its connect is its own,
 // like the attempt itself: the connect chain bounds racing, and there is no
 // race left to bound.
-func (c *setupChain) attempt(ctx context.Context, answered bool) (net.Conn, error, bool) {
+func (c *setupChain) attempt(ctx context.Context, answered bool, a *attemptState) (net.Conn, error, bool) {
 	if c.k.tlsCfg == nil || answered {
 		raw, err := c.dial(ctx, c.k.network, c.k.addr)
 		if err != nil {
@@ -439,20 +488,20 @@ func (c *setupChain) attempt(ctx context.Context, answered bool) (net.Conn, erro
 		if c.k.tlsCfg == nil {
 			return conn, nil, false
 		}
-		return c.handshake(ctx, conn)
+		return c.handshake(ctx, conn, a)
 	}
 	conn, err := connectChains.dial(ctx, chainKey{network: c.k.network, addr: c.k.addr}, c.dial)
 	if err != nil {
 		return nil, err, false
 	}
 	c.onConnected()
-	return c.handshake(ctx, conn)
+	return c.handshake(ctx, conn, a)
 }
 
 // handshake runs the TLS handshake of a TLS chain's attempt on conn.
-func (c *setupChain) handshake(ctx context.Context, conn net.Conn) (net.Conn, error, bool) {
+func (c *setupChain) handshake(ctx context.Context, conn net.Conn, a *attemptState) (net.Conn, error, bool) {
 	if ec, ok := conn.(*endpointConn); ok {
-		ec.watchRead(c.onProgress)
+		ec.watchRead(func() { c.onProgress(a) })
 		defer ec.watchRead(nil)
 	}
 	cfg := c.k.tlsCfg.Clone()
@@ -469,13 +518,13 @@ func (c *setupChain) handshake(ctx context.Context, conn net.Conn) (net.Conn, er
 	return tc, nil, false
 }
 
-// result takes an attempt's outcome; answered and epoch are the chain's state
-// when the attempt started (it counts in fresh only for its own period).
-func (c *setupChain) result(r racedConn, answered bool, epoch int) {
+// result takes attempt a's outcome.
+func (c *setupChain) result(r racedConn, a *attemptState) {
 	c.mu.Lock()
 	c.outstanding--
-	if answered && epoch == c.epoch {
-		c.fresh--
+	delete(c.attempts, a)
+	if a.covers {
+		c.covering--
 	}
 	if r.err == nil {
 		w := c.popLocked()
@@ -486,14 +535,10 @@ func (c *setupChain) result(r racedConn, answered bool, epoch int) {
 			return
 		}
 		c.deliverLocked(w, r)
-		// The destination answered: every waiter left gets an attempt of its
-		// own, and the timer now watches for fresh evidence (onTimer). A new
-		// answering period does not count attempts started before it.
-		if !c.answered {
-			c.answered = true
-			c.epoch++
-			c.fresh = 0
-		}
+		// The destination answered: every waiter left is covered by an attempt
+		// (a live one, or a new one), and the timer now watches for fresh
+		// evidence (onTimer).
+		c.answered = true
 		c.progress = true
 		if c.timer != nil {
 			trigger, _ := connectTimes.trigger(c.ringKey)
@@ -536,6 +581,15 @@ func (c *setupChain) onTimer() {
 	if c.done || len(c.waiters) == 0 {
 		return
 	}
+	// Per attempt: one with no evidence in the interval just ended stops
+	// covering; every attempt's evidence starts over for the next interval.
+	for a := range c.attempts {
+		if !a.evidence && a.covers {
+			a.covers = false
+			c.covering--
+		}
+		a.evidence = false
+	}
 	if c.answered {
 		trigger, _ := connectTimes.trigger(c.ringKey)
 		if c.progress {
@@ -549,16 +603,23 @@ func (c *setupChain) onTimer() {
 		c.answered = false
 		c.wait = trigger
 	}
+	racesFired.Add(1)
 	c.startAttemptLocked()
 	c.wait *= 2
 	c.timer.Reset(c.wait)
 }
 
-// onProgress records a TLS attempt reading its server's handshake bytes (each
-// read): the destination answers even if no setup has completed yet.
-func (c *setupChain) onProgress() {
+// onProgress records attempt a reading its server's handshake bytes (each
+// read): the destination answers even if no setup has completed yet, and a is
+// alive, so it covers a waiter again if it had stopped.
+func (c *setupChain) onProgress(a *attemptState) {
 	c.mu.Lock()
 	c.progress = true
+	a.evidence = true
+	if _, live := c.attempts[a]; live && !a.covers {
+		a.covers = true
+		c.covering++
+	}
 	c.mu.Unlock()
 }
 

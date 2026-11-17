@@ -40,15 +40,17 @@ func TestIssue1509_B_TriggerColdDestinationIsTheP95Goal(t *testing.T) {
 	}
 }
 
-// Too few samples for the quantile to exclude anything: the window's maximum,
-// so one fast sample cannot make every later connect race.
-func TestIssue1509_B_TriggerPartialWindowIsItsMaximum(t *testing.T) {
+// Too few samples for the quantile to exclude anything are not a measured
+// trigger (#1521, owner ruling "after enough samples"): the cold default, so
+// a few fast samples cannot make every later setup race. (The threshold's
+// two edges: trigger_samples_1521_test.go.)
+func TestIssue1509_B_TriggerPartialWindowIsTheColdDefault(t *testing.T) {
 	resetConnectTimes(t)
 	for _, ms := range []int{3, 40, 7} {
 		connectTimes.record("few.invalid:443", time.Duration(ms)*time.Millisecond)
 	}
-	if d, measured := connectTimes.trigger("few.invalid:443"); !measured || d != 40*time.Millisecond {
-		t.Fatalf("trigger = %v (measured %v), want the maximum 40ms", d, measured)
+	if d, measured := connectTimes.trigger("few.invalid:443"); measured || d != pagebudget.PageP95Goal {
+		t.Fatalf("trigger = %v (measured %v), want the cold default %v, not measured", d, measured, pagebudget.PageP95Goal)
 	}
 }
 
