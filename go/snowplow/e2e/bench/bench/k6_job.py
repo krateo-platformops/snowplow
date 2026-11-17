@@ -101,13 +101,14 @@ def loadgen_fit(machine: str, requests: list[tuple[str, str]]) -> dict:
 def k6_plan_requests(k6_cpu: str | None = None, browser_cpu: str | None = None,
                      viewers: bool = True) -> list[tuple[str, str]]:
     """Every container the k6 plan puts on the loadgen node: k6 (+ its viewer
-    sidecar), the browser (Chrome), fresh606, mem606, and (#1297) the run's
+    sidecar), the browser (Chrome) and its renderers sidecar, fresh606, mem606, and (#1297) the run's
     observer (bench/incluster.py: the APF / top samplers and the log stream),
     which stays on the node through the measure."""
     from bench import incluster
     return ([(k6_cpu or K6_CPU, K6_MEMORY)]
             + ([(VIEWER_CPU, VIEWER_MEMORY)] if viewers else [])
-            + [(browser_cpu or BROWSER_CPU, BROWSER_MEMORY), (FRESH_CPU, FRESH_MEMORY), ("250m", "512Mi"),
+            + [(browser_cpu or BROWSER_CPU, BROWSER_MEMORY), (RENDERERS_CPU, RENDERERS_MEMORY),
+               (FRESH_CPU, FRESH_MEMORY), ("250m", "512Mi"),
                (incluster.OBSERVE_CPU, incluster.OBSERVE_MEMORY)])
 
 
@@ -223,8 +224,11 @@ def browser_config(*, sessions: list[dict], routes: list[str], password: str,
                    think_s: float, duration_s: float, quiet_ms: int = 1000,
                    page_timeout_ms: int = 60000, signin_timeout_ms: int = 60000,
                    frontend_url: str, snowplow_url: str, authn_url: str, debug_user: str,
-                   fresh: dict | None = None) -> dict:
-    """`fresh` (#935): bench/fresh_classes.plan — each session's fresh users,
+                   fresh: dict | None = None, renderer_watch: bool = True) -> dict:
+    """`renderer_watch` (#1517): whether a renderers watcher reads this browser's pages, a property of the run:
+    the k6browser pod always has one (render_browser refuses a config that says otherwise); only a bare `k6 run`
+    of browser.js with no sidecar (a test fixture) has none, and then no page waits for a read that cannot come.
+    `fresh` (#935): bench/fresh_classes.plan — each session's fresh users,
     in order; `frontend_url`: the portal's origin; `snowplow_url`: snowplow as the browser reaches it (config
     SNOWPLOW_API_BASE_URL), where a session reads the learned-class counters, as `debug_user` (bench/rbac_model.py
     THE DEBUG READER, logged in at `authn_url`), never as the session's own user."""
@@ -236,7 +240,17 @@ def browser_config(*, sessions: list[dict], routes: list[str], password: str,
             "pageTimeoutMs": page_timeout_ms, "signinTimeoutMs": signin_timeout_ms,
             "frontendUrl": frontend_url, "snowplowUrl": snowplow_url,
             "authnUrl": authn_url.rstrip("/"), "debugUser": debug_user,
-            "firstVisit": first_visit_label(sessions)}
+            "firstVisit": first_visit_label(sessions),
+            # #1517 review: how long a page waits for the read it asked renderers.js for (before its class's sign-in,
+            # after its login load, after its last load): the read it asked for, behind at most one read of the
+            # same Chrome still in flight, each bounded by RENDERER_READ_MS. With the watcher running, a wait ends
+            # as soon as its read is over; the bound is reached only when no read comes. Outside every measured
+            # time: the sign-in's clock starts after the before-wait, the login read follows the login load, the
+            # after-wait the class's last load (browser_renderer_wait_ms)
+            "rendererWatch": bool(renderer_watch),
+            "rendererReadWaitMs": 2 * RENDERER_READ_MS if renderer_watch else 0,
+            # after a class's last read, the page stays open for the sampler's next sample of its renderer
+            "rendererSampleWaitMs": 2 * RENDERER_SAMPLE_S * 1000 if renderer_watch else 0}
 
 
 def _indent(text: str, n: int) -> str:
@@ -325,6 +339,129 @@ anchor
 printf '{{"kind": "cpu_start", "container": "{prefix}", "request_m": {_mcpu(request)}, "limit_m": {lim}, "cgroup_limit_m": %s, "interval_s": {CPU_SAMPLE_S}, "node_cpus": %s, "epoch": %s, "uptime": %s, "uptime_lo": %s}}\\n' "$cg" "$nc" "$an_ep" "$an_up" "$an_lo" > {f}
 ( while :; do cpu_sample; sleep {CPU_SAMPLE_S}; done ) &
 sampler=$!
+"""
+
+
+#: the renderer sampler's period (the owner's ruling of 2026-11-17, "Measure it precisely"): a load's stall is its
+#: own renderer's run-queue wait between the samples that bracket it, so the bracket's excess over the load is at
+#: most two periods of that renderer's own runnable time (an idle page's renderer is not runnable: it accrues none).
+#: 1 s: under the judged loads' bars (500 ms warm, 1000 ms cold) and one awk over /proc a second
+RENDERER_SAMPLE_S = 1
+#: one page's read by renderers.js (attach, marker, trace, stamp, detach): past it the read is a failed one, and the
+#: watcher waits for its session's detach before it reads the next page (no trace of it overlaps another read)
+RENDERER_READ_MS = 10000
+#: renderers.js waits for every session's Chrome (its DevToolsActivePort) at most this long: the browser's first
+#: navigation's retries (browser.js GOTO_TRIES x pageTimeout + waits) are well inside it; past it, it starts with
+#: the Chrome it found, and the sessions it does not watch have no renderer (their stall UNKNOWN)
+RENDERER_WAIT_S = 600
+#: the renderers sidecar (#1517 review, 2026-11-17): the sampler and the CDP watcher run OUTSIDE the browser
+#: container's cgroup (measured: +0.106 cores, about +24%, inside it), in a container of their own; the pod shares
+#: its process namespace (the renderers' /proc is readable) and /tmp (each Chrome's DevToolsActivePort); the
+#: network namespace is the pod's (the CDP endpoints on 127.0.0.1)
+RENDERERS_CPU, RENDERERS_MEMORY = "250m", "256Mi"
+
+
+def _renderer_sampler(sessions: int) -> str:
+    """POSIX sh (busybox, the k6 browser image), the renderers sidecar's: every RENDERER_SAMPLE_S, each Chrome
+    renderer process's run-queue wait, /proc/<pid>/task/*/schedstat field 2 (run_delay, ns, summed over its
+    threads: the time they were runnable and waited for a CPU), KEYED BY (pid, starttime) (/proc/<pid>/stat field
+    22: a reused pid is another series, never the old one's continuation), timed by /proc/uptime (node-wide: the
+    browser container's cpu_start anchor places it), into /out/browser-renderers.jsonl: {"kind": "renderer", "t",
+    "rd": {"<pid>:<starttime>": ns}}, and once per series its Chrome's --user-data-dir ({"kind": "renderer_udd",
+    "pid", "start", "udd"}), which the evaluator matches against the CDP endpoint that named the pid.
+    KNOWN UNDER-COUNT: an exited thread's run_delay leaves the sum with it; a sum that decreases is flagged by the
+    evaluator, a decrease hidden by later growth is not. And renderer_watch: once `sessions` Chrome (one per k6 VU)
+    wrote DevToolsActivePort (or RENDERER_WAIT_S passed), k6/renderers.js on their CDP endpoints, its lines into
+    /out/renderer-map.jsonl."""
+    return f"""# stof <pid>: ST = the process's starttime (/proc/<pid>/stat field 22, after the parenthesised comm)
+stof() {{
+  {{ read -r l < /proc/$1/stat; }} 2>/dev/null || return 1
+  r=${{l##*) }}
+  set -- $r
+  ST=${{20}}
+}}
+rsample() {{
+  # candidates: any process whose command line holds the text; a renderer is a Chromium whose arguments hold the
+  # WORD --type=renderer (this shell's own script holds the text too), decided once per (pid, starttime) and
+  # remembered either way. Chromium rewrites its command line into one space-joined string (read 2026-11-17,
+  # Chrome 152): its words are split on spaces, never on NULs
+  rs=""
+  for p in $(grep -la -- '--type=renderer' /proc/[0-9]*/cmdline 2>/dev/null | cut -d/ -f3); do
+    stof "$p" || continue
+    key="$p:$ST"
+    case " $rknown " in *" $key "*) rs="$rs $p"; continue ;; esac
+    case " $rnot " in *" $key "*) continue ;; esac
+    c=$( {{ tr '\\0' ' ' < /proc/$p/cmdline; }} 2>/dev/null)
+    w1=${{c%% *}}
+    case "$w1 | $c " in */chromium" | "*" --type=renderer "*|*/chrome" | "*" --type=renderer "*)
+      d=; for w in $c; do case "$w" in --user-data-dir=*) d=${{w#--user-data-dir=}}; break ;; esac; done
+      printf '{{"kind": "renderer_udd", "pid": %s, "start": %s, "udd": "%s"}}\\n' "$p" "$ST" "$d" >> /out/browser-renderers.jsonl
+      rknown="$rknown $key"; rs="$rs $p" ;;
+    *) rnot="$rnot $key" ;;
+    esac
+  done
+  set -- $rs
+  [ $# -gt 0 ] || return 0
+  files=""
+  for p in "$@"; do
+    [ -r /proc/$p/stat ] || continue
+    files="$files /proc/$p/stat"
+    for f in /proc/$p/task/*/schedstat; do [ -r "$f" ] && files="$files $f"; done
+  done
+  [ -n "$files" ] || return 0
+  read -r up _ < /proc/uptime
+  # each pid's own stat first (its starttime: the series key), then its threads' schedstat (field 2 summed)
+  # shellcheck disable=SC2086
+  awk -v t="$up" 'FNR == 1 {{ n = split(FILENAME, a, "/"); p = a[3] }}
+    FILENAME ~ /^\\/proc\\/[0-9]+\\/stat$/ {{ x = $0; sub(/^.*\\) /, "", x); split(x, f, " "); st[p] = f[20]; next }}
+    {{ s[p] += $2 }}
+    END {{ o = ""; for (p in s) if (p in st) o = o (o == "" ? "" : ", ") "\\"" p ":" st[p] "\\": " s[p];
+          printf "{{\\"kind\\": \\"renderer\\", \\"t\\": %s, \\"rd\\": {{%s}}}}\\n", t, o }}' \\
+    $files 2>/dev/null >> /out/browser-renderers.jsonl
+}}
+rknown=""; rnot=""
+rsampler_loop() {{ while :; do rsample; sleep {RENDERER_SAMPLE_S}; done; }}
+renderer_watch() {{
+  n=0; w=0
+  while [ "$w" -lt {RENDERER_WAIT_S} ]; do
+    n=$(ls /tmp/k6browser-data-*/DevToolsActivePort 2>/dev/null | wc -l)
+    [ "$n" -ge {sessions} ] && break
+    [ -f /out/done ] && break
+    sleep 1; w=$((w + 1))
+  done
+  ts=""
+  for f in /tmp/k6browser-data-*/DevToolsActivePort; do
+    [ -r "$f" ] || continue
+    port=$(sed -n 1p "$f"); path=$(sed -n 2p "$f")
+    # the CDP endpoint of a Chrome of THIS pod (its network namespace): never the portal, which the browser
+    # loads from its own origin
+    ts="$ts${{ts:+,}}{{\\"udd\\": \\"${{f%/DevToolsActivePort}}\\", \\"url\\": \\"ws://127.0.0.1:$port$path\\"}}"
+  done
+  printf '{{"kind": "renderer_watch", "browsers": %s, "of": {sessions}, "waited_s": %s}}\\n' "$n" "$w" > /out/renderer-watch.json
+  CDP_TARGETS="[$ts]" READ_MS={RENDERER_READ_MS} k6 run --quiet --log-format raw \\
+    --console-output /out/renderer-map.jsonl /opt/k6/renderers.js >/dev/null 2>/out/renderer-watch.err
+}}
+"""
+
+
+def renderers_script(sessions: int, linger_s: float) -> str:
+    """The renderers sidecar's command: the sampler and the watcher from the browser container's start until its run
+    is over (/out/done), then /out/renderers-done (its readiness: the Job's pod is Ready when both are over), then it
+    lingers for collect like the browser container."""
+    return f"""set -u
+{_renderer_sampler(sessions)}# the clock ticks a starttime counts (each series' process start on the node's uptime: a process that started
+# before a read and was sampled after it held its pid through the read)
+hz=$(getconf CLK_TCK 2>/dev/null) || hz=
+printf '{{"kind": "renderer_clock", "hz": %s}}\\n' "${{hz:-null}}" >> /out/browser-renderers.jsonl
+rsampler_loop &
+rsampler=$!
+renderer_watch &
+rw=$!
+while [ ! -f /out/done ]; do sleep 1; done
+pkill -P "$rw" 2>/dev/null; kill "$rw" "$rsampler" 2>/dev/null
+echo 0 > /out/renderers-done
+echo "renderers: over with the browser's run; holding {linger_s:g}s for collect"
+sleep {linger_s:g}
 """
 
 
@@ -553,9 +690,19 @@ def render_browser(*, config: dict, linger_s: float,
                    origin_wait_s: int = ORIGIN_WAIT_S) -> str:
     """ConfigMap k6browser (script + config) + the k6browser Job: Chrome
     through k6 browser, loading the portal from its own origin (config
-    frontendUrl: the platform gateway, as on 057) once that origin answers."""
+    frontendUrl: the platform gateway, as on 057) once that origin answers.
+    Beside it (2026-11-17, "Measure it precisely"; #1517 review), the
+    `renderers` sidecar: each renderer's run-queue wait and which renderer
+    renders each session's page, from OUTSIDE the browser container's cgroup
+    (shareProcessNamespace: its /proc; a shared /tmp: each Chrome's
+    DevToolsActivePort; the pod's network: the CDP endpoints)."""
+    if config.get("rendererWatch") is not True or not config.get("rendererReadWaitMs"):
+        raise ValueError("the k6browser pod has a renderers watcher, so its browser config must say so "
+                         "(browser_config(renderer_watch=True)): without its wait a page is not read on both sides "
+                         "of its loads, and every load would be charged UNKNOWN")
     files = {"browser.js": (K6_DIR / "browser.js").read_text(),
              "pageload.js": (K6_DIR / "pageload.js").read_text(),
+             "renderers.js": (K6_DIR / "renderers.js").read_text(),
              "browser-config.json": json.dumps(config, indent=1)}
     run = (_origin_wait([config["frontendUrl"].rstrip("/") + "/"], origin_wait_s) + "wait_origin && "
            "k6 run --quiet --out json=/out/browser.json.gz /opt/k6/browser.js")
@@ -576,6 +723,7 @@ spec:
         kubectl.kubernetes.io/default-container: browser
     spec:
 {_POOL}
+      shareProcessNamespace: true
       securityContext:
         fsGroup: {K6_UID}
       containers:
@@ -607,11 +755,38 @@ spec:
           mountPath: /opt/k6
         - name: out
           mountPath: /out
+        - name: tmp
+          mountPath: /tmp
+      - name: renderers
+        image: {K6_BROWSER_IMAGE}
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+{_indent(renderers_script(len(config["sessions"]), linger_s), 10)}
+        resources:
+          requests:
+            cpu: {json.dumps(RENDERERS_CPU)}
+            memory: {RENDERERS_MEMORY}
+          limits:
+            cpu: {json.dumps(RENDERERS_CPU)}
+        readinessProbe:
+          exec:
+            command: ["test", "-f", "/out/renderers-done"]
+          periodSeconds: 10
+        volumeMounts:
+        - name: k6
+          mountPath: /opt/k6
+        - name: out
+          mountPath: /out
+        - name: tmp
+          mountPath: /tmp
       volumes:
       - name: k6
         configMap:
           name: k6browser
       - name: out
+        emptyDir: {{}}
+      - name: tmp
         emptyDir: {{}}
 """
 
