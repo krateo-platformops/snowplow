@@ -51,10 +51,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
 
-	"github.com/krateo-platformops/plumbing/env"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/frontendconfig"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,16 +63,16 @@ import (
 )
 
 // frontendConfigConfigMapEnv names the env var (chart value) that points
-// at the frontend ConfigMap. Default `frontend-config-vars`. Per the
-// no-special-cases contract: even the ConfigMap NAME is config, never a
-// Go constant — an operator who renames the ConfigMap re-points Phase 1
-// without a code change.
-const frontendConfigConfigMapEnv = "FRONTEND_CONFIG_CONFIGMAP"
+// at the frontend ConfigMap. Per the no-special-cases contract: even the
+// ConfigMap NAME is config, never a Go constant — an operator who renames
+// the ConfigMap re-points Phase 1 without a code change. Its one definition
+// is internal/frontendconfig, which the sandbox's fake apiserver shares.
+const frontendConfigConfigMapEnv = frontendconfig.Env
 
 // frontendConfigConfigMapDefault is the default ConfigMap name when
-// FRONTEND_CONFIG_CONFIGMAP is unset. It is a DEFAULT, not a hardcoded
-// policy — the env var overrides it.
-const frontendConfigConfigMapDefault = "frontend-config-vars"
+// FRONTEND_CONFIG_CONFIGMAP is unset (frontendconfig.Default). It is a
+// DEFAULT, not a hardcoded policy — the env var overrides it.
+const frontendConfigConfigMapDefault = frontendconfig.Default
 
 // frontendConfigDataKey is the single key inside the ConfigMap whose
 // value is the `config.json` JSON string.
@@ -85,7 +84,7 @@ const frontendConfigConfigMapDefault = "frontend-config-vars"
 // hole). Narrowing the gate to only this key would require widening it in
 // lockstep with any such change; the full-Data compare deliberately avoids that
 // coupling. See docs/configvars-update-datagate-design-2026-07-07.md §Scope.
-const frontendConfigDataKey = "config.json"
+const frontendConfigDataKey = frontendconfig.DataKey
 
 // configMapGVR is the GVR for core/v1 ConfigMap — the meta object Phase 1
 // reads the navigation contract from. This is NOT a business GVR and NOT
@@ -110,13 +109,10 @@ type frontendConfig struct {
 // frontendConfigConfigMapName returns the configured frontend ConfigMap
 // name (FRONTEND_CONFIG_CONFIGMAP, default frontendConfigConfigMapDefault).
 // An UNSET or EMPTY env var falls back to the default — an empty chart
-// value is treated as "use the default", not "no ConfigMap".
-func frontendConfigConfigMapName() string {
-	if v := strings.TrimSpace(env.String(frontendConfigConfigMapEnv, "")); v != "" {
-		return v
-	}
-	return frontendConfigConfigMapDefault
-}
+// value is treated as "use the default", not "no ConfigMap". It is
+// frontendconfig.ConfigMapName: the sandbox's fake apiserver synthesises
+// the ConfigMap under that same name.
+func frontendConfigConfigMapName() string { return frontendconfig.ConfigMapName() }
 
 // listNavigationRootsFromConfigMap is the 0.30.107 navigation-root
 // SOURCE. It reads the frontend ConfigMap, parses config.json, decodes

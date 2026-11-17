@@ -61,7 +61,13 @@ type opts struct {
 	rawSnap, rawPage func(string) string
 	// rawExtra rewrites the extra objects' page text.
 	rawExtra func(string) string
+	// frontend, when set, is Options.FrontendConfig in place of frontendConfigText (empty: none).
+	frontend *string
 }
+
+// frontendConfigText is the frontend config.json the harness hands New, as bridge.js hands it the
+// SPA's (boot's buildPortalConfig): its INIT is the /call Phase 1 reads its navigation root from.
+const frontendConfigText = `{"api":{"INIT":"/call?resource=navmenus&apiVersion=widgets.templates.krateo.io/v1beta1&name=sidebar-nav-menu&namespace=krateo-system"},"params":{"FRONTEND_NAMESPACE":"krateo-system"}}`
 
 func readFixture(t *testing.T, rel string) []byte {
 	t.Helper()
@@ -120,8 +126,12 @@ func loadHarness(t *testing.T, o opts) (*harness, error) {
 		pages = append(pages, b)
 	}
 	n := 0
+	frontend := frontendConfigText
+	if o.frontend != nil {
+		frontend = *o.frontend
+	}
 	s, err := New(Options{
-		Snapshot: snap, Pages: pages, SAToken: "sa-token", VisitorToken: "visitor-token",
+		Snapshot: snap, Pages: pages, SAToken: "sa-token", VisitorToken: "visitor-token", FrontendConfig: []byte(frontend),
 		Clock: func() time.Time { h.mu.Lock(); defer h.mu.Unlock(); return h.now },
 		AfterFunc: func(d time.Duration, f func()) func() bool {
 			h.mu.Lock()
