@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from bench import clusterops, gke, k6eval, load606
+from tests.manifests import old_evidence_manifest
 from tests.fake_gke_ops import operation
 from tests.test_k6_830 import (BENCH_DIR, _browser_points, _browser_summary, _check, _cpu_file, _k6_points,
                                _k6_summary, _point, _write_out, _write_viewer)
@@ -451,6 +452,7 @@ def _n2_evaluate(tmp_path, *, new_format, with_log=True, lost=("s4", "s5"), resi
         "readable": True, "unreadable": None, "operations": ops}))
     p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", str(fresh), "--k6-out", str(k6dir),
                         "--browser-out", str(bdir), "--browser-sessions", "5",
+                        "--loadgen-job", old_evidence_manifest(tmp_path, 5),
                         "--cluster-operations", str(tmp_path / "cluster-operations.json"),
                         *(["--browser-log", str(log)] if with_log else [])],
                        capture_output=True, text=True, cwd=BENCH_DIR, timeout=300)

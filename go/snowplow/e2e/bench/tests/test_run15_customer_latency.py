@@ -39,6 +39,7 @@ import pytest
 
 from bench import custlat, load606
 from tests import fake_gcs, fake_region
+from tests.manifests import old_evidence_manifest
 from tests.test_run14_list_narrow import FRESH, LN_KEY, _mem
 
 FIX = Path(__file__).resolve().parent / "fixtures"
@@ -104,7 +105,8 @@ def _write_run(d: Path, doc=P14, scale=lambda t, v: v, drop=lambda t: False, con
 def _evaluate(d: Path, files, capsys, digest=DIG_A) -> dict:
     capsys.readouterr()
     load606.main(["evaluate", *files, "--k6-out", str(d / "k6"), "--browser-out", str(d / "browser"),
-                  "--browser-sessions", "5", "--no-viewers", "--expect-digest", digest])
+                  "--browser-sessions", "5", "--no-viewers", "--expect-digest", digest,
+                  "--loadgen-job", old_evidence_manifest(d, 5)])
     v = json.loads(capsys.readouterr().out)
     # the fixture has no snowplow pods / image-digest gate records: the
     # run's own validity is not what these tests judge
@@ -122,7 +124,8 @@ def va(tmp_path_factory):
     d = tmp_path_factory.mktemp("a")
     files = _write_run(d)
     args = ["evaluate", *files, "--k6-out", str(d / "k6"), "--browser-out", str(d / "browser"),
-            "--browser-sessions", "5", "--no-viewers", "--expect-digest", DIG_A]
+            "--browser-sessions", "5", "--no-viewers", "--expect-digest", DIG_A,
+            "--loadgen-job", old_evidence_manifest(d, 5)]
     p = subprocess.run(["python3", "-m", "bench.load606", *args], cwd=BENCH, capture_output=True,
                        text=True, check=False)
     v = json.loads(p.stdout)

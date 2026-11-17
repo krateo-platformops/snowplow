@@ -6653,6 +6653,13 @@ def recorded_env_events(path: str | None) -> tuple[list[dict] | None, str]:
 
 
 def _cmd_evaluate(a) -> int:
+    # #1525 review: a real browser is judged by what its pod was configured to do, read from the run's own
+    # manifest: without it the judgment would silently fall back to the old (container) rule. Every k6 run's
+    # evidence holds its loadgen-job.yaml (run606 writes it before it applies the Jobs; reevaluate passes it)
+    if a.browser_out is not None and a.loadgen_job is None:
+        print("refusing: --browser-out needs --loadgen-job (the run's loadgen-job.yaml): the renderer watch its "
+              "browser pod was configured with decides how its loads are judged", file=sys.stderr)
+        return 2
     recs = []
     streams = []
     mem_streams = []

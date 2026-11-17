@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from bench import calltiming, load606, netns606, netpath, sampler
+from tests.manifests import old_evidence_manifest
 from tests.test_919_evidence_gaps import NODE, _evaluate, needs_node
 from tests.test_k6_830 import _point, _write_out
 from tests.test_run606_real_sequence import BENCH_DIR
@@ -610,7 +611,8 @@ def _dashboard_first_loads(n_loads=3, calls=57, conns=4, service=20.0, chrome_ex
 def _browser_eval(tmp_path, pts):
     _write_out(tmp_path / "browser", "browser", pts, None, 0)
     return _evaluate(tmp_path, {"preflight.jsonl": [{"kind": "preflight"}]},
-                     "--browser-out", str(tmp_path / "browser"), "--browser-sessions", "1")
+                     "--browser-out", str(tmp_path / "browser"), "--browser-sessions", "1",
+                     "--loadgen-job", old_evidence_manifest(tmp_path, 1))
 
 
 QUEUE_PER_LOAD = 20 * (4 * sum(range(14)) + 14)          # 7,560 ms: call i waits (i // 4) x 20 ms

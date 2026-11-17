@@ -1153,6 +1153,7 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                     ms = (600 if mode in ("starved", "saturated") else 300) + i
                     # each load's own start (pageload.recordOps' t0), inside the sampled windows
                     t["t0"] = str(1792576800000 - 3000 + 40 * (20 * int(s[1:] or 0) + i))
+                    t["class"] = "0"                     # the session's identity class (renderers.js's reads key)
                     lines += [pt("browser_page_load_ms", ms, **t),
                               pt("browser_page_loads", 1, **t)]
                 # #1508: the session's end, as browser.js records it (FAKE_BROWSER_LOST=<session>: it ended early)
@@ -1183,6 +1184,41 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                       "node_busy_ticks": 1000 * i, "node_idle_ticks": idle * i} for i in range(6)]
             recs.append({"kind": "cpu_end", "epoch": 1792576800 - 15 + 26, "uptime": 126.0, "uptime_lo": 125.98})
             with open(os.path.join(dest, c + "-cpu.jsonl"), "w") as fh:
+                fh.write("".join(json.dumps(r) + "\\n" for r in recs))
+        if name == "browser":
+            # #1525 review: the per-renderer records the k6browser pod's renderers sidecar leaves (its config has the
+            # renderer watch, as run606 renders it), in the bench's own formats, on the CPU samples' clock (uptime
+            # 100 = epoch 1792576785): each session's renderer read before (T - 5) and after (T + 3) its loads
+            # (T - 2.2 .. T + 0.8), each sampled every second by (pid, starttime) with its --user-data-dir, the
+            # node's CLK_TCK; and the sidecar's own CPU record. starved / saturated: each renderer waited for a CPU
+            # through its loads (1 s per second); else its run_delay only ever moved before them (a live counter)
+            T, off = 1792576800, 1792576785 - 100
+            pids = {"s1": 3101, "s2": 3102, "s3": 3103}
+            udd = {s: "/tmp/k6browser-data-" + s for s in pids}
+            maps = []
+            for s, pid in pids.items():
+                for t0 in (T - 5, T + 3):
+                    maps.append({"kind": "renderer_map", "t0": t0, "t1": t0 + 0.05, "udd": udd[s], "target": "T" + s,
+                                 "ask": "before" if t0 < T else "after", "session": s, "class": "0", "pid": pid})
+            with open(os.path.join(dest, "renderer-map.jsonl"), "w") as fh:
+                fh.write("".join(json.dumps(m) + "\\n" for m in maps))
+            rows = [{"kind": "renderer_clock", "hz": 100}]
+            rows += [{"kind": "renderer_udd", "pid": pid, "start": 1000, "udd": udd[s]} for s, pid in pids.items()]
+            stalled = mode in ("starved", "saturated")
+            for u in range(100, 127):
+                e = u + off
+                rd = int(1e9 * min(max(0.0, e - (T - 3)), 4.0)) if stalled else 0
+                rows.append({"kind": "renderer", "t": float(u),
+                             "rd": {"%d:1000" % pid: rd + (1000 if e < T - 10 else 2001000) for pid in pids.values()}})
+            with open(os.path.join(dest, "browser-renderers.jsonl"), "w") as fh:
+                fh.write("".join(json.dumps(r) + "\\n" for r in rows))
+            recs = [{"kind": "cpu_start", "container": "renderers", "request_m": 250, "limit_m": 250, "node_cpus": 16,
+                     "epoch": 1792576800 - 15, "uptime": 100.0, "uptime_lo": 99.98}]
+            recs += [{"kind": "cpu", "t": 100.0 + 5 * i, "usage_usec": int(0.05 * 5e6 * i), "throttled_usec": 0,
+                      "pressure_some_usec": 0, "pressure_full_usec": 0, "node_busy_ticks": 1000 * i,
+                      "node_idle_ticks": 400 * i} for i in range(6)]
+            recs.append({"kind": "cpu_end", "epoch": 1792576800 - 15 + 26, "uptime": 126.0, "uptime_lo": 125.98})
+            with open(os.path.join(dest, "renderers-cpu.jsonl"), "w") as fh:
                 fh.write("".join(json.dumps(r) + "\\n" for r in recs))
         with open(os.path.join(dest, name + "-exit.json"), "w") as fh:
             json.dump({"kind": name + "_exit", "rc": 0}, fh)

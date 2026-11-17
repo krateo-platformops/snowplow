@@ -27,6 +27,7 @@ import pytest
 
 from bench import clusterops, gke
 from tests import fake_gke_ops
+from tests.manifests import old_evidence_manifest
 from tests.fake_gke_ops import operation
 from tests.test_gke_pvc_disks import BENCH, NAME, _calls, fakes  # noqa: F401  (fixture)
 from tests.test_run15_customer_latency import _write_run
@@ -366,6 +367,7 @@ def k6run(tmp_path_factory):
     files = _write_run(d / "src")
     p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", *files, "--k6-out", str(d / "src" / "k6"),
                         "--browser-out", str(d / "src" / "browser"), "--browser-sessions", "5", "--no-viewers",
+                        "--loadgen-job", old_evidence_manifest(d / "src", 5),
                         "--expect-digest", DIGEST], cwd=BENCH, capture_output=True, text=True, timeout=600)
     cl = json.loads(p.stdout)["report"]["customer_latency"]
     return d / "src", cl["k6_span"]
@@ -383,6 +385,7 @@ def _blocks_arm(tmp, k6run, label, ops, **env):
     files = sorted(str(f) for f in d.glob("*.jsonl"))
     p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", *files, "--k6-out", str(d / "k6"),
                         "--browser-out", str(d / "browser"), "--browser-sessions", "5", "--no-viewers",
+                        "--loadgen-job", old_evidence_manifest(d, 5),
                         "--expect-digest", DIGEST, "--cluster-operations", str(path)],
                        cwd=BENCH, capture_output=True, text=True, timeout=600)
     (d / "verdict.json").write_text(p.stdout)

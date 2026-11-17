@@ -32,6 +32,7 @@ import yaml
 
 from bench import k6_job, k6eval, load606, load606_job, rbac_model
 from bench.load606 import SCALEUSER_PASSWORD
+from tests.manifests import old_evidence_manifest
 from tests.test_navmodel import INIT, NS, PORTAL, TREE, Fake, P, W, canon
 from tests.test_run606_real_sequence import _calls, harness  # noqa: F401
 
@@ -894,7 +895,10 @@ def _evaluate_cli(tmp_path, k6dir, bdir, *extra):
                                  "latency_ms": 100, "polls": 1, "poll_ms": 100}) + "\n")
     p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", str(fresh),
                         "--k6-out", str(k6dir), "--browser-out", str(bdir),
-                        "--browser-sessions", "3", *extra],
+                        "--browser-sessions", "3",
+                        # a caller that states no config evaluates OLD EVIDENCE (#1525 review: it is required)
+                        *([] if "--loadgen-job" in extra else ["--loadgen-job", old_evidence_manifest(tmp_path)]),
+                        *extra],
                        capture_output=True, text=True, cwd=BENCH_DIR, timeout=120)
     return p.returncode, json.loads(p.stdout)
 

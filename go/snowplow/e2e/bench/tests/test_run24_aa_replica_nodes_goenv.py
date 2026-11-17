@@ -31,6 +31,7 @@ import pytest
 
 from bench import custlat, goruntime, load606, nodes
 from bench import tracing as tr
+from tests.manifests import old_evidence_manifest
 from tests.test_k6_830 import INIT, NODE, NS, needs_node
 from tests.test_run15_customer_latency import DIG_A, DIG_B, P14, _write_run, pairbed  # noqa: F401
 from tests.test_run22_three_runs import ROOM_FOR_THREE, _launch_env
@@ -53,7 +54,8 @@ def _evaluate_dir(d: Path, digest: str, *, scale=lambda t, v: v, digest_gate="PA
     buf = io.StringIO()
     with redirect_stdout(buf):
         load606.main(["evaluate", *files, "--k6-out", str(d / "k6"), "--browser-out", str(d / "browser"),
-                      "--browser-sessions", "5", "--no-viewers", "--expect-digest", digest])
+                      "--browser-sessions", "5", "--no-viewers", "--expect-digest", digest,
+                      "--loadgen-job", old_evidence_manifest(d, 5)])
     v = json.loads(buf.getvalue())
     v["verdict"] = "FAIL"                          # the fixture's own stream checks are not judged here
     for c in v["validity"]:
@@ -422,7 +424,8 @@ def _evaluate_with(tmp_path, extra, tracing=None):
     buf = io.StringIO()
     with redirect_stdout(buf):
         load606.main(["evaluate", *files, *extra, "--k6-out", str(d / "k6"), "--browser-out", str(d / "browser"),
-                      "--browser-sessions", "5", "--no-viewers", "--expect-digest", DIG_A]
+                      "--browser-sessions", "5", "--no-viewers", "--expect-digest", DIG_A,
+                      "--loadgen-job", old_evidence_manifest(d, 5)]
                      + (["--tracing", tracing] if tracing else []))
     return json.loads(buf.getvalue())
 
