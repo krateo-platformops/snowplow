@@ -204,8 +204,14 @@ def test_the_browser_loads_the_portal_from_its_origin_with_no_forwarder(tmp_path
     assert "forward.py" not in bcm["data"]
     job = next(d for d in docs if d["kind"] == "Job" and d["metadata"]["name"] == "k6browser")
     assert "initContainers" not in job["spec"]["template"]["spec"]          # no localhost forwarder
-    script = job["spec"]["template"]["spec"]["containers"][0]["args"][0]
+    containers = job["spec"]["template"]["spec"]["containers"]
+    script = next(c for c in containers if c["name"] == "browser")["args"][0]
     assert "http://10.0.0.9/" in script and "127.0.0.1" not in script       # it waits for the origin
+    # no forwarder anywhere in the pod: the one loopback address in it is the renderers sidecar's CDP endpoint of
+    # the pod's own Chrome (ws://127.0.0.1:<DevToolsActivePort>), never a way to the portal
+    import re
+    loopbacks = [m.group(0) for c in containers for m in re.finditer(r"\S*127\.0\.0\.1\S*", c["args"][0])]
+    assert loopbacks and all(x.startswith('\\"ws://127.0.0.1:$port$path') for x in loopbacks), loopbacks
     k6cm = next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "k6")
     cfg = json.loads(k6cm["data"]["config.json"])
     assert cfg["menuClasses"] == {ADMINS: ADMIN, "devs": DEVS} and cfg["userClass"]["2"] == ADMINS

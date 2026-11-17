@@ -76,7 +76,9 @@ _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "browser_call_ms", "browser_request_incomplete_ms", "browser_request_failed_start_unseen",
          "browser_fresh_class",
          # #1508: one per browser session, how it ended (early yes/no, its cause)
-         "browser_session_end")
+         "browser_session_end",
+         # #1517: each wait for a renderer read (before a class's sign-in, after its last load): outside every load
+         "browser_renderer_wait_ms")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 # the points whose time is kept too (out["times"], index-aligned with
 # out["points"]): run 12 compares latency inside / outside the CPU profiles;
@@ -172,11 +174,34 @@ def read_k6_out(d: str, name: str) -> dict | None:
         except (OSError, ValueError):
             pass
     out["cpu"] = {c: read_cpu(d, c) for c in ((name, "viewer") if name == "k6" else (name,))}
+    if name == "browser":
+        # 2026-11-17 ("Measure it precisely"): each renderer's run-queue wait, and which renderer renders each
+        # session's page (None: not recorded, a bench before it)
+        out["renderers"] = _jsonl(os.path.join(d, "browser-renderers.jsonl"))
+        out["renderer_map"] = _jsonl(os.path.join(d, "renderer-map.jsonl"))
     try:
         with open(os.path.join(d, f"{name}-forward.json")) as fh:
             out["forward"] = json.load(fh)   # the browser wrapper's wait for its forwards
     except (OSError, ValueError):
         out["forward"] = None
+    return out
+
+
+def _jsonl(path: str) -> list[dict] | None:
+    """The JSON object lines of `path` (a cut last line skipped); None when there is no such file."""
+    try:
+        with open(path, errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    out = []
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(r, dict):
+            out.append(r)
     return out
 
 
@@ -274,11 +299,126 @@ def starvation(o: dict | None, container: str = "browser") -> dict:
             w["node_busy_share"] = round(db / (db + di), 4) if db + di > 0 else None
         wins.append(w)
     span = sum(w["t1"] - w["t0"] for w in wins)
-    return {"container": container, "pressure": pressure, "node": node, "anchored": anchored,
+    rend = (renderer_state(o, off if anchored else None)
+            if container == "browser" and ((o or {}).get("renderers") is not None
+                                           or (o or {}).get("renderer_map") is not None) else None)
+    return {"rule": RULE_RENDERER if rend is not None else RULE_CONTAINER, "renderer": rend,
+            "container": container, "pressure": pressure, "node": node, "anchored": anchored,
             "end_anchored": a1 is not None, "clock_step_s": step,
             "slack_s": slack, "node_cpus": start.get("node_cpus"), "windows": wins,
             "stall_share": (round(sum(w["stall_s"] for w in wins) / span, 4) if pressure and span else None),
             "saturated_windows": (sum(1 for w in wins if w["saturated"]) if node else None)}
+
+
+#: the two rules a page load's possible delay is judged by (browser.cpu_starvation says which judged a run)
+RULE_RENDERER = "per renderer"
+RULE_CONTAINER = "container window"
+RULE_TEXT = {
+    RULE_RENDERER: ("per renderer (2026-11-17): each load charged its OWN renderer process's run-queue wait "
+                    "(/proc/<pid>/task/*/schedstat run_delay) between the samples that bracket it, the renderer named "
+                    "by Chrome's frame->process record (k6/renderers.js)"),
+    RULE_CONTAINER: ("container window (evidence without per-renderer data, before 2026-11-17): each 5 s window's "
+                     "whole browser-container cgroup stall charged to every load overlapping it"),
+}
+
+
+def renderer_state(o: dict | None, off: float | None) -> dict:
+    """The per-renderer evidence of one browser run: each renderer's run_delay series on the epoch, KEYED BY
+    (pid, starttime) (`off`: the CPU samples' realtime - uptime offset; None: not anchored, nothing can be placed),
+    each series' --user-data-dir, and every renderer read (k6/renderers.js), the failed ones too (pid null: they
+    break a chain of agreeing reads)."""
+    series: dict[tuple[int, str], list[tuple[float, int]]] = {}
+    udd: dict[tuple[int, str], str | None] = {}
+    for r in (o or {}).get("renderers") or []:
+        if r.get("kind") == "renderer_udd" and isinstance(r.get("pid"), int):
+            udd[(r["pid"], str(r.get("start")))] = r.get("udd")
+        elif r.get("kind") == "renderer" and isinstance(r.get("t"), (int, float)) and off is not None:
+            for k, v in (r.get("rd") or {}).items():
+                pid, _, start = str(k).partition(":")
+                if pid.isdigit() and start:
+                    series.setdefault((int(pid), start), []).append((float(r["t"]) + off, int(v)))
+    for s in series.values():
+        s.sort(key=lambda x: x[0])
+    # each series' process start on the epoch (its starttime / the sampler's CLK_TCK, on the same uptime the samples
+    # are timed by): the earliest instant the process is known alive, before its first sample
+    hz = next((r.get("hz") for r in (o or {}).get("renderers") or [] if r.get("kind") == "renderer_clock"), None)
+    started = ({k: int(k[1]) / hz + off for k in series if k[1].isdigit()}
+               if isinstance(hz, int) and hz > 0 and off is not None else {})
+    reads = [m for m in (o or {}).get("renderer_map") or []
+             if m.get("kind") == "renderer_map" and isinstance(m.get("t0"), (int, float))
+             and isinstance(m.get("t1"), (int, float))]
+    return {"series": series, "udd": udd, "started": started, "reads": sorted(reads, key=lambda m: m["t0"]),
+            "anchored": off is not None, "recorded": {"renderers": (o or {}).get("renderers") is not None,
+                                                     "renderer_map": (o or {}).get("renderer_map") is not None}}
+
+
+def _series_of(r: dict, pid: int, t0: float, t1: float) -> tuple[tuple[int, str] | None, str]:
+    """The one (pid, starttime) series of `pid` that was sampled through a read lasting [t0, t1]: a pid's series
+    ends where its process ended; another process that got the pid later is another series. Known alive from its
+    process's own start (its starttime, r["started"]) or else its first sample, to its last sample."""
+    started = r.get("started") or {}
+    alive = [k for k, s in r["series"].items()
+             if k[0] == pid and min(s[0][0], started.get(k, s[0][0])) <= t1 and s[-1][0] >= t0]
+    if len(alive) != 1:
+        return None, (f"{len(alive)} sampled processes held pid {pid} through its read" if alive
+                      else f"no renderer sample of pid {pid} spans its read")
+    return alive[0], ""
+
+
+def renderer_delay_ms(n: dict, st: dict) -> tuple[float | None, str]:
+    """(at most how much of page load `n` was its OWN renderer waiting for a CPU, "") or (None, why it is UNKNOWN).
+
+    Its renderer: the pid Chrome's frame->process record named for the load's session and identity class in a read
+    that ENDED before the load started and in one that STARTED after it ended, the same pid and page target in
+    both and in every read between them, with no failed read of that Chrome between them (a renderer that changed,
+    or that was not read on both sides, is not known), resolved to the one (pid, starttime) series the sampler
+    recorded through both reads, under the --user-data-dir of the Chrome whose endpoint named it. Its stall: that
+    series' run_delay between the last sample at or before the load's start and the first at or after its end (each
+    side widened OUTWARD by the anchor's error, st["slack_s"]), capped at the load's own time. UNKNOWN too: a
+    series whose run_delay never advanced over the run (the counter is not shown live), and one that decreased
+    across the load (a thread of the renderer exited with its run_delay: the known under-count, flagged)."""
+    r = st.get("renderer") or {}
+    if not r.get("anchored"):
+        return None, "the renderer samples have no wall-clock anchor"
+    if not (r.get("recorded") or {}).get("renderers"):
+        return None, "no renderer samples were recorded (browser-renderers.jsonl)"
+    if not (r.get("recorded") or {}).get("renderer_map"):
+        return None, "no renderer reads were recorded (renderer-map.jsonl)"
+    if n.get("start") is None:
+        return None, "the load has no start"
+    s0, s1 = n["start"], n["start"] + n["wall_ms"] / 1000
+    slack = st.get("slack_s") or 0.0
+    key = (n.get("session"), n.get("class"))
+    ok = [m for m in r["reads"] if isinstance(m.get("pid"), int) and (m.get("session"), m.get("class")) == key]
+    before = [m for m in ok if m["t1"] <= s0]
+    after = [m for m in ok if m["t0"] >= s1]
+    if not before or not after:
+        return None, "its renderer was not read both before and after it"
+    b, a = max(before, key=lambda m: m["t1"]), min(after, key=lambda m: m["t0"])
+    span = [m for m in ok if m["t0"] >= b["t0"] and m["t1"] <= a["t1"]]
+    if len({m["pid"] for m in span}) != 1 or len({m.get("target") for m in span}) != 1:
+        return None, "its renderer changed while it loaded"
+    if any(m.get("pid") is None and m.get("udd") == b.get("udd") and m["t0"] < a["t1"] and m["t1"] > b["t0"]
+           for m in r["reads"]):
+        return None, "a read of its Chrome between the two failed"
+    pid = b["pid"]
+    k1, why1 = _series_of(r, pid, b["t0"], b["t1"])
+    k2, why2 = _series_of(r, pid, a["t0"], a["t1"])
+    if k1 is None or k2 is None or k1 != k2:
+        return None, why1 or why2 or f"pid {pid} was another process at the read after the load"
+    if r["udd"].get(k1) != b.get("udd"):
+        return None, "the pid Chrome named is not a renderer the sampler saw under that Chrome's --user-data-dir"
+    s = r["series"][k1]
+    if len(s) < 2 or max(v for _, v in s) == min(v for _, v in s):
+        return None, "its renderer's run_delay never advanced over the run: the counter is not shown live"
+    lo = [v for t, v in s if t <= s0 - slack]
+    hi = [v for t, v in s if t >= s1 + slack]
+    if not lo or not hi:
+        return None, "no renderer sample brackets it"
+    d = hi[0] - lo[-1]
+    if d < 0:
+        return None, "its renderer's summed run_delay decreased across it (a thread exited with its run_delay)"
+    return min(n["wall_ms"], d / 1e6), ""
 
 
 def possible_delay_ms(start: float, wall_ms: float, st: dict) -> float:
@@ -740,22 +880,53 @@ def session_ends(o: dict | None, declared: int | None, logs: list[str] | None = 
     return out
 
 
+def saturation_events(st: dict, w0: float, w1: float) -> tuple[list[dict] | None, str]:
+    """#1517 (the owner's ruling, 2026-11-17: "saturation = environment, stated honestly"): the sample windows in
+    which the load-generator node was MEASURED saturated (starvation()'s `saturated`: not one idle CPU tick on any
+    CPU) that OVERLAP the session's window [w0, w1], i.e. share at least one instant with it (win.t0 <= w1 and
+    win.t1 >= w0, each window widened by the anchor's error, st["slack_s"]). On a saturated node every running
+    process waits for a CPU, the bench's own driver among them, so the bench cannot tell snowplow from its driver
+    there: an environment event, said as such, with no claim of what it caused.
+    (events, "") or (None, why) when it cannot be told: the node's CPU not measured, the samples not anchored, or
+    a part of [w0, w1] that no sample window covers (an unsampled stretch is not "no saturation")."""
+    if not st.get("node"):
+        return None, "the loadgen node's CPU was not measured"
+    if not st.get("anchored"):
+        return None, "the CPU samples have no wall-clock anchor"
+    slack = st.get("slack_s") or 0.0
+    wins = sorted((w for w in st.get("windows") or [] if w["t0"] - slack <= w1 and w["t1"] + slack >= w0),
+                  key=lambda w: w["t0"])
+    hit = [w for w in wins if w.get("saturated")]
+    if hit:
+        return [{"t0": w["t0"], "t1": w["t1"],
+                 "what": "load generator saturated (no idle CPU) during the session's window"} for w in hit], ""
+    # no saturation seen: only a "no event" when the windows cover the whole session window, gap-free
+    covered = bool(wins) and wins[0]["t0"] - slack <= w0 and wins[-1]["t1"] + slack >= w1 and all(
+        b["t0"] - slack <= a["t1"] + slack for a, b in zip(wins, wins[1:]))
+    if not covered:
+        return None, "the loadgen node's CPU samples do not cover the whole session window"
+    return [], ""
+
+
 def sessions_check(ends: dict, loads: int | None = None, events: list[dict] | None = None,
                    events_why: str = "", last_activity: dict | None = None,
-                   drive_start: float | None = None) -> tuple[dict, dict | None]:
+                   drive_start: float | None = None, saturation=None) -> tuple[dict, dict | None]:
     """(environment.browser_sessions, browser.sessions_lost): every declared session ran to the drive's end; one
     that did not is judged by CAUSE (the owner's ruling, 2026-11-17), from evidence the bench records only:
 
       - a lost session whose last stretch (its last recorded activity, `last_activity`, any class's last load, else
         the drive's start, `drive_start`; to the latest its end can be, `at_until`, else `at`) a recorded
-        environment event overlaps (`events`: each {t0, t1, what}: a control-plane operation of the cluster's
-        cluster-operations record) is INVALID by environment, named with the event;
+        environment event overlaps, i.e. shares at least one instant with (event t0 <= window end and event t1 >=
+        window start; `events`: each {t0, t1, what}: a control-plane operation of the cluster's cluster-operations
+        record), is INVALID by environment, named with the event;
       - one that no recorded event overlaps is a FAIL (a product failure: browser.sessions_lost), named with its
         cause and "no environment event in its window";
       - one whose end is not recorded, or a run whose events could not be read (`events` None: `events_why`), is
         INVALID (undecided): its cause cannot be told.
-    Evidence without per-renderer data has only the control-plane operations as environment events; a
-    load-generator CPU starvation measured per renderer (#1517) is one more once that evidence exists."""
+    Evidence without per-renderer data has only the control-plane operations as environment events; with it
+    (#1517), `saturation(w0, w1)` -> (events, "") or (None, why unmeasured) adds the load generator's node measured
+    saturated in a sample window overlapping the session's window (saturation_events), and a node it cannot tell
+    for that window leaves the loss undecided."""
     base = {"check": "environment.browser_sessions", "bar": "every declared browser session runs to the drive's end"}
     if ends.get("state") != "READ":
         return dict(base, value=None, result="FAIL",
@@ -783,6 +954,14 @@ def sessions_check(ends: dict, loads: int | None = None, events: list[dict] | No
             continue
         w0, w1 = min(w0, at), max(at, x.get("at_until") or at)
         hit = [e for e in events if e["t0"] <= w1 and (e["t1"] is None or e["t1"] >= w0)]
+        if not hit and saturation is not None:
+            # #1517 ("saturation = environment, stated honestly"): the load generator measured saturated in a window
+            # overlapping the session's is an environment event too; one it cannot tell leaves the loss undecided
+            got, why = saturation(w0, w1)
+            if got is None:
+                undecided.append(dict(x, window=[w0, w1], why=why))
+                continue
+            hit = got
         (env if hit else product).append(dict(x, window=[w0, w1], events=[e["what"] for e in hit]))
     tail = ((f": the arm drove {max(0, n - len(lost))} of {n} sessions to the end" if n else "")
             + (f" ({loads} page loads)" if loads is not None else ""))

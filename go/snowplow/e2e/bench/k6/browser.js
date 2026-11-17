@@ -77,6 +77,9 @@ const FRESH = new Counter('browser_fresh_class')
 // drive's end, and why. Run 27c N2 lost 2 of 5 sessions to an uncaught login-form error and the verdict never
 // said so: evaluate makes an arm whose session ended early INVALID by environment, naming it
 const SESSION_END = new Counter('browser_session_end')
+// #1517: how long each class waited for a renderer read (side: before its sign-in / after its last load; read: yes,
+// or no when none came within rendererReadWaitMs). Never part of a load: the sign-in clock starts after it
+const RENDERER_WAIT = new Trend('browser_renderer_wait_ms', true)
 const LEDGER_METRICS = { browser_request_incomplete_ms: INCOMPLETE, browser_request_failed_start_unseen: UNSEEN }
 
 export const options = {
@@ -213,6 +216,37 @@ async function drainCalls (page, tags, loadT0, loadId) {
 let LOADS = 0
 function nextLoadId () { return `${exec.vu.idInTest}:${++LOADS}` }
 
+// #1517 review: ask renderers.js for a read of this page and wait (at most CFG.rendererReadWaitMs) until a read that
+// STARTED after `afterMs` (epoch ms) named its renderer (it stamps window.__benchMapped with its start). Asked only
+// where the renderer can have changed, and never inside a load: before a class's sign-in, after its login load
+// (the class's one cross-document navigation: a same-document one keeps its document, and so its renderer), and
+// after its last load, so every load has a read on both sides with no read in Chrome between (the watcher's cost
+// is inside the browser's cgroup). The ask is a call of window.__benchRead, the binding renderers.js gives the page
+// (Runtime.bindingCalled reaches only the watcher: the app sees no DOM, title or event change; the page's title is
+// the portal's own, set from its routes, and would race an ask carried there). Asked once, from the page, as soon
+// as the binding is there; nothing is polled by the watcher. A read that never comes (no watcher, a page gone)
+// leaves its loads with no known renderer: the evaluator says UNKNOWN
+let READS = 0
+async function awaitRead (page, afterMs, tags) {
+  if (!CFG.rendererWatch) return
+  const t0 = Date.now()
+  const ask = `bench-read:${tags.side}:${exec.vu.idInTest}:${++READS}`
+  let read = 'yes'
+  try {
+    await page.waitForFunction(`(() => {
+      if (typeof window.__benchRead !== 'function') return false
+      if (window.__benchAsked !== ${JSON.stringify(ask)}) { window.__benchAsked = ${JSON.stringify(ask)}; window.__benchRead(${JSON.stringify(ask)}) }
+      return (window.__benchMapped || 0) > ${afterMs}
+    })()`, { polling: 200, timeout: CFG.rendererReadWaitMs })
+  } catch (e) { read = 'no' /* none came within its bound: said by the evaluator, per load */ }
+  // after a class's last load the page closes next, and its renderer with it: the read places this pid only with a
+  // sample of it AFTER the read (no other process took the pid in between), so the page stays open for the
+  // sampler's next sample (renderers.js stamps the page once its read is over; CFG.rendererSampleWaitMs: two of
+  // the sampler's periods)
+  if (read === 'yes' && tags.side === 'after') await page.waitForTimeout(CFG.rendererSampleWaitMs)
+  RENDERER_WAIT.add(Date.now() - t0, Object.assign({ read }, tags))
+}
+
 // The first navigation, retried within GOTO_TRIES x GOTO_WAIT_MS (above).
 async function gotoLogin (page) {
   for (let i = 1; ; i++) {
@@ -318,6 +352,9 @@ export default async function () {
 async function runClass (s, user, k, last, deadline, prevToken, secrets) {
   const context = await browser.newContext()
   await context.addInitScript(OBSERVER)
+  // 2026-11-17 ("Measure it precisely"): the page says whose it is, so renderers.js can name the renderer process
+  // that renders this session's page (Chrome's own frame -> process record) and charge each load its own stall
+  await context.addInitScript(`window.__benchSession = ${JSON.stringify({ session: s.name, class: String(k) })}`)
   const page = await context.newPage()
   const visits = {}
   const base = { session: s.name, class: String(k), identity: k === 0 ? 'initial' : 'fresh' }
@@ -360,6 +397,8 @@ async function runClass (s, user, k, last, deadline, prevToken, secrets) {
       throw new Error(`session ${s.name}: the login form ${LOGIN.form} holds ${submits} ${LOGIN.submit} ` +
         'controls, not exactly 1: which one signs in is not the contract\'s')
     }
+    // #1517 review: a renderer read of this page BEFORE its first load (the sign-in arrival) starts
+    await awaitRead(page, 0, { session: s.name, side: 'before' })
     // the first page's clock starts when the app leaves /login (pageload.js)
     await page.evaluate(() => {
       const b = window.__bench
@@ -397,6 +436,9 @@ async function runClass (s, user, k, last, deadline, prevToken, secrets) {
     }
     visits[landed] = (visits[landed] || 0) + 1
     shown = landed
+    // #1517 review: the login load was the class's one cross-document navigation, so its renderer can have changed:
+    // a read now, after it (outside every load), brackets the same-document loads that follow
+    await awaitRead(page, Date.now(), { session: s.name, side: 'login' })
     let n = 0
     while (Date.now() < deadline && !switchDue(visits, CFG.routes, last)) {
       await page.waitForTimeout(CFG.thinkS * 1000)
@@ -428,6 +470,8 @@ async function runClass (s, user, k, last, deadline, prevToken, secrets) {
       shown = route
     }
   } finally {
+    // #1517 review: the context stays open until renderers.js has read the page AFTER its last load
+    await awaitRead(page, Date.now(), { session: s.name, side: 'after' })
     await drainCalls(page, Object.assign({ route: shown, during: 'between' }, base))
     for (const [, value, t] of ledger.unfinished(Date.now())) {
       INCOMPLETE.add(value, Object.assign({ session: s.name, route: shown }, t))
