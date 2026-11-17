@@ -212,22 +212,10 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 	// tokens on one CA therefore never share a connection, and the idle sweep
 	// closing one identity's connections never closes another's. When the
 	// endpoint names no proxy, the one set is http.ProxyFromEnvironment: what
-	// client-go and plumbing both use when none is given.
-	cfg := &transport.Config{
-		TLS:   tlsCfg,
-		Proxy: http.ProxyFromEnvironment,
-		// No DialHolder: credhttp.NewEndpointTransport (below) dials itself.
-		// Its dialer is snowplow's, not client-go's 30 s one: every connection
-		// setup gives up the page goal (10 s) after it starts, whoever started
-		// it (#1115), a late setup is raced on a new socket, TLS handshake
-		// included (#1509 b), and every connect passes the destination policy
-		// (#1131); the plumbing branch above gets that from plumbing's transport.
-		// js/wasm only: the browser's fetch below the credential wrappers
-		// replaces the dial, as credhttp.Harden installs it (credhttp's package
-		// doc says what that leaves to the browser). nil on a server build,
-		// which is the field's zero value.
-		WrapTransport: credhttp.BrowserEgress,
-	}
+	// client-go and plumbing both use when none is given. (#1509: the transport
+	// is no longer client-go's cached one, but it is still this identity's own:
+	// NewEndpointTransport builds one per call.)
+	proxy := http.ProxyFromEnvironment
 	// #267 robust fix (design §4). When this dispatch dials snowplow's own SA
 	// endpoint — recognised by PROVENANCE (cache.WithServiceAccountDial, stamped by
 	// runStage when resolveStageEndpoint returned the ctx-carried internal endpoint
@@ -255,9 +243,9 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 	// endpoint with no token has no bearer credential to refresh and presents
 	// none, exactly as plumbing sent it (the SA endpoint always carries its
 	// boot token, sa_client.go).
-	cfg.BearerToken = ep.Token
+	bearerToken, bearerTokenFile := ep.Token, ""
 	if cache.ServiceAccountDialFromContext(ctx) && ep.HasTokenAuth() {
-		cfg.BearerTokenFile = dynamic.ServiceAccountTokenFile()
+		bearerTokenFile = dynamic.ServiceAccountTokenFile()
 	}
 
 	// THE TWO LIBRARIES DEFINE "basic auth" ON DIFFERENT FIELDS, and copying
@@ -280,9 +268,9 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 	// plumbing's classification exactly. Adopting client-go's would silently
 	// change WHICH endpoints count as basic auth, which is a different (and
 	// unrequested) behavioural change.
+	username, password := "", ""
 	if ep.HasBasicAuth() {
-		cfg.Username = ep.Username
-		cfg.Password = ep.Password
+		username, password = ep.Username, ep.Password
 	}
 
 	// Mirror plumbing's proxy handling (transport.go:28-35 + its
@@ -298,14 +286,34 @@ func buildEndpointClient(ctx context.Context, ep *endpoints.Endpoint, ri *httpca
 		default:
 			return nil, false, fmt.Errorf("unsupported scheme %q, must be http, https, or socks5", u.Scheme)
 		}
-		cfg.Proxy = http.ProxyURL(u)
+		proxy = http.ProxyURL(u)
 	}
 
 	// #1509 (b) — credhttp builds the base transport (client-go's fields, TLS
 	// material and wrappers, credhttp/endpoint_transport_1509.go) so its https
-	// setups go through the raced TLS dialer; one transport per identity, as
-	// the explicit Proxy kept client-go's cache from sharing one before.
-	rt, err := credhttp.NewEndpointTransport(cfg)
+	// setups go through the raced TLS dialer; one transport per identity.
+	//
+	// The config goes STRAIGHT into NewEndpointTransport, with no DialHolder:
+	// that function supplies the dial itself (#1131 guard,
+	// destination_guard_1131_test.go). Its dialer is snowplow's, not client-go's
+	// 30 s one: every connection setup gives up the page goal (10 s) after it
+	// starts, whoever started it (#1115), a late setup is raced on a new socket,
+	// TLS handshake included (#1509 b), and every connect passes the
+	// destination policy (#1131); the plumbing branch above gets that from
+	// plumbing's transport.
+	rt, err := credhttp.NewEndpointTransport(&transport.Config{
+		TLS:             tlsCfg,
+		Proxy:           proxy,
+		BearerToken:     bearerToken,
+		BearerTokenFile: bearerTokenFile,
+		Username:        username,
+		Password:        password,
+		// js/wasm only: the browser's fetch below the credential wrappers
+		// replaces the dial, as credhttp.Harden installs it (credhttp's package
+		// doc says what that leaves to the browser). nil on a server build,
+		// which is the field's zero value.
+		WrapTransport: credhttp.BrowserEgress,
+	})
 	if err != nil {
 		return nil, false, err
 	}
