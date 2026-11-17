@@ -1,0 +1,141 @@
+{
+ "kind": "gke_operations_evidence",
+ "what": "every RESIZE_CLUSTER GKE ran by itself on a bench cluster (target the cluster, ended), as each run's own cluster-operations.json recorded it: the settle step's window, poll and deadline are derived from these (bench/clusterops.py cadence). A run whose settle deadline ran out names what its own operations did that these do not cover; add its record here.",
+ "not_included": [
+  "snowplow-bench-run26in1-bc4da8ad: its RESIZE_CLUSTER from 2026-11-14T11:12:21Z had not ended at the read (issue #1422): no duration",
+  "run28 N1B: a RESIZE_CLUSTER from 2026-11-16T21:27:52Z, running when the owner ruled (issue #1422, 2026-11-16): no duration"
+ ],
+ "clusters": [
+  {
+   "cluster": "snowplow-bench-run26jn1-40d9fc36",
+   "region": "europe-west4",
+   "source": "gs://snowplow-bench-evidence-operations-dev-krateo-io/runs/pair-snowplow-bench-run26jn1-40d9fc36-snowplow-bench-run26jn1b-40d9fc36-snowplow-bench-run26jn2-40d9fc36-20261116T144054Z-6664/snowplow-bench-run26jn1-40d9fc36/cluster-operations.json",
+   "operations": [
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T16:01:24.870243537Z",
+     "end": "2026-11-16T16:09:39.027715705Z"
+    },
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T16:10:24.692226594Z",
+     "end": "2026-11-16T16:10:25.862626483Z"
+    }
+   ]
+  },
+  {
+   "cluster": "snowplow-bench-run26jn1-8ef7e3ec",
+   "region": "europe-west4",
+   "source": "gs://snowplow-bench-evidence-operations-dev-krateo-io/runs/pair-snowplow-bench-run26jn1-8ef7e3ec-snowplow-bench-run26jn1b-8ef7e3ec-snowplow-bench-run26jn2-8ef7e3ec-20261116T061807Z-6733/snowplow-bench-run26jn1-8ef7e3ec/cluster-operations.json",
+   "operations": []
+  },
+  {
+   "cluster": "snowplow-bench-run26jn1b-40d9fc36",
+   "region": "europe-west4",
+   "source": "gs://snowplow-bench-evidence-operations-dev-krateo-io/runs/pair-snowplow-bench-run26jn1-40d9fc36-snowplow-bench-run26jn1b-40d9fc36-snowplow-bench-run26jn2-40d9fc36-20261116T144054Z-6664/snowplow-bench-run26jn1b-40d9fc36/cluster-operations.json",
+   "operations": [
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T15:20:55.787202529Z",
+     "end": "2026-11-16T15:25:14.193222927Z"
+    },
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T15:25:55.839456117Z",
+     "end": "2026-11-16T15:25:57.081372647Z"
+    }
+   ]
+  },
+  {
+   "cluster": "snowplow-bench-run26jn1b-8ef7e3ec",
+   "region": "europe-west4",
+   "source": "gs://snowplow-bench-evidence-operations-dev-krateo-io/runs/pair-snowplow-bench-run26jn1-8ef7e3ec-snowplow-bench-run26jn1b-8ef7e3ec-snowplow-bench-run26jn2-8ef7e3ec-20261116T061807Z-6733/snowplow-bench-run26jn1b-8ef7e3ec/cluster-operations.json",
+   "operations": [
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T06:49:22.70889052Z",
+     "end": "2026-11-16T06:58:00.901074901Z"
+    },
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T06:58:22.59986011Z",
+     "end": "2026-11-16T07:07:17.192243227Z"
+    }
+   ]
+  },
+  {
+   "cluster": "snowplow-bench-run26jn2-40d9fc36",
+   "region": "europe-west4",
+   "source": "gs://snowplow-bench-evidence-operations-dev-krateo-io/runs/pair-snowplow-bench-run26jn1-40d9fc36-snowplow-bench-run26jn1b-40d9fc36-snowplow-bench-run26jn2-40d9fc36-20261116T144054Z-6664/snowplow-bench-run26jn2-40d9fc36/cluster-operations.json",
+   "operations": []
+  },
+  {
+   "cluster": "snowplow-bench-run27n1-40d9fc36",
+   "region": "europe-west1",
+   "source": "gs://snowplow-bench-evidence-operations-dev-krateo-io/runs/pair-snowplow-bench-run27n1-40d9fc36-snowplow-bench-run27n1b-40d9fc36-snowplow-bench-run27n2-40d9fc36-20261116T145631Z-6703/snowplow-bench-run27n1-40d9fc36/cluster-operations.json",
+   "operations": [
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T15:30:28.48845058Z",
+     "end": "2026-11-16T15:39:52.699010816Z"
+    },
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T15:40:28.430310705Z",
+     "end": "2026-11-16T15:40:29.35402941Z"
+    }
+   ]
+  },
+  {
+   "cluster": "snowplow-bench-run27n1b-40d9fc36",
+   "region": "europe-west1",
+   "source": "gs://snowplow-bench-evidence-operations-dev-krateo-io/runs/pair-snowplow-bench-run27n1-40d9fc36-snowplow-bench-run27n1b-40d9fc36-snowplow-bench-run27n2-40d9fc36-20261116T145631Z-6703/snowplow-bench-run27n1b-40d9fc36/cluster-operations.json",
+   "operations": [
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T15:30:33.805252491Z",
+     "end": "2026-11-16T15:35:17.075951871Z"
+    }
+   ]
+  },
+  {
+   "cluster": "snowplow-bench-run27n2-40d9fc36",
+   "region": "europe-west1",
+   "source": "gs://snowplow-bench-evidence-operations-dev-krateo-io/runs/pair-snowplow-bench-run27n1-40d9fc36-snowplow-bench-run27n1b-40d9fc36-snowplow-bench-run27n2-40d9fc36-20261116T145631Z-6703/snowplow-bench-run27n2-40d9fc36/cluster-operations.json",
+   "operations": [
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T15:40:24.917187634Z",
+     "end": "2026-11-16T15:40:56.30818903Z"
+    },
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T15:45:25.251036958Z",
+     "end": "2026-11-16T15:49:55.93452177Z"
+    },
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-16T15:50:25.411713538Z",
+     "end": "2026-11-16T15:50:26.408091304Z"
+    }
+   ]
+  },
+  {
+   "cluster": "snowplow-bench-run26in2-bc4da8ad",
+   "region": "europe-west4",
+   "source": "issue #1422's body: gcloud container operations list, read 2026-11-14 (whole seconds)",
+   "operations": [
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-14T09:23:45Z",
+     "end": "2026-11-14T09:32:18Z"
+    },
+    {
+     "type": "RESIZE_CLUSTER",
+     "start": "2026-11-14T09:32:45Z",
+     "end": "2026-11-14T09:41:18Z"
+    }
+   ]
+  }
+ ]
+}

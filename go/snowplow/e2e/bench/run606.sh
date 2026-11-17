@@ -23,7 +23,14 @@
 # so no control-plane or node upgrade starts mid-run. Control-plane resizes and
 # repairs ignore maintenance policies (run 26i: RESIZE_CLUSTER, at different times
 # per arm): collect records the cluster's operations ($OUT/cluster-operations.json)
-# and evaluate marks every measured phase one overlapped (report only).
+# and evaluate marks every measured phase one overlapped. The owner's ruling of
+# 2026-11-16 ("warm up until settled, then measure"): before the measured reboot
+# the settle step drives the arm's real load until GKE's control plane has settled
+# (bench/clusterops.py settle, $OUT/settle.json), within a deadline derived from
+# the operations GKE ran on bench clusters (bench/gke_operations_evidence.json);
+# an arm not settled by then is INVALID by environment and is not measured, and
+# an operation that still overlaps the measure makes the arm INVALID by
+# environment (evaluate), so its pair is INVALID too.
 #
 # A paid run is not finished until its evidence is safe (#1194, bench/evidence.py):
 # OUT defaults to the durable run directory, and before gke-down the teardown
@@ -401,8 +408,20 @@ INC_FINISH_CALLS=8
 GO_RUNTIME_S="$PREFLIGHT_TIMEOUT_S"
 INC_POLL_S="$(python3 -c 'import math, sys; print(math.ceil(float(sys.argv[1])))' "$PREFLIGHT_POLL_S")"   # data606_wait's poll, rounded up
 INC_S=$(( PREFLIGHT_TIMEOUT_S + PREFLIGHT_TIMEOUT_S + INC_POLL_S + INC_FINISH_CALLS * COLLECT_TIMEOUT_S + COLLECT_CAP_S ))
+# #1422 (the owner's ruling of 2026-11-16): the settle step's terms, DERIVED from the operations GKE ran on
+# bench clusters (bench/clusterops.py cadence over bench/gke_operations_evidence.json): GKE's check period,
+# the two-check window, the longest burst seen and the deadline (two windows + that burst, from the warm-up
+# load's start), and the poll. Its whole bound: the warm-up driver's start (a preflight's bound), the
+# deadline, one poll, the last poll's reads (the listing's LIST_TIMEOUT_S, the pod read's 70 s) and the
+# warm-up's stop (one bounded delete)
+eval "$(python3 -m bench.clusterops terms)" \
+  || { echo "refusing: the settle's terms could not be derived from bench/gke_operations_evidence.json" >&2; exit 2; }
+SETTLE_LIST_S="$(python3 -c 'from bench import clusterops; print(int(clusterops.LIST_TIMEOUT_S))')"
+SETTLE_BOUND_S="$(python3 -c 'import math, sys; print(math.ceil(float(sys.argv[1]) + float(sys.argv[2]) + float(sys.argv[3]) + float(sys.argv[4]) + 70))' \
+    "$PREFLIGHT_TIMEOUT_S" "$SETTLE_DEADLINE_S" "$SETTLE_POLL_S" "$SETTLE_LIST_S")"
+SETTLE_STEP_S=$(( SETTLE_BOUND_S + COLLECT_TIMEOUT_S ))
 RUN_BUDGET_S=$(( INC_S + UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + CERT_MANAGER_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
-                 + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S
+                 + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S + SETTLE_STEP_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + GO_RUNTIME_S + MEASURE_WAIT_S
                  + COLLECT_CAP_S + EVALUATE_EST_S + FW_S + DIAG_CAP_S + 2 * DEFS_CAP_S + EVIDENCE_CAP_S + DOWN_BUDGET_S ))
 TTL_NEEDED_H=$(( (RUN_BUDGET_S + TTL_MARGIN_S + 3599) / 3600 ))
@@ -419,7 +438,7 @@ TTL_SLACK_S=$(( TTL_S - TTL_MARGIN_S - RUN_BUDGET_S ))
 FW_LINE=""
 (( FW_S == 0 )) || FW_LINE=" + full widen ${FW_S} (applies ${FW_APPLIES}x${COLLECT_TIMEOUT_S} + ready ${PREFLIGHT_TIMEOUT_S} + objects ${FW_CREATE_S} + job ${FW_JOB_S} (preflight ${PREFLIGHT_TIMEOUT_S} + register ${FW_BOUND_S} + widen wait ${FW_WIDEN_WAIT_S} + settle ${FW_BOUND_S}) + reads ${FW_READS}x${COLLECT_TIMEOUT_S} + deletes ${FW_DELETES}x${COLLECT_TIMEOUT_S} + CRD delete ${FW_DELETE_S})"
 AGREE_LINE=" + go runtime ${GO_RUNTIME_S}"
-budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + in-cluster ${INC_S} (observer start ${PREFLIGHT_TIMEOUT_S} + data606 start ${PREFLIGHT_TIMEOUT_S} + its last poll ${INC_POLL_S} + finish ${INC_FINISH_CALLS}x${COLLECT_TIMEOUT_S} + cleanup ${COLLECT_CAP_S}) + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S}${AGREE_LINE} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + evidence ${EVIDENCE_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + settle ${SETTLE_STEP_S} (warm-up start ${PREFLIGHT_TIMEOUT_S} + deadline ${SETTLE_DEADLINE_S} + poll ${SETTLE_POLL_S} + reads ${SETTLE_LIST_S}+70 + stop ${COLLECT_TIMEOUT_S}) + in-cluster ${INC_S} (observer start ${PREFLIGHT_TIMEOUT_S} + data606 start ${PREFLIGHT_TIMEOUT_S} + its last poll ${INC_POLL_S} + finish ${INC_FINISH_CALLS}x${COLLECT_TIMEOUT_S} + cleanup ${COLLECT_CAP_S}) + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S}${AGREE_LINE} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + evidence ${EVIDENCE_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
@@ -1882,6 +1901,85 @@ menu_classes_cleanup() {
         >/dev/null 2>"$KERR" || log "menu classes cleanup: $(kerr_line)"
   done < <(python3 -m bench.menu_classes cleanup --plan "$OUT/menu-classes.json")
 }
+# s_settle (#1422, the owner's ruling of 2026-11-16: "warm up until settled, then measure"): GKE resizes a
+# bench cluster's control plane by itself, at a different time per arm, and run 27c N2's resize during its
+# measure stalled snowplow's apiserver dials for ~10 s. So before the measured reboot the arm drives its
+# real load on the loaded cluster (the warm-up Job, bench/load606_job.py WARMUP_JOB: the measure's customer
+# load, no browser, no fresh606, no mem606) until GKE's control plane has SETTLED (bench/clusterops.py
+# settle: nothing runs on the cluster and nothing ran in its last two checks under that load, read from
+# `gcloud container operations list`, fail closed), then stops it. Every poll, and the operations it read,
+# go into $OUT/settle.json. Not settled by the deadline (DERIVED from the evidence, see SETTLE_* above): the
+# arm is INVALID by environment, its verdict.json says so, and it is not measured. A warm-up that never ran
+# fails the step (tooling).
+s_settle() {
+  local mf="$OUT/warmup-job.yaml" rc=0 container
+  # the data load and the warm-up never share the loadgen node (and nothing is rendered, with the bench users'
+  # password in it, before that is known)
+  data606_gone || return 1
+  container="$(python3 -c 'import sys; from bench import load606_job; print(load606_job.WARMUP_CONTAINER[sys.argv[1]])' "$LOAD_DRIVER")"
+  # shellcheck disable=SC2046
+  python3 -m bench.load606_job --warmup --users "$USERS" --shards 1 \
+      --think-s "$THINK_S" --duration-s "$SETTLE_BOUND_S" --linger-s "$COLLECT_TIMEOUT_S" \
+      --snowplow-url "$SNOWPLOW_URL" --authn-url "$AUTHN_URL" --password "$PW" \
+      --init "$PORTAL_INIT" --frontend-ns "$PORTAL_FRONTEND_NS" --builders-ns "$PORTAL_BUILDERS_NS" \
+      --namespaces "$NAMESPACES" \
+      --burst-users "$COMPOSITE_BURST_USERS" --burst-at-s "$COMPOSITE_BURST_AT_S" \
+      ${COMPOSITE_ROUTES[@]+$(printf -- '--composite-route %q ' "${COMPOSITE_ROUTES[@]}")} \
+      $([[ "$VIEWERS" == "1" ]] || printf -- '--no-viewers') \
+      --driver "$LOAD_DRIVER" --preflight-file "$OUT/preflight.jsonl" $([[ "$DRY" == "1" ]] && printf -- "--dry-run") \
+      --browser-sessions "$BROWSER_SESSIONS" --browser-think-s "$BROWSER_THINK_S" \
+      --loadgen-machine-type "$LOADGEN_MACHINE_TYPE" \
+      ${CLASS_PREFLIGHTS[@]+$(printf -- '--class-preflight %q ' "${CLASS_PREFLIGHTS[@]}")} \
+      --browser-origin "$PORTAL_ORIGIN" --browser-snowplow-url "$PORTAL_SNOWPLOW_URL" \
+      > "$mf"
+  if [[ "$DRY" == "1" ]]; then
+    redact_pw "$mf"
+    log "DRY: kapply $mf (Job bench-loadgen/warmup606: the measure's customer load, ${LOAD_DRIVER}); python3 -m bench.clusterops settle --name $RUN_NAME --job warmup606 --container $container --start-within $PREFLIGHT_TIMEOUT_S --out $OUT/settle.json --verdict-out $OUT/verdict.json -- <kubectl> (settled: nothing ran on the cluster in the last ${SETTLE_WINDOW_S} s under the load and nothing runs; read every ${SETTLE_POLL_S} s; deadline the load's start + ${SETTLE_DEADLINE_S} s, else INVALID by environment, not measured); delete job/warmup606 (its pod gone before the reboot)"
+    return 0
+  fi
+  kapply "$mf"
+  bounded "$SETTLE_BOUND_S" python3 -m bench.clusterops settle --name "$RUN_NAME" --project "$PROJECT" --zone "$ZONE" \
+      --created-from "$OUT/maintenance-exclusion.json" --job warmup606 --container "$container" \
+      --start-within "$PREFLIGHT_TIMEOUT_S" --out "$OUT/settle.json" --verdict-out "$OUT/verdict.json" \
+      -- "${K[@]}" > "$OUT/.settle.out" 2>"$KERR" || rc=$?
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && log "settle: $line"
+  done < "$OUT/.settle.out"
+  (( rc == 0 || rc == 3 )) || log "settle: $(kerr_line)"
+  warmup_stop || return 1
+  case "$rc" in
+    0) return 0 ;;
+    3) : > "$VERDICT_MARK"
+       local r
+       while IFS= read -r r; do
+         [[ -n "$r" ]] && log "INVALID: $r"
+       done < <(python3 -c 'import json, sys; print("\n".join(json.load(open(sys.argv[1])).get("invalid_reasons") or []))' \
+                  "$OUT/verdict.json" 2>/dev/null || true)
+       log "the arm is not measured: $OUT/verdict.json"
+       return 1 ;;
+    *) record_failure "settle FAILED (exit ${rc}): $(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])); print(r.get("state"), "-", r.get("why"))' "$OUT/settle.json" 2>/dev/null || echo 'no settle record')" || true
+       return 1 ;;
+  esac
+}
+# warmup_stop: the warm-up Job and its pods are gone before the measured reboot (the measure's drivers have
+# the loadgen node to themselves); a pod still listed fails the step
+warmup_stop() {
+  local left
+  bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen delete \
+      job/warmup606 --cascade=foreground --wait=true --ignore-not-found >/dev/null 2>"$KERR" \
+    || log "warm-up: deleting job/warmup606: $(kerr_line)"
+  "${K[@]}" --request-timeout=60s -n bench-loadgen delete configmap/warmup606 --ignore-not-found >/dev/null 2>&1 || true
+  if ! left="$("${K[@]}" --request-timeout=60s -n bench-loadgen get pods -l job-name=warmup606 -o name 2>"$KERR")"; then
+    record_failure "settle FAILED: whether the warm-up's pod is gone could not be read" || true
+    return 1
+  fi
+  if [[ -n "$left" ]]; then
+    record_failure "settle FAILED: the warm-up's pod is still listed (${left//$'\n'/ }): it would overlap the measure" || true
+    return 1
+  fi
+  log "warm-up stopped: no warmup606 pod left"
+}
 s_reboot() {
   # Cold start at 50K: restart once the data exists, time Ready (#594/#637).
   # #922 F3: boot is its own phase — its restart time here (boot.jsonl; the
@@ -2965,7 +3063,10 @@ s_evaluate() {
   local trargs=(--tracing "$OUT/tracing.json")
   # #1422: the cluster's operations (cluster_operations), marked on every measured phase; a missing or
   # unreadable record reads "operations could not be read", never "none"
-  local opargs=(--cluster-operations "$OUT/cluster-operations.json" --snowplow-env "$OUT/snowplow-env.json")
+  # #1422 (2026-11-16): an operation overlapping the measure makes the arm INVALID by environment, and so does a
+  # settle record that is missing or says the control plane had not settled
+  local opargs=(--cluster-operations "$OUT/cluster-operations.json" --settle "$OUT/settle.json"
+                --snowplow-env "$OUT/snowplow-env.json")
   # run 26: the frontend override and its digest, judged like snowplow's (none without FRONTEND_TAG)
   local feargs=()
   if [[ -n "$FRONTEND_TAG" ]]; then
@@ -2976,6 +3077,11 @@ s_evaluate() {
   [[ "$LOAD_DRIVER" == "k6" ]] && k6args=(--k6-out "$OUT/k6" --browser-out "$OUT/browser"
                                           --browser-sessions "$BROWSER_SESSIONS")
   [[ "$LOAD_DRIVER" == "k6" && "$VIEWERS" != "1" ]] && k6args+=(--no-viewers)
+  # #1508: the browser driver's log, where k6 says which session's iteration threw (a session that ended early)
+  local blog
+  if [[ "$LOAD_DRIVER" == "k6" ]]; then
+    for blog in "$OUT"/driver-k6browser-*.log; do k6args+=(--browser-log "$blog"); done
+  fi
   if [[ "$DRY" == "1" ]]; then
     log "DRY: python3 -m bench.load606 evaluate ${files[*]:-<none>} ${r8[*]:-} --profile-dir $OUT/heap ${k6args[*]:-} ${trargs[*]} ${opargs[*]} ${apfargs[*]}${feargs[*]+ ${feargs[*]}}"; return 0
   fi
@@ -3317,6 +3423,7 @@ fi
 step preflight s_preflight
 step data      s_data
 if [[ "$LOAD_DRIVER" == "k6" ]]; then step classes s_classes; fi
+step settle    s_settle
 step reboot    s_reboot
 step digest    s_digest
 step measure   s_measure

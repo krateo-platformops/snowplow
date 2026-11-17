@@ -45,8 +45,10 @@ CREATE = operation("CREATE_CLUSTER", NAME, start=T - 3600, end=T - 3200)
 def _phases_file(d):
     """A run's input that gives evaluate two measured phases with a recorded start and end."""
     f = d / "fresh-fresh606-0.jsonl"
-    f.write_text("".join(json.dumps({"kind": "churn", "label": n.split(":", 1)[1], "t0": a, "t1": b,
-                                     "target_rate": 1}) + "\n" for n, a, b in (P1, P2)))
+    # the measured reboot at the first phase's start: the measure (#1422, 2026-11-16) is its first phase
+    f.write_text(json.dumps({"kind": "boot", "t_restart": P1[1]}) + "\n"
+                 + "".join(json.dumps({"kind": "churn", "label": n.split(":", 1)[1], "t0": a, "t1": b,
+                                       "target_rate": 1}) + "\n" for n, a, b in (P1, P2)))
     return f
 
 
@@ -157,9 +159,9 @@ def test_a_failed_listing_is_recorded_and_reported_as_unreadable_never_as_none(f
     assert rec["unreadable"] in said
     v, sec, err = _evaluate(fakes, path)
     assert sec["state"] == "UNREADABLE" and sec["operations"] is None
-    assert {p["overlap"] for p in sec["phases"]} == {clusterops.UNKNOWN} and len(sec["phases"]) == 2
+    assert {p["overlap"] for p in sec["phases"]} == {clusterops.UNKNOWN} and len(sec["phases"]) == 3
     text = "\n".join(sec["lines"])
-    assert text.count("operations could not be read: ") == 3 and "no operation overlapped" not in text
+    assert text.count("operations could not be read: ") == 4 and "no operation overlapped" not in text
     assert "overlapped by" not in text
     assert any("cluster operations: operations could not be read" in w for w in v["report"]["report_warnings"])
     assert "INFO cluster operations: operations could not be read" in err
@@ -451,10 +453,10 @@ def test_the_pair_names_the_phase_only_one_arm_measured_under_an_operation(fakes
     da, _ = _arm(fakes, "a", [resize])
     db, _ = _arm(fakes, "b", [])
     sec = _pair_cli(da, db)
-    assert sec["asymmetric"] == [P1[0]] and sec["unknown"] == []
+    assert sec["asymmetric"] == ["measure", P1[0]] and sec["unknown"] == []
     assert [(p["phase"], p["a"], p["b"], p["asymmetric"]) for p in sec["phases"]] == [
-        (P1[0], O, N, True), (P2[0], N, N, False)]
-    one, two, blocks = sec["lines"]
+        ("measure", O, N, True), (P1[0], O, N, True), (P2[0], N, N, False)]
+    _, one, two, blocks = sec["lines"]
     assert blocks == ("INFO cluster operations, latency blocks: N1 (baseline): no latency block; "
                       "N2 (candidate): no latency block")          # these arms have no customer calls
     assert one.startswith(f"INFO cluster operations, phase {P1[0]}: ASYMMETRIC, one arm only measured under a "
@@ -463,7 +465,7 @@ def test_the_pair_names_the_phase_only_one_arm_measured_under_an_operation(fakes
     assert one.endswith("N2 (candidate): no operation overlapped")
     assert two == f"INFO cluster operations, phase {P2[0]}: no operation overlapped on either arm"
     # the other way round is the same finding, on the other arm
-    assert _pair_cli(db, da)["asymmetric"] == [P1[0]]
+    assert _pair_cli(db, da)["asymmetric"] == ["measure", P1[0]]
 
 
 def test_the_pair_is_not_asymmetric_when_both_or_neither_overlapped_and_unknown_when_one_is_unreadable(fakes):
@@ -474,14 +476,14 @@ def test_the_pair_is_not_asymmetric_when_both_or_neither_overlapped_and_unknown_
     both = _pair_cli(da, db)
     assert both["asymmetric"] == [] and both["unknown"] == [] and "both arms overlapped" in both["lines"][0]
     unk = _pair_cli(da, dc)
-    assert unk["asymmetric"] == [] and unk["unknown"] == [P1[0], P2[0]]
+    assert unk["asymmetric"] == [] and unk["unknown"] == ["measure", P1[0], P2[0]]
     assert "whether the arms differ is UNKNOWN" in unk["lines"][0]
     assert "N2 (candidate): operations could not be read: " in unk["lines"][0]
     assert "ASYMMETRIC" not in "\n".join(unk["lines"]) and "on either arm" not in "\n".join(unk["lines"])
     # a verdict from before #1422 has no section: unknown, never symmetric
     (dc / "verdict.json").write_text(json.dumps({"verdict": "PASS", "report": {}}))
     old = _pair_cli(da, dc)
-    assert old["unknown"] == [P1[0], P2[0]] and "has no cluster_operations_report_only" in old["lines"][0]
+    assert old["unknown"] == ["measure", P1[0], P2[0]] and "has no cluster_operations_report_only" in old["lines"][0]
 
 
 def test_the_in_run_replica_says_it_too(fakes):
@@ -494,10 +496,10 @@ def test_the_in_run_replica_says_it_too(fakes):
                        cwd=BENCH, capture_output=True, text=True, timeout=300)
     assert p.returncode == 0, p.stderr
     sec = json.loads(p.stdout)["cluster_operations_report_only"]
-    assert sec["asymmetric"] == [P2[0]]
+    assert sec["asymmetric"] == ["measure", P2[0]]
     assert ("ASYMMETRIC, one arm only measured under a cluster operation: N1 (replica arm): overlapped by: "
-            "RESIZE_CLUSTER 2026-11-14T10:04:10Z..not ended at the read (RUNNING,") in sec["lines"][1]
-    assert sec["lines"][1].endswith("N1B (replica arm): no operation overlapped")
+            "RESIZE_CLUSTER 2026-11-14T10:04:10Z..not ended at the read (RUNNING,") in sec["lines"][2]
+    assert sec["lines"][2].endswith("N1B (replica arm): no operation overlapped")
 
 
 def test_the_statistics_stage_logs_the_asymmetric_phase_for_the_replica_and_for_the_pair(fakes):
@@ -825,9 +827,11 @@ def _gcloud(state):
 
 
 def test_run606_records_the_operations_marks_the_phases_and_holds_the_exclusion(harness):  # noqa: F811
-    """One whole run: GKE resizes the control plane before the measure and has not finished at collect."""
+    """One whole run: GKE starts resizing the control plane as the measured reboot begins (run 27c N2), after the
+    settle step saw it settled, and has not finished at collect: every measured phase is marked, and the arm is
+    INVALID by environment (the owner's ruling, 2026-11-16)."""
     env, state, _, tmp = harness
-    p = _run606(env, FAKE_GKE_RESIZES="1")
+    p = _run606(env, FAKE_GKE_RESIZE_AT_REBOOT="1")
     out = tmp / "out"
     log = (out / "run.log").read_text()
     assert p.returncode == 0 and "run complete" in log, log[-3000:]
@@ -854,26 +858,36 @@ def test_run606_records_the_operations_marks_the_phases_and_holds_the_exclusion(
     assert "UPDATE_CLUSTER" in kinds and kinds[0] == "CREATE_CLUSTER" and kinds.count("RESIZE_CLUSTER") == 1
     assert next(o for o in rec["operations"] if o["type"] == "RESIZE_CLUSTER")["end"] is None
     # the mark: every measured phase started after the resize, which had not ended at collect
-    sec = json.loads((out / "verdict.json").read_text())["report"]["cluster_operations_report_only"]
+    v = json.loads((out / "verdict.json").read_text())
+    sec = v["report"]["cluster_operations_report_only"]
     assert sec["state"] == "READ" and sec["phases"], sec
+    assert sec["phases"][0]["phase"] == "measure"
     for row in sec["phases"]:
+        if row["phase"] == "boot":           # the restart came a moment before GKE listed the resize
+            continue
         assert row["overlap"] == clusterops.OVERLAPPED and [o["type"] for o in row["by"]] == ["RESIZE_CLUSTER"], row
     assert "overlapped by: RESIZE_CLUSTER" in log and "not ended at the read" in log
     assert f"WARNING: cluster operations: phase {sec['phases'][0]['phase']} overlapped by: RESIZE_CLUSTER" in log
+    # the settle saw the control plane settled; the operation that came after it still voids the arm
+    assert json.loads((out / "settle.json").read_text())["state"] == clusterops.SETTLED
+    assert v["verdict"] == "INVALID" and any(r.startswith("environment.cluster_operations: INVALID by environment: "
+                                                          "GKE's RESIZE_CLUSTER") for r in v["invalid_reasons"])
 
 
 def test_run606_says_unreadable_when_the_listing_fails(harness):  # noqa: F811
+    """A listing that fails is never 'settled' (#1422, 2026-11-16): the arm is INVALID by environment and not
+    measured; never 'no operation overlapped'."""
     env, state, _, tmp = harness
     p = _run606(env, FAKE_OPERATIONS_RC="1")
     out = tmp / "out"
     log = (out / "run.log").read_text()
-    assert p.returncode == 0 and "run complete" in log, log[-3000:]          # evidence, not a reason to end the run
-    rec = json.loads((out / "cluster-operations.json").read_text())
-    assert rec["readable"] is False and rec["operations"] is None
-    sec = json.loads((out / "verdict.json").read_text())["report"]["cluster_operations_report_only"]
-    assert sec["state"] == "UNREADABLE" and sec["phases"]
-    assert all(r["overlap"] == clusterops.UNKNOWN for r in sec["phases"])
-    assert "WARNING: cluster operations: operations could not be read: " in log
+    assert p.returncode != 0 and "=== step reboot ===" not in log, log[-3000:]
+    rec = json.loads((out / "settle.json").read_text())
+    assert rec["state"] == clusterops.NOT_READ and rec["operations"] is None
+    assert all(x["state"] == clusterops.NOT_READ for x in rec["polls"]) and "could not be read" in rec["why"]
+    v = json.loads((out / "verdict.json").read_text())
+    assert v["verdict"] == "INVALID" and v["invalid_reasons"][0].startswith(
+        "environment.control_plane_settled: INVALID by environment (undecided): ")
     assert "no operation overlapped" not in log
 
 

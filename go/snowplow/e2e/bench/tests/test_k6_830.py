@@ -500,7 +500,7 @@ def test_the_sampler_reads_pressure_and_the_nodes_ticks_in_a_posix_shell(tmp_pat
     assert cpu and all(r["pressure_some_usec"] is None and r["pressure_full_usec"] is None for r in cpu)
 
 
-_BROWSER_KW = ("first_ms", "timeouts", "widget_timeouts", "t0_ms")
+_BROWSER_KW = ("first_ms", "timeouts", "widget_timeouts", "t0_ms", "late_ms")
 
 
 def _starve_case(tmp_path, *, base_ms=600.0, stall=None, idle=None, cores=None, **kw):
@@ -633,10 +633,16 @@ def test_every_wall_time_bar_is_rejudged(tmp_path, kw, decided):
 def test_a_timeout_or_a_widget_timeout_a_stall_overlapped_is_rejudged_too(tmp_path):
     """Diego's ruling, without special cases: a page that timed out, or a
     widget that timed out, inside a stalled window may have been the load
-    generator's: re-judged as the bars are."""
-    rc, v = _starve_case(tmp_path, base_ms=200.0, stall=[0, 0, 5.0, 5.0, 5.0, 0], timeouts=1)
+    generator's: re-judged as the bars are. #1508: by the bars' own
+    subtraction, on the load's real time: one that completed 1 s past its
+    bound with up to 15 s of stall may have been in time; one censored at
+    its bound (a browser.js before #1508) has no time to subtract from."""
+    rc, v = _starve_case(tmp_path, base_ms=200.0, stall=[0, 0, 5.0, 5.0, 5.0, 0], timeouts=1, late_ms=61000.0)
     c = _check(v["validity"], "browser.cpu_starvation")
     assert c["result"] == "FAIL" and "browser.page_timeouts" in c["why"], c
+    rc, v = _starve_case(tmp_path / "c", base_ms=200.0, stall=[0, 0, 5.0, 5.0, 5.0, 0], timeouts=1)
+    assert _check(v["validity"], "browser.cpu_starvation")["result"] == "PASS"
+    assert _check(v["checks"], "browser.page_timeouts")["result"] == "FAIL"
     rc, v = _starve_case(tmp_path / "w", base_ms=200.0, stall=[0, 0, 5.0, 5.0, 5.0, 0], widget_timeouts=2)
     c = _check(v["validity"], "browser.cpu_starvation")
     assert c["result"] == "FAIL" and "browser.widget_errors" in c["why"], c
@@ -735,10 +741,12 @@ def test_k6_error_rate_and_route_table(tmp_path):
 
 def _browser_points(sessions=("s1", "s2", "s3"), loads=21, timeouts=0,
                     sse=("refreshes", "notifications"), error_states=0, base_ms=200.0,
-                    t0_ms=None, first_ms=None, widget_timeouts=0):
+                    t0_ms=None, first_ms=None, widget_timeouts=0, late_ms=None):
     """Each load carries its own start (`t0`, epoch ms, as pageload.recordOps
     writes it): from `t0_ms` (default 3 s before the points' time) 40 ms
-    apart. `first_ms`: first-visit loads at that time instead."""
+    apart. `first_ms`: first-visit loads at that time instead. `late_ms`
+    (#1508): each timeout completed after that long, past its 60 s bound
+    (default: censored at the bound, as a browser.js before #1508 wrote it)."""
     pts = []
     t0 = int((T_POINTS - 3) * 1000) if t0_ms is None else int(t0_ms)
     k = 0
@@ -760,12 +768,17 @@ def _browser_points(sessions=("s1", "s2", "s3"), loads=21, timeouts=0,
     for _ in range(timeouts):                    # pageload.recordOps: a timeout is a load too
         t = {"session": sessions[0], "route": "/r0", "visit": "warm", "method": "click",
              "skeleton": "timeout", "timeout": "yes", "t0": str(t0 + 40 * k)}
+        if late_ms is not None:
+            t.update(skeleton="yes", completed="yes", bound="60000")
         k += 1
         pts += [_point("browser_page_timeouts", 1, session=sessions[0], route="/r0", t0=t["t0"]),
-                _point("browser_page_load_ms", 60000.0, **t), _point("browser_page_loads", 1, **t)]
+                _point("browser_page_load_ms", late_ms or 60000.0, **t), _point("browser_page_loads", 1, **t)]
     pts += [_point("browser_widget_states", 1, session=sessions[0], route="/r1", state="error")
             ] * error_states
     pts += [_point("browser_widget_states", 2, session=sessions[0], route="/r1", state="forbidden")]
+    # #1508: browser.js ends each session with its browser_session_end point (ran to the drive's end)
+    pts += [_point("browser_session_end", 1, session=s, early="no", cause="the drive is over", **{"class": "0"})
+            for s in sessions]
     return pts
 
 
@@ -1508,8 +1521,13 @@ def needs_docker(test):
     return pytest.mark.docker(pytest.mark.usefixtures("_require_docker")(test))
 
 
+#: #1508: /never last: a load past its bound is watched until it settles or the drive ends, so nothing of its
+#: class runs after it
+FIXTURE_ROUTES = ("/dashboard", "/compositions", "/err", "/never")
+
+
 def _run_browser_fixture(tmp_path, k6dir=None, signin_ms=3400, skel_ms=150, page_ms=250, fresh=(),
-                         duration_s=12):
+                         duration_s=12, routes=FIXTURE_ROUTES):
     """k6/browser.js in the pinned k6 browser image against
     tests/fixtures/k6_browser_fixture.py, on a private docker network."""
     net = f"k6brfix-{os.getpid()}"
@@ -1521,7 +1539,7 @@ def _run_browser_fixture(tmp_path, k6dir=None, signin_ms=3400, skel_ms=150, page
     # authn (for the debug reader, `fixture-debug`) and the portal at once
     cfg = k6_job.browser_config(
         sessions=[{"name": "s1", "user": "fixture-user", "offset": 0, "cold": True}],
-        routes=["/dashboard", "/compositions", "/never", "/err"], password="x", think_s=0.3,
+        routes=list(routes), password="x", think_s=0.3,
         duration_s=duration_s, quiet_ms=1000, page_timeout_ms=3000, signin_timeout_ms=10000,
         frontend_url=f"http://{spa}:8080", snowplow_url=f"http://{spa}:8080", authn_url=f"http://{spa}:8080",
         debug_user="fixture-debug", fresh={"sessions": [{"session": "s1", "fresh": [{"user": u} for u in fresh]}]})
@@ -1702,11 +1720,17 @@ def test_browser_js_in_chrome_against_the_fixture_spa(tmp_path):
     # quiet window waits for a skeleton that appears 150 ms in)
     clicks = [x for x in loads if x[0] == "click" and x[2] == "no"]
     assert clicks and all(380 <= x[3] <= 480 for x in clicks), loads
-    # /never times out: a load at its timeout value AND a timeout
-    never = [x for x in loads if x[1] == "/never"]
-    assert never and all(x[2] == "yes" and x[3] == 3000 for x in never), loads
+    # /never times out (#1508: no longer censored at its 3 s bound): watched until the drive's end, a load AND a
+    # timeout, never completed, with its bound and why the watch ended
+    never = [(v, t) for v, t in o["points"]["browser_page_load_ms"] if t["route"] == "/never"]
+    assert len(never) == 1, loads
+    v, t = never[0]
+    assert t["timeout"] == "yes" and t["completed"] == "no" and t["bound"] == "3000" and v > 3000, never
+    assert t["cause"].startswith("not settled by the drive's end (watched "), t
     assert len(o["points"]["browser_page_timeouts"]) == len(never)
     assert {t["state"] for _, t in o["points"]["browser_widget_states"]} == {"error"}
+    # the session ran to the drive's end, and says so
+    assert [(t["session"], t["early"]) for _, t in o["points"]["browser_session_end"]] == [("s1", "no")]
     sse = {t["stream"]: v for v, t in o["points"]["browser_sse_opened"]}
     assert sse["refreshes"] >= 1 and sse["notifications"] >= 1
     # the stream is whole and the evaluator reads it
@@ -1769,16 +1793,17 @@ def test_in_chrome_each_session_switches_to_its_fresh_identity_classes(tmp_path)
     first time its token reaches /call, and its /debug/vars answers the debug
     reader alone (snowplow #1365: 403 for a session's token), so every fresh
     class is proven cold, and only through the debug reader."""
+    # no /never: a load past its bound is watched to the drive's end (#1508), and the classes would never switch
     o = _run_browser_fixture(tmp_path, signin_ms=300, fresh=["fixture-fresh-1", "fixture-fresh-2"],
-                             duration_s=40)
+                             duration_s=40, routes=("/dashboard", "/compositions", "/err"))
     loads = [(t["class"], t["identity"], t["route"], t["visit"]) for _, t in o["points"]["browser_page_load_ms"]]
     classes = sorted({c for c, *_ in loads})
     assert classes[:2] == ["0", "1"], loads
     for c in classes[:-1]:                 # every class but the last switched after two visits of each route
         routes = [r for k, _, r, _ in loads if k == c]
-        assert all(routes.count(r) >= 2 for r in ("/dashboard", "/compositions", "/never", "/err")), loads
+        assert all(routes.count(r) >= 2 for r in ("/dashboard", "/compositions", "/err")), loads
     first1 = sorted(r for k, i, r, v in loads if k == "1" and v == "first")
-    assert first1 == ["/compositions", "/dashboard", "/err", "/never"], loads
+    assert first1 == ["/compositions", "/dashboard", "/err"], loads
     assert {i for k, i, *_ in loads if k == "1"} == {"fresh"} and {i for k, i, *_ in loads if k == "0"} == {"initial"}
     fc = [t for _, t in o["points"]["browser_fresh_class"]]
     assert sorted(t["class"] for t in fc) == [c for c in classes if c != "0"]
@@ -1867,8 +1892,11 @@ def test_kind_proof_outputs_pass_every_k6_browser_and_viewer_check(tmp_path):
     # never "not starved" (and the page-load bars it would judge read INCONCLUSIVE)
     assert len(val) == 17 and all(c["result"] == "PASS" for c in val if c["check"] != "browser.cpu_starvation"), val
     assert _check(v["validity"], "browser.cpu_starvation")["result"] == "UNMEASURED"
-    # only the fake portal's missing snowplow pod records make it INVALID
+    # the fake portal's missing snowplow pod records make it INVALID; and #1508: a browser.js from before it
+    # recorded no session end, and the proof kept no driver log: whether a session ended early is undecided
     assert v["invalid_reasons"] == [
+        "environment.browser_sessions: INVALID by environment (undecided): the browser recorded no session end "
+        "(a browser.js before #1508) and no browser driver log was given: whether a session ended early is unknown",
         "snowplow.restarts_during_measure: restart state unknown (missing before/after pod record)"]
     rep = v["report"]
     assert rep["navs"] == 99 and rep["browser"]["timeouts"] == 0

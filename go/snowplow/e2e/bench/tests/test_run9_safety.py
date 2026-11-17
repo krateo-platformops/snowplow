@@ -186,11 +186,15 @@ def test_a_hung_gke_up_is_bounded_and_torn_down(harness):
 @pytest.mark.serial  # #1166/#1174: asserts `time.time() - t0 < 35` on the wall clock
 def test_partial_collect_has_one_wall_clock_cap(harness):
     env, state, ambient, tmp = harness
-    env = _measure_fails(env, FAKE_SLOW_LOGS="40", COLLECT_CAP_S="2")
+    # the hung read's hang: twice the whole run's bound, so a run the cap did not stop can never pass, whatever
+    # the runner's speed (#1422's settle step made the whole run a few seconds longer: 37 s seen against a 40 s
+    # hang and a 35 s bound under -n 8)
+    hang_s = 120
+    env = _measure_fails(env, FAKE_SLOW_LOGS=str(hang_s), COLLECT_CAP_S="2")
     t0 = time.time()
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env,
-                       capture_output=True, text=True, timeout=120)
-    assert time.time() - t0 < 35
+                       capture_output=True, text=True, timeout=2 * hang_s)
+    assert time.time() - t0 < hang_s / 2
     assert "partial collect: stopped after 2s (cap 2s reached)" in p.stderr
     gcl = [c["argv"][:3] for c in _calls(state) if c["tool"] == "gcloud"]
     assert gcl[-3:] == TEARDOWN_TAIL
@@ -242,7 +246,9 @@ def test_the_ttl_is_derived_from_the_plan_when_unset(tmp_path):
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60")
     assert p.returncode == 0, p.stderr[-2000:]
     # + the 300 s wait of the runtime606 Job (the process's effective GC settings, before the measure)
-    assert "= 45636 s" in p.stderr and "fits TTL_HOURS=14 (50400 s; derived: the plan's 45636 s" in p.stderr
+    # + #1422's settle step, 3,126 s (warm-up start 300 + deadline 2,275.82 + poll 60.07 + reads 190, rounded up,
+    # + its stop 300): 48,762 s, with the margin 50,562 s -> 15 h
+    assert "= 48762 s" in p.stderr and "fits TTL_HOURS=15 (54000 s; derived: the plan's 48762 s" in p.stderr
     # a longer plan derives a longer TTL; it is not refused
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800")
     assert p.returncode == 0 and "fits TTL_HOURS=15 (54000 s; derived" in p.stderr
@@ -265,7 +271,7 @@ def test_a_hand_set_ttl_inside_the_margin_but_over_the_plan_is_refused(tmp_path)
     in-cluster = 47,821 s, now over the 12 h outright; #1422: + 915 s of gke-up = 48,736 s)
     the hours it needs."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800", TTL_HOURS="12")
-    assert p.returncode == 2 and "refusing: worst-case run 49036 s" in p.stderr
+    assert p.returncode == 2 and "refusing: worst-case run 52162 s" in p.stderr
     assert "needs TTL_HOURS >= 15" in p.stderr
 
 

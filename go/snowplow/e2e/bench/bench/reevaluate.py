@@ -18,6 +18,8 @@ evaluate is DERIVED from the run's own evidence, never from a default:
                     contradiction
   run 8 report      the run's own verdict.json: its report holds `run8` iff evaluate ran with --run8
                     (RUN8_REPORT)
+  settle            the run's own run.log: it names the settle step (#1511 on), and then --settle is passed,
+                    whether settle.json is there or not (a missing one reads INVALID, undecided)
 
 A setting the evidence cannot decide is REFUSED, named, unless the operator states it (--driver,
 --expect-digest, --frontend-tag + --expect-frontend-digest or --no-frontend, --browser-sessions, --viewers,
@@ -154,6 +156,15 @@ def derive(d: str) -> dict:
                        + ("holds run8" if "run8" in (v.get("report") or {}) else "holds no run8"))
     except (OSError, ValueError, AttributeError):
         out["run8"] = (None, "no readable verdict.json of the run")
+    # #1422 (the settle step, #1511): decided by what the run DID, its own run.log naming the step, never by whether
+    # settle.json is there: a run that had the step and lost its record must read INVALID (undecided), not unchecked
+    try:
+        with open(os.path.join(d, "run.log"), errors="replace") as fh:
+            ran = "=== step settle ===" in fh.read()
+        out["settle"] = (ran, "the run's own run.log: " + ("its settle step ran (a bench from #1511 on)" if ran else
+                                                           "no settle step (a bench before #1511)"))
+    except OSError:
+        out["settle"] = (None, "no readable run.log of the run: whether it had a settle step is not known")
     return out
 
 
@@ -162,7 +173,7 @@ def settings(d: str, stated: dict) -> dict:
     setting the evidence cannot decide and the operator did not state, and every stated one it contradicts."""
     der = derive(d)
     out, why = {}, []
-    names = ["driver", "expect_digest", "frontend", "run8"] + (
+    names = ["driver", "expect_digest", "frontend", "run8", "settle"] + (
         ["browser_sessions", "viewers"] if (stated.get("driver") or der["driver"][0]) == "k6" else [])
     for k in names:
         dv, src = der.get(k, (None, "not derived"))
@@ -178,6 +189,12 @@ def settings(d: str, stated: dict) -> dict:
     return out
 
 
+def browser_logs(d: str) -> list[str]:
+    """#1508: `--browser-log F` for each browser driver log the run collected (run606 s_evaluate's glob): where
+    k6 logged which session's iteration threw, for a browser.js that recorded no session end."""
+    return [x for p in sorted(glob.glob(os.path.join(d, "driver-k6browser-*.log"))) for x in ("--browser-log", p)]
+
+
 def argv_for(d: str, s: dict) -> list[str]:
     """run606 s_evaluate's argv for run dir `d` with settings `s`."""
     files = [f for g in EVALUATE_GLOBS for f in sorted(glob.glob(os.path.join(d, g)))]
@@ -186,8 +203,12 @@ def argv_for(d: str, s: dict) -> list[str]:
     if s["driver"][0] == "k6":
         argv += ["--k6-out", os.path.join(d, "k6"), "--browser-out", os.path.join(d, "browser"),
                  "--browser-sessions", str(s["browser_sessions"][0]), *([] if s["viewers"][0] else ["--no-viewers"])]
+        argv += browser_logs(d)
+    # #1422: a run that had the settle step is judged on its settle.json, there or not (derive: its run.log)
+    settle = os.path.join(d, "settle.json")
     argv += ["--tracing", os.path.join(d, "tracing.json"), "--cluster-operations",
-             os.path.join(d, "cluster-operations.json"), "--snowplow-env", os.path.join(d, "snowplow-env.json"),
+             os.path.join(d, "cluster-operations.json"), *(["--settle", settle] if s["settle"][0] else []),
+             "--snowplow-env", os.path.join(d, "snowplow-env.json"),
              "--apf", os.path.join(d, "apf.jsonl.gz")]
     if s["frontend"][0] != "none":
         tag, dig = s["frontend"][0]
@@ -207,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--browser-sessions", type=int, default=None)
     ap.add_argument("--viewers", choices=["on", "off"], default=None)
     ap.add_argument("--run8", choices=["on", "off"], default=None)
+    ap.add_argument("--settle", choices=["on", "off"], default=None, help="the run had the settle step (#1511)")
     a = ap.parse_args(argv)
     d = os.path.abspath(a.run_dir)
     if os.path.abspath(a.out) == os.path.join(d, "verdict.json"):
@@ -222,13 +244,20 @@ def main(argv: list[str] | None = None) -> int:
         with open(rec) as fh:
             ev = ["evaluate", *(x.replace("{OUT}", d) for x in json.load(fh))]
         used = {"argv": {"value": "evaluate-argv.json", "source": "the run's own record of its evaluate argv"}}
+        if "--browser-out" in ev and "--browser-log" not in ev and browser_logs(d):
+            # a run recorded before #1508 passed no browser log; the run collected it
+            ev += browser_logs(d)
+            used["browser_log"] = {"value": [os.path.basename(p) for p in browser_logs(d)[1::2]],
+                                   "source": "the run's collected driver-k6browser-*.log (#1508; its recorded argv "
+                                             "predates the flag)"}
     else:
         stated = {"driver": a.driver, "expect_digest": a.expect_digest,
                   "frontend": ("none" if a.no_frontend else (a.frontend_tag, a.expect_frontend_digest)
                                if a.frontend_tag else None),
                   "browser_sessions": a.browser_sessions,
                   "viewers": None if a.viewers is None else a.viewers == "on",
-                  "run8": None if a.run8 is None else a.run8 == "on"}
+                  "run8": None if a.run8 is None else a.run8 == "on",
+                  "settle": None if a.settle is None else a.settle == "on"}
         try:
             s = settings(d, stated)
         except Refused as e:

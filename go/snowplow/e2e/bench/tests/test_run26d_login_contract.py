@@ -174,7 +174,7 @@ def test_browser_js_signs_in_through_the_contract_only():
     assert "const submit = form.locator(LOGIN.submit)" in body
     # exactly one, checked once the form is rendered (after the fills), before the click
     assert (body.index("fill(CFG.password, opts)") < body.index("const submits = await submit.count()")
-            < body.index("if (submits !== 1)") < body.index("submit.click(opts)") < body.index("await settled(page, null)"))
+            < body.index("if (submits !== 1)") < body.index("submit.click(opts)") < body.index("await settled(page, null, deadline, secrets)"))
     for s in ("getByLabel", "getByRole", "getByText", "has-text", "autocomplete", "Sign in", "Sign In"):
         assert s not in body, s
 
@@ -184,7 +184,7 @@ def test_browser_js_gate_is_the_only_threshold_that_can_fail():
     th = src[src.index("thresholds: {"):src.index("summaryTrendStats")]
     assert ("browser_first_signins: [{ threshold: 'count>0', abortOnFail: true, "
             "delayAbortEval: `${Math.ceil(SIGNIN_BOUND_MS / 1000)}s` }]") in th
-    assert th.count("'count>=0'") == 8 and th.count("abortOnFail") == 1
+    assert th.count("'count>=0'") == 9 and th.count("abortOnFail") == 1
     body = src[src.index("export default async function"):]
     # every session's 0 comes first (an empty Counter is not judged while the test runs), its 1 on
     # its FIRST class's landed sign-in only

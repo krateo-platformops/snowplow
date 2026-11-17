@@ -634,6 +634,8 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         with open(os.path.join(STATE, "deleted.jsonl"), "a") as fh:
             fh.write(json.dumps({"ns": ns, "names": [x for x in a[1:] if not x.startswith("-")],
                                  "t": time.time()}) + chr(10))
+        if "job/warmup606" in a and os.environ.get("FAKE_WARMUP") != "stays":     # #1422: its pod goes with it
+            open(os.path.join(STATE, "warmup-deleted"), "w").write("1")
         for job in INC:
             if f"job/{job}" in a and os.path.exists(os.path.join(inc_dir(job), "job.json")):
                 open(os.path.join(inc_dir(job), "deleted"), "w").write("1")
@@ -834,6 +836,26 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             print("Unable to connect to the server: dial tcp 10.0.0.2:443: i/o timeout", file=sys.stderr)
             sys.exit(1)
         print("ok"); sys.exit(0)
+    # #1422: the warm-up Job (run606 s_settle, bench/load606_job.py WARMUP_JOB): once applied its pod runs, its
+    # driver container started FAKE_WARMUP_AGO_S before (the harness's default: an hour, so the load has run for
+    # GKE's last two checks at the first poll), and it is gone once the Job is deleted. FAKE_WARMUP: never (no pod
+    # is ever listed) | ended (its driver container exited 1) | stays (deleting the Job leaves its pod listed)
+    if a[:2] == ["get", "pods"] and "job-name=warmup606" in a:
+        jf = os.path.join(STATE, "job-warmup606")
+        mode = os.environ.get("FAKE_WARMUP", "run")
+        up = os.path.exists(jf) and mode != "never" and not os.path.exists(os.path.join(STATE, "warmup-deleted"))
+        if "name" in a:
+            print("pod/warmup606-0" if up else ""); sys.exit(0)
+        items = []
+        if up:
+            c = json.load(open(jf))["spec"]["template"]["spec"]["containers"][0]["name"]
+            at = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                               time.gmtime(time.time() - float(os.environ.get("FAKE_WARMUP_AGO_S", "3600"))))
+            st = {"terminated": {"exitCode": 1, "reason": "Error"}} if mode == "ended" else {"running": {"startedAt": at}}
+            items.append({"metadata": {"name": "warmup606-0", "labels": {"job-name": "warmup606"}},
+                          "status": {"phase": "Running",
+                                     "containerStatuses": [{"name": c, "state": st, "restartCount": 0}]}})
+        print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items})); sys.exit(0)
     drivers = ("load606", "k6load", "k6browser")
     # FAKE_ANSWERED_ERROR=job|pods: the API server ANSWERS that read with an
     # error (NotFound): a real answer, not an outage
@@ -911,8 +933,10 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     if (a[:1] == ["wait"] and "job/fresh606" in a) or (a[:2] == ["get", "job/fresh606"] and "name" in a):
         api_blip("FAKE_API_DOWN_WAITS", "api_down_waits")
     # FAKE_API_EMPTY_PODS=N: the first N driver pod listings answer rc 0 with
-    # an empty body (a proxy in between, a cut stream): proves nothing either
-    if a[:2] == ["get", "pods"] and any(x in (f"job-name={d}" for d in drivers) for x in a) and "json" in a:
+    # an empty body (a proxy in between, a cut stream): proves nothing either. Counted in the MEASURE only (#1519):
+    # what collect reads never depends on how many of them the measure's polls happened to use
+    if (a[:2] == ["get", "pods"] and any(x in (f"job-name={d}" for d in drivers) for x in a) and "json" in a
+            and not os.path.exists(collect_started)):
         n_max = int(os.environ.get("FAKE_API_EMPTY_PODS", "0"))
         cnt = os.path.join(STATE, "api_empty_pods")
         n = int(open(cnt).read()) if os.path.exists(cnt) else 0
@@ -970,6 +994,18 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     f483 = os.environ.get("FAKE_483", "")          # "", pass, wide
     if a[:3] == ["get", "crd", "alerts.observability.krateo.io"]:
         sys.exit(0 if f483 in ("pass", "wide") else 1)
+    if a[:3] == ["rollout", "restart", "deploy/snowplow"] and os.environ.get("FAKE_GKE_RESIZE_AT_REBOOT") == "1":
+        # #1422: GKE starts resizing the control plane as the measured reboot begins (run 27c N2), and has not
+        # finished at collect: the operation GKE lists for the cluster this context names
+        _, _, region, cname = (resolved or "").split("_", 3)
+        import importlib.util as _ilu
+        _sp = _ilu.spec_from_file_location("fake_gke_ops", os.environ["FAKE_GKE_OPS_PY"])
+        _fo = _ilu.module_from_spec(_sp)
+        _sp.loader.exec_module(_fo)
+        _p = os.path.join(STATE, "operations.json")
+        _ops = json.load(open(_p)) if os.path.exists(_p) else []
+        _ops.append(_fo.operation("RESIZE_CLUSTER", cname, start=time.time(), region=region))
+        json.dump(_ops, open(_p, "w"))
     if a[:3] == ["rollout", "status", "deploy/frontend"] and os.environ.get("FAKE_FRONTEND_ROLLOUT_FAIL") == "1":
         # run 26: the frontend's rollout never completes (a pod still Pending)
         print('error: timed out waiting for the condition', file=sys.stderr)
@@ -1119,6 +1155,11 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                     t["t0"] = str(1792576800000 - 3000 + 40 * (20 * int(s[1:] or 0) + i))
                     lines += [pt("browser_page_load_ms", ms, **t),
                               pt("browser_page_loads", 1, **t)]
+                # #1508: the session's end, as browser.js records it (FAKE_BROWSER_LOST=<session>: it ended early)
+                lost = s == os.environ.get("FAKE_BROWSER_LOST")
+                lines.append(pt("browser_session_end", 1, session=s, early="yes" if lost else "no",
+                                cause="the login form could not be filled: timed out" if lost else "the drive is over",
+                                **{"class": "0"}))
             m = {"metrics": {"browser_page_loads": {"count": 60}}}
         lines.append(pt("bench_frame", 1, frame="end"))
         with gzip.open(os.path.join(dest, name + ".json.gz"), "wt") as fh:
@@ -1947,6 +1988,11 @@ def harness(tmp_path):
         "FAKE_CRD_CHARTS": str(CRD_CHARTS), "FAKE_CERT_MANAGER_TGZ": str(CERT_MANAGER_TGZ),
         # #985: GKE's per-location cluster limit, read from the Cloud Quotas fake
         "CLOUDSDK_API_ENDPOINT_OVERRIDES_CLOUDQUOTAS": quotas_url,
+        # #1422: GKE's operations of the fake cluster (its create, node pools, the exclusion's update) are
+        # stamped 50 min before the call, as a real run's are long before its settle step; the warm-up load has
+        # run an hour (the fake kubectl's FAKE_WARMUP_AGO_S default): the settle step settles at its first poll
+        "FAKE_OPS_AGO_S": "3000",
+        "FAKE_GKE_OPS_PY": str(Path(fake_gke_ops.__file__).resolve()),
     })
     from datetime import datetime, timezone
     env["BENCH_606_GO"] = datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + RUN_NAME
