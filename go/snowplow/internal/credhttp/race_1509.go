@@ -29,9 +29,14 @@ package credhttp
 //     destination sees at most log2(bound / trigger) + 1 attempts per attempt
 //     bound, however many requests wait on it;
 //   - each connection that comes up goes to ONE waiter, the longest waiting;
-//     the waiters left wait for the next one, and since the destination just
-//     answered, the next attempt starts at once (one at a time, not one per
-//     waiter) and the waits start again from the trigger;
+//   - once a connection has come up, the destination is ANSWERING and the race
+//     is over for this chain (#1521): every waiter left, and every one that
+//     joins, gets an attempt of its own, at once, exactly as net/http dials one
+//     connection per waiting request without a race. No timer adds attempts
+//     then, so a healthy destination sees one connection per waiter and no
+//     surplus (a 25-request burst opens 25), and many waiters are served in
+//     parallel, not one after another. The race guards the phase it is for: a
+//     destination that has not answered since the chain began;
 //   - each waiter leaves at its own deadline or cancellation, whatever the
 //     chain does; a connection that comes up with nobody waiting is closed
 //     (counted as opened, noteRacedConnectionUp); and when the last waiter
@@ -247,6 +252,7 @@ type setupChain struct {
 	wait        time.Duration
 	timer       *time.Timer
 	connected   bool // some attempt's connect came up
+	answered    bool // a setup completed: the race is over, attempts follow demand
 	firstConn   error
 	firstTLS    error
 	countCtx    context.Context // a waiter's ctx: its connection counting (connections.go)
@@ -274,12 +280,23 @@ func (c *setupChain) join(ctx context.Context) *chainWaiter {
 	c.waiters = append(c.waiters, w)
 	c.countCtx = ctx
 	c.notifyLocked(w)
-	if c.outstanding == 0 && c.timer == nil {
+	switch {
+	case c.answered:
+		c.coverDemandLocked()
+	case c.outstanding == 0 && c.timer == nil:
 		c.wait, _ = connectTimes.trigger(c.ringKey)
 		c.startAttemptLocked()
 		c.timer = time.AfterFunc(c.wait, c.onTimer)
 	}
 	return w
+}
+
+// coverDemandLocked gives every waiter an attempt of its own, once the
+// destination has answered (see the file comment).
+func (c *setupChain) coverDemandLocked() {
+	for !c.done && c.outstanding < len(c.waiters) {
+		c.startAttemptLocked()
+	}
 }
 
 // leave removes w; delivered reports that the chain had already handed it r.
@@ -370,11 +387,12 @@ func (c *setupChain) onConnected() {
 
 func (c *setupChain) startAttemptLocked() {
 	c.outstanding++
+	answered := c.answered
 	actx, acancel := context.WithDeadline(c.ctx, dialNow().Add(pagebudget.PageMaxGoal))
 	go func() {
 		defer acancel()
 		start := dialNow()
-		conn, err, tlsErr := c.attempt(actx)
+		conn, err, tlsErr := c.attempt(actx, answered)
 		if err == nil {
 			connectTimes.record(c.ringKey, dialNow().Sub(start))
 		}
@@ -384,21 +402,33 @@ func (c *setupChain) startAttemptLocked() {
 
 // attempt is one setup on a new socket: the connect (endpointDialFn) for a
 // connect chain; for a TLS chain, a connection from the address's connect
-// chain, then the handshake.
-func (c *setupChain) attempt(ctx context.Context) (net.Conn, error, bool) {
-	if c.k.tlsCfg == nil {
+// chain, then the handshake. Once the TLS chain's destination has answered
+// (answered: the attempt serves demand, not the race), its connect is its own,
+// like the attempt itself: the connect chain bounds racing, and there is no
+// race left to bound.
+func (c *setupChain) attempt(ctx context.Context, answered bool) (net.Conn, error, bool) {
+	if c.k.tlsCfg == nil || answered {
 		raw, err := endpointDialFn(ctx, c.k.network, c.k.addr)
 		if err != nil {
 			return nil, err, false
 		}
 		c.onConnected()
-		return newEndpointConn(raw), nil, false
+		conn := net.Conn(newEndpointConn(raw))
+		if c.k.tlsCfg == nil {
+			return conn, nil, false
+		}
+		return c.handshake(ctx, conn)
 	}
 	conn, err := connectChains.dial(ctx, chainKey{network: c.k.network, addr: c.k.addr})
 	if err != nil {
 		return nil, err, false
 	}
 	c.onConnected()
+	return c.handshake(ctx, conn)
+}
+
+// handshake runs the TLS handshake of a TLS chain's attempt on conn.
+func (c *setupChain) handshake(ctx context.Context, conn net.Conn) (net.Conn, error, bool) {
 	cfg := c.k.tlsCfg.Clone()
 	if cfg.ServerName == "" {
 		if host, _, herr := net.SplitHostPort(c.k.addr); herr == nil {
@@ -425,16 +455,16 @@ func (c *setupChain) result(r racedConn) {
 			return
 		}
 		c.deliverLocked(w, r)
-		if len(c.waiters) > 0 && !c.done {
-			// The destination answered: the next waiter's attempt starts now,
-			// and the waits start again from the trigger.
-			c.wait, _ = connectTimes.trigger(c.ringKey)
-			c.startAttemptLocked()
-			if c.timer != nil {
-				c.timer.Reset(c.wait)
-			}
-		} else if len(c.waiters) == 0 {
+		// The destination answered: the race is over (no timer adds attempts
+		// any more), and every waiter left gets an attempt of its own.
+		c.answered = true
+		if c.timer != nil {
+			c.timer.Stop()
+		}
+		if len(c.waiters) == 0 {
 			c.finishLocked()
+		} else {
+			c.coverDemandLocked()
 		}
 		c.mu.Unlock()
 		return
@@ -465,7 +495,7 @@ func (c *setupChain) result(r racedConn) {
 func (c *setupChain) onTimer() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.done || len(c.waiters) == 0 {
+	if c.done || c.answered || len(c.waiters) == 0 {
 		return
 	}
 	c.startAttemptLocked()
