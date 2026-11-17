@@ -1714,8 +1714,9 @@ def _browser_pod_in_docker(tmp_path, *, origin_delay_s, wrapper=True, login_trie
 def test_run11_race_reproduced_without_the_gate(tmp_path):
     """Run 11, reproduced: Chrome navigates while the portal's origin does
     not answer yet, no wait, no retry -> sessions lost, and browser.sessions
-    keeps such a run INVALID."""
-    p, out = _browser_pod_in_docker(tmp_path, origin_delay_s=6, wrapper=False, login_tries=1)
+    keeps such a run INVALID. The origin is late by far more than any container start (2026-11-17: on the build
+    VM's Docker the 6 s it was late by had passed before Chrome's first navigation, and nothing raced)."""
+    p, out = _browser_pod_in_docker(tmp_path, origin_delay_s=120, wrapper=False, login_tries=1)
     assert "ERR_" in p.stdout + p.stderr
     o = k6eval.read_k6_out(str(out), "browser")
     c = _check(k6eval.browser_checks(o, 3), "browser.sessions")
