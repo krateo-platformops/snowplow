@@ -315,7 +315,7 @@ def test_old_evidence_judges_a_lost_session_on_control_plane_events_only(tmp_pat
     assert ses["result"] == "PASS" and lost["result"] == "FAIL", (ses, lost)
 
 
-def _st(*wins, node=True, anchored=True, slack=0.0):
+def _sat_st(*wins, node=True, anchored=True, slack=0.0):
     return {"node": node, "anchored": anchored, "slack_s": slack,
             "windows": [{"t0": a, "t1": b, "saturated": sat} for a, b, sat in wins]}
 
@@ -327,16 +327,16 @@ def _st(*wins, node=True, anchored=True, slack=0.0):
     ([(0, 5, False), (5, 10, False), (10, 15, False)], 1, 14, 0),      # covered, never saturated: no event
 ], ids=["inside", "partial", "touching", "covered-unsaturated"])
 def test_saturation_overlaps_mean_one_shared_instant(wins, w0, w1, want):
-    got, why = k6eval.saturation_events(_st(*wins), w0, w1)
+    got, why = k6eval.saturation_events(_sat_st(*wins), w0, w1)
     assert why == "" and len(got) == want and all(e["what"] == SATURATED for e in got), (got, why)
 
 
 @pytest.mark.parametrize("st, w0, w1, why", [
-    (_st((0, 5, False), node=False), 1, 4, "the loadgen node's CPU was not measured"),
-    (_st((0, 5, False), anchored=False), 1, 4, "the CPU samples have no wall-clock anchor"),
-    (_st((0, 5, False), (5, 10, False)), 1, 14, "the loadgen node's CPU samples do not cover the whole session window"),
-    (_st((0, 5, False), (8, 12, False)), 1, 11, "the loadgen node's CPU samples do not cover the whole session window"),
-    (_st(), 1, 4, "the loadgen node's CPU samples do not cover the whole session window"),
+    (_sat_st((0, 5, False), node=False), 1, 4, "the loadgen node's CPU was not measured"),
+    (_sat_st((0, 5, False), anchored=False), 1, 4, "the CPU samples have no wall-clock anchor"),
+    (_sat_st((0, 5, False), (5, 10, False)), 1, 14, "the loadgen node's CPU samples do not cover the whole session window"),
+    (_sat_st((0, 5, False), (8, 12, False)), 1, 11, "the loadgen node's CPU samples do not cover the whole session window"),
+    (_sat_st(), 1, 4, "the loadgen node's CPU samples do not cover the whole session window"),
 ], ids=["node-unmeasured", "unanchored", "window-past-the-samples", "gap-in-the-samples", "no-samples"])
 def test_saturation_that_cannot_be_told_is_undecided_never_no_event(st, w0, w1, why):
     """Rd / Re: an unmeasured node, unanchored samples, or a stretch of the session window no sample covers, with
@@ -346,7 +346,7 @@ def test_saturation_that_cannot_be_told_is_undecided_never_no_event(st, w0, w1, 
 
 def test_the_anchors_error_widens_each_window_outward():
     """A window 0.05 s short of the session's start overlaps it once widened by the anchor's 0.1 s error."""
-    got, _ = k6eval.saturation_events(_st((0, 4.95, True), (4.95, 10, False), slack=0.1), 5, 9)
+    got, _ = k6eval.saturation_events(_sat_st((0, 4.95, True), (4.95, 10, False), slack=0.1), 5, 9)
     assert len(got) == 1
 
 
