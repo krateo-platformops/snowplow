@@ -1,33 +1,43 @@
 # Published versions of this repo's charts that must not be pinned.
 #
 # A tag cannot be withdrawn: it stays in the registry and looks like any other release. This list is
-# how a release is marked bad where a pinning session will see it. installer's CI reads it on every
-# PR, over every pin (not only the pins a PR changes), and refuses a pin on a listed version, so a bad
-# pin resting on installer's main fails CI until it is moved, whether or not anyone was told.
+# how a release is marked as not-to-be-pinned where a pinning session will see it. installer's CI
+# (check-retracted-versions.py) reads it from this repo's main and refuses a pin on a listed version:
+# on a PR it checks the pins that PR changes; on a push to installer's main, and on a manual run, it
+# checks every pin.
 #
 # Same schema as krateo-platformops/frontend's and portal's retracted-versions.yaml. `charts` names
 # the chart, as in the `chart:` field of installer's component-pins.yaml (a helm/<dir>/Chart.yaml
 # `name:` here: snowplow and snowplow-crds), not the component (snowplow-crd). `use` is the version to
 # pin instead, and it must already be published when the entry lands.
 # go/snowplow/scripts/check_retracted_versions.sh guards both.
+#
+# Removing entries: one entry among others is a plain edit. The LAST entry cannot be removed by
+# emptying the list (the guard refuses `retracted: []`, and installer's reader fails closed on a
+# missing file): installer first stops reading this file (removes snowplow from its
+# retraction-sources.yaml), and only then is this file deleted.
 retracted:
   - version: 1.12.71
     charts: [snowplow, snowplow-crds]
     use: 1.12.70
     reason: >-
-      Pre-release built only for a paired bench run (do-not-install): not yet measured against
-      1.12.70. Expected to become a real release after its paired run against 1.12.70 (launch B,
-      verdict expected Tuesday 17 November 2026, evening, Rome time); this entry is then removed in
-      its own PR.
+      Pre-release built only for a paired bench run (do-not-install), never measured: its paired run
+      against 1.12.70 (launch B, 2026-11-17) was INVALID, because GKE resized the clusters' control
+      planes during the measurement. Not known to be defective. Snowplow releases only versions
+      measured against the current release, and by the owner's ruling of 2026-11-17 the next measured
+      version is 1.12.74 (which contains this one's changes). This entry is permanent.
   - version: 1.12.72
     charts: [snowplow, snowplow-crds]
     use: 1.12.70
     reason: >-
-      Pre-release built only for a paired bench run (do-not-install): not yet measured against
-      1.12.70. Stays listed until its own paired run gives a verdict.
+      Pre-release built only for a paired bench run (do-not-install), never measured: its paired run
+      (launch A, 2026-11-16) was INVALID. Not known to be defective. Superseded for measurement by
+      1.12.74 (the owner's ruling of 2026-11-17), so it will never be measured. This entry is permanent.
   - version: 1.12.73
     charts: [snowplow, snowplow-crds]
     use: 1.12.70
     reason: >-
-      Pre-release built only for a paired bench run (do-not-install): not yet measured against
-      1.12.70. Stays listed until its own paired run gives a verdict.
+      Pre-release built only for a paired bench run (do-not-install), never measured: no paired run
+      was launched for it. Not known to be defective. Superseded for
+      measurement by 1.12.74 (the owner's ruling of 2026-11-17), so it will never be measured. This
+      entry is permanent.
