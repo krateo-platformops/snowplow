@@ -121,7 +121,7 @@ func TestNewRefusesASnapshotHoldingTheClientconfigSecret(t *testing.T) {
 	_, err := loadHarness(t, opts{extra: []map[string]any{{
 		"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
 		"metadata": map[string]any{"name": "sandbox-visitor-clientconfig", "namespace": "krateo-system", "uid": "u-2", "resourceVersion": "1"},
-		"data":     map[string]any{"token": "Y2x1c3Rlci10b2tlbg=="},
+		"data":     map[string]any{"token": "eA=="},
 	}}})
 	if err == nil || !strings.Contains(err.Error(), "Secret krateo-system/sandbox-visitor-clientconfig is in the snapshot, and the fake env synthesises it") {
 		t.Fatal(err)
