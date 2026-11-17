@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -367,6 +368,9 @@ func TestIssue1509_Chain_AnsweredIntervalIsNotRaced(t *testing.T) {
 	if n := pl.accepted.Load(); n != 2 {
 		t.Fatalf("the server accepted %d connections for 2 setups of a destination that answered; want 2 (the answered interval is not raced; second setup up at %v)", n, last)
 	}
+	if r := racesFiredAt(addr); r != 0 {
+		t.Fatalf("%d races fired at the destination; want exactly 0 (accepted - requests = 0)", r)
+	}
 	if last < trigger {
 		t.Fatalf("the second setup came up after %v; the arm needs it slower than the trigger (%v)", last, trigger)
 	}
@@ -484,29 +488,35 @@ func TestIssue1509_Chain_AHandshakeStillReceivingBytesIsNotRaced(t *testing.T) {
 	if n := tl.accepted.Load(); n != 2 {
 		t.Fatalf("the server accepted %d connections; want 2: the second setup's handshake kept receiving bytes (up at %v), so it must not be raced again", n, last)
 	}
+	if r := racesFiredAt(addr); r != 0 {
+		t.Fatalf("%d races fired at the destination; want exactly 0 (accepted - requests = 0)", r)
+	}
 	if last < 3*trigger {
 		t.Fatalf("the trickled setup came up after %v; the arm needs its handshake to last over 3 trigger intervals (%v)", last, 3*trigger)
 	}
 }
 
 // A live attempt keeps covering its waiter when the chain flips out of
-// answering and back (#1521 review: dropping every earlier attempt as cover
-// on the flip back doubled a healthy burst's setups). Cover is per attempt,
-// by its own evidence. Trigger T = 50 ms:
+// answering and back (#1521 review: dropping earlier attempts as cover on the
+// flip back doubled a healthy burst's setups). A connected attempt covers
+// until it ends (rule B). Trigger T = 50 ms:
 //
 //	0       W1, W2 join; attempt 1 (conn 1) comes up at 15 ms: W1 served,
-//	        answered; attempt 2 (conn 2) starts for W2, its handshake held.
+//	        answered; attempt 2 (conn 2) starts for W2: connected, its
+//	        handshake held by the server.
 //	65      interval check: the success is fresh evidence; still answering.
-//	90      W3 joins: attempt 3 (conn 3) starts for it, held too.
+//	90      W3 joins: attempt 3 (conn 3) starts for it: connected, held too.
 //	115     interval check: nothing came up and no bytes were read: the chain
-//	        races (attempt 4, conn 4, answers at once). Attempt 2 has shown no
-//	        evidence for an interval: it stops covering. Attempt 3 started in
-//	        the interval: it still covers W3.
-//	~116    attempt 4 comes up: W2 served, answered again. W3 is covered by
-//	        attempt 3: no new attempt.
+//	        races (attempt 4, conn 4, answers at once). Attempts 2 and 3 are
+//	        connected: they keep covering.
+//	~116    attempt 4 comes up: W2 served, answered again. W3 is covered by a
+//	        live attempt: no new attempt.
 //
-// The server must accept exactly 4 connections. Dropping every earlier
-// attempt as cover on the flip back (M-epoch) starts a fifth for W3.
+// The server must accept exactly 4 connections, and every connection beyond
+// one per waiter is the one race fired at this destination (exactly: accepted
+// - 3 == racesFiredAt). Dropping earlier attempts as cover on the flip back
+// (M-epoch), or every attempt at every check (M-dropall), starts another for
+// W3 that replaces the race's or adds a fifth.
 func TestIssue1509_Chain_ALiveAttemptStillCoversAcrossAReRace(t *testing.T) {
 	resetConnectTimes(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -547,35 +557,42 @@ func TestIssue1509_Chain_ALiveAttemptStillCoversAcrossAReRace(t *testing.T) {
 		}
 	}
 	time.Sleep(2 * trigger) // a late attempt would be accepted by now
-	if n := pl.accepted.Load(); n != 4 {
-		t.Fatalf("the server accepted %d connections; want 4 (attempts 1-3 and the one race): a live attempt must keep covering its waiter when the chain answers again", n)
+	n, races := pl.accepted.Load(), racesFiredAt(addr)
+	if n != 4 || uint64(n-3) != races {
+		t.Fatalf("the server accepted %d connections with %d races fired; want 4 and exactly 1 (attempts 1-3, one per waiter, and the one race): a live attempt must keep covering its waiter when the chain answers again", n, races)
 	}
 }
 
 // A healthy burst opens one setup per request (#1521 review; the #1088
 // idle-bound subtest's shape): 25 concurrent HTTP/1.1 TLS requests through
 // NewEndpointTransport, to a new destination (an empty window: the cold
-// default trigger) and to a warm one (a full window of a realistic mix: solo
-// setups and a concurrent burst's, so the trigger is measured).
+// default trigger), to a warm one (a full window of a realistic mix: solo
+// setups and a concurrent burst's, so the trigger is measured), and to one
+// warmed by solo setups only (#1521 review: its trigger, a solo setup's time,
+// is shorter than the burst's concurrent handshakes, which therefore wait on
+// the server past an interval while connected and must keep covering).
 func TestIssue1509_Chain_AHealthyBurstOpensOneSetupPerRequest(t *testing.T) {
-	t.Run("cold destination", func(t *testing.T) {
-		if err := healthyBurst1521(t, false, false); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("warm destination", func(t *testing.T) {
-		if err := healthyBurst1521(t, true, false); err != nil {
-			t.Fatal(err)
-		}
-	})
+	for _, warm := range []string{burstCold, burstMixWarm, burstSoloWarm} {
+		t.Run(warm, func(t *testing.T) {
+			if err := healthyBurst1521(t, warm, false); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
+
+const (
+	burstCold     = "cold destination"
+	burstMixWarm  = "warm destination"
+	burstSoloWarm = "solo-warmed destination"
+)
 
 // The bound above reads the races fired AT THE BURST'S DESTINATION. Its own
 // check: while another destination's chain fires races, three deliberate extra
 // connects to the burst's destination must still be flagged. A count across
 // destinations would let the other destination's races excuse it.
 func TestIssue1509_Chain_ABurstsExtraConnectIsNotExcusedByAnotherDestinationsRaces(t *testing.T) {
-	err := healthyBurst1521(t, true, true)
+	err := healthyBurst1521(t, burstMixWarm, true)
 	if err == nil {
 		t.Fatal("three deliberate extra connects to the burst's destination passed the bound while another destination fired races: the race accounting is not per destination")
 	}
@@ -585,7 +602,7 @@ func TestIssue1509_Chain_ABurstsExtraConnectIsNotExcusedByAnotherDestinationsRac
 // healthyBurst1521 runs the burst and returns the bound's verdict. inject:
 // during the burst, another destination's chain fires races and three extra
 // connects go to the burst's destination outside any chain.
-func healthyBurst1521(t *testing.T, warm, inject bool) error {
+func healthyBurst1521(t *testing.T, warm string, inject bool) error {
 	resetConnectTimes(t) // a reused port must not bring another test's samples
 	const n = 25
 	var accepted, arrived atomic.Int32
@@ -657,7 +674,16 @@ func healthyBurst1521(t *testing.T, warm, inject bool) error {
 		}
 		_ = resp.Body.Close()
 	}
-	if warm {
+	switch warm {
+	case burstSoloWarm:
+		for range 25 {
+			solo()
+		}
+		srv.CloseClientConnections()
+		if _, measured := connectTimes.trigger(key); !measured {
+			t.Fatalf("the solo-warmed destination's window holds %d setups; its trigger is not measured", connectTimes.ring(key).count())
+		}
+	case burstMixWarm:
 		for range 5 {
 			solo()
 		}
@@ -669,8 +695,10 @@ func healthyBurst1521(t *testing.T, warm, inject bool) error {
 		if _, measured := connectTimes.trigger(key); !measured {
 			t.Fatalf("the warm destination's window holds %d setups; its trigger is not measured", connectTimes.ring(key).count())
 		}
-	} else if _, measured := connectTimes.trigger(key); measured {
-		t.Fatal("the new destination's trigger is measured already")
+	default:
+		if _, measured := connectTimes.trigger(key); measured {
+			t.Fatal("the new destination's trigger is measured already")
+		}
 	}
 	trigger, _ := connectTimes.trigger(key)
 	acceptedBefore := accepted.Load()
@@ -725,7 +753,7 @@ func healthyBurst1521(t *testing.T, warm, inject bool) error {
 	mu.Lock()
 	defer mu.Unlock()
 	d, a := len(starts), int(accepted.Load()-acceptedBefore)
-	if !warm && (races != 0 || d != n || a != n) {
+	if warm == burstCold && (races != 0 || d != n || a != n) {
 		// A new destination's trigger is the cold default (3 s), which a
 		// burst of milliseconds never reaches: no race can fire, and the
 		// count is exact, independent of the race accounting below.
@@ -744,4 +772,257 @@ func healthyBurst1521(t *testing.T, warm, inject bool) error {
 		t.Logf("%d races fired (connects %d, accepted %d)", races, d, a)
 	}
 	return nil
+}
+
+// A connect that was stuck past an interval stops covering its waiter, and
+// covers again once it completes (rule B: a connected attempt covers until it
+// ends). Trigger T = 100 ms; connects are scripted per attempt:
+//
+//	0       W1, W2 join; attempt 1 (connect 1, at once) comes up at ~15 ms:
+//	        W1 served, answered; attempt 2 starts for W2, its connect taking
+//	        250 ms.
+//	~115    interval check: the success is fresh evidence; still answering.
+//	180     W3 joins: attempt 3 starts for it, its connect taking 600 ms.
+//	~215    interval check: nothing came up: the chain races (attempt 4,
+//	        connect 4 at once, comes up). Attempt 2 is still connecting with no
+//	        evidence for an interval: it stops covering; attempt 3 started in
+//	        the interval: it covers. W2 is served by attempt 4.
+//	~265    attempt 2's connect completes: it covers again (its handshake is
+//	        held by the server).
+//	300     W4 joins: W3 and W4 are covered by attempts 2 and 3: no new attempt.
+//
+// So exactly 4 connects have started by 330 ms. Without the regain on connect
+// (M-noregain), W4's join starts a fifth.
+func TestIssue1509_Chain_AStuckConnectThatCompletesCoversAgain(t *testing.T) {
+	resetConnectTimes(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const trigger = 100 * time.Millisecond
+	pl := &paceListener{
+		Listener: ln,
+		// accepts: 1 = attempt 1, 2 = the race (attempt 4), 3 = attempt 2.
+		delay: map[int32]time.Duration{1: 15 * time.Millisecond, 3: 3 * trigger},
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.Listener = pl
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	addr := ln.Addr().String()
+	seedConnectTimes(setupKey(addr, true), trigger)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEMOf(srv))
+	cfg := &tls.Config{RootCAs: pool, NextProtos: []string{"h2"}}
+
+	connectDelay := map[int32]time.Duration{2: 250 * time.Millisecond, 3: 600 * time.Millisecond}
+	var calls atomic.Int32
+	var mu sync.Mutex
+	var starts []time.Duration
+	t0 := time.Now()
+	prev := endpointDialFn
+	endpointDialFn = func(ctx context.Context, network, a string) (net.Conn, error) {
+		n := calls.Add(1)
+		mu.Lock()
+		starts = append(starts, time.Since(t0))
+		mu.Unlock()
+		if d := connectDelay[n]; d > 0 {
+			select {
+			case <-time.After(d):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, a)
+	}
+	t.Cleanup(func() { endpointDialFn = prev })
+
+	errs := make(chan error, 4)
+	dial := func() {
+		c, err := endpointDialTLS(context.Background(), "tcp", addr, cfg)
+		if err == nil {
+			t.Cleanup(func() { _ = c.Close() })
+		}
+		errs <- err
+	}
+	go dial()
+	go dial()
+	time.Sleep(180 * time.Millisecond)
+	go dial()
+	time.Sleep(120 * time.Millisecond) // 300 ms
+	go dial()
+	time.Sleep(30 * time.Millisecond) // 330 ms
+	mu.Lock()
+	by330 := slices.Clone(starts)
+	mu.Unlock()
+	for range 4 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(by330) != 4 {
+		t.Fatalf("%d connects had started by 330 ms (%v); want 4: the stuck connect that completed must cover W3 or W4 again", len(by330), by330)
+	}
+}
+
+// The hung-TLS second stall (#1521 review): a busy destination answers a
+// joiner every 2 ms; for 300 ms it then accepts TCP but never answers a
+// ClientHello (its held handshakes are connected, so they keep covering their
+// waiters, rule B), and the last joiner arrives at its comeback. Every waiter
+// that joined during the stall must be served, and served together: once an
+// attempt comes up after the comeback, every waiter beyond the attempts
+// covering it gets one of its own at once. A serial handout — waiters left to
+// the race's own attempts — serves them at least a trigger interval apart
+// (the race schedule's shortest gap between two of its attempts), so p95 −
+// p50 of their serve times must stay below one trigger.
+func TestIssue1509_Chain_AHungTLSStallsWaitersAreServedTogether(t *testing.T) {
+	resetConnectTimes(t)
+	srv, sl := stallTLSServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	addr := sl.Addr().String()
+	const trigger = 100 * time.Millisecond
+	seedConnectTimes(setupKey(addr, true), trigger)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEMOf(srv))
+	cfg := &tls.Config{RootCAs: pool, NextProtos: []string{"h2"}}
+	const stallAt, stall, every = 200 * time.Millisecond, 300 * time.Millisecond, 2 * time.Millisecond
+	comeback := stallAt + stall
+	type served struct {
+		joined, got time.Duration
+		err         error
+	}
+	var mu sync.Mutex
+	var out []served
+	t0 := time.Now()
+	time.AfterFunc(stallAt, func() { sl.stallFor(stall) })
+	var wg sync.WaitGroup
+	for i := 0; time.Duration(i)*every <= comeback; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			j := time.Since(t0)
+			c, err := endpointDialTLS(ctx, "tcp", addr, cfg)
+			g := time.Since(t0)
+			if err == nil {
+				_ = c.Close()
+			}
+			mu.Lock()
+			out = append(out, served{j, g, err})
+			mu.Unlock()
+		}()
+		time.Sleep(every)
+	}
+	wg.Wait()
+	var got []time.Duration
+	for _, s := range out {
+		if s.joined < stallAt+every || s.joined > comeback {
+			continue
+		}
+		if s.err != nil {
+			t.Fatalf("a waiter that joined %v (during the stall) failed: %v", s.joined, s.err)
+		}
+		got = append(got, s.got)
+	}
+	if len(got) < 100 {
+		t.Fatalf("only %d waiters joined during the stall; the arm needs its stream", len(got))
+	}
+	slices.Sort(got)
+	p50, p95 := got[len(got)/2], got[len(got)*95/100]
+	if p95-p50 >= trigger {
+		t.Fatalf("the %d waiters that joined during the stall were served from %v to %v (p50 %v, p95 %v): p95 - p50 = %v, not below one trigger (%v): a serial handout",
+			len(got), got[0], got[len(got)-1], p50, p95, p95-p50, trigger)
+	}
+	t.Logf("%d stall-joined waiters served by p50 %v, p95 %v after start (comeback at %v); %d handshakes held", len(got), p50, p95, comeback, sl.held.Load())
+}
+
+// No waiter is ever added to a done chain (#1521 review: the chain could
+// finish between dial finding it and the waiter joining it, and the waiter
+// then waited out its whole budget on a chain that would never start an
+// attempt for it). The chain is finished exactly in that gap (the test seam);
+// the waiter must be served by a new chain, at once.
+func TestIssue1521_AJoinOntoAChainThatJustFinishedStartsAFreshOne(t *testing.T) {
+	resetConnectTimes(t)
+	l := newRaceListener(t)
+	addr := l.ln.Addr().String()
+	// Waiter 1's attempt hangs, so its chain is alive when waiter 2 dials;
+	// waiter 2's attempt, on a new chain, connects at once.
+	countingRaceDial(t, "hang", "ok")
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	go func() { _, _ = raceDial(ctx1, "tcp", addr) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		connectChains.mu.Lock()
+		c := connectChains.chains[chainKey{network: "tcp", addr: addr}]
+		connectChains.mu.Unlock()
+		if c != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("waiter 1's chain never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	joinGapForTest = func(c *setupChain) {
+		c.mu.Lock()
+		c.finishLocked() // an attempt's result finishing the chain, in the gap
+		c.mu.Unlock()
+	}
+	t.Cleanup(func() { joinGapForTest = nil })
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	start := time.Now()
+	conn, err := raceDial(ctx2, "tcp", addr)
+	joinGapForTest = nil
+	if err != nil {
+		t.Fatalf("a dial whose chain finished as it joined failed after %v: %v (it joined the done chain)", time.Since(start), err)
+	}
+	_ = conn.Close()
+}
+
+// The same dial/join path at TLS level, under churn: 200 concurrent TLS
+// setups to a healthy destination, whose chains finish and are replaced
+// while setups keep joining. Every one must come up.
+func TestIssue1521_ConcurrentTLSSetupsAreNeverStranded(t *testing.T) {
+	resetConnectTimes(t)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	addr := srv.Listener.Addr().String()
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEMOf(srv))
+	cfg := &tls.Config{RootCAs: pool, NextProtos: []string{"h2"}}
+	const n = 200
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			c, err := endpointDialTLS(ctx, "tcp", addr, cfg)
+			if err != nil {
+				errs <- err
+				return
+			}
+			_ = c.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	failed := 0
+	var first error
+	for err := range errs {
+		if first == nil {
+			first = err
+		}
+		failed++
+	}
+	if failed > 0 {
+		t.Fatalf("%d of %d TLS setups to a healthy destination failed (first: %v): a setup was stranded", failed, n, first)
+	}
 }

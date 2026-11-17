@@ -30,11 +30,13 @@ package credhttp
 //     bound, however many requests wait on it;
 //   - each connection that comes up goes to ONE waiter, the longest waiting;
 //   - once a connection has come up, the destination is ANSWERING (#1521):
-//     every waiter left, and every one that joins, gets an attempt of its own,
-//     at once, exactly as net/http dials one connection per waiting request
-//     without a race, and no extra attempt is added. So a healthy destination
-//     sees one connection per waiter and no surplus (a 25-request burst opens
-//     25), and many waiters are served in parallel, not one after another;
+//     every waiter left, and every one that joins, is covered by an attempt —
+//     a live one, or a new one started at once, exactly as net/http dials one
+//     connection per waiting request — and no race attempt is added. So a
+//     healthy destination sees one setup per waiter plus the race's own
+//     attempts (racesFiredAt; a setup slower than the trigger is raced, the
+//     design's ~5 %), and many waiters are served in parallel, not one after
+//     another;
 //   - "answering" holds only on FRESH evidence: within every trigger interval
 //     some attempt must come up or show progress (a TLS attempt reading its
 //     server's handshake bytes in that interval: a handshake still receiving
@@ -44,15 +46,18 @@ package credhttp
 //     the chain empty — and the chain returns to racing
 //     for the waiters still waiting, with the same bound, from the trigger. No
 //     new number: the interval is the measured trigger;
-//   - demand is covered per ATTEMPT, by evidence: an outstanding attempt
-//     covers a waiter while it shows fresh evidence of its own — started, or
-//     read handshake bytes, within the last trigger interval. One with no
-//     evidence for an interval (a connect stuck in SYN backoff through a
-//     stall) stops covering, and the waiters it covered get attempts of their
-//     own once the destination answers again. A live attempt keeps covering
-//     whatever state the chain passes through (#1521 review: a burst's 24
-//     live handshakes must not be dropped as cover when the chain flips out of
-//     answering and back, which doubled a healthy burst's setups);
+//   - demand is covered per ATTEMPT (owner decision on #1521, "rule B"): an
+//     attempt whose TCP connect has completed covers a waiter until it comes
+//     up, fails, is cancelled or reaches its own bound — whatever state the
+//     chain passes through. An attempt still connecting stops covering after
+//     a trigger interval with no evidence of its own (it neither started nor
+//     connected in it: a connect stuck in SYN backoff through a stall), and
+//     covers again if its connect completes. So a connected handshake waiting
+//     on a busy server is never replaced (#1521 review: dropping such
+//     handshakes as cover started a replacement for each, up to doubling a
+//     healthy burst's setups: 37 of 200 solo-warmed bursts, 97 % of the
+//     dropped handshakes later completing), while a stuck connect's waiter
+//     gets an attempt of its own once the destination answers again;
 //   - each waiter leaves at its own deadline or cancellation, whatever the
 //     chain does; a connection that comes up with nobody waiting is closed
 //     (counted as opened, noteRacedConnectionUp); and when the last waiter
@@ -117,10 +122,12 @@ import (
 // raceCounts counts the race's own attempts per destination window (setupKey:
 // the address and the level), each one an attempt started because the setups
 // before it ran past the trigger with no evidence (onTimer). Every other
-// attempt is a waiter's own (the chain's first, or one covering a waiter once
-// the destination answered). So the setups a destination sees beyond one per
-// waiting request are at most the races fired AT THAT DESTINATION
-// (racesFiredAt); a count across destinations would let another
+// attempt is a waiter's own: the chain's first, or one covering a waiter, of
+// which a waiter gets a second only when its first stopped covering while
+// still connecting (a connect stuck through an interval). So the setups a
+// destination sees beyond one per waiting request are at most the races
+// fired AT THAT DESTINATION (racesFiredAt) plus such stuck connects that
+// later completed; a count across destinations would let another
 // destination's races excuse this one's extra setups.
 var raceCounts sync.Map // setupKey → *atomic.Uint64
 
@@ -248,14 +255,30 @@ func raceDialTLS(ctx context.Context, network, addr string, cfg *tls.Config) (ne
 // up for this waiter, the chain fails, or ctx ends. connect is the connect a
 // chain started here uses (endpointDialFn, read by the caller): attempts run
 // on goroutines of their own and never read the package-level seam.
+//
+// No waiter is ever added to a done chain: join refuses a done chain under
+// the chain's own lock, the same lock under which a chain is finished, so
+// "is it done" and "add the waiter" are one step. On a refusal dial starts a
+// new chain (still under s.mu, so no other dial can race it); a new chain is
+// never done before its first join, which starts its first attempt. (#1521
+// review: checking done and joining as two steps let an attempt finish the
+// chain in between, and the waiter then waited out its whole budget on a
+// chain that would never start an attempt for it.)
 func (s *setupChains) dial(ctx context.Context, k chainKey, connect dialFunc) (net.Conn, error) {
 	s.mu.Lock()
+	var w *chainWaiter
 	c := s.chains[k]
-	if c == nil || c.isDone() {
+	if c != nil {
+		if joinGapForTest != nil {
+			joinGapForTest(c)
+		}
+		w = c.join(ctx)
+	}
+	if w == nil {
 		c = newSetupChain(s, k, connect)
 		s.chains[k] = c
+		w = c.join(ctx)
 	}
-	w := c.join(ctx)
 	s.mu.Unlock()
 
 	select {
@@ -344,27 +367,30 @@ func newSetupChain(s *setupChains, k chainKey, connect dialFunc) *setupChain {
 		attempts: map[*attemptState]struct{}{}}
 }
 
-// attemptState is one outstanding attempt's evidence (see the file comment):
-// evidence is whether it started or read handshake bytes since the chain's
-// last interval check; covers is whether it counts as a waiter's cover.
+// attemptState is one outstanding attempt's cover state (see the file
+// comment): connected is whether its TCP connect has completed; evidence is
+// whether it started since the chain's last interval check (it only matters
+// while connecting); covers is whether it counts as a waiter's cover.
 type attemptState struct {
-	evidence, covers bool
+	connected, evidence, covers bool
 }
 
-func (c *setupChain) isDone() bool {
+// joinGapForTest, when set (tests only), runs between dial finding a chain and
+// joining it: where a chain could once finish unseen.
+var joinGapForTest func(*setupChain)
+
+// join adds a waiter; the first one starts the chain. It refuses (nil) a
+// chain that is done: no waiter is ever added to a done chain.
+func (c *setupChain) join(ctx context.Context) *chainWaiter {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.done
-}
-
-// join adds a waiter; the first one starts the chain.
-func (c *setupChain) join(ctx context.Context) *chainWaiter {
+	if c.done {
+		return nil
+	}
 	w := &chainWaiter{ch: make(chan racedConn, 1), trace: httptrace.ContextClientTrace(ctx)}
 	if w.trace != nil && w.trace.ConnectStart != nil {
 		w.trace.ConnectStart(c.k.network, c.k.addr)
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.waiters = append(c.waiters, w)
 	c.countCtx = ctx
 	c.notifyLocked(w)
@@ -503,25 +529,27 @@ func (c *setupChain) attempt(ctx context.Context, answered bool, a *attemptState
 		if err != nil {
 			return nil, err, false
 		}
+		c.onAttemptConnected(a)
 		c.onConnected()
 		conn := net.Conn(newEndpointConn(raw))
 		if c.k.tlsCfg == nil {
 			return conn, nil, false
 		}
-		return c.handshake(ctx, conn, a)
+		return c.handshake(ctx, conn)
 	}
 	conn, err := connectChains.dial(ctx, chainKey{network: c.k.network, addr: c.k.addr}, c.dial)
 	if err != nil {
 		return nil, err, false
 	}
+	c.onAttemptConnected(a)
 	c.onConnected()
-	return c.handshake(ctx, conn, a)
+	return c.handshake(ctx, conn)
 }
 
 // handshake runs the TLS handshake of a TLS chain's attempt on conn.
-func (c *setupChain) handshake(ctx context.Context, conn net.Conn, a *attemptState) (net.Conn, error, bool) {
+func (c *setupChain) handshake(ctx context.Context, conn net.Conn) (net.Conn, error, bool) {
 	if ec, ok := conn.(*endpointConn); ok {
-		ec.watchRead(func() { c.onProgress(a) })
+		ec.watchRead(c.onProgress)
 		defer ec.watchRead(nil)
 	}
 	cfg := c.k.tlsCfg.Clone()
@@ -601,10 +629,11 @@ func (c *setupChain) onTimer() {
 	if c.done || len(c.waiters) == 0 {
 		return
 	}
-	// Per attempt: one with no evidence in the interval just ended stops
-	// covering; every attempt's evidence starts over for the next interval.
+	// Per attempt: one still connecting with no evidence in the interval just
+	// ended stops covering; a connected one always covers. Evidence starts
+	// over for the next interval.
 	for a := range c.attempts {
-		if !a.evidence && a.covers {
+		if !a.connected && !a.evidence && a.covers {
 			a.covers = false
 			c.covering--
 		}
@@ -629,13 +658,21 @@ func (c *setupChain) onTimer() {
 	c.timer.Reset(c.wait)
 }
 
-// onProgress records attempt a reading its server's handshake bytes (each
-// read): the destination answers even if no setup has completed yet, and a is
-// alive, so it covers a waiter again if it had stopped.
-func (c *setupChain) onProgress(a *attemptState) {
+// onProgress records an attempt reading its server's handshake bytes (each
+// read): the destination answers even if no setup has completed yet. (The
+// attempt is connected, so it covers already: onAttemptConnected.)
+func (c *setupChain) onProgress() {
 	c.mu.Lock()
 	c.progress = true
-	a.evidence = true
+	c.mu.Unlock()
+}
+
+// onAttemptConnected records attempt a's TCP connect completing: from now on
+// it covers a waiter until it ends (rule B), again if it had stopped while
+// connecting.
+func (c *setupChain) onAttemptConnected(a *attemptState) {
+	c.mu.Lock()
+	a.connected = true
 	if _, live := c.attempts[a]; live && !a.covers {
 		a.covers = true
 		c.covering++
@@ -670,9 +707,11 @@ func closeLoser(countCtx context.Context, conn net.Conn, withTLS bool) {
 	_ = conn.Close()
 }
 
-// resetChainsForTest forgets every chain (each test's destinations are its own;
-// this keeps a test's leftovers from another's counts).
+// resetChainsForTest forgets every chain and every race count (each test's
+// destinations are its own; this keeps a test's leftovers, or a reused port's,
+// from another's counts).
 func resetChainsForTest() {
+	raceCounts.Clear()
 	for _, s := range []*setupChains{connectChains, tlsChains} {
 		s.mu.Lock()
 		for _, c := range s.chains {

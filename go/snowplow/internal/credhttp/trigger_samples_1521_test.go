@@ -94,3 +94,16 @@ func requireWarm1521(t *testing.T, srv *httptest.Server) {
 		}
 	}
 }
+
+// The threshold is the race trigger's only (trigger, not reserveRing): the
+// customer path's retry reserve still reads a partial window's maximum
+// (#1521 review N3; budget.go reserve, unchanged).
+func TestIssue1521_RetryReserveStillReadsAPartialWindowsMaximum(t *testing.T) {
+	r := &reserveRing{}
+	for _, ms := range []int{3, 40, 7} {
+		r.record(time.Duration(ms) * time.Millisecond)
+	}
+	if d, measured := r.reserve(); !measured || d != 40*time.Millisecond {
+		t.Fatalf("a 3-sample reserve is %v (measured %v); want the partial window's maximum 40ms, measured", d, measured)
+	}
+}
