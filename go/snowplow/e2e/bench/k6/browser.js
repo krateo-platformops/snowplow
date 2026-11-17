@@ -213,6 +213,18 @@ async function drainCalls (page, tags, loadT0, loadId) {
 let LOADS = 0
 function nextLoadId () { return `${exec.vu.idInTest}:${++LOADS}` }
 
+// #1517 review: wait (at most CFG.rendererReadWaitMs, renderers.js's poll + one read) until a renderers.js read that
+// STARTED after `afterMs` (epoch ms) named this page's renderer (it stamps window.__benchMapped with its start): before a
+// class's sign-in and after its last load, so every load has a renderer read on both sides. A read that never
+// comes (no watcher, a page gone) leaves its loads with no known renderer: the evaluator says UNKNOWN
+async function awaitRead (page, afterMs) {
+  if (!CFG.rendererReadWaitMs) return
+  try {
+    await page.waitForFunction(`(window.__benchMapped || 0) > ${afterMs}`,
+      { polling: 200, timeout: CFG.rendererReadWaitMs })
+  } catch (e) { /* none came within its bound: said by the evaluator, per load */ }
+}
+
 // The first navigation, retried within GOTO_TRIES x GOTO_WAIT_MS (above).
 async function gotoLogin (page) {
   for (let i = 1; ; i++) {
@@ -363,6 +375,8 @@ async function runClass (s, user, k, last, deadline, prevToken, secrets) {
       throw new Error(`session ${s.name}: the login form ${LOGIN.form} holds ${submits} ${LOGIN.submit} ` +
         'controls, not exactly 1: which one signs in is not the contract\'s')
     }
+    // #1517 review: a renderer read of this page BEFORE its first load (the sign-in arrival) starts
+    await awaitRead(page, 0)
     // the first page's clock starts when the app leaves /login (pageload.js)
     await page.evaluate(() => {
       const b = window.__bench
@@ -431,6 +445,8 @@ async function runClass (s, user, k, last, deadline, prevToken, secrets) {
       shown = route
     }
   } finally {
+    // #1517 review: the context stays open until renderers.js has read the page AFTER its last load
+    await awaitRead(page, Date.now())
     await drainCalls(page, Object.assign({ route: shown, during: 'between' }, base))
     for (const [, value, t] of ledger.unfinished(Date.now())) {
       INCOMPLETE.add(value, Object.assign({ session: s.name, route: shown }, t))

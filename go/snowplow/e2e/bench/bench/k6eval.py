@@ -315,22 +315,38 @@ RULE_TEXT = {
 
 
 def renderer_state(o: dict | None, off: float | None) -> dict:
-    """The per-renderer evidence of one browser run: its renderer samples on the epoch (`off`: the CPU samples'
-    realtime - uptime offset; None: not anchored, nothing can be placed), each renderer pid's --user-data-dir, and
-    the renderer reads (k6/renderers.js) that named a pid."""
-    samples, udd = [], {}
+    """The per-renderer evidence of one browser run: each renderer's run_delay series on the epoch, KEYED BY
+    (pid, starttime) (`off`: the CPU samples' realtime - uptime offset; None: not anchored, nothing can be placed),
+    each series' --user-data-dir, and every renderer read (k6/renderers.js), the failed ones too (pid null: they
+    break a chain of agreeing reads)."""
+    series: dict[tuple[int, str], list[tuple[float, int]]] = {}
+    udd: dict[tuple[int, str], str | None] = {}
     for r in (o or {}).get("renderers") or []:
         if r.get("kind") == "renderer_udd" and isinstance(r.get("pid"), int):
-            udd[r["pid"]] = r.get("udd")
+            udd[(r["pid"], str(r.get("start")))] = r.get("udd")
         elif r.get("kind") == "renderer" and isinstance(r.get("t"), (int, float)) and off is not None:
-            samples.append((float(r["t"]) + off, {int(p): int(v) for p, v in (r.get("rd") or {}).items()}))
-    samples.sort(key=lambda s: s[0])
-    maps = [m for m in (o or {}).get("renderer_map") or []
-            if m.get("kind") == "renderer_map" and isinstance(m.get("pid"), int) and m.get("session") is not None
-            and isinstance(m.get("t0"), (int, float)) and isinstance(m.get("t1"), (int, float))]
-    return {"samples": samples, "udd": udd, "maps": sorted(maps, key=lambda m: m["t0"]),
+            for k, v in (r.get("rd") or {}).items():
+                pid, _, start = str(k).partition(":")
+                if pid.isdigit() and start:
+                    series.setdefault((int(pid), start), []).append((float(r["t"]) + off, int(v)))
+    for s in series.values():
+        s.sort(key=lambda x: x[0])
+    reads = [m for m in (o or {}).get("renderer_map") or []
+             if m.get("kind") == "renderer_map" and isinstance(m.get("t0"), (int, float))
+             and isinstance(m.get("t1"), (int, float))]
+    return {"series": series, "udd": udd, "reads": sorted(reads, key=lambda m: m["t0"]),
             "anchored": off is not None, "recorded": {"renderers": (o or {}).get("renderers") is not None,
                                                      "renderer_map": (o or {}).get("renderer_map") is not None}}
+
+
+def _series_of(r: dict, pid: int, t0: float, t1: float) -> tuple[tuple[int, str] | None, str]:
+    """The one (pid, starttime) series of `pid` that was sampled through a read lasting [t0, t1]: a pid's series
+    ends where its process ended; another process that got the pid later is another series."""
+    alive = [k for k, s in r["series"].items() if k[0] == pid and s[0][0] <= t1 and s[-1][0] >= t0]
+    if len(alive) != 1:
+        return None, (f"{len(alive)} sampled processes held pid {pid} through its read" if alive
+                      else f"no renderer sample of pid {pid} spans its read")
+    return alive[0], ""
 
 
 def renderer_delay_ms(n: dict, st: dict) -> tuple[float | None, str]:
@@ -338,10 +354,13 @@ def renderer_delay_ms(n: dict, st: dict) -> tuple[float | None, str]:
 
     Its renderer: the pid Chrome's frame->process record named for the load's session and identity class in a read
     that ENDED before the load started and in one that STARTED after it ended, the same pid and page target in
-    both and in every read between them (a renderer that changed, or was not read on both sides, is not known), a
-    pid the renderer sampler saw under the --user-data-dir of the Chrome whose endpoint named it. Its stall: that
-    pid's run_delay between the last sample at or before the load's start and the first at or after its end (each
-    side widened by the anchor's error, st["slack_s"]), capped at the load's own time."""
+    both and in every read between them, with no failed read of that Chrome between them (a renderer that changed,
+    or that was not read on both sides, is not known), resolved to the one (pid, starttime) series the sampler
+    recorded through both reads, under the --user-data-dir of the Chrome whose endpoint named it. Its stall: that
+    series' run_delay between the last sample at or before the load's start and the first at or after its end (each
+    side widened OUTWARD by the anchor's error, st["slack_s"]), capped at the load's own time. UNKNOWN too: a
+    series whose run_delay never advanced over the run (the counter is not shown live), and one that decreased
+    across the load (a thread of the renderer exited with its run_delay: the known under-count, flagged)."""
     r = st.get("renderer") or {}
     if not r.get("anchored"):
         return None, "the renderer samples have no wall-clock anchor"
@@ -353,23 +372,37 @@ def renderer_delay_ms(n: dict, st: dict) -> tuple[float | None, str]:
         return None, "the load has no start"
     s0, s1 = n["start"], n["start"] + n["wall_ms"] / 1000
     slack = st.get("slack_s") or 0.0
-    rows = [m for m in r["maps"] if (m["session"], m.get("class")) == (n.get("session"), n.get("class"))]
-    before = [m for m in rows if m["t1"] <= s0]
-    after = [m for m in rows if m["t0"] >= s1]
+    key = (n.get("session"), n.get("class"))
+    ok = [m for m in r["reads"] if isinstance(m.get("pid"), int) and (m.get("session"), m.get("class")) == key]
+    before = [m for m in ok if m["t1"] <= s0]
+    after = [m for m in ok if m["t0"] >= s1]
     if not before or not after:
         return None, "its renderer was not read both before and after it"
     b, a = max(before, key=lambda m: m["t1"]), min(after, key=lambda m: m["t0"])
-    span = [m for m in rows if m["t0"] >= b["t0"] and m["t1"] <= a["t1"]]
+    span = [m for m in ok if m["t0"] >= b["t0"] and m["t1"] <= a["t1"]]
     if len({m["pid"] for m in span}) != 1 or len({m.get("target") for m in span}) != 1:
         return None, "its renderer changed while it loaded"
+    if any(m.get("pid") is None and m.get("udd") == b.get("udd") and m["t0"] < a["t1"] and m["t1"] > b["t0"]
+           for m in r["reads"]):
+        return None, "a read of its Chrome between the two failed"
     pid = b["pid"]
-    if r["udd"].get(pid) != b.get("udd"):
+    k1, why1 = _series_of(r, pid, b["t0"], b["t1"])
+    k2, why2 = _series_of(r, pid, a["t0"], a["t1"])
+    if k1 is None or k2 is None or k1 != k2:
+        return None, why1 or why2 or f"pid {pid} was another process at the read after the load"
+    if r["udd"].get(k1) != b.get("udd"):
         return None, "the pid Chrome named is not a renderer the sampler saw under that Chrome's --user-data-dir"
-    lo = [rd[pid] for t, rd in r["samples"] if t <= s0 - slack and pid in rd]
-    hi = [rd[pid] for t, rd in r["samples"] if t >= s1 + slack and pid in rd]
+    s = r["series"][k1]
+    if len(s) < 2 or max(v for _, v in s) == min(v for _, v in s):
+        return None, "its renderer's run_delay never advanced over the run: the counter is not shown live"
+    lo = [v for t, v in s if t <= s0 - slack]
+    hi = [v for t, v in s if t >= s1 + slack]
     if not lo or not hi:
         return None, "no renderer sample brackets it"
-    return min(n["wall_ms"], max(0, hi[0] - lo[-1]) / 1e6), ""
+    d = hi[0] - lo[-1]
+    if d < 0:
+        return None, "its renderer's summed run_delay decreased across it (a thread exited with its run_delay)"
+    return min(n["wall_ms"], d / 1e6), ""
 
 
 def possible_delay_ms(start: float, wall_ms: float, st: dict) -> float:

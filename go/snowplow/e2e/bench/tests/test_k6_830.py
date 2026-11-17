@@ -1148,14 +1148,23 @@ def test_render_k6_driver(tmp_path):
     assert cfg["viewers"] is True
     b = by[("Job", "k6browser")]["spec"]["template"]
     assert b["metadata"]["annotations"]["kubectl.kubernetes.io/default-container"] == "browser"
-    assert [x["name"] for x in b["spec"]["containers"]] == ["browser"]
+    # the browser, and (#1517 review) the renderers sidecar: the renderer sampler and the CDP watcher, outside the
+    # browser's cgroup, in its process namespace
+    assert [x["name"] for x in b["spec"]["containers"]] == ["browser", "renderers"]
+    assert b["spec"]["shareProcessNamespace"] is True
     assert b["spec"]["containers"][0]["image"] == k6_job.K6_BROWSER_IMAGE
-    # run 19: no sidecar; run 11's race is covered by the browser waiting for
+    # run 19: no forwarder; run 11's race is covered by the browser waiting for
     # an HTTP answer from the portal's ORIGIN before it starts
     assert "initContainers" not in b["spec"]
     args = b["spec"]["containers"][0]["args"][0]
     assert "for u in http://10.0.0.9/; do" in args
-    assert args.index("wait_origin && ") < args.index("k6 run --quiet")
+    # the browser's own k6 (its one run, browser.js) starts only after the origin answered
+    runs = [i for i in range(len(args)) if args.startswith("k6 run ", i)]
+    assert len(runs) == 1 and "/opt/k6/browser.js" in args[runs[0]:].split("\n", 1)[0], runs
+    assert args.index("wait_origin && ") < runs[0]
+    # the sidecar's k6 runs renderers.js only, never browser.js, and loads no portal
+    side = b["spec"]["containers"][1]["args"][0]
+    assert "/opt/k6/renderers.js" in side and "/opt/k6/browser.js" not in side and "10.0.0.9" not in side
     bcfg = json.loads(by[("ConfigMap", "k6browser")]["data"]["browser-config.json"])
     assert bcfg["frontendUrl"] == "http://10.0.0.9" and bcfg["snowplowUrl"] == "http://10.0.0.9/content"
     browser_users = {int(s["user"].rsplit("-", 1)[1]) for s in bcfg["sessions"]}
@@ -1645,12 +1654,33 @@ def _browser_pod_in_docker(tmp_path, *, origin_delay_s, wrapper=True, login_trie
         subprocess.run(["docker", "run", "-d", "--name", spa, "--network", net,
                         "-v", f"{BENCH_DIR / 'tests' / 'fixtures'}:/f:ro", "python:3.12-slim",
                         "sh", "-c", spa_cmd], capture_output=True, check=True)
-        p = subprocess.run(["docker", "run", "--rm", "--network", net,
-                            "-v", f"{k6dir}:/opt/k6:ro", "-v", f"{out}:/out", *env,
-                            "--entrypoint", "/bin/sh", k6_job.K6_BROWSER_IMAGE, "-c", script],
-                           capture_output=True, text=True, timeout=300)
+        # the pod's two containers (#1517 review): the browser, and the renderers sidecar sharing its process
+        # namespace (shareProcessNamespace), its network namespace (the pod's) and /tmp (an emptyDir), each in its
+        # own cgroup
+        tmpd = tmp_path / "podtmp"
+        tmpd.mkdir(mode=0o777)
+        tmpd.chmod(0o777)
+        br = f"{net}-browser"
+        subprocess.run(["docker", "run", "-d", "--name", br, "--network", net,
+                        "-v", f"{k6dir}:/opt/k6:ro", "-v", f"{out}:/out", "-v", f"{tmpd}:/tmp", *env,
+                        "--entrypoint", "/bin/sh", k6_job.K6_BROWSER_IMAGE, "-c", script],
+                       capture_output=True, text=True, check=True)
+        side = None
+        if wrapper:
+            rend = next(c for c in job["spec"]["template"]["spec"]["containers"] if c["name"] == "renderers")
+            side = f"{net}-renderers"
+            subprocess.run(["docker", "run", "-d", "--name", side, "--pid", f"container:{br}",
+                            "--network", f"container:{br}", "-v", f"{k6dir}:/opt/k6:ro", "-v", f"{out}:/out",
+                            "-v", f"{tmpd}:/tmp", "--entrypoint", "/bin/sh", k6_job.K6_BROWSER_IMAGE,
+                            "-c", rend["args"][0]], capture_output=True, text=True, check=True)
+        w = subprocess.run(["docker", "wait", br], capture_output=True, text=True, timeout=300)
+        if side:
+            subprocess.run(["docker", "wait", side], capture_output=True, text=True, timeout=120)
+        logs = subprocess.run(["docker", "logs", br], capture_output=True, text=True)
+        p = subprocess.CompletedProcess(w.args, int(w.stdout.strip() or 1), logs.stdout, logs.stderr)
     finally:
-        subprocess.run(["docker", "rm", "-f", spa], capture_output=True)
+        for c in (f"{net}-renderers", f"{net}-browser", spa):
+            subprocess.run(["docker", "rm", "-f", c], capture_output=True)
         subprocess.run(["docker", "network", "rm", net], capture_output=True)
     if not (out / "browser-exit.json").exists():                # the bare k6 run has no wrapper
         (out / "browser-exit.json").write_text(json.dumps({"kind": "browser_exit",
