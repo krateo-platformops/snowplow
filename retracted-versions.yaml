@@ -37,6 +37,7 @@ retracted:
     charts: [snowplow, snowplow-crds]
     use: 1.12.70
     reason: >-
-      Pre-release built only for a paired bench run (do-not-install), never measured. Superseded for
+      Pre-release built only for a paired bench run (do-not-install), never measured: no paired run
+      was launched for it. Not known to be defective. Superseded for
       measurement by 1.12.74 (the owner's ruling of 2026-11-17), so it will never be measured. This
       entry is permanent.
