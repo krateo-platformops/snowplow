@@ -76,6 +76,65 @@ DENY = re.compile(
     r"scaleuser-\d+|clientconf|\buser(name)?s?\b|subject|serviceaccount|system:|token|"
     r"secret|passw|authoriz|bearer|cookie|credential|eyJ[A-Za-z0-9_-]{10,}|@|=|\"",
     re.IGNORECASE)
+# #1516: snowplow's slowcall records ("slowcall.request", and "slowcall.goroutines", the snapshot taken while a
+# customer request is past its bound) read as hashes, so a stall's blocked frames could not be read from a run's
+# evidence (run 28 N1, #1515). slowcall restricts them itself (internal/slowcall/slowcall.go:28-40, verified in
+# snapshot.go / monitor.go at main 5dc927ff): `stacks` holds, per aggregated stack, its count, the pprof labels
+# on an allowlist (snowplow_work and the fill's apistage_fill_gvr / apistage_fill_reason: a closed class, a GVR,
+# a closed reason; the fill also sets apistage_fill_ra, which is not allowlisted, so slowcall drops it) and
+# frames as `function file-basename:line` (frameOf, keptLabels, renderGroup), never an
+# argument or a pc; `requests` holds, per in-flight slow request, its ServeMux route, work class, ages, open phases
+# and waits (a phase, a mechanism, the waited key only as its redact digest `wait:<hex>`, a GVR, a dial branch and
+# verb, a leader's work class, attempts and status: writeRequestLine). So these records' KEY names (each a code
+# constant of slowcall) are written as they are, and those two text attributes are kept LINE BY LINE where a line
+# has exactly that grammar and names no identity (DENY's identity patterns, the --deny literals and patterns, and
+# bench/identity.py changing nothing); any other line is hashed alone, so one odd frame never hides the others and
+# never leaks. Every other value of these records is judged as any line's is (KEEP, else hashed).
+SLOWCALL_MSGS = frozenset({"slowcall.request", "slowcall.goroutines"})
+SLOWCALL_TEXT = frozenset({"stacks", "requests"})
+_SLOWCALL_PHASES = ("auth", "object_fetch", "rbac_check", "key_mint", "l1_get", "content_read", "flight_wait",
+                    "lock_wait", "fill_admission", "stage_dial", "informer_dispatch", "informer_sync_wait",
+                    "refresher_yield", "jq", "refilter", "parse", "encode", "compress", "write")
+_SLOWCALL_INFO = ("kind", "ms", "outcome", "phase", "key", "gvr", "verb", "leader_class", "leader_work", "branch",
+                  "attempts", "status", "last_cause", "retry_wait_ms", "conn_wait_ms", "dns_ms", "connect_ms",
+                  "tls_ms", "ttfb_ms", "reused", "http_429", "http_5xx", "http_network_errors", "attempt_detail",
+                  "host")
+SLOWCALL_KEYS = frozenset({
+    # snapshotAttrs (snapshot.go)
+    "subsystem", "inflight", "slow_inflight", "slow_customers", "requests_omitted", "oldest_age_ms", "route",
+    "yield_parked", "capture_ms", "goroutines", "request_goroutines", "background_goroutines", "other_goroutines",
+    "stacks_kept", "stacks_omitted", "truncated", "requests", "stacks",
+    # recordAttrs (monitor.go)
+    "method", "class", "wall_ms", "bound_ms", "outcome", "budget", "phase", "phase_sum_ms", "unattributed_ms",
+    "http_attempts", "http_429", "http_5xx", "http_network_errors", "http_reused", "retry_wait_ms", "conn_wait_ms",
+    "connect_ms", "ttfb_ms", "unscoped_http_n", "unscoped_http_ms", "leads",
+    # the CPU window (cpu.go windowAttrs)
+    "cpu_window_ms", "cpu_window_partial", "process_cpu_ms", "process_cores", "cgroup_cpu_ms", "cfs_periods",
+    "cfs_throttled_periods", "cfs_throttled_ms",
+}) | {f"{p}{s}" for p in _SLOWCALL_PHASES for s in ("_ms", "_n", "_max_ms", "_open")} | {
+    f"{pre}{k}" for pre in ("wait_", "dial_", "lead_") for k in _SLOWCALL_INFO}
+# A GVR as snowplow renders it everywhere slowcall shows one: schema.GroupVersionResource.String(),
+# "<group>/<version>, Resource=<resource>" (the core group empty: "/v1, Resource=pods"): the fill's label
+# (apistage.go:1005 beginContentFill(..., gvr.String(), ...)), a lead (apistage.go:980), a dial
+# (internal_dispatch.go:477 / 690), a wait (informer_dispatch.go:621), as slowcall's own tests write it
+# (slowcall_1054_test.go:185 / 198). Admitted as its OWN production, never by widening the token's characters
+# (no ',', ' ' nor '=' anywhere else). NOTE: the GVR comes from a RESTAction stage's path, which a RESTAction can
+# template from request data, so an admitted GVR string can be requester-chosen: it is kept only through every
+# identity guard (DENY's identity patterns, the --deny literals and patterns, bench/identity.py), as any line is.
+_GVR = r"[a-z0-9.-]*/[A-Za-z0-9.-]+, Resource=[A-Za-z0-9.-]+"
+_LABEL = (r"(?:apistage_fill_gvr=" + _GVR + r"|(?:snowplow_work|apistage_fill_reason)=[A-Za-z0-9_./-]*)")
+_STACKS_LINE = re.compile(
+    r"^(?:== (?:request|background) stacks ==|\d+(?: \{" + _LABEL + r"(?:," + _LABEL + r")*\})?"
+    r"|  [A-Za-z0-9_./()*\[\],{}-]+(?: [A-Za-z0-9_.-]+\.(?:go|s):\d+)?)$")
+_TOKEN = r"(?:" + _GVR + r"|[A-Za-z0-9_:./{}*-]+)"
+_REQUESTS_LINE = re.compile(r"^[A-Z]+ /" + r"[A-Za-z0-9_./{}*-]*" + r" class:[A-Za-z0-9_-]+ age_ms:\d+"
+                            r"(?: " + _TOKEN + r")*$")
+# DENY's identity alternatives alone (its "=" and '"' are a concatenated message's marks, not identities, and the
+# grammar above admits no quote at all)
+DENY_IDENTITY = re.compile(
+    r"scaleuser-\d+|clientconf|\buser(name)?s?\b|subject|serviceaccount|system:|token|"
+    r"secret|passw|authoriz|bearer|cookie|credential|eyJ[A-Za-z0-9_-]{10,}|@",
+    re.IGNORECASE)
 TS = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z (.*)$", re.DOTALL)
 # klog's header (k8s.io/klog/v2): Lmmdd hh:mm:ss.uuuuuu threadid file.go:line]
 # body. The file:line is a Go source file's base name: anything else is not a
@@ -129,16 +188,30 @@ class Scrubber:
         # only the caller's own literals / patterns can veto one.
         return k if k in KEY_NAMES and not self._given(k) else "k:" + _h(k)[2:]
 
+    def slowcall_text(self, k: str, v: str) -> str:
+        """#1516: a slowcall record's `stacks` / `requests`, line by line: a line of slowcall's own grammar that
+        names no identity is kept, any other line is hashed alone."""
+        grammar = _STACKS_LINE if k == "stacks" else _REQUESTS_LINE
+        out = []
+        for ln in v.split("\n"):
+            ok = (ln == "" or (grammar.match(ln) is not None and not DENY_IDENTITY.search(ln)
+                               and not self._given(ln) and identity.redact_identity(ln) == ln))
+            out.append(ln if ok else _h(ln))
+        return "\n".join(out)
+
     def scrub(self, rec: dict) -> dict:
         out = {}
+        slowcall = rec.get("msg") in SLOWCALL_MSGS and rec.get("subsystem") == "slowcall"
         for k, v in rec.items():
             if isinstance(v, bool) or isinstance(v, (int, float)) or v is None:
                 val = v
+            elif slowcall and k in SLOWCALL_TEXT and isinstance(v, str):
+                val = self.slowcall_text(k, v)
             elif isinstance(v, str) and k in KEEP and not self.denied(v):
                 val = self.kept(v)
             else:
                 val = _h(v)
-            out[self.key(k)] = val
+            out[k if slowcall and k in SLOWCALL_KEYS and not self._given(k) else self.key(k)] = val
         return out
 
     def line(self, raw: str) -> str:
