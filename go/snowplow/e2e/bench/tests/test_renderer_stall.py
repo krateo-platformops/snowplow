@@ -182,7 +182,8 @@ def test_the_anchors_slack_widens_the_bracket_outward_never_inward():
 def test_in_chrome_each_sessions_page_maps_to_a_renderer_of_its_own_chrome(tmp_path):
     """The rendered k6browser pod against the fixture SPA, 3 sessions for 22 s: the browser container, and the
     renderers sidecar beside it (its own cgroup; the browser's process namespace, network and /tmp). renderers.js
-    reads, every MAP_S, which renderer renders each session's page; the sampler records each renderer's run_delay by
+    reads which renderer renders each session's page only when the page asks (before a class's sign-in, after its
+    login load, after its last load: never on a timer, never inside a load); the sampler records each renderer's run_delay by
     (pid, starttime) and its Chrome's --user-data-dir. Exact: every read names a pid whose sampled series lies under
     the --user-data-dir of the very Chrome whose endpoint named it, each session its own pid, the same pid in every
     read of a class; and EVERY load is charged a measured stall (browser.js waits for a read before a class's
@@ -213,6 +214,74 @@ def test_in_chrome_each_sessions_page_maps_to_a_renderer_of_its_own_chrome(tmp_p
     placed = [k6eval.renderer_delay_ms(n, st) for n in navs]
     assert navs and all(d is not None for d, _ in placed), [w for _, w in placed if w]
     assert all(0 <= d <= n["wall_ms"] for n, (d, _) in zip(navs, placed))
+    # reads only where asked, never more: each read names its ask, and each ask of a class is read once
+    assert all(m.get("ask") in ("before", "login", "after") for m in reads), reads
+    per: dict = {}
+    for m in reads:
+        per[(m["session"], m["class"], m["ask"])] = per.get((m["session"], m["class"], m["ask"]), 0) + 1
+    assert per and all(v == 1 for v in per.values()), per
+    # the wait, with the watcher running: every ask ended on its read (none reached its bound); the after-wait then
+    # holds the page for the sampler's next sample
+    # (2 x RENDERER_SAMPLE_S), so the read after a class's last load has a sample of its renderer after it
+    from bench import k6_job
+    waits = o["points"]["browser_renderer_wait_ms"]
+    assert {(t["session"], t["side"]) for _, t in waits} >= {(s, w) for s in ("s1", "s2", "s3")
+                                                             for w in ("before", "after")}, waits
+    hold = 2 * k6_job.RENDERER_SAMPLE_S * 1000
+    assert all(t["read"] == "yes" and v <= 2 * k6_job.RENDERER_READ_MS
+               + (hold if t["side"] == "after" else 0) for v, t in waits), waits
+    assert all(v >= hold for v, t in waits if t["side"] == "after"), waits
+
+
+@needs_docker
+def test_in_chrome_a_renderer_wait_is_outside_every_measured_time(tmp_path):
+    """A watcher stated but none running (a bare `k6 run`): each class's before-wait runs to its full bound
+    (rendererReadWaitMs, 20 s), and still the sign-in (3.4 s) and the first page (150 + 250 ms) are timed exactly as
+    without one: the wait is never part of a measured time (mutation: starting the sign-in's clock before the wait
+    turns this RED)."""
+    from bench import k6_job
+    from tests.test_k6_830 import _run_browser_fixture
+    o = _run_browser_fixture(tmp_path, renderer_watch=True, duration_s=30, routes=("/dashboard", "/compositions"))
+    waits = o["points"]["browser_renderer_wait_ms"]
+    before = [v for v, t in waits if t["side"] == "before"]
+    bound = 2 * k6_job.RENDERER_READ_MS
+    assert before and all(t["read"] == "no" for _, t in waits), waits
+    assert all(bound <= v <= bound + 2000 for v in before), before
+    login = [v for v, t in o["points"]["browser_page_load_ms"] if t["method"] == "login"]
+    assert len(login) == 1 and 380 <= login[0] <= 480, login
+    signin = [v for v, _ in o["points"]["browser_signin_ms"]]
+    assert len(signin) == 1 and 3300 <= signin[0] <= 4500, signin
+
+
+def test_a_renderer_is_known_alive_from_its_process_start_not_only_from_its_first_sample():
+    """A class's first read can come before the sampler's first sample of a renderer created just before it (the pod
+    test, 2026-11-17: read at +0.0 s, first sample at +0.4 s): its process's own start (starttime / CLK_TCK, on the
+    samples' uptime) shows it held the pid through the read. One that started after the read did not (mutation:
+    ignoring the start leaves the first case UNKNOWN; reading the start as "alive" without the hz the sampler
+    recorded is not done: no hz, no start)."""
+    o = {"renderers": [{"kind": "renderer_clock", "hz": 100},
+                       {"kind": "renderer", "t": 5.4, "rd": {"10:500": 1}},
+                       {"kind": "renderer", "t": 6.4, "rd": {"10:500": 2}}]}
+    r = k6eval.renderer_state(o, 100.0)                       # epoch = uptime + 100: the process started at 105.0
+    assert r["started"] == {(10, "500"): 105.0}
+    assert k6eval._series_of(r, 10, 105.1, 105.2) == ((10, "500"), "")
+    assert k6eval._series_of(r, 10, 104.0, 104.5)[0] is None  # before the process existed: not its pid then
+    no_hz = k6eval.renderer_state({"renderers": o["renderers"][1:]}, 100.0)
+    assert no_hz["started"] == {} and k6eval._series_of(no_hz, 10, 105.1, 105.2)[0] is None
+
+
+def test_render_browser_refuses_a_config_without_its_renderer_watch():
+    """The k6browser pod always has its renderers sidecar: a config that says no watcher (no wait for a read) is
+    refused, never rendered into a measured pod (mutation: dropping the refusal turns this RED)."""
+    from bench import k6_job
+    kw = dict(sessions=[{"name": "s1", "user": "u", "offset": 0, "cold": True}], routes=["/a"], password="x",
+              think_s=1, duration_s=10, frontend_url="http://f", snowplow_url="http://s", authn_url="http://a",
+              debug_user="d")
+    assert "renderers" in k6_job.render_browser(config=k6_job.browser_config(**kw), linger_s=0)
+    with pytest.raises(ValueError, match="the k6browser pod has a renderers watcher"):
+        k6_job.render_browser(config=k6_job.browser_config(**kw, renderer_watch=False), linger_s=0)
+    with pytest.raises(ValueError, match="the k6browser pod has a renderers watcher"):
+        k6_job.render_browser(config=dict(k6_job.browser_config(**kw), rendererReadWaitMs=0), linger_s=0)
 
 
 # ─── the sidecar's sampler, under a POSIX sh, against a process that rewrites its command line as Chromium does ──

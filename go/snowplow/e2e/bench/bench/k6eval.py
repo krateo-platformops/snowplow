@@ -76,7 +76,9 @@ _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "browser_call_ms", "browser_request_incomplete_ms", "browser_request_failed_start_unseen",
          "browser_fresh_class",
          # #1508: one per browser session, how it ended (early yes/no, its cause)
-         "browser_session_end")
+         "browser_session_end",
+         # #1517: each wait for a renderer read (before a class's sign-in, after its last load): outside every load
+         "browser_renderer_wait_ms")
 _METRIC = re.compile(r'\{"metric":"([^"]+)"')
 # the points whose time is kept too (out["times"], index-aligned with
 # out["points"]): run 12 compares latency inside / outside the CPU profiles;
@@ -331,18 +333,26 @@ def renderer_state(o: dict | None, off: float | None) -> dict:
                     series.setdefault((int(pid), start), []).append((float(r["t"]) + off, int(v)))
     for s in series.values():
         s.sort(key=lambda x: x[0])
+    # each series' process start on the epoch (its starttime / the sampler's CLK_TCK, on the same uptime the samples
+    # are timed by): the earliest instant the process is known alive, before its first sample
+    hz = next((r.get("hz") for r in (o or {}).get("renderers") or [] if r.get("kind") == "renderer_clock"), None)
+    started = ({k: int(k[1]) / hz + off for k in series if k[1].isdigit()}
+               if isinstance(hz, int) and hz > 0 and off is not None else {})
     reads = [m for m in (o or {}).get("renderer_map") or []
              if m.get("kind") == "renderer_map" and isinstance(m.get("t0"), (int, float))
              and isinstance(m.get("t1"), (int, float))]
-    return {"series": series, "udd": udd, "reads": sorted(reads, key=lambda m: m["t0"]),
+    return {"series": series, "udd": udd, "started": started, "reads": sorted(reads, key=lambda m: m["t0"]),
             "anchored": off is not None, "recorded": {"renderers": (o or {}).get("renderers") is not None,
                                                      "renderer_map": (o or {}).get("renderer_map") is not None}}
 
 
 def _series_of(r: dict, pid: int, t0: float, t1: float) -> tuple[tuple[int, str] | None, str]:
     """The one (pid, starttime) series of `pid` that was sampled through a read lasting [t0, t1]: a pid's series
-    ends where its process ended; another process that got the pid later is another series."""
-    alive = [k for k, s in r["series"].items() if k[0] == pid and s[0][0] <= t1 and s[-1][0] >= t0]
+    ends where its process ended; another process that got the pid later is another series. Known alive from its
+    process's own start (its starttime, r["started"]) or else its first sample, to its last sample."""
+    started = r.get("started") or {}
+    alive = [k for k, s in r["series"].items()
+             if k[0] == pid and min(s[0][0], started.get(k, s[0][0])) <= t1 and s[-1][0] >= t0]
     if len(alive) != 1:
         return None, (f"{len(alive)} sampled processes held pid {pid} through its read" if alive
                       else f"no renderer sample of pid {pid} spans its read")

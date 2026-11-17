@@ -224,8 +224,11 @@ def browser_config(*, sessions: list[dict], routes: list[str], password: str,
                    think_s: float, duration_s: float, quiet_ms: int = 1000,
                    page_timeout_ms: int = 60000, signin_timeout_ms: int = 60000,
                    frontend_url: str, snowplow_url: str, authn_url: str, debug_user: str,
-                   fresh: dict | None = None) -> dict:
-    """`fresh` (#935): bench/fresh_classes.plan — each session's fresh users,
+                   fresh: dict | None = None, renderer_watch: bool = True) -> dict:
+    """`renderer_watch` (#1517): whether a renderers watcher reads this browser's pages, a property of the run:
+    the k6browser pod always has one (render_browser refuses a config that says otherwise); only a bare `k6 run`
+    of browser.js with no sidecar (a test fixture) has none, and then no page waits for a read that cannot come.
+    `fresh` (#935): bench/fresh_classes.plan — each session's fresh users,
     in order; `frontend_url`: the portal's origin; `snowplow_url`: snowplow as the browser reaches it (config
     SNOWPLOW_API_BASE_URL), where a session reads the learned-class counters, as `debug_user` (bench/rbac_model.py
     THE DEBUG READER, logged in at `authn_url`), never as the session's own user."""
@@ -238,9 +241,16 @@ def browser_config(*, sessions: list[dict], routes: list[str], password: str,
             "frontendUrl": frontend_url, "snowplowUrl": snowplow_url,
             "authnUrl": authn_url.rstrip("/"), "debugUser": debug_user,
             "firstVisit": first_visit_label(sessions),
-            # #1517 review: how long a page waits for renderers.js's next read of it (its poll + one read), before
-            # its class's sign-in and after its class's last load, so every load has a read on both sides
-            "rendererReadWaitMs": MAP_S * 1000 + RENDERER_READ_MS}
+            # #1517 review: how long a page waits for the read it asked renderers.js for (before its class's sign-in,
+            # after its login load, after its last load): the read it asked for, behind at most one read of the
+            # same Chrome still in flight, each bounded by RENDERER_READ_MS. With the watcher running, a wait ends
+            # as soon as its read is over; the bound is reached only when no read comes. Outside every measured
+            # time: the sign-in's clock starts after the before-wait, the login read follows the login load, the
+            # after-wait the class's last load (browser_renderer_wait_ms)
+            "rendererWatch": bool(renderer_watch),
+            "rendererReadWaitMs": 2 * RENDERER_READ_MS if renderer_watch else 0,
+            # after a class's last read, the page stays open for the sampler's next sample of its renderer
+            "rendererSampleWaitMs": 2 * RENDERER_SAMPLE_S * 1000 if renderer_watch else 0}
 
 
 def _indent(text: str, n: int) -> str:
@@ -337,8 +347,6 @@ sampler=$!
 #: most two periods of that renderer's own runnable time (an idle page's renderer is not runnable: it accrues none).
 #: 1 s: under the judged loads' bars (500 ms warm, 1000 ms cold) and one awk over /proc a second
 RENDERER_SAMPLE_S = 1
-#: how often renderers.js reads which renderer renders each session's page, the CPU windows' own period
-MAP_S = CPU_SAMPLE_S
 #: one page's read by renderers.js (attach, marker, trace, stamp, detach): past it the read is a failed one, and the
 #: watcher waits for its session's detach before it reads the next page (no trace of it overlaps another read)
 RENDERER_READ_MS = 10000
@@ -430,7 +438,7 @@ renderer_watch() {{
     ts="$ts${{ts:+,}}{{\\"udd\\": \\"${{f%/DevToolsActivePort}}\\", \\"url\\": \\"ws://127.0.0.1:$port$path\\"}}"
   done
   printf '{{"kind": "renderer_watch", "browsers": %s, "of": {sessions}, "waited_s": %s}}\\n' "$n" "$w" > /out/renderer-watch.json
-  CDP_TARGETS="[$ts]" MAP_S={MAP_S} READ_MS={RENDERER_READ_MS} k6 run --quiet --log-format raw \\
+  CDP_TARGETS="[$ts]" READ_MS={RENDERER_READ_MS} k6 run --quiet --log-format raw \\
     --console-output /out/renderer-map.jsonl /opt/k6/renderers.js >/dev/null 2>/out/renderer-watch.err
 }}
 """
@@ -441,7 +449,11 @@ def renderers_script(sessions: int, linger_s: float) -> str:
     is over (/out/done), then /out/renderers-done (its readiness: the Job's pod is Ready when both are over), then it
     lingers for collect like the browser container."""
     return f"""set -u
-{_renderer_sampler(sessions)}rsampler_loop &
+{_renderer_sampler(sessions)}# the clock ticks a starttime counts (each series' process start on the node's uptime: a process that started
+# before a read and was sampled after it held its pid through the read)
+hz=$(getconf CLK_TCK 2>/dev/null) || hz=
+printf '{{"kind": "renderer_clock", "hz": %s}}\\n' "${{hz:-null}}" >> /out/browser-renderers.jsonl
+rsampler_loop &
 rsampler=$!
 renderer_watch &
 rw=$!
@@ -684,6 +696,10 @@ def render_browser(*, config: dict, linger_s: float,
     renders each session's page, from OUTSIDE the browser container's cgroup
     (shareProcessNamespace: its /proc; a shared /tmp: each Chrome's
     DevToolsActivePort; the pod's network: the CDP endpoints)."""
+    if config.get("rendererWatch") is not True or not config.get("rendererReadWaitMs"):
+        raise ValueError("the k6browser pod has a renderers watcher, so its browser config must say so "
+                         "(browser_config(renderer_watch=True)): without its wait a page is not read on both sides "
+                         "of its loads, and every load would be charged UNKNOWN")
     files = {"browser.js": (K6_DIR / "browser.js").read_text(),
              "pageload.js": (K6_DIR / "pageload.js").read_text(),
              "renderers.js": (K6_DIR / "renderers.js").read_text(),
