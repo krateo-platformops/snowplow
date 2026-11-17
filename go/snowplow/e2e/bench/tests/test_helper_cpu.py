@@ -145,17 +145,21 @@ def _rho(x):
 
 
 def test_a_drifting_series_has_fewer_effective_windows_than_windows():
-    """Ten 60 s windows drifting up (0.040 .. 0.058): rho is well above 0, n_eff = n (1 - rho) / (1 + rho), and the
-    resolution 2 SD / sqrt(n_eff) is wider than 2 SD / sqrt(n) would say (mutation: rho ignored turns this RED)."""
-    x = [0.040 + 0.002 * i for i in range(10)]
+    """Thirty 60 s windows drifting slowly up and down (a 12.6-window wave): rho is well above 0 (0.86),
+    n_eff = n (1 - rho) / (1 + rho) is 2.25 of 30, and the resolution 2 SD / sqrt(n_eff) is wider than
+    2 SD / sqrt(n) would say (mutation: rho ignored turns this RED). A straight-line drift is unresolved: below."""
+    import math
+    x = [0.05 + 0.004 * math.sin(0.5 * i) for i in range(30)]
     rho = _rho(x)
-    assert rho == pytest.approx(0.7, abs=1e-9)                   # (n - 3) / n for a straight line, n = 10
+    assert rho == pytest.approx(0.8603, abs=1e-4)
     sp = k6eval.spread(x)
-    n_eff = 10 * (1 - rho) / (1 + rho)
-    sd = (sum((a - sum(x) / 10) ** 2 for a in x) / 9) ** 0.5
+    n_eff = 30 * (1 - rho) / (1 + rho)
+    sd = (sum((a - sum(x) / 30) ** 2 for a in x) / 29) ** 0.5
     assert sp["rho"] == pytest.approx(rho, abs=1e-4) and sp["n_eff"] == pytest.approx(n_eff, abs=1e-3)
     assert sp["resolution"] == pytest.approx(2 * sd / n_eff ** 0.5, abs=1e-4)
-    assert sp["resolution"] > 2 * sd / 10 ** 0.5
+    assert sp["resolution"] > 2 * sd / 30 ** 0.5
+    line = k6eval.spread([0.040 + 0.002 * i for i in range(10)])       # rho = (n - 3) / n = 0.7: n_eff 1.76
+    assert line["rho"] == pytest.approx(0.7) and line["resolution"] is None and "unresolved" in line["why"]
 
 
 def test_too_few_effective_windows_is_unresolved_said():

@@ -202,10 +202,11 @@ def argv_for(d: str, s: dict) -> list[str]:
             "--expect-digest", s["expect_digest"][0], "--profile-dir", os.path.join(d, "heap")]
     if s["driver"][0] == "k6":
         argv += ["--k6-out", os.path.join(d, "k6"), "--browser-out", os.path.join(d, "browser"),
-                 "--browser-sessions", str(s["browser_sessions"][0]), *([] if s["viewers"][0] else ["--no-viewers"]),
+                 "--browser-sessions", str(s["browser_sessions"][0]),
                  # #1525 review: the renderer watch the run was configured with, from its own manifest (the one
-                 # browser_sessions was derived from)
-                 "--loadgen-job", os.path.join(d, "loadgen-job.yaml")]
+                 # browser_sessions was derived from); in run606's own order
+                 "--loadgen-job", os.path.join(d, "loadgen-job.yaml"),
+                 *([] if s["viewers"][0] else ["--no-viewers"])]
         argv += browser_logs(d)
     # #1422: a run that had the settle step is judged on its settle.json, there or not (derive: its run.log)
     settle = os.path.join(d, "settle.json")
