@@ -59,13 +59,54 @@ func requireExponentialSYNRetransmits(t *testing.T) {
 	}
 }
 
-func iptablesSYN(t *testing.T, op string, port int) {
-	t.Helper()
+func iptablesSYN(op string, port int) error {
 	out, err := exec.Command("sudo", "-n", "iptables", op, "INPUT", "-p", "tcp", "--syn",
 		"--dport", strconv.Itoa(port), "-j", "DROP").CombinedOutput()
 	if err != nil {
-		t.Fatalf("iptables %s: %v: %s (this arm must drop SYNs; it runs only in the syndrop-1509 CI job)", op, err, out)
+		return fmt.Errorf("iptables %s: %v: %s", op, err, strings.TrimSpace(string(out)))
 	}
+	return nil
+}
+
+// synDropRule is the arm's SYN-drop rule, and the arm owns its lifecycle
+// exactly once: one install, and one removal, by whichever remove first finds
+// it installed. The comeback removes it; the cleanup first stops and waits for
+// the comeback, then removes it only if it is still in place (the arm failed
+// before the comeback). A removal that fails leaves it marked installed and
+// is reported: a leftover rule would drop the next run's SYNs.
+//
+// #1521: the comeback used to flip a "removed" flag only after its iptables
+// process had exited, while the kernel lets SYNs through as soon as the rule
+// is gone. A request that answered in that window (17 ms after comeback, CI
+// run 44087993326) let the test end and its cleanup find the flag unset, and
+// the second -D found no rule.
+type synDropRule struct {
+	port      int
+	mu        sync.Mutex
+	installed bool
+}
+
+func (r *synDropRule) install() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := iptablesSYN("-I", r.port); err != nil {
+		return err
+	}
+	r.installed = true
+	return nil
+}
+
+func (r *synDropRule) remove() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.installed {
+		return nil
+	}
+	if err := iptablesSYN("-D", r.port); err != nil {
+		return err
+	}
+	r.installed = false
+	return nil
 }
 
 func TestIssue1509_SYNDrop_RaceRidesThroughADroppingDestination(t *testing.T) {
@@ -149,11 +190,17 @@ func TestIssue1509_SYNDrop_RaceRidesThroughADroppingDestination(t *testing.T) {
 	// 2. Leave, and drop SYNs: the rule goes in before the request, and the
 	// probe proves the drop works (a connect that cannot complete).
 	leaving.Store(true)
-	iptablesSYN(t, "-I", port)
-	var removed atomic.Bool
+	rule := &synDropRule{port: port}
+	if err := rule.install(); err != nil {
+		t.Fatalf("%v (this arm must drop SYNs; it runs only in the syndrop-1509 CI job)", err)
+	}
+	stopComeback := func() error { return nil }
 	t.Cleanup(func() {
-		if !removed.Load() {
-			iptablesSYN(t, "-D", port)
+		if err := stopComeback(); err != nil {
+			t.Errorf("removing the SYN-drop rule at comeback: %v", err)
+		}
+		if err := rule.remove(); err != nil {
+			t.Errorf("removing the SYN-drop rule at cleanup: %v (a leftover rule would drop the next run's SYNs)", err)
 		}
 	})
 	if c, err := net.DialTimeout("tcp", srv.Listener.Addr().String(), 300*time.Millisecond); err == nil {
@@ -164,11 +211,16 @@ func TestIssue1509_SYNDrop_RaceRidesThroughADroppingDestination(t *testing.T) {
 	// 3. The request; the rule is removed 3.3 s after it started.
 	start = time.Now()
 	const comeback = 3300 * time.Millisecond
+	stop, comebackErr := make(chan struct{}), make(chan error, 1)
 	go func() {
-		time.Sleep(comeback)
-		iptablesSYN(t, "-D", port)
-		removed.Store(true)
+		select {
+		case <-time.After(comeback):
+			comebackErr <- rule.remove()
+		case <-stop:
+			comebackErr <- nil
+		}
 	}()
+	stopComeback = func() error { close(stop); return <-comebackErr }
 	resp, err := Send(SendSiteStage, cli, getReq(t, budgetLeft(9*time.Second), srv.URL))
 	took := time.Since(start)
 	attemptsMu.Lock()
