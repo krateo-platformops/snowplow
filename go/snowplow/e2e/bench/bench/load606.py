@@ -4005,16 +4005,28 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
     # its own renderer's stall; a load whose renderer is not known is UNKNOWN, never the container's bound
     rule = st.get("rule") or k6eval.RULE_CONTAINER
     per_load: list[float] | None = None
+    threads: dict | None = None
     if rule == k6eval.RULE_RENDERER:
-        got = [k6eval.renderer_delay_ms(n, st) for n in navs]
-        why_unknown = Counter(w for d, w in got if d is None)
+        got = [k6eval.renderer_delay(n, st) for n in navs]
+        why_unknown = Counter(g["why"] for g in got if g["ms"] is None)
         if why_unknown:
             missing.append(f"the renderer of {sum(why_unknown.values())} page load(s) ("
                            + "; ".join(f"{k}: {v}" for k, v in why_unknown.most_common()) + ")")
-        per_load = [d or 0.0 for d, _ in got]
+        # a renderer thread that exited (or started) inside a load's bracket is measured, with what the sum cannot
+        # hold stated as an under-count bound; the load's stall is judged at its upper end (measured + bound): the
+        # most of the load the load generator may have taken, never the least
+        per_load = [g["upper_ms"] or 0.0 for g in got]
+        measured = [g for g in got if g["ms"] is not None]
+        bounds = [g["bound_ms"] for g in measured if g["bound_ms"]]
+        threads = {"loads_measured": len(measured),
+                   "loads_with_thread_exit": sum(1 for g in measured if g["exited"]),
+                   "loads_with_thread_start": sum(1 for g in measured if g["started"]),
+                   "undercount_bound_ms_max": round(max(bounds), 1) if bounds else 0.0,
+                   "undercount_bound_ms_total": round(sum(bounds), 1)}
     value = {"rule": rule, "rule_text": k6eval.RULE_TEXT[rule],
              "stall_share": st["stall_share"], "saturated_windows": st["saturated_windows"],
-             "windows": len(st["windows"]), "node_cpus": st["node_cpus"]}
+             "windows": len(st["windows"]), "node_cpus": st["node_cpus"],
+             **({"renderer_threads": threads} if threads is not None else {})}
     if missing or not st["windows"]:
         return {"check": name, "value": value, "bar": "measured: no judged outcome decided by the stall",
                 "result": "UNMEASURED",

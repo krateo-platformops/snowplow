@@ -32,7 +32,7 @@ def _uptime(epoch: float) -> float:
 
 
 def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, stall=None, lost=(), idle=None,
-          ops=None, node=True, helper_cpu=True, watch=None, omit=()):
+          ops=None, node=True, helper_cpu=True, watch=None, omit=(), per_thread=False, exiting=(), churn=()):
     """Warm loads at 600 ms (over the 500 ms bar) for 3 sessions, inside 20 s of browser-container stall (every
     window stalled 5 s: the container rule explains the FAIL away). `renderer`: the run also recorded per-renderer
     evidence: each session's renderer (PIDS) read by renderers.js before and (`map_after`) after its loads, and
@@ -41,7 +41,11 @@ def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, s
     `idle`: the node's idle ticks per CPU window (0 = no idle CPU); `ops`: the cluster's operations record (none
     recorded by default: every lost session is judged on its renderer alone). The run's recorded loadgen manifest
     states the renderer watch (#1525 review): `watch` True (default: as `renderer`), or False (absent: a bench
-    before #1517); `omit`: those per-renderer files removed after they were written."""
+    before #1517); `omit`: those per-renderer files removed after they were written. `per_thread`: the samples also
+    hold each renderer THREAD's own run_delay ("th", a sampler since 2026-11-18): the renderer's main thread holds
+    the whole stall; the renderers of `exiting` sessions also had a thread holding 3 s of run_delay (accrued before
+    the loads) that exits halfway through them, so their summed "rd" drops by 3 s; those of `churn` sessions start a
+    thread at every sample that is gone by the next (no run_delay of its own)."""
     k6dir, bdir = tmp_path / "k6", tmp_path / "browser"
     _write_out(k6dir, "k6", _k6_points(20), _k6_summary(20), 0)
     _write_viewer(k6dir)
@@ -64,14 +68,24 @@ def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, s
         first, last = min(int(t["t0"]) for t in loads) / 1000, max(int(t["t0"]) for t in loads) / 1000 + 1
         udd = {s: f"/tmp/k6browser-data-{s}" for s in SESSIONS}
         rows = [{"kind": "renderer_udd", "pid": PIDS[s], "start": START, "udd": (udd_of or udd)[s]} for s in SESSIONS]
+        mid = (first + last) / 2
         for i in range(60):                                   # every second from T_POINTS - 15
             t = T_POINTS - 15 + i
             # a stalled renderer waits for a CPU all the time its loads run (1 s of run_delay per second); every
             # renderer's counter is live: it advanced (2 ms) while its page first rendered, before the loads
-            rows.append({"kind": "renderer", "t": _uptime(t), "rd": {
-                f"{PIDS[s]}:{START}": (int(1e9 * min(max(0.0, t - (first - 1)), last + 1 - (first - 1)))
-                                       if s in stalled else 0) + (1000 if t < first - 8 else 2001000)
-                for s in SESSIONS}})
+            main = {s: (int(1e9 * min(max(0.0, t - (first - 1)), last + 1 - (first - 1))) if s in stalled else 0)
+                    + (1000 if t < first - 8 else 2001000) for s in SESSIONS}
+            th = {s: {f"{PIDS[s]}:{START}": main[s]} for s in SESSIONS}
+            for s in exiting:
+                if t < mid:
+                    th[s][f"{PIDS[s] + 5000}:{int(START) + 7}"] = 3_000_000_000
+            for s in churn:
+                th[s][f"{20000 + i}:{int(START) + 100 + i}"] = 0
+            row = {"kind": "renderer", "t": _uptime(t),
+                   "rd": {f"{PIDS[s]}:{START}": sum(th[s].values()) for s in SESSIONS}}
+            if per_thread:
+                row["th"] = {f"{PIDS[s]}:{START}": th[s] for s in SESSIONS}
+            rows.append(row)
         (bdir / "browser-renderers.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
         maps = []
         for s in SESSIONS:
@@ -201,6 +215,132 @@ def test_the_anchors_slack_widens_the_bracket_outward_never_inward():
     waiting 1000 ns/s), never 6 .. 6."""
     st = _st([_read(1), _read(9.5)], slack=1.0)
     assert k6eval.renderer_delay_ms(LOAD, st) == (pytest.approx(4000 / 1e6), "")
+
+
+# ─── per-thread run_delay (rehf1, 2026-11-18): a renderer thread that exits is measured, with its bound ──────────
+# rehf1: 8 wall-time checks INCONCLUSIVE and browser.cpu_starvation UNMEASURED from 2 of 5172 loads whose renderer's
+# SUMMED run_delay decreased (a thread exited with its run_delay). The sampler now records each thread's own
+# run_delay, keyed by (tid, the thread's own starttime), and the evaluator sums each thread's own delta.
+
+def test_a_renderer_thread_that_exits_mid_load_is_measured_with_its_bound(tmp_path):
+    """s1's renderer loses a thread holding 3 s of run_delay halfway through its loads. Per thread: every load is
+    MEASURED (the thread keeps its last value: no stall is charged for it), the check is decided (PASS: the idle
+    renderers take nothing from the 600 ms loads) and warm p95 FAILs as measured; the exit is a signal, its
+    under-count bound one sampling period (1 s, the gap between the thread's last sample and the next)."""
+    _, v = _case(tmp_path, per_thread=True, exiting=("s1",))
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "PASS", c
+    th = c["value"]["renderer_threads"]
+    assert th["loads_with_thread_exit"] >= 1 and th["loads_with_thread_start"] == 0, th
+    assert th["undercount_bound_ms_max"] == pytest.approx(1000.0, abs=1), th
+    assert th["loads_measured"] == 63, th
+    assert _check(v["checks"], "warm_nav_p95_ms")["result"] == "FAIL"
+
+
+def test_old_evidence_with_only_the_summed_run_delay_keeps_the_exit_unknown(tmp_path):
+    """The same renderers recorded by a sampler before per-thread samples (only "rd"): the drop is not
+    distinguishable from a broken counter, so those loads stay UNKNOWN and the wall-time checks INCONCLUSIVE
+    (rehf1's shape: its evidence can only be read this way)."""
+    _, v = _case(tmp_path, per_thread=False, exiting=("s1",))
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "UNMEASURED", c
+    assert "its renderer's summed run_delay decreased across it (a thread exited with its run_delay)" in c["why"]
+    assert _check(v["checks"], "warm_nav_p95_ms")["result"] == "INCONCLUSIVE"
+
+
+def test_the_under_count_bound_is_judged_as_stall_the_load_generator_may_have_caused(tmp_path):
+    """Every renderer starts a thread at every sample that is gone by the next: no run_delay is measured on any
+    load, but each load's bracket holds threads whose run_delay outside their samples is unknown, up to 1 s each
+    side. Judged at the upper end (measured + bound, capped at the load's time), the 600 ms loads may be the load
+    generator's: warm p95 is decided by the stall, FAIL (mutation: judging the measured part alone reads PASS)."""
+    _, v = _case(tmp_path, per_thread=True, churn=SESSIONS)
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "FAIL" and "warm_nav_p95_ms" in c["why"], c
+    th = c["value"]["renderer_threads"]
+    assert th["loads_with_thread_exit"] == 63 and th["loads_with_thread_start"] == 63, th
+
+
+def _thr(series_ns, extra):
+    """renderer_state's per-thread shape by hand: at each integer t in 0..20 the main thread ("7", "1") at
+    `series_ns`(t), plus each extra thread {(tid, start): {t: ns}} where it has a sample."""
+    at = {}
+    for t in range(0, 21):
+        snap = {("7", "1"): series_ns(t)}
+        for k, vals in extra.items():
+            if t in vals:
+                snap[k] = vals[t]
+        at[float(t)] = snap
+    return at
+
+
+def _st_thr(extra, main=lambda t: 1000 * t):
+    threads = _thr(main, extra)
+    series = {(7, "1"): [(t, sum(s.values())) for t, s in sorted(threads.items())]}
+    st = _st([_read(1), _read(9)], series)
+    st["renderer"].update(threads={(7, "1"): threads}, per_thread=True)
+    return st
+
+
+@pytest.mark.parametrize("extra,want", [
+    # an exited thread keeps its last sampled value: +1000 ns from t5 to t6, then gone (bound: t6 -> t7, 1 s)
+    ({("12", "80"): {t: 1000 * t for t in range(0, 7)}},
+     {"ms": pytest.approx(3000 / 1e6), "bound_ms": 1000.0, "exited": 1, "started": 0}),
+    # a thread first seen mid-load counts from its first sample: +100 ns from t6 to t7 (bound: t5 -> t6, 1 s)
+    ({("11", "70"): {t: 5000 + 100 * (t - 6) for t in range(6, 21)}},
+     {"ms": pytest.approx(2100 / 1e6), "bound_ms": 1000.0, "exited": 0, "started": 1}),
+    # a tid reused with another starttime is another thread: (9, 50) exits after t5, (9, 60) starts at t6
+    ({("9", "50"): {t: 9000 for t in range(0, 6)}, ("9", "60"): {t: 100 * (t - 6) for t in range(6, 21)}},
+     {"ms": pytest.approx(2100 / 1e6), "bound_ms": 2000.0, "exited": 1, "started": 1}),
+], ids=["exited-keeps-its-last-value", "new-thread-from-its-first-sample", "tid-reused-new-starttime"])
+def test_each_threads_own_delta_is_summed_with_the_bound_stated(extra, want):
+    """LOAD 5.0 .. 7.0, bracketed by the samples at 5 and 7; the main thread waits 1000 ns/s (2000 ns). Mutants
+    pinned: an exited thread dropped (summing only the threads alive at the end), a new thread counted from 0, a
+    thread keyed by its tid alone (the reused tid reads as one thread going backwards: UNKNOWN), the bound not
+    added."""
+    got = k6eval.renderer_delay(LOAD, _st_thr(extra))
+    assert got["why"] == "" and {k: got[k] for k in want} == want, got
+    assert got["upper_ms"] == pytest.approx(min(LOAD["wall_ms"], got["ms"] + want["bound_ms"]))
+
+
+def test_a_threads_own_run_delay_going_backwards_stays_unknown():
+    """The same tid AND starttime with a lower run_delay at a later sample is a broken counter, not an exit: UNKNOWN,
+    never clamped (mutation: clamping the decrease to 0 reads MEASURED)."""
+    got = k6eval.renderer_delay(LOAD, _st_thr({("13", "90"): {5: 8000, 6: 7000, 7: 9000}}))
+    assert got["ms"] is None and got["why"] == ("thread 13 (starttime 90) of its renderer: its own run_delay went "
+                                                "backwards across it (a broken counter, not an exit)"), got
+
+
+def test_a_bracketing_sample_without_its_per_thread_record_is_unknown():
+    """Per-thread evidence where one bracketing sample lacks the renderer's threads: UNKNOWN, never the summed rule."""
+    st = _st_thr({})
+    del st["renderer"]["threads"][(7, "1")][6.0]
+    got = k6eval.renderer_delay(LOAD, st)
+    assert got["ms"] is None and got["why"] == "a sample of its renderer that brackets it has no per-thread record"
+
+
+def test_renderer_state_reads_each_threads_key_and_value():
+    o = {"renderers": [{"kind": "renderer", "t": 5.0, "rd": {"10:500": 7}, "th": {"10:500": {"10:500": 3, "11:530": 4}}},
+                       {"kind": "renderer", "t": 6.0, "rd": {"10:500": 3}, "th": {"10:500": {"10:500": 3}}}]}
+    r = k6eval.renderer_state(o, 100.0)
+    assert r["per_thread"] is True
+    assert r["threads"] == {(10, "500"): {105.0: {("10", "500"): 3, ("11", "530"): 4}, 106.0: {("10", "500"): 3}}}
+    old = {"renderers": [{k: v for k, v in r_.items() if k != "th"} for r_ in o["renderers"]]}
+    assert k6eval.renderer_state(old, 100.0)["per_thread"] is False
+
+
+def test_a_reused_tid_read_from_the_samples_is_another_thread():
+    """From the sampler's own records through renderer_state: tid 9 with starttime 50 exits after t5 and a new
+    thread gets tid 9 with starttime 60 at t6, its run_delay starting low. Two threads (one exited, one started,
+    the stall measured), never one thread going backwards (mutation: keying a thread by its tid alone reads UNKNOWN)."""
+    rows = [{"kind": "renderer_udd", "pid": 7, "start": "1", "udd": "u"}]
+    for t in range(0, 21):
+        th = {"7:1": 1000 * t}
+        th.update({"9:50": 9000} if t <= 5 else {"9:60": 100 * (t - 6)})
+        rows.append({"kind": "renderer", "t": float(t), "rd": {"7:1": sum(th.values())}, "th": {"7:1": th}})
+    r = k6eval.renderer_state({"renderers": rows, "renderer_map": [_read(1), _read(9)]}, 0.0)
+    got = k6eval.renderer_delay(LOAD, {"slack_s": 0.0, "renderer": r})
+    assert got["why"] == "" and got["ms"] == pytest.approx(2100 / 1e6), got
+    assert (got["exited"], got["started"], got["bound_ms"]) == (1, 1, 2000.0), got
 
 
 # ─── real Chrome: the frame -> renderer mapping, from the rendered browser container ─────────────────────────
@@ -434,3 +574,49 @@ def test_the_sampler_keys_each_renderer_by_pid_and_starttime_and_reads_its_run_d
     assert len(samples) == 2 and all(list(s["rd"]) == [f"{fake.pid}:{start}"] for s in samples), samples
     key = f"{fake.pid}:{start}"
     assert samples[1]["rd"][key] >= samples[0]["rd"][key] >= 0
+    # per thread: the single-threaded process's one thread, its tid the pid and its starttime the process's
+    for r in rows:
+        if r["kind"] == "renderer" and key in r["rd"]:
+            assert r["th"][key] == {f"{fake.pid}:{start}": r["rd"][key]}, r
+
+
+@pytest.mark.skipif(not __import__("os").path.isdir("/proc/self/task"), reason="needs Linux /proc")
+def test_the_sampler_records_each_thread_by_tid_and_its_own_starttime_and_drops_an_exited_one(tmp_path):
+    """A renderer-shaped process (a python3 named `chromium`, `--type=renderer` among its arguments) that starts a
+    second thread 0.3 s after it starts and lets it exit 1.2 s later: sampled while both run, its "th" holds both
+    threads, the second under its own tid and its OWN starttime (not the process's), and "rd" is their sum; sampled
+    after the second exited, only the first (mutation: keying a thread by the process's starttime turns this RED)."""
+    import os
+    import subprocess
+    import sys
+    import time
+
+    from bench import k6_job
+    exe = tmp_path / "chromium"
+    exe.symlink_to(os.path.realpath(sys.executable))
+    code = ("import threading,time;t=threading.Thread(target=lambda: time.sleep(1.2));time.sleep(0.3);t.start();"
+            "[time.sleep(0.05) for _ in iter(int, 1)]")
+    fake = subprocess.Popen([str(exe), "-I", "-c", code, "--type=renderer", "--user-data-dir=/tmp/k6browser-data-t2"])
+    try:
+        time.sleep(0.8)
+        with open(f"/proc/{fake.pid}/stat") as fh:
+            start = fh.read().rsplit(") ", 1)[1].split()[19]
+        tids = sorted(os.listdir(f"/proc/{fake.pid}/task"), key=int)
+        assert len(tids) == 2, tids
+        script = k6_job._renderer_sampler(1).replace("/out/", f"{tmp_path}/")
+        p = subprocess.run(["sh", "-c", script + "rsample\nsleep 1.5\nrsample\n"], capture_output=True, text=True,
+                           timeout=60)
+        assert p.returncode == 0, p.stderr
+        rows = [json.loads(x) for x in (tmp_path / "browser-renderers.jsonl").read_text().splitlines()]
+    finally:
+        fake.kill()
+    key = f"{fake.pid}:{start}"
+    samples = [r for r in rows if r["kind"] == "renderer" and key in r["rd"]]
+    assert len(samples) == 2, rows
+    first, second = samples[0]["th"][key], samples[1]["th"][key]
+    other = [k for k in first if not k.startswith(f"{fake.pid}:")]
+    assert f"{fake.pid}:{start}" in first and len(other) == 1, first
+    tid, tstart = other[0].split(":")
+    assert tid == tids[1] and int(tstart) > int(start), (other, start)    # its own starttime, 0.3 s later
+    assert list(second) == [f"{fake.pid}:{start}"], second                  # the exited thread is gone
+    assert all(s["rd"][key] == sum(s["th"][key].values()) for s in samples), samples

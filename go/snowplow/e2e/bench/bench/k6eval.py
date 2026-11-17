@@ -332,15 +332,23 @@ def renderer_state(o: dict | None, off: float | None) -> dict:
     each series' --user-data-dir, and every renderer read (k6/renderers.js), the failed ones too (pid null: they
     break a chain of agreeing reads)."""
     series: dict[tuple[int, str], list[tuple[float, int]]] = {}
+    threads: dict[tuple[int, str], dict[float, dict[tuple[str, str], int]]] = {}
     udd: dict[tuple[int, str], str | None] = {}
+    per_thread = False
     for r in (o or {}).get("renderers") or []:
         if r.get("kind") == "renderer_udd" and isinstance(r.get("pid"), int):
             udd[(r["pid"], str(r.get("start")))] = r.get("udd")
         elif r.get("kind") == "renderer" and isinstance(r.get("t"), (int, float)) and off is not None:
+            per_thread = per_thread or "th" in r
             for k, v in (r.get("rd") or {}).items():
                 pid, _, start = str(k).partition(":")
                 if pid.isdigit() and start:
                     series.setdefault((int(pid), start), []).append((float(r["t"]) + off, int(v)))
+            for k, ths in (r.get("th") or {}).items():
+                pid, _, start = str(k).partition(":")
+                if pid.isdigit() and start and isinstance(ths, dict):
+                    threads.setdefault((int(pid), start), {})[float(r["t"]) + off] = {
+                        tuple(str(tk).partition(":")[::2]): int(tv) for tk, tv in ths.items()}
     for s in series.values():
         s.sort(key=lambda x: x[0])
     # each series' process start on the epoch (its starttime / the sampler's CLK_TCK, on the same uptime the samples
@@ -351,7 +359,8 @@ def renderer_state(o: dict | None, off: float | None) -> dict:
     reads = [m for m in (o or {}).get("renderer_map") or []
              if m.get("kind") == "renderer_map" and isinstance(m.get("t0"), (int, float))
              and isinstance(m.get("t1"), (int, float))]
-    return {"series": series, "udd": udd, "started": started, "reads": sorted(reads, key=lambda m: m["t0"]),
+    return {"series": series, "threads": threads, "per_thread": per_thread, "udd": udd, "started": started,
+            "reads": sorted(reads, key=lambda m: m["t0"]),
             "anchored": off is not None, "recorded": {"renderers": (o or {}).get("renderers") is not None,
                                                      "renderer_map": (o or {}).get("renderer_map") is not None}}
 
@@ -370,7 +379,40 @@ def _series_of(r: dict, pid: int, t0: float, t1: float) -> tuple[tuple[int, str]
 
 
 def renderer_delay_ms(n: dict, st: dict) -> tuple[float | None, str]:
-    """(at most how much of page load `n` was its OWN renderer waiting for a CPU, "") or (None, why it is UNKNOWN).
+    """renderer_delay's (ms, why): the stall it measured (without its under-count bound), or None and why."""
+    d = renderer_delay(n, st)
+    return d["ms"], d["why"]
+
+
+def _thread_delta(times: list[float], snaps: list[dict]) -> tuple[dict | None, str]:
+    """A load's renderer run_delay from each THREAD's own samples (k6_job._renderer_sampler's "th"), over the samples
+    that bracket the load (`times`, `snaps`: {(tid, thread starttime): ns} per sample): the sum over threads of each
+    thread's last sampled value less its first. A thread that exits keeps its last sampled value (the sum never
+    decreases because of an exit), one first seen after the first sample counts from its first sample. What the sum
+    cannot hold, it bounds: an exited thread's run_delay after its last sample, and a new thread's before its first,
+    are each at most the time between that sample and its neighbour (one thread waits at most the wall time). A
+    thread (the same tid AND starttime) whose run_delay went backwards is a broken instrument: (None, why)."""
+    total, bound_s, exited, started = 0, 0.0, 0, 0
+    for key in sorted({k for s in snaps for k in s}):
+        idx = [i for i, s in enumerate(snaps) if key in s]
+        vals = [snaps[i][key] for i in idx]
+        if any(b < a for a, b in pairwise(vals)):
+            return None, (f"thread {key[0]} (starttime {key[1]}) of its renderer: its own run_delay went backwards "
+                          "across it (a broken counter, not an exit)")
+        total += vals[-1] - vals[0]
+        if idx[-1] < len(snaps) - 1:
+            exited += 1
+            bound_s += times[idx[-1] + 1] - times[idx[-1]]
+        if idx[0] > 0:
+            started += 1
+            bound_s += times[idx[0]] - times[idx[0] - 1]
+    return {"ns": total, "bound_ms": bound_s * 1000, "exited": exited, "started": started}, ""
+
+
+def renderer_delay(n: dict, st: dict) -> dict:
+    """{"ms": at most how much of page load `n` was its OWN renderer waiting for a CPU, "bound_ms": what that may
+    under-count (threads that exited or started inside its bracket: _thread_delta), "upper_ms": the two together
+    (capped at the load's time), "exited", "started": those threads, "why": ""}, or "ms" None and why it is UNKNOWN.
 
     Its renderer: the pid Chrome's frame->process record named for the load's session and identity class in a read
     that ENDED before the load started and in one that STARTED after it ended, the same pid and page target in
@@ -378,18 +420,24 @@ def renderer_delay_ms(n: dict, st: dict) -> tuple[float | None, str]:
     or that was not read on both sides, is not known), resolved to the one (pid, starttime) series the sampler
     recorded through both reads, under the --user-data-dir of the Chrome whose endpoint named it. Its stall: that
     series' run_delay between the last sample at or before the load's start and the first at or after its end (each
-    side widened OUTWARD by the anchor's error, st["slack_s"]), capped at the load's own time. UNKNOWN too: a
-    series whose run_delay never advanced over the run (the counter is not shown live), and one that decreased
-    across the load (a thread of the renderer exited with its run_delay: the known under-count, flagged)."""
+    side widened OUTWARD by the anchor's error, st["slack_s"]), capped at the load's own time. With per-thread samples
+    (a sampler since 2026-11-18) the stall is the sum of each thread's own delta (_thread_delta): a thread that exits
+    is a stated under-count bound, never UNKNOWN; a thread whose own run_delay went backwards is UNKNOWN. Without
+    them (older evidence) the series' summed run_delay, and a sum that decreased across the load is UNKNOWN (a
+    thread exited with its run_delay: #1517's known under-count, which only per-thread samples can resolve).
+    UNKNOWN too: a series whose run_delay never advanced over the run (the counter is not shown live)."""
+    def unknown(why: str) -> dict:
+        return {"ms": None, "bound_ms": None, "upper_ms": None, "exited": 0, "started": 0, "why": why}
+
     r = st.get("renderer") or {}
     if not r.get("anchored"):
-        return None, "the renderer samples have no wall-clock anchor"
+        return unknown("the renderer samples have no wall-clock anchor")
     if not (r.get("recorded") or {}).get("renderers"):
-        return None, "no renderer samples were recorded (browser-renderers.jsonl)"
+        return unknown("no renderer samples were recorded (browser-renderers.jsonl)")
     if not (r.get("recorded") or {}).get("renderer_map"):
-        return None, "no renderer reads were recorded (renderer-map.jsonl)"
+        return unknown("no renderer reads were recorded (renderer-map.jsonl)")
     if n.get("start") is None:
-        return None, "the load has no start"
+        return unknown("the load has no start")
     s0, s1 = n["start"], n["start"] + n["wall_ms"] / 1000
     slack = st.get("slack_s") or 0.0
     key = (n.get("session"), n.get("class"))
@@ -397,32 +445,44 @@ def renderer_delay_ms(n: dict, st: dict) -> tuple[float | None, str]:
     before = [m for m in ok if m["t1"] <= s0]
     after = [m for m in ok if m["t0"] >= s1]
     if not before or not after:
-        return None, "its renderer was not read both before and after it"
+        return unknown("its renderer was not read both before and after it")
     b, a = max(before, key=lambda m: m["t1"]), min(after, key=lambda m: m["t0"])
     span = [m for m in ok if m["t0"] >= b["t0"] and m["t1"] <= a["t1"]]
     if len({m["pid"] for m in span}) != 1 or len({m.get("target") for m in span}) != 1:
-        return None, "its renderer changed while it loaded"
+        return unknown("its renderer changed while it loaded")
     if any(m.get("pid") is None and m.get("udd") == b.get("udd") and m["t0"] < a["t1"] and m["t1"] > b["t0"]
            for m in r["reads"]):
-        return None, "a read of its Chrome between the two failed"
+        return unknown("a read of its Chrome between the two failed")
     pid = b["pid"]
     k1, why1 = _series_of(r, pid, b["t0"], b["t1"])
     k2, why2 = _series_of(r, pid, a["t0"], a["t1"])
     if k1 is None or k2 is None or k1 != k2:
-        return None, why1 or why2 or f"pid {pid} was another process at the read after the load"
+        return unknown(why1 or why2 or f"pid {pid} was another process at the read after the load")
     if r["udd"].get(k1) != b.get("udd"):
-        return None, "the pid Chrome named is not a renderer the sampler saw under that Chrome's --user-data-dir"
+        return unknown("the pid Chrome named is not a renderer the sampler saw under that Chrome's --user-data-dir")
     s = r["series"][k1]
     if len(s) < 2 or max(v for _, v in s) == min(v for _, v in s):
-        return None, "its renderer's run_delay never advanced over the run: the counter is not shown live"
-    lo = [v for t, v in s if t <= s0 - slack]
-    hi = [v for t, v in s if t >= s1 + slack]
+        return unknown("its renderer's run_delay never advanced over the run: the counter is not shown live")
+    lo = [i for i, (t, _) in enumerate(s) if t <= s0 - slack]
+    hi = [i for i, (t, _) in enumerate(s) if t >= s1 + slack]
     if not lo or not hi:
-        return None, "no renderer sample brackets it"
-    d = hi[0] - lo[-1]
+        return unknown("no renderer sample brackets it")
+    win = s[lo[-1]:hi[0] + 1]
+    if r.get("per_thread"):
+        at = (r.get("threads") or {}).get(k1) or {}
+        if any(t not in at for t, _ in win):
+            return unknown("a sample of its renderer that brackets it has no per-thread record")
+        got, why = _thread_delta([t for t, _ in win], [at[t] for t, _ in win])
+        if got is None:
+            return unknown(why)
+        ms = min(n["wall_ms"], got["ns"] / 1e6)
+        return {"ms": ms, "bound_ms": got["bound_ms"], "upper_ms": min(n["wall_ms"], ms + got["bound_ms"]),
+                "exited": got["exited"], "started": got["started"], "why": ""}
+    d = win[-1][1] - win[0][1]
     if d < 0:
-        return None, "its renderer's summed run_delay decreased across it (a thread exited with its run_delay)"
-    return min(n["wall_ms"], d / 1e6), ""
+        return unknown("its renderer's summed run_delay decreased across it (a thread exited with its run_delay)")
+    ms = min(n["wall_ms"], d / 1e6)
+    return {"ms": ms, "bound_ms": 0.0, "upper_ms": ms, "exited": 0, "started": 0, "why": ""}
 
 
 def possible_delay_ms(start: float, wall_ms: float, st: dict) -> float:

@@ -369,10 +369,13 @@ def _renderer_sampler(sessions: int) -> str:
     threads: the time they were runnable and waited for a CPU), KEYED BY (pid, starttime) (/proc/<pid>/stat field
     22: a reused pid is another series, never the old one's continuation), timed by /proc/uptime (node-wide: the
     browser container's cpu_start anchor places it), into /out/browser-renderers.jsonl: {"kind": "renderer", "t",
-    "rd": {"<pid>:<starttime>": ns}}, and once per series its Chrome's --user-data-dir ({"kind": "renderer_udd",
-    "pid", "start", "udd"}), which the evaluator matches against the CDP endpoint that named the pid.
-    KNOWN UNDER-COUNT: an exited thread's run_delay leaves the sum with it; a sum that decreases is flagged by the
-    evaluator, a decrease hidden by later growth is not. And renderer_watch: once `sessions` Chrome (one per k6 VU)
+    "rd": {"<pid>:<starttime>": ns}, "th": {"<pid>:<starttime>": {"<tid>:<thread starttime>": ns}}}, and once per
+    series its Chrome's --user-data-dir ({"kind": "renderer_udd", "pid", "start", "udd"}), which the evaluator
+    matches against the CDP endpoint that named the pid. "th" is each THREAD's own run_delay, keyed by its tid and
+    its own starttime (/proc/<pid>/task/<tid>/stat field 22: a reused tid is another thread), and "rd" is their sum:
+    the evaluator sums each thread's own delta, so a thread that exits keeps its last sampled value (the summed "rd"
+    loses it: #1517's known under-count), and what it accrued after that sample is at most one sampling period, a
+    bound the evaluator states. And renderer_watch: once `sessions` Chrome (one per k6 VU)
     wrote DevToolsActivePort (or RENDERER_WAIT_S passed), k6/renderers.js on their CDP endpoints, its lines into
     /out/renderer-map.jsonl."""
     return f"""# stof <pid>: ST = the process's starttime (/proc/<pid>/stat field 22, after the parenthesised comm)
@@ -408,17 +411,25 @@ rsample() {{
   for p in "$@"; do
     [ -r /proc/$p/stat ] || continue
     files="$files /proc/$p/stat"
-    for f in /proc/$p/task/*/schedstat; do [ -r "$f" ] && files="$files $f"; done
+    # each thread's own stat (its starttime: with its tid, the thread's key), then its schedstat
+    for d in /proc/$p/task/*; do [ -r "$d/stat" ] && [ -r "$d/schedstat" ] && files="$files $d/stat $d/schedstat"; done
   done
   [ -n "$files" ] || return 0
   read -r up _ < /proc/uptime
-  # each pid's own stat first (its starttime: the series key), then its threads' schedstat (field 2 summed)
+  # each pid's own stat first (its starttime: the series key), then per thread its stat (the thread's own
+  # starttime, field 22) and its schedstat (field 2: the thread's run_delay, and summed into the process's "rd"). A
+  # thread whose stat could not be read (it exited between the listing and the read) is in neither
   # shellcheck disable=SC2086
-  awk -v t="$up" 'FNR == 1 {{ n = split(FILENAME, a, "/"); p = a[3] }}
+  awk -v t="$up" 'FNR == 1 {{ n = split(FILENAME, a, "/"); p = a[3]; tid = (a[4] == "task") ? a[5] : "" }}
     FILENAME ~ /^\\/proc\\/[0-9]+\\/stat$/ {{ x = $0; sub(/^.*\\) /, "", x); split(x, f, " "); st[p] = f[20]; next }}
-    {{ s[p] += $2 }}
-    END {{ o = ""; for (p in s) if (p in st) o = o (o == "" ? "" : ", ") "\\"" p ":" st[p] "\\": " s[p];
-          printf "{{\\"kind\\": \\"renderer\\", \\"t\\": %s, \\"rd\\": {{%s}}}}\\n", t, o }}' \\
+    FILENAME ~ /\\/task\\/[0-9]+\\/stat$/ {{ x = $0; sub(/^.*\\) /, "", x); split(x, f, " "); tst[p, tid] = f[20]; next }}
+    ((p, tid) in tst) {{ s[p] += $2; trd[p, tid] = $2 }}
+    END {{ for (k in trd) {{ split(k, q, SUBSEP)
+                            th[q[1]] = th[q[1]] (th[q[1]] == "" ? "" : ", ") "\\"" q[2] ":" tst[k] "\\": " trd[k] }}
+          o = ""; h = ""
+          for (p in s) if (p in st) {{ o = o (o == "" ? "" : ", ") "\\"" p ":" st[p] "\\": " s[p]
+                                     h = h (h == "" ? "" : ", ") "\\"" p ":" st[p] "\\": {{" th[p] "}}" }}
+          printf "{{\\"kind\\": \\"renderer\\", \\"t\\": %s, \\"rd\\": {{%s}}, \\"th\\": {{%s}}}}\\n", t, o, h }}' \\
     $files 2>/dev/null >> /out/browser-renderers.jsonl
 }}
 rknown=""; rnot=""
