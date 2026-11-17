@@ -31,7 +31,7 @@ def _uptime(epoch: float) -> float:
 
 
 def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, stall=None, lost=(), idle=None,
-          ops=None):
+          ops=None, node=True):
     """Warm loads at 600 ms (over the 500 ms bar) for 3 sessions, inside 20 s of browser-container stall (every
     window stalled 5 s: the container rule explains the FAIL away). `renderer`: the run also recorded per-renderer
     evidence: each session's renderer (PIDS) read by renderers.js before and (`map_after`) after its loads, and
@@ -50,7 +50,8 @@ def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, s
             p["data"]["tags"].update(early="yes", cause=f"session {p['data']['tags']['session']}: the login form "
                                                         "could not be filled: timed out")
     _write_out(bdir, "browser", pts, _browser_summary(63), 0)
-    _cpu_file(bdir, "browser", 3000, [1.0] * 20, stall=stall if stall is not None else [5.0] * 20, idle=idle)
+    _cpu_file(bdir, "browser", 3000, [1.0] * 20, stall=stall if stall is not None else [5.0] * 20, idle=idle,
+              node=node)
     if renderer:
         loads = [p["data"]["tags"] for p in pts if p["metric"] == "browser_page_load_ms"]
         first, last = min(int(t["t0"]) for t in loads) / 1000, max(int(t["t0"]) for t in loads) / 1000 + 1
@@ -265,10 +266,12 @@ def test_in_chrome_a_renderer_wait_is_outside_every_measured_time(tmp_path):
     assert len(signin) == 1 and 3300 <= signin[0] <= 4500, signin
 
 
-# ─── a lost session, judged by cause: its own renderer's measured starvation is an environment event (#1517) ──
+# ─── a lost session, judged by cause: the load generator measured saturated is an environment event (#1517) ──
+# the owner's ruling (2026-11-17): "saturation = environment, stated honestly"
 
 #: the CPU windows (5 s from T_POINTS - 15): the third, [T - 5, T], holds s2's loss window; idle 0 = no idle CPU
 SATURATED_AT_LOSS = [400, 400, 0] + [400] * 17
+SATURATED = "load generator saturated (no idle CPU) during the session's window"
 
 
 def _sessions(v):
@@ -276,49 +279,75 @@ def _sessions(v):
             next((c for c in v["checks"] if c["check"] == "browser.sessions_lost"), None))
 
 
-def test_a_session_lost_while_its_own_renderer_was_starved_is_the_environment(tmp_path):
-    """No control-plane operation in its window, but the node had no idle CPU there and s2's renderer waited for one
-    across it: INVALID by environment, named (mutation: dropping the renderer events turns this a product FAIL)."""
-    _, v = _case(tmp_path, lost=("s2",), stalled=("s2",), idle=SATURATED_AT_LOSS)
+@pytest.mark.parametrize("stalled", [("s2",), ()], ids=["its-renderer-waited", "its-renderer-did-not-wait"])
+def test_a_session_lost_while_the_load_generator_was_saturated_is_the_environment(tmp_path, stalled):
+    """No control-plane operation in its window, but the node had not one idle CPU tick in a window overlapping
+    it: INVALID by environment, named so, with no causal claim, whether or not its renderer's run_delay moved (on a
+    saturated node every process waits) (mutation: dropping the saturation events turns this a product FAIL)."""
+    _, v = _case(tmp_path, lost=("s2",), stalled=stalled, idle=SATURATED_AT_LOSS)
     ses, lost = _sessions(v)
     assert ses["result"] == "FAIL" and ses["why"].startswith("INVALID by environment: 1 of 3 "), ses
-    assert "s2's renderer (pid 102) waited" in ses["why"] and lost is None
+    assert SATURATED in ses["why"] and "waited" not in ses["why"] and lost is None
 
 
-@pytest.mark.parametrize("stalled,idle", [((), SATURATED_AT_LOSS), (("s2",), None)],
-                         ids=["renderer-not-waiting", "node-not-saturated"])
-def test_a_session_lost_without_its_renderer_starved_is_a_product_fail(tmp_path, stalled, idle):
-    """Either signal alone is not starvation of THIS session's renderer: a product FAIL, named."""
-    _, v = _case(tmp_path, lost=("s2",), stalled=stalled, idle=idle)
+def test_a_session_lost_on_an_unsaturated_load_generator_is_a_product_fail(tmp_path):
+    _, v = _case(tmp_path, lost=("s2",), stalled=("s2",))
     ses, lost = _sessions(v)
     assert ses["result"] == "PASS" and lost["result"] == "FAIL", (ses, lost)
     assert "no environment event in its window" in lost["why"]
 
 
-def test_a_session_lost_with_its_renderer_unmeasured_is_undecided(tmp_path):
-    """Per-renderer evidence, but s2's renderer was never read: whether it starved is unknown, never "no event"
-    (mutation: reading an unmeasured renderer as no event turns this a product FAIL)."""
-    _, v = _case(tmp_path, lost=("s2",), stalled=("s2",), idle=SATURATED_AT_LOSS, udd_of=None, map_after=False)
-    ses, _ = _sessions(v)
-    assert ses["result"] == "FAIL", ses
-    # its before-read exists (map_after only drops the after-reads): drop s2's reads altogether
-    rm = tmp_path / "browser" / "renderer-map.jsonl"
-    rm.write_text("".join(x + "\n" for x in rm.read_text().splitlines() if '"session": "s2"' not in x))
-    from tests.test_k6_830 import _evaluate_cli
-    _, v = _evaluate_cli(tmp_path, tmp_path / "k6", tmp_path / "browser", "--cluster-operations",
-                         str(tmp_path / "cluster-operations.json"))
+def test_a_session_lost_with_the_nodes_cpu_unmeasured_is_undecided(tmp_path):
+    """Re: per-renderer evidence, but the node's idle ticks were not sampled: undecided, never "no event"
+    (mutation: reading an unmeasured node as unsaturated turns this a product FAIL)."""
+    _, v = _case(tmp_path, lost=("s2",), node=False)
     ses, lost = _sessions(v)
     assert ses["result"] == "FAIL" and lost is None, (ses, lost)
-    assert ses["why"].startswith("INVALID by environment (undecided): s2: ") and "its renderer was never read" in \
-        ses["why"], ses["why"]
+    assert ses["why"].startswith("INVALID by environment (undecided): s2: ") and \
+        "the loadgen node's CPU was not measured" in ses["why"], ses["why"]
 
 
 def test_old_evidence_judges_a_lost_session_on_control_plane_events_only(tmp_path):
-    """No per-renderer data (a bench before #1517): the container's stall is not a session's environment event;
+    """No per-renderer data (a bench before #1517): the node's saturation is not a session's environment event;
     with no control-plane operation in the window the loss is a product FAIL (the owner's ruling)."""
     _, v = _case(tmp_path, renderer=False, lost=("s2",), idle=SATURATED_AT_LOSS)
     ses, lost = _sessions(v)
     assert ses["result"] == "PASS" and lost["result"] == "FAIL", (ses, lost)
+
+
+def _st(*wins, node=True, anchored=True, slack=0.0):
+    return {"node": node, "anchored": anchored, "slack_s": slack,
+            "windows": [{"t0": a, "t1": b, "saturated": sat} for a, b, sat in wins]}
+
+
+@pytest.mark.parametrize("wins, w0, w1, want", [
+    ([(0, 5, False), (5, 10, True), (10, 15, False)], 8, 12, 1),       # inside one saturated window
+    ([(0, 5, False), (5, 10, True), (10, 15, False)], 9.9, 14, 1),     # a PARTIAL overlap counts
+    ([(0, 5, False), (5, 10, True), (10, 15, False)], 10, 14, 1),      # touching its end: one shared instant
+    ([(0, 5, False), (5, 10, False), (10, 15, False)], 1, 14, 0),      # covered, never saturated: no event
+], ids=["inside", "partial", "touching", "covered-unsaturated"])
+def test_saturation_overlaps_mean_one_shared_instant(wins, w0, w1, want):
+    got, why = k6eval.saturation_events(_st(*wins), w0, w1)
+    assert why == "" and len(got) == want and all(e["what"] == SATURATED for e in got), (got, why)
+
+
+@pytest.mark.parametrize("st, w0, w1, why", [
+    (_st((0, 5, False), node=False), 1, 4, "the loadgen node's CPU was not measured"),
+    (_st((0, 5, False), anchored=False), 1, 4, "the CPU samples have no wall-clock anchor"),
+    (_st((0, 5, False), (5, 10, False)), 1, 14, "the loadgen node's CPU samples do not cover the whole session window"),
+    (_st((0, 5, False), (8, 12, False)), 1, 11, "the loadgen node's CPU samples do not cover the whole session window"),
+    (_st(), 1, 4, "the loadgen node's CPU samples do not cover the whole session window"),
+], ids=["node-unmeasured", "unanchored", "window-past-the-samples", "gap-in-the-samples", "no-samples"])
+def test_saturation_that_cannot_be_told_is_undecided_never_no_event(st, w0, w1, why):
+    """Rd / Re: an unmeasured node, unanchored samples, or a stretch of the session window no sample covers, with
+    no saturation seen elsewhere in it: (None, why), never [] (mutations: each check dropped turns its case RED)."""
+    assert k6eval.saturation_events(st, w0, w1) == (None, why)
+
+
+def test_the_anchors_error_widens_each_window_outward():
+    """A window 0.05 s short of the session's start overlaps it once widened by the anchor's 0.1 s error."""
+    got, _ = k6eval.saturation_events(_st((0, 4.95, True), (4.95, 10, False), slack=0.1), 5, 9)
+    assert len(got) == 1
 
 
 def test_a_renderer_is_known_alive_from_its_process_start_not_only_from_its_first_sample():

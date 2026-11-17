@@ -880,63 +880,53 @@ def session_ends(o: dict | None, declared: int | None, logs: list[str] | None = 
     return out
 
 
-def renderer_starvation_events(st: dict, session: str | None, w0: float, w1: float) -> tuple[list[dict] | None, str]:
-    """#1517 (the owner's ruling, 2026-11-17: a session lost while the load generator measurably starved it is
-    INVALID by environment): the windows inside [w0, w1] in which the session's OWN renderer was starved, from two
-    measured signals and no threshold of the bench's making: the loadgen node had not one idle CPU tick in the
-    window (starvation()'s `saturated`), and the session's renderer (its last read at or before w1, resolved to its
-    (pid, starttime) series) waited for a CPU across that same window (its run_delay advanced). (events, "") or
-    (None, why) when the renderer or the node cannot be measured there: never read as "not starved"."""
-    r = st.get("renderer") or {}
+def saturation_events(st: dict, w0: float, w1: float) -> tuple[list[dict] | None, str]:
+    """#1517 (the owner's ruling, 2026-11-17: "saturation = environment, stated honestly"): the sample windows in
+    which the load-generator node was MEASURED saturated (starvation()'s `saturated`: not one idle CPU tick on any
+    CPU) that OVERLAP the session's window [w0, w1], i.e. share at least one instant with it (win.t0 <= w1 and
+    win.t1 >= w0, each window widened by the anchor's error, st["slack_s"]). On a saturated node every running
+    process waits for a CPU, the bench's own driver among them, so the bench cannot tell snowplow from its driver
+    there: an environment event, said as such, with no claim of what it caused.
+    (events, "") or (None, why) when it cannot be told: the node's CPU not measured, the samples not anchored, or
+    a part of [w0, w1] that no sample window covers (an unsampled stretch is not "no saturation")."""
     if not st.get("node"):
         return None, "the loadgen node's CPU was not measured"
-    if not r.get("anchored"):
-        return None, "the renderer samples have no wall-clock anchor"
-    reads = [m for m in r.get("reads") or [] if m.get("session") == session and isinstance(m.get("pid"), int)
-             and m["t0"] <= w1]
-    if not reads:
-        return None, "its renderer was never read"
-    m = max(reads, key=lambda x: x["t0"])
-    key, why = _series_of(r, m["pid"], m["t0"], m["t1"])
-    if key is None:
-        return None, why
-    s = r["series"][key]
-    out, unjudged = [], 0
-    for win in st.get("windows") or []:
-        if win["t1"] < w0 or win["t0"] > w1 or not win.get("saturated"):
-            continue
-        lo = [v for t, v in s if t <= win["t0"]]
-        hi = [v for t, v in s if t >= win["t1"]]
-        if not lo or not hi:
-            unjudged += 1
-            continue
-        if hi[0] > lo[-1]:
-            out.append({"t0": win["t0"], "t1": win["t1"],
-                        "what": f"the loadgen node had no idle CPU and {session}'s renderer (pid {m['pid']}) waited "
-                                f"{(hi[0] - lo[-1]) / 1e6:.0f} ms for one"})
-    if not out and unjudged:
-        return None, f"{unjudged} saturated window(s) in it are not bracketed by samples of its renderer"
-    return out, ""
+    if not st.get("anchored"):
+        return None, "the CPU samples have no wall-clock anchor"
+    slack = st.get("slack_s") or 0.0
+    wins = sorted((w for w in st.get("windows") or [] if w["t0"] - slack <= w1 and w["t1"] + slack >= w0),
+                  key=lambda w: w["t0"])
+    hit = [w for w in wins if w.get("saturated")]
+    if hit:
+        return [{"t0": w["t0"], "t1": w["t1"],
+                 "what": "load generator saturated (no idle CPU) during the session's window"} for w in hit], ""
+    # no saturation seen: only a "no event" when the windows cover the whole session window, gap-free
+    covered = bool(wins) and wins[0]["t0"] - slack <= w0 and wins[-1]["t1"] + slack >= w1 and all(
+        b["t0"] - slack <= a["t1"] + slack for a, b in zip(wins, wins[1:]))
+    if not covered:
+        return None, "the loadgen node's CPU samples do not cover the whole session window"
+    return [], ""
 
 
 def sessions_check(ends: dict, loads: int | None = None, events: list[dict] | None = None,
                    events_why: str = "", last_activity: dict | None = None,
-                   drive_start: float | None = None, renderer_events=None) -> tuple[dict, dict | None]:
+                   drive_start: float | None = None, saturation=None) -> tuple[dict, dict | None]:
     """(environment.browser_sessions, browser.sessions_lost): every declared session ran to the drive's end; one
     that did not is judged by CAUSE (the owner's ruling, 2026-11-17), from evidence the bench records only:
 
       - a lost session whose last stretch (its last recorded activity, `last_activity`, any class's last load, else
         the drive's start, `drive_start`; to the latest its end can be, `at_until`, else `at`) a recorded
-        environment event overlaps (`events`: each {t0, t1, what}: a control-plane operation of the cluster's
-        cluster-operations record) is INVALID by environment, named with the event;
+        environment event overlaps, i.e. shares at least one instant with (event t0 <= window end and event t1 >=
+        window start; `events`: each {t0, t1, what}: a control-plane operation of the cluster's cluster-operations
+        record), is INVALID by environment, named with the event;
       - one that no recorded event overlaps is a FAIL (a product failure: browser.sessions_lost), named with its
         cause and "no environment event in its window";
       - one whose end is not recorded, or a run whose events could not be read (`events` None: `events_why`), is
         INVALID (undecided): its cause cannot be told.
     Evidence without per-renderer data has only the control-plane operations as environment events; with it
-    (#1517), `renderer_events(session, w0, w1)` -> (events, "") or (None, why unmeasured) adds the load generator's
-    CPU starvation of that session's own renderer (renderer_starvation_events), and a renderer it cannot measure
-    leaves the loss undecided."""
+    (#1517), `saturation(w0, w1)` -> (events, "") or (None, why unmeasured) adds the load generator's node measured
+    saturated in a sample window overlapping the session's window (saturation_events), and a node it cannot tell
+    for that window leaves the loss undecided."""
     base = {"check": "environment.browser_sessions", "bar": "every declared browser session runs to the drive's end"}
     if ends.get("state") != "READ":
         return dict(base, value=None, result="FAIL",
@@ -964,10 +954,10 @@ def sessions_check(ends: dict, loads: int | None = None, events: list[dict] | No
             continue
         w0, w1 = min(w0, at), max(at, x.get("at_until") or at)
         hit = [e for e in events if e["t0"] <= w1 and (e["t1"] is None or e["t1"] >= w0)]
-        if not hit and renderer_events is not None:
-            # #1517: the session's own renderer, measured starved in the window, is an environment event too;
-            # an unmeasured renderer leaves the loss undecided, never "no event"
-            got, why = renderer_events(x.get("session"), w0, w1)
+        if not hit and saturation is not None:
+            # #1517 ("saturation = environment, stated honestly"): the load generator measured saturated in a window
+            # overlapping the session's is an environment event too; one it cannot tell leaves the loss undecided
+            got, why = saturation(w0, w1)
             if got is None:
                 undecided.append(dict(x, window=[w0, w1], why=why))
                 continue
