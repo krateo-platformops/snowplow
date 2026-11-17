@@ -4,10 +4,17 @@
 # GitHub's runners have passwordless sudo, which the build VM and a developer laptop do not, so the
 # arm is built only here, and here it never skips: when it cannot drop SYNs it fails.
 #
+# The kernel must resend a lost SYN on the exponential schedule production showed (#1509, run27
+# N2: connects at about 3.1 s and 7.1 s). The runner kernel resends the first SYNs linearly, 1 s
+# apart (net.ipv4.tcp_syn_linear_timeouts), under which ONE socket reaches the destination within
+# 1 s of its return and no arm can tell the race from no race (RUN, #1521 first run). So the job
+# sets it to 0; the arm fails if it is not 0.
+#
 # Two legs prove the arm can say both things:
-#   - base:   the code as it is: the arm must PASS (the race rides through the dropped SYNs);
-#   - mutant: the race reverted (M-b: no raced attempt): the arm must FAIL. A mutant that passes
-#             means the arm no longer detects the race, and the leg fails.
+#   - base:   the code as it is: the arm must PASS, three runs;
+#   - mutant: the race reverted (M-b: no raced attempt): the arm must FAIL, and on its NO-RACE
+#             assertion (the request waited for its one socket's SYN retransmit). A mutant that
+#             passes, or fails for any other reason, fails the leg.
 name: syndrop-1509
 
 on:
@@ -46,6 +53,13 @@ jobs:
           go-version-file: go/snowplow/go.mod
       - name: iptables is usable (the arm fails without it)
         run: sudo -n iptables -S INPUT >/dev/null
+      - name: exponential SYN retransmits, as production showed
+        run: |
+          if [ -e /proc/sys/net/ipv4/tcp_syn_linear_timeouts ]; then
+            sudo -n sysctl -w net.ipv4.tcp_syn_linear_timeouts=0
+          fi
+          sysctl net.ipv4.tcp_syn_retries
+          cat /proc/sys/net/ipv4/tcp_syn_linear_timeouts 2>/dev/null || echo "no tcp_syn_linear_timeouts: exponential"
       - name: apply M-b (no raced attempt)
         if: matrix.leg == 'mutant'
         run: |
@@ -60,11 +74,19 @@ jobs:
       - name: the SYN-drop arm, three runs
         if: matrix.leg == 'base'
         run: go test -tags syndrop1509 -run '^TestIssue1509_SYNDrop_' -count=3 -v ./internal/credhttp/
-      - name: the SYN-drop arm must fail on the mutant
+      - name: the SYN-drop arm must fail on the mutant, on its NO-RACE assertion
         if: matrix.leg == 'mutant'
         run: |
-          if go test -tags syndrop1509 -run '^TestIssue1509_SYNDrop_' -count=1 -v ./internal/credhttp/; then
+          set +e
+          go test -tags syndrop1509 -run '^TestIssue1509_SYNDrop_' -count=1 -v ./internal/credhttp/ 2>&1 | tee /tmp/mutant.out
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -eq 0 ]; then
             echo "::error::M-b (no raced attempt) passed the SYN-drop arm: the arm does not detect the race"
             exit 1
           fi
-          echo "M-b failed the arm, as it must"
+          if ! grep -q 'NO-RACE:' /tmp/mutant.out; then
+            echo "::error::M-b failed the arm, but not on its NO-RACE assertion: the failure proves nothing about the race"
+            exit 1
+          fi
+          echo "M-b failed the arm on NO-RACE, as it must"

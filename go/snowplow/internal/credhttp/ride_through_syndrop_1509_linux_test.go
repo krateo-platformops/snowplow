@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -39,6 +40,25 @@ import (
 	"k8s.io/client-go/transport"
 )
 
+// requireExponentialSYNRetransmits fails unless this kernel resends a lost SYN
+// with the exponential schedule run27 N2 showed on GKE nodes (+1 s, +3 s,
+// +7 s: connects at about 3.1 s and 7.1 s, #1509). A kernel with
+// net.ipv4.tcp_syn_linear_timeouts > 0 resends the first ones 1 s apart, so
+// ONE socket reaches a destination within 1 s of its return and the arm could
+// not tell the race from no race (RUN, #1521: Ubuntu 26.04's runner kernel,
+// the mutant leg's one socket done in about 4.2 s). The CI job sets it to 0.
+func requireExponentialSYNRetransmits(t *testing.T) {
+	t.Helper()
+	b, err := os.ReadFile("/proc/sys/net/ipv4/tcp_syn_linear_timeouts")
+	if err != nil {
+		return // no such sysctl: this kernel's SYN retransmits are exponential
+	}
+	if v := strings.TrimSpace(string(b)); v != "0" {
+		t.Fatalf("net.ipv4.tcp_syn_linear_timeouts = %s: the kernel resends SYNs linearly; set it to 0 "+
+			"(the exponential schedule production showed) — the syndrop-1509 job does", v)
+	}
+}
+
 func iptablesSYN(t *testing.T, op string, port int) {
 	t.Helper()
 	out, err := exec.Command("sudo", "-n", "iptables", op, "INPUT", "-p", "tcp", "--syn",
@@ -49,6 +69,7 @@ func iptablesSYN(t *testing.T, op string, port int) {
 }
 
 func TestIssue1509_SYNDrop_RaceRidesThroughADroppingDestination(t *testing.T) {
+	requireExponentialSYNRetransmits(t)
 	resetConnectTimes(t)
 	seedReserve(t, 50*time.Millisecond)
 
@@ -99,8 +120,9 @@ func TestIssue1509_SYNDrop_RaceRidesThroughADroppingDestination(t *testing.T) {
 		t.Fatalf("warm request over %s; the arm needs HTTP/2", warm.Proto)
 	}
 
-	// Every connect attempt, through the real guarded dialer: when it started
-	// and which local address it got, so the winner can be named.
+	// Every connect attempt, through the real guarded dialer, IN THE ORDER IT
+	// STARTED (index 0 = the chain's first socket): when it started and which
+	// local address it got, so the winner can be named by its start order.
 	start := time.Now()
 	var attemptsMu sync.Mutex
 	type attempt struct {
@@ -110,15 +132,16 @@ func TestIssue1509_SYNDrop_RaceRidesThroughADroppingDestination(t *testing.T) {
 	var attempts []attempt
 	prev := endpointDialFn
 	endpointDialFn = func(ctx context.Context, network, a string) (net.Conn, error) {
-		at := time.Since(start)
-		c, err := prev(ctx, network, a)
 		attemptsMu.Lock()
-		local := ""
-		if c != nil {
-			local = c.LocalAddr().String()
-		}
-		attempts = append(attempts, attempt{at.Round(time.Millisecond), local})
+		i := len(attempts)
+		attempts = append(attempts, attempt{at: time.Since(start).Round(time.Millisecond)})
 		attemptsMu.Unlock()
+		c, err := prev(ctx, network, a)
+		if c != nil {
+			attemptsMu.Lock()
+			attempts[i].local = c.LocalAddr().String()
+			attemptsMu.Unlock()
+		}
 		return c, err
 	}
 	t.Cleanup(func() { endpointDialFn = prev })
@@ -160,8 +183,8 @@ func TestIssue1509_SYNDrop_RaceRidesThroughADroppingDestination(t *testing.T) {
 		t.Fatalf("status %d after %v", resp.StatusCode, took)
 	}
 	if took > comeback+time.Second {
-		t.Fatalf("done %v after start, %v after the destination answered again; want ≤ 1 s after it "+
-			"(≈7 s = the one socket waited for its own SYN retransmit: no race)", took, took-comeback)
+		t.Fatalf("NO-RACE: done %v after start, %v after the destination answered again; want ≤ 1 s after it "+
+			"(about 7 s = the one socket waited for its own SYN retransmit)", took, took-comeback)
 	}
 
 	// The connection that answered is one the RACE opened: not the chain's
@@ -178,7 +201,7 @@ func TestIssue1509_SYNDrop_RaceRidesThroughADroppingDestination(t *testing.T) {
 	}
 	attemptsMu.Unlock()
 	if index < 1 {
-		t.Fatalf("the answering connection (%s) was attempt %d; want a raced one (index ≥ 1) — attempts %s", winner, index, log)
+		t.Fatalf("NOT-RACED: the answering connection (%s) was attempt %d in start order; want a raced one (index ≥ 1) — attempts %s", winner, index, log)
 	}
 	t.Logf("done %v after start (%v after comeback) on attempt %d", took, took-comeback, index)
 
