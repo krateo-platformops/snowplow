@@ -51,10 +51,12 @@ package credhttp
 //     comes at the close or at the wait's end, whichever is first);
 //   - sendRetrying's last attempt (no retry left; plumbing returns at once):
 //     only a close that has already happened counts (#1521 B1);
-//   - sendBudgeted, when Retry-After does not fit the budget left: the send
-//     waits for the close up to (budget left − retry reserve), then redoes, or
-//     returns the 429 (#1521). A 429 whose connection stays open is then
-//     returned at that point instead of at once: the same answer, later.
+//   - sendBudgeted, when Retry-After does not fit the budget left (owner ruling
+//     on #1521: other 429s unchanged): only a signal ALREADY there when the
+//     answer is processed counts (HTTP/1.x Connection: close; an HTTP/2
+//     connection already closed). Nothing is waited for, so an ordinary 429
+//     returns at once, as before; an HTTP/2 leaving answer whose close comes a
+//     moment later is returned, not redone (the accepted cost).
 //
 // The HTTP/2 signal needs the attempt's connection, which only the dialer
 // snowplow owns can identify (endpointDial wraps every connection it returns).
@@ -155,6 +157,19 @@ var closedChan = func() <-chan struct{} {
 	close(c)
 	return c
 }()
+
+// alreadyLeft reports whether a leaving signal has already fired (never waits).
+func alreadyLeft(leaving <-chan struct{}) bool {
+	if leaving == nil {
+		return false
+	}
+	select {
+	case <-leaving:
+		return true
+	default:
+		return false
+	}
+}
 
 // sleepBudgetOrLeaving is sleepBudget that also ends when leaving is closed.
 // left reports that it ended because of leaving (the caller redoes the attempt

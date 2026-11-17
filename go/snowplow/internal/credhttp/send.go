@@ -37,12 +37,10 @@ package credhttp
 // same refusal.
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptrace"
@@ -243,26 +241,17 @@ func sendBudgeted(site string, cli *http.Client, req *http.Request, b *pagebudge
 				resp.Body = x.bodyEnding(resp.Body)
 				return resp, nil
 			}
-		case retry && leaving != nil && b.Deadline().Sub(budgetNow()) > reserve:
-			// #1521 — a 429 whose Retry-After does not fit, from a connection
-			// that may be closing: wait for the close up to the budget left −
-			// reserve, then redo; else the 429 is the answer, returned then.
-			// The body is read first (the caller still gets it), which also ends
-			// the stream an HTTP/2 connection's close waits for.
-			body, rerr := io.ReadAll(resp.Body)
+		case retry && alreadyLeft(leaving) && b.Deadline().Sub(budgetNow()) > reserve:
+			// #1521, owner ruling: a 429 whose Retry-After does not fit is
+			// redone only when its leaving signal is ALREADY there when the
+			// answer is processed (HTTP/1.x Connection: close; an HTTP/2
+			// connection already closed). Nothing is waited for: an ordinary
+			// 429 returns at once, as before, and an HTTP/2 leaving answer whose
+			// close comes a moment later is not redone (the accepted cost).
 			_ = resp.Body.Close()
 			x.end()
-			left, ok := sleepBudgetOrLeaving(req.Context(), b, b.Deadline().Sub(budgetNow())-reserve, leaving)
-			if left && ok {
-				redone = true
-				continue
-			}
-			if rerr != nil {
-				return sendBudgetedFailed(rerr, x, obs, b, req.Method)
-			}
-			b.Note(pagebudget.Within)
-			resp.Body = io.NopCloser(bytes.NewReader(body))
-			return resp, nil
+			redone = true
+			continue
 		case err == nil:
 			if redone {
 				b.Note(pagebudget.Retried)

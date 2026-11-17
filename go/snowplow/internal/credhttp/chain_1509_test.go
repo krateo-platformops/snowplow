@@ -189,41 +189,45 @@ func TestIssue1509_Background_LastAttemptOrdinary429ReturnsAtOnceOverHTTP2(t *te
 	}
 }
 
-// The budgeted path: an HTTP/2 leaving 429 whose Retry-After does not fit the
-// budget left is redone at its connection's close; an ordinary one is returned,
-// body intact, by the budget left − reserve.
-func TestIssue1509_A_BudgetedLeavingRedoneWhenRetryAfterDoesNotFit(t *testing.T) {
-	s := &leavingScript{steps: []string{"leave"}, retryAfter: "5"}
+// The budgeted path when Retry-After does not fit the budget left (owner
+// ruling on #1521: other 429s unchanged): an ordinary HTTP/2 429 returns AT
+// ONCE, body intact, never waiting for its connection to close; a 429 whose
+// leaving signal is already there when it is processed (HTTP/1.x
+// Connection: close) is redone at once on a fresh connection.
+func TestIssue1509_A_BudgetedNoFitOrdinaryReturnsAtOnceAlreadyLeavingIsRedone(t *testing.T) {
+	seedReserve(t, 50*time.Millisecond)
+
+	s := &leavingScript{steps: []string{"busy"}, retryAfter: "30"}
 	srv := leavingServer(t, s, true)
 	cli := h2EndpointClient(t, srv)
-	seedReserve(t, 50*time.Millisecond)
 	start := time.Now()
 	resp, err := Send(SendSiteStage, cli, getReq(t, budgetLeft(3*time.Second), srv.URL))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	if took := time.Since(start); resp.StatusCode != http.StatusOK || s.n.Load() != 2 || s.distinctConns() != 2 || took > time.Second {
-		t.Fatalf("status %d, %d requests on %d connections, %v; want the leaving 429 redone at once on a new connection", resp.StatusCode, s.n.Load(), s.distinctConns(), took)
-	}
-
-	s2 := &leavingScript{steps: []string{"busy"}, retryAfter: "5"}
-	srv2 := leavingServer(t, s2, true)
-	cli2 := h2EndpointClient(t, srv2)
-	start = time.Now()
-	resp2, err := Send(SendSiteStage, cli2, getReq(t, budgetLeft(2*time.Second), srv2.URL))
+	took := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
 	}
 	body := make([]byte, 64)
-	n, _ := resp2.Body.Read(body)
-	_ = resp2.Body.Close()
-	took := time.Since(start)
-	if resp2.StatusCode != http.StatusTooManyRequests || s2.n.Load() != 1 || n == 0 {
-		t.Fatalf("ordinary 429: status %d after %d requests, body %q; want the 429 with its body", resp2.StatusCode, s2.n.Load(), body[:n])
+	n, _ := resp.Body.Read(body)
+	_ = resp.Body.Close()
+	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusTooManyRequests || s.n.Load() != 1 || n == 0 {
+		t.Fatalf("ordinary HTTP/2 429: %s status %d after %d requests, body %q; want the 429 with its body", resp.Proto, resp.StatusCode, s.n.Load(), body[:n])
 	}
-	if took > 2*time.Second {
-		t.Fatalf("ordinary 429 returned after %v; want by the budget left − reserve", took)
+	if took > 200*time.Millisecond {
+		t.Fatalf("an ordinary HTTP/2 429 whose Retry-After (30 s) does not fit returned after %v; want at once, as before", took)
+	}
+
+	s2 := &leavingScript{steps: []string{"leave"}, retryAfter: "30"}
+	srv2 := leavingServer(t, s2, false)
+	start = time.Now()
+	resp2, err := Send(SendSiteStage, srv2.Client(), getReq(t, budgetLeft(3*time.Second), srv2.URL))
+	took = time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK || s2.n.Load() != 2 || s2.distinctConns() != 2 || took > time.Second {
+		t.Fatalf("already-leaving 429 (Connection: close): status %d, %d requests on %d connections, %v; want it redone at once on a new connection",
+			resp2.StatusCode, s2.n.Load(), s2.distinctConns(), took)
 	}
 }
 
