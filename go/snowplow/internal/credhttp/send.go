@@ -37,10 +37,12 @@ package credhttp
 // same refusal.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptrace"
@@ -241,6 +243,26 @@ func sendBudgeted(site string, cli *http.Client, req *http.Request, b *pagebudge
 				resp.Body = x.bodyEnding(resp.Body)
 				return resp, nil
 			}
+		case retry && leaving != nil && b.Deadline().Sub(budgetNow()) > reserve:
+			// #1521 — a 429 whose Retry-After does not fit, from a connection
+			// that may be closing: wait for the close up to the budget left −
+			// reserve, then redo; else the 429 is the answer, returned then.
+			// The body is read first (the caller still gets it), which also ends
+			// the stream an HTTP/2 connection's close waits for.
+			body, rerr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			x.end()
+			left, ok := sleepBudgetOrLeaving(req.Context(), b, b.Deadline().Sub(budgetNow())-reserve, leaving)
+			if left && ok {
+				redone = true
+				continue
+			}
+			if rerr != nil {
+				return sendBudgetedFailed(rerr, x, obs, b, req.Method)
+			}
+			b.Note(pagebudget.Within)
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+			return resp, nil
 		case err == nil:
 			if redone {
 				b.Note(pagebudget.Retried)
@@ -349,13 +371,18 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 // (sendRetrying, retry_loop_1509.go: transcribedBackoff is backoff(attempt, …),
 // sleepCtx is sleepWithContext), and it DEVIATES from plumbing in exactly one
 // place, deliberately (owner ruling on #1509): a 429 whose connection is
-// closing (HTTP/1.x Connection: close, HTTP/2 GOAWAY — kube-apiserver's
-// shutdown answer) is not counted as an attempt and is redone at once on a
-// fresh connection, once per send; plumbing waits its Retry-After on the
-// leaving instance. The budgeted send (sendBudgeted) applies the same rule.
-// Every other branch of the loop is plumbing's as transcribed. A plumbing bump
-// re-audits the whole of RetryClient.Do against sendRetrying, not only backoff
-// and parseRetryAfter.
+// closed (HTTP/1.x Response.Close; an HTTP/2 connection the client transport
+// closes, as it does after kube-apiserver's shutdown GOAWAY —
+// leaving_1509.go says exactly which closes count) is not counted as an
+// attempt and is redone at once on a fresh connection, once per send; plumbing
+// waits its Retry-After. Within a retry's Retry-After wait the redo comes at
+// the close; on the last attempt only a close that already happened counts
+// (no wait, as plumbing returns at once, #1521 B1). The budgeted send
+// (sendBudgeted) applies the same rule. Every other branch of the loop — every
+// other 429, every 5xx and network error, the count, the backoff, the errors —
+// is plumbing's as transcribed (retry_loop_1509_test.go pins them, over
+// HTTP/1.1 and HTTP/2). A plumbing bump re-audits the whole of RetryClient.Do
+// against sendRetrying, not only backoff and parseRetryAfter.
 const retryPolicyTranscribedFrom = "v1.85.0"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing

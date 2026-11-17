@@ -1,24 +1,27 @@
 package credhttp
 
-// ride_through_1509_linux_test.go — #1509 acceptance arm, on the real Linux
-// kernel (no fake dialer, no fake server):
+// ride_through_1509_linux_test.go — #1509: riding through a GATED ACCEPT, on
+// the real Linux kernel (no fake dialer, no fake server). What it proves, and
+// what it does not (#1521 review):
 //
 //  1. A TLS HTTP/2 server serves a warm, pooled connection.
 //  2. It leaves: its next answer is 429, Retry-After: 5, Connection: close
 //     (kube-apiserver's shutdown answer; Go's server sends it as a GOAWAY), and
-//     at the same moment it stops accepting. Its listener has a backlog of 0
-//     and one connection queued, so the kernel drops every further SYN, as for
-//     an endpoint being replaced: a client socket resends its SYN only at
-//     +1 s, +3 s, +7 s after it started.
+//     at the same moment it stops accepting: its listener has a backlog of 0
+//     and one connection queued.
 //  3. At comeback (3.3 s after the request started) it accepts again.
 //
-// The customer request (page budget 9 s) must complete by comeback + 1 s:
-//   - with (a) reverted it waits the 5 s Retry-After first: done at ≈5 s;
-//   - with (b) reverted its one socket's next SYN is at +7 s: done at ≈7 s;
-//   - with both, a raced socket started after the 1 s/3 s instants sends a
-//     SYN shortly after comeback.
-// And no socket leaks: when it is done the server holds only the request's
-// connection.
+// The customer request (page budget 9 s) must complete by comeback + 1 s, and
+// no socket leaks. With (a) reverted it waits the 5 s Retry-After first (done
+// at about 5 s): this arm is (a)'s end-to-end proof.
+//
+// It is NOT (b)'s proof. With net.ipv4.tcp_abort_on_overflow = 0 (Linux's
+// default) a full accept queue does not drop the client's SYN for good: the
+// kernel answers it, drops the final ACK, and the connection is accepted as
+// soon as the queue has room, so ONE socket rides through the outage and the
+// arm stays GREEN with the race reverted (RUN: M-b, gate 5). The race's proof
+// on a real kernel is the SYN-drop arm (ride_through_syndrop_1509_linux_test.go),
+// which drops SYNs with iptables in its own CI job.
 
 import (
 	"context"
@@ -83,7 +86,7 @@ func backlogZeroListener(t *testing.T) net.Listener {
 	return ln
 }
 
-func TestIssue1509_RideThroughAReplicaChange(t *testing.T) {
+func TestIssue1509_RideThroughAGatedAccept(t *testing.T) {
 	resetConnectTimes(t)
 	seedReserve(t, 50*time.Millisecond)
 
@@ -199,7 +202,7 @@ func TestIssue1509_RideThroughAReplicaChange(t *testing.T) {
 	}
 	if took > comeback+time.Second {
 		t.Fatalf("done %v after start, %v after the server came back; want ≤ 1 s after it came back "+
-			"(≈5 s = the leaving server's Retry-After was waited; ≈7 s = the connect waited for its own SYN retransmit)",
+			"(≈5 s = the leaving server's Retry-After was waited)",
 			took, took-comeback)
 	}
 	t.Logf("done %v after start (%v after comeback)", took, took-comeback)

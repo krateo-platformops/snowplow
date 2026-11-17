@@ -1,0 +1,70 @@
+# #1509 (b) on a real kernel (owner ruling on #1521: "real SYN drop in CI"). The arm
+# (go/snowplow/internal/credhttp/ride_through_syndrop_1509_linux_test.go, build tag syndrop1509)
+# drops SYNs to its test port with iptables during the outage and removes the rule at comeback.
+# GitHub's runners have passwordless sudo, which the build VM and a developer laptop do not, so the
+# arm is built only here, and here it never skips: when it cannot drop SYNs it fails.
+#
+# Two legs prove the arm can say both things:
+#   - base:   the code as it is: the arm must PASS (the race rides through the dropped SYNs);
+#   - mutant: the race reverted (M-b: no raced attempt): the arm must FAIL. A mutant that passes
+#             means the arm no longer detects the race, and the leg fails.
+name: syndrop-1509
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - go/snowplow/internal/credhttp/**
+      - .github/workflows/syndrop-1509.yaml
+  push:
+    branches:
+      - main
+    paths:
+      - go/snowplow/internal/credhttp/**
+      - .github/workflows/syndrop-1509.yaml
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  syndrop:
+    name: syndrop-1509 (${{ matrix.leg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [base, mutant]
+    defaults:
+      run:
+        working-directory: go/snowplow
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go/snowplow/go.mod
+      - name: iptables is usable (the arm fails without it)
+        run: sudo -n iptables -S INPUT >/dev/null
+      - name: apply M-b (no raced attempt)
+        if: matrix.leg == 'mutant'
+        run: |
+          python3 - <<'EOF'
+          p = "internal/credhttp/race_1509.go"
+          s = open(p).read()
+          old = "\tc.startAttemptLocked()\n\tc.wait *= 2\n"
+          assert s.count(old) == 1, "M-b anchor not found: update the mutant with the race"
+          open(p, "w").write(s.replace(old, "\t// MUTANT M-b: no raced attempt\n\tc.wait *= 2\n"))
+          EOF
+          grep -c 'MUTANT M-b' internal/credhttp/race_1509.go
+      - name: the SYN-drop arm, three runs
+        if: matrix.leg == 'base'
+        run: go test -tags syndrop1509 -run '^TestIssue1509_SYNDrop_' -count=3 -v ./internal/credhttp/
+      - name: the SYN-drop arm must fail on the mutant
+        if: matrix.leg == 'mutant'
+        run: |
+          if go test -tags syndrop1509 -run '^TestIssue1509_SYNDrop_' -count=1 -v ./internal/credhttp/; then
+            echo "::error::M-b (no raced attempt) passed the SYN-drop arm: the arm does not detect the race"
+            exit 1
+          fi
+          echo "M-b failed the arm, as it must"

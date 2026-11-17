@@ -61,6 +61,11 @@ func NewEndpointTransport(cfg *transport.Config) (http.RoundTripper, error) {
 		return nil, errors.New("credhttp: the endpoint transport dials itself; a caller's transport or dial hook is not taken")
 	case cfg.TLS.CAFile != "", cfg.TLS.CertFile != "", cfg.TLS.KeyFile != "", cfg.TLS.ReloadTLSFiles, cfg.HasCertCallback():
 		return nil, errors.New("credhttp: the endpoint transport takes TLS material as data only")
+	case cfg.WrapTransport != nil && !browserBuild:
+		// A wrapper may replace the base transport, and the guarded dial with
+		// it (#1521). Only the js/wasm build installs one (BrowserEgress, the
+		// browser's fetch, nil on a server build).
+		return nil, errors.New("credhttp: the endpoint transport takes no WrapTransport on a server build")
 	}
 	tlsCfg, err := transport.TLSConfigFor(cfg)
 	if err != nil {

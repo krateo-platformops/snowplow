@@ -14,12 +14,19 @@ package credhttp
 // numbers come from util.NewRetryClient itself (CLIENT_MAX_RETRIES,
 // CLIENT_BASE_BACKOFF, CLIENT_MAX_BACKOFF), so they cannot drift.
 //
-// THE ONE DEVIATION (#1509 a): a 429 from a server that is leaving (its
-// connection is closing, leaving_1509.go) is not counted as an attempt and is
-// redone at once, on a fresh connection — once per send. The wait for an HTTP/2
-// connection's close is the Retry-After wait itself, so no 429 waits longer
-// than plumbing's loop would have. Every other 429 waits Retry-After as
-// plumbing's does.
+// THE ONE DEVIATION (#1509 a): a 429 whose connection is closed (the leaving
+// signal, leaving_1509.go: HTTP/1.x Connection: close, or an HTTP/2 connection
+// the client transport closes) is not counted as an attempt and is redone at
+// once, on a fresh connection — once per send. Exactly when:
+//   - an attempt with a retry left waits for that close within the Retry-After
+//     wait plumbing does anyway: the redo comes when the connection closes or
+//     the wait ends, whichever is first, so it never waits longer than plumbing;
+//   - the LAST attempt (no retry left), where plumbing returns at once, redoes
+//     only on a close that has ALREADY happened: it never waits for one (#1521
+//     B1), so a 429 whose connection stays open returns at once, as plumbing's.
+// Everything else in the loop — every other 429, every 5xx, every network
+// error, the attempt count, the backoff, the errors returned — is plumbing's as
+// transcribed above.
 //
 // NOT TRANSCRIBED, and why it changes nothing: RetryClient.Do first waits on
 // its token bucket (CLIENT_QPS 30, CLIENT_BURST 45). Send built a RetryClient
@@ -90,6 +97,17 @@ func sendRetrying(policy *util.RetryClient, cli *http.Client, req *http.Request)
 				}
 			}
 			_ = resp.Body.Close()
+			if attempt >= policy.MaxRetries && leaving != nil {
+				// The last attempt: plumbing returns at once, so a wait for the
+				// connection's close would delay an ordinary 429 (#1521 B1). Only
+				// a signal that has already fired redoes it.
+				select {
+				case <-leaving:
+					wait = 0
+				default:
+					leaving = nil
+				}
+			}
 			if attempt < policy.MaxRetries || leaving != nil {
 				left, err := sleepCtxOrLeaving(req.Context(), wait, leaving)
 				if err != nil {

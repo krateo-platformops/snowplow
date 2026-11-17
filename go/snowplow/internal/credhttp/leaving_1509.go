@@ -14,23 +14,47 @@ package credhttp
 // goAway != nil). In run27 N2 one customer request honoured that 5 s on a
 // regional control plane and then spent its budget on a fresh connect (#1509).
 //
-// THE RULE. For a safe request of a budgeted send, a 429 whose connection the
-// protocol says is closing is not an answer: the attempt is made again at once,
-// on a fresh connection, and everything after it (the connect cut, the retry
-// decision, Retry-After) runs as for a first attempt. So Retry-After applies
-// only when the fresh attempt answers 429 too. Every other 429 is handled
-// exactly as before: its connection stays open, and the send waits Retry-After.
+// THE RULE. For a safe request, on both send paths (sendBudgeted;
+// sendRetrying, the unbudgeted path), a 429 whose connection is closed is not
+// an answer: the attempt is made again at once, on a fresh connection, once
+// per send, and everything after it (the connect cut, the retry decision,
+// Retry-After) runs as for a first attempt. So Retry-After applies only when
+// the fresh attempt answers 429 too. A 429 whose connection stays open is
+// handled exactly as before.
 //
-// THE SIGNALS, both the protocol's own, no timer:
-//   - HTTP/1.x: Response.Close, set by net/http when the server sent
-//     `Connection: close` (the connection will not be reused).
-//   - HTTP/2: the connection the 429 arrived on is closed by the client
-//     transport. Send closes the 429's body first; a connection the server sent
-//     GOAWAY on is then closed once it carries no stream, while an ordinary
-//     connection stays pooled. The wait for that close is the Retry-After wait
-//     itself: the attempt is redone when the connection closes or when
-//     Retry-After ends, whichever comes first, so no 429 ever waits longer than
-//     it did before.
+// WHAT THE SIGNAL IS, exactly: "the connection this 429 arrived on is closed".
+//   - HTTP/1.x: Response.Close, set by net/http when the answer said
+//     `Connection: close` — and also for an HTTP/1.0 answer without
+//     keep-alive: such a 429 also reads as leaving (its connection is not
+//     reused either, so the redo costs the fresh connect the next attempt
+//     would have paid anyway).
+//   - HTTP/2: the client transport closes the connection. Send closes (or, on
+//     the budgeted path, reads) the 429's body first; a connection the server
+//     sent GOAWAY on is then closed once it carries no stream, while an
+//     ordinary one stays pooled. ANY close counts, not only a GOAWAY's: one
+//     closed by CloseIdleConnections, the HTTP/2 health check or a broken
+//     socket during the wait reads as leaving too, and its 429 is redone at
+//     once on a fresh connection (the wait it skips was for an instance that
+//     the closed connection no longer reaches).
+//   WHY NOT GOAWAY ITSELF: x/net/http2 gives the http.Transport above it no
+//   view of a GOAWAY. The ClientConn is owned by the transport's connection
+//   pool, which net/http's HTTP/2 integration (http2.ConfigureTransports) does
+//   not expose; ClientConn.State().Closing would not tell either, as it is also
+//   true for a connection marked do-not-reuse after an error; and the GOAWAY
+//   frame may reach the client after the 429's headers, so even a direct view
+//   could not decide it when the answer arrives. The close is the first fact
+//   the client can observe that a GOAWAY caused, and it reaches every waiter.
+//
+// WHEN THE SIGNAL IS WAITED FOR. On HTTP/2 the close comes a moment after the
+// 429, so the redo waits for it, never longer than the send would wait anyway:
+//   - with a retry the send will make, during its Retry-After wait (the redo
+//     comes at the close or at the wait's end, whichever is first);
+//   - sendRetrying's last attempt (no retry left; plumbing returns at once):
+//     only a close that has already happened counts (#1521 B1);
+//   - sendBudgeted, when Retry-After does not fit the budget left: the send
+//     waits for the close up to (budget left − retry reserve), then redoes, or
+//     returns the 429 (#1521). A 429 whose connection stays open is then
+//     returned at that point instead of at once: the same answer, later.
 //
 // The HTTP/2 signal needs the attempt's connection, which only the dialer
 // snowplow owns can identify (endpointDial wraps every connection it returns).

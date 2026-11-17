@@ -23,7 +23,11 @@ import (
 func resetConnectTimes(t *testing.T) {
 	t.Helper()
 	connectTimes.resetForTest()
-	t.Cleanup(connectTimes.resetForTest)
+	resetChainsForTest()
+	t.Cleanup(func() {
+		connectTimes.resetForTest()
+		resetChainsForTest()
+	})
 }
 
 // A destination with no sample races only after the goal's typical bound, as
@@ -365,8 +369,14 @@ func TestIssue1509_B_SocketsPerStuckDialAreLogarithmic(t *testing.T) {
 		if n > limit || n < 2 {
 			t.Fatalf("trigger %v, cap %v: %d sockets; want 2..%d (log2(cap/trigger)+1)", tc.trigger, tc.bound, n, limit)
 		}
+		// The waiter leaves at its deadline; the chain then cancels its
+		// attempts, which end promptly after it (not before it returns).
+		settle := time.Now().Add(time.Second)
+		for time.Now().Before(settle) && live.Load() != 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
 		if v := live.Load(); v != 0 {
-			t.Fatalf("%d attempts still running after raceDial returned", v)
+			t.Fatalf("%d attempts still running a second after raceDial returned", v)
 		}
 	}
 }
