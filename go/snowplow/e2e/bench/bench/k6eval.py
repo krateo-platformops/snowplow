@@ -173,7 +173,9 @@ def read_k6_out(d: str, name: str) -> dict | None:
                 out[key] = json.load(fh)
         except (OSError, ValueError):
             pass
-    out["cpu"] = {c: read_cpu(d, c) for c in ((name, "viewer") if name == "k6" else (name,))}
+    # the browser pod's renderers sidecar records its own cgroup too (Diego 2026-11-17: the helper measured directly)
+    out["cpu"] = {c: read_cpu(d, c) for c in {"k6": ("k6", "viewer"), "browser": ("browser", "renderers")}.get(
+        name, (name,))}
     if name == "browser":
         # 2026-11-17 ("Measure it precisely"): each renderer's run-queue wait, and which renderer renders each
         # session's page (None: not recorded, a bench before it)
@@ -446,6 +448,70 @@ def covered(start: float, wall_ms: float, st: dict) -> bool:
         return False
     slack = st.get("slack_s") or 0.0
     return st["windows"][0]["t0"] - slack <= start and start + wall_ms / 1000 <= st["windows"][-1]["t1"] + slack
+
+
+#: the windows a container's cores are averaged over for their spread: long enough to hold several samples
+#: (CPU_SAMPLE_S apart), short enough for an arm to hold several of them
+SPREAD_WINDOW_S = 60.0
+
+
+def container_cpu_report(recs: list[dict] | None) -> dict | None:
+    """One container's own cgroup over the drive (k6_job._cpu_sampler's record): its mean cores (usage over the
+    whole record), the p95 of its sample windows, its throttled time and its PSI some / full per second; and the
+    RESOLUTION of that mean, from the arm's own spread: the record cut into SPREAD_WINDOW_S windows, the SD of
+    their cores, and 2 SD / sqrt(n) (n the windows). Fewer than two windows: no spread, so no resolution (None,
+    said). None when the record holds fewer than two samples."""
+    if not recs:
+        return None
+    start = next((r for r in recs if r.get("kind") == "cpu_start"), {})
+    pts = [r for r in recs if r.get("kind") == "cpu" and r.get("usage_usec") is not None]
+    if len(pts) < 2 or float(pts[-1]["t"]) <= float(pts[0]["t"]):
+        return None
+    a, b = pts[0], pts[-1]
+    span = float(b["t"]) - float(a["t"])
+
+    def rate(k: str, x: dict, y: dict, scale: float) -> float | None:
+        return (round((y[k] - x[k]) / scale / (float(y["t"]) - float(x["t"])), 4)
+                if x.get(k) is not None and y.get(k) is not None else None)
+    per = [rate("usage_usec", x, y, 1e6) for x, y in pairwise(pts) if float(y["t"]) > float(x["t"])]
+    wins, w0 = [], a
+    for p in pts[1:]:
+        if float(p["t"]) - float(w0["t"]) >= SPREAD_WINDOW_S:
+            wins.append(rate("usage_usec", w0, p, 1e6))
+            w0 = p
+    n = len(wins)
+    sd = (sum((x - sum(wins) / n) ** 2 for x in wins) / (n - 1)) ** 0.5 if n >= 2 else None
+    return {"request_m": start.get("request_m"), "limit_m": start.get("limit_m"), "seconds": round(span, 1),
+            "cores_mean": rate("usage_usec", a, b, 1e6), "cores_p95": _pct(per, 95) if per else None,
+            "throttled_s_per_s": rate("throttled_usec", a, b, 1e6),
+            "psi_some_s_per_s": rate("pressure_some_usec", a, b, 1e6),
+            "psi_full_s_per_s": rate("pressure_full_usec", a, b, 1e6),
+            "spread": {"window_s": SPREAD_WINDOW_S, "windows": n,
+                       "sd_cores": round(sd, 4) if sd is not None else None,
+                       "resolution_cores": round(2 * sd / n ** 0.5, 4) if sd is not None else None,
+                       **({} if sd is not None else {"why": f"{n} window(s) of {SPREAD_WINDOW_S:g} s: no spread, so "
+                                                            f"no stated resolution"})}}
+
+
+def helper_cpu_check(o: dict | None) -> dict | None:
+    """loadgen.renderers_cpu (Diego 2026-11-17: the helper's cost is measured, directly): a browser run whose pod
+    had the renderers sidecar (its per-renderer records exist) must hold the sidecar's own CPU record with
+    samples; missing or empty FAILS (a missing measure is never a zero cost). None for a run without the sidecar
+    (a bench before #1517): it had no helper to measure."""
+    if o is None or (o.get("renderers") is None and o.get("renderer_map") is None):
+        return None
+    base = {"check": "loadgen.renderers_cpu", "bar": "the renderers sidecar's own CPU record, with samples"}
+    recs = (o.get("cpu") or {}).get("renderers")
+    rep = container_cpu_report(recs)
+    if recs is None:
+        return dict(base, value=None, result="FAIL",
+                    why="INVALID (undecided): the renderers sidecar left no CPU record (renderers-cpu.jsonl): its "
+                        "cost is unknown, never zero")
+    if rep is None:
+        return dict(base, value=None, result="FAIL",
+                    why="INVALID (undecided): the renderers sidecar's CPU record holds fewer than two samples: its "
+                        "cost is unknown, never zero")
+    return dict(base, value=rep, result="PASS")
 
 
 def cpu_check(o: dict | None, container: str, th: dict | None = None) -> dict:

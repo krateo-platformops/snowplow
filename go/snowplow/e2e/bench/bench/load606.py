@@ -4218,6 +4218,10 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         validity.append(sess)
         if lost_check is not None:
             checks.append(lost_check)
+        # the renderers sidecar's own CPU record: a pod that had the helper must have measured it
+        helper = k6eval.helper_cpu_check(k6.get("browser"))
+        if helper is not None:
+            validity.append(helper)
     else:
         _check("driver.sched_lag_p95_ms",
                pct([n.get("sched_lag_ms", 0) for n in navs], 95), "<=",
@@ -4386,6 +4390,11 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         report["viewer_report_only"] = k6eval.viewer_report(k6.get("viewer"))
         report["load_generator_cpu_report_only"] = {
             c: k6eval.cpu_stats(((k6.get("k6") or {}).get("cpu") or {}).get(c)) for c in ("k6", "viewer")}
+        # the browser pod's two containers, each its own cgroup: Chrome's, and the renderers sidecar's (Diego
+        # 2026-11-17: the helper's cost measured directly, its resolution from the arm's own spread)
+        report["browser_pod_cpu"] = {
+            c: k6eval.container_cpu_report(((k6.get("browser") or {}).get("cpu") or {}).get(c))
+            for c in ("browser", "renderers")}
         # the paired gate's input (custlat pair reads it from both runs'
         # verdicts); in one run's verdict it is report only
         from bench import custlat

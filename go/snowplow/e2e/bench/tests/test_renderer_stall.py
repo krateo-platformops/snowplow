@@ -31,7 +31,7 @@ def _uptime(epoch: float) -> float:
 
 
 def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, stall=None, lost=(), idle=None,
-          ops=None, node=True):
+          ops=None, node=True, helper_cpu=True):
     """Warm loads at 600 ms (over the 500 ms bar) for 3 sessions, inside 20 s of browser-container stall (every
     window stalled 5 s: the container rule explains the FAIL away). `renderer`: the run also recorded per-renderer
     evidence: each session's renderer (PIDS) read by renderers.js before and (`map_after`) after its loads, and
@@ -52,6 +52,10 @@ def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, s
     _write_out(bdir, "browser", pts, _browser_summary(63), 0)
     _cpu_file(bdir, "browser", 3000, [1.0] * 20, stall=stall if stall is not None else [5.0] * 20, idle=idle,
               node=node)
+    if renderer and helper_cpu:
+        # the renderers sidecar's own cgroup (Diego 2026-11-17: the helper measured directly): 0.04 then 0.06
+        # cores, a minute each, over 5 minutes
+        _cpu_file(bdir, "renderers", 250, ([0.04] * 12 + [0.06] * 12) * 2 + [0.04] * 12, limit_m=250)
     if renderer:
         loads = [p["data"]["tags"] for p in pts if p["metric"] == "browser_page_load_ms"]
         first, last = min(int(t["t0"]) for t in loads) / 1000, max(int(t["t0"]) for t in loads) / 1000 + 1
