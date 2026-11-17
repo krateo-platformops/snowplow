@@ -254,14 +254,19 @@ type setupChain struct {
 	done        bool
 	waiters     []*chainWaiter
 	outstanding int
-	wait        time.Duration
-	timer       *time.Timer
-	connected   bool // some attempt's connect came up
-	answered    bool // a setup completed recently: attempts follow demand, no race
-	progress    bool // since the last check: an attempt came up or read handshake bytes
-	firstConn   error
-	firstTLS    error
-	countCtx    context.Context // a waiter's ctx: its connection counting (connections.go)
+	// fresh counts the outstanding attempts started in the current answering
+	// period (epoch): demand is covered by those, not by attempts started
+	// while the destination was not answering, which may be stuck for good.
+	epoch     int
+	fresh     int
+	wait      time.Duration
+	timer     *time.Timer
+	connected bool // some attempt's connect came up
+	answered  bool // a setup completed recently: attempts follow demand, no race
+	progress  bool // since the last check: an attempt came up or read handshake bytes
+	firstConn error
+	firstTLS  error
+	countCtx  context.Context // a waiter's ctx: its connection counting (connections.go)
 }
 
 func newSetupChain(s *setupChains, k chainKey) *setupChain {
@@ -300,7 +305,7 @@ func (c *setupChain) join(ctx context.Context) *chainWaiter {
 // coverDemandLocked gives every waiter an attempt of its own, once the
 // destination has answered (see the file comment).
 func (c *setupChain) coverDemandLocked() {
-	for !c.done && c.outstanding < len(c.waiters) {
+	for !c.done && c.fresh < len(c.waiters) {
 		c.startAttemptLocked()
 	}
 }
@@ -393,7 +398,10 @@ func (c *setupChain) onConnected() {
 
 func (c *setupChain) startAttemptLocked() {
 	c.outstanding++
-	answered := c.answered
+	answered, epoch := c.answered, c.epoch
+	if answered {
+		c.fresh++
+	}
 	actx, acancel := context.WithDeadline(c.ctx, dialNow().Add(pagebudget.PageMaxGoal))
 	go func() {
 		defer acancel()
@@ -402,7 +410,7 @@ func (c *setupChain) startAttemptLocked() {
 		if err == nil {
 			connectTimes.record(c.ringKey, dialNow().Sub(start))
 		}
-		c.result(racedConn{c: conn, err: err, tlsErr: tlsErr})
+		c.result(racedConn{c: conn, err: err, tlsErr: tlsErr}, answered, epoch)
 	}()
 }
 
@@ -453,9 +461,14 @@ func (c *setupChain) handshake(ctx context.Context, conn net.Conn) (net.Conn, er
 	return tc, nil, false
 }
 
-func (c *setupChain) result(r racedConn) {
+// result takes an attempt's outcome; answered and epoch are the chain's state
+// when the attempt started (it counts in fresh only for its own period).
+func (c *setupChain) result(r racedConn, answered bool, epoch int) {
 	c.mu.Lock()
 	c.outstanding--
+	if answered && epoch == c.epoch {
+		c.fresh--
+	}
 	if r.err == nil {
 		w := c.popLocked()
 		if w == nil {
@@ -466,8 +479,13 @@ func (c *setupChain) result(r racedConn) {
 		}
 		c.deliverLocked(w, r)
 		// The destination answered: every waiter left gets an attempt of its
-		// own, and the timer now watches for fresh evidence (onTimer).
-		c.answered = true
+		// own, and the timer now watches for fresh evidence (onTimer). A new
+		// answering period does not count attempts started before it.
+		if !c.answered {
+			c.answered = true
+			c.epoch++
+			c.fresh = 0
+		}
 		c.progress = true
 		if c.timer != nil {
 			trigger, _ := connectTimes.trigger(c.ringKey)

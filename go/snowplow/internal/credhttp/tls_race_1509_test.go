@@ -162,6 +162,11 @@ func TestIssue1509_B_AllHandshakesHungReportsTheTLSPhase(t *testing.T) {
 	srv, sl := stallTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
 	addr := sl.Addr().String()
 	seedConnectTimes(setupKey(addr, true), 30*time.Millisecond)
+	// The bound is the TLS level's: its connects answer (loopback, sub-ms),
+	// so the connect level is given a measured time that keeps its own race
+	// out of the count (each level races on its own trigger; this arm counts
+	// one level's sockets).
+	seedConnectTimes(setupKey(addr, false), time.Hour)
 	sl.stallFor(time.Hour)
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caPEMOf(srv))

@@ -108,6 +108,39 @@ func TestIssue1509_Chain_JoinersReturnByTheirOwnDeadlines(t *testing.T) {
 
 // Every waiter gets its own connection, the longest waiting first; and nothing
 // leaks: every connection that came up is either handed out or closed.
+// Once the destination answers, waiters are served IN PARALLEL, one attempt
+// each (#1521: the serial handout made 200 readers miss their budget): K
+// waiters on a destination whose connects take 50 ms are all served in about
+// two connect times (the first, then the rest at once), not K of them.
+func TestIssue1509_Chain_AnsweringServesWaitersInParallel(t *testing.T) {
+	resetConnectTimes(t)
+	l := newRaceListener(t)
+	addr := l.ln.Addr().String()
+	countingRaceDial(t, "after:50ms")
+
+	const k = 10
+	var wg sync.WaitGroup
+	start := time.Now()
+	for range k {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			c, err := raceDial(ctx, "tcp", addr)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_ = c.Close()
+		}()
+	}
+	wg.Wait()
+	if took := time.Since(start); took > 250*time.Millisecond {
+		t.Fatalf("%d waiters took %v; want about two 50 ms connects (the first, then the rest in parallel), not %d in a row", k, took, k)
+	}
+}
+
 func TestIssue1509_Chain_EachConnectionGoesToOneWaiterAndNoneLeaks(t *testing.T) {
 	resetConnectTimes(t)
 	l := newRaceListener(t)
