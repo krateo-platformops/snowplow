@@ -27,6 +27,7 @@ import (
 	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
 
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
+	"github.com/krateo-platformops/snowplow/internal/frontendconfig"
 )
 
 // Options configure a Server. Clock, AfterFunc and NewUID are injectable for tests.
@@ -35,10 +36,14 @@ type Options struct {
 	Pages        [][]byte // the object pages, objects/<n>.json
 	SAToken      string   // the ServiceAccount's bearer token (the mounted token file)
 	VisitorToken string   // the visitor's bearer token (the synthesised clientconfig, §8)
-	Clock        func() time.Time
-	AfterFunc    func(d time.Duration, f func()) (stop func() bool)
-	Log          func(line map[string]any)
-	NewUID       func() string
+	// FrontendConfig is the frontend's config.json text, exactly as bridge.js hands the SPA its
+	// config (boot's buildPortalConfig): the synthesised frontend ConfigMap's data (§8). Required,
+	// and a JSON object.
+	FrontendConfig []byte
+	Clock          func() time.Time
+	AfterFunc      func(d time.Duration, f func()) (stop func() bool)
+	Log            func(line map[string]any)
+	NewUID         func() string
 }
 
 // Server is the fake apiserver: an http.Handler.
@@ -189,7 +194,8 @@ func New(o Options) (*Server, error) {
 	s.sa = serviceAccountIdentity(id.ServiceAccount.Namespace, id.ServiceAccount.Name)
 	s.sa.Label = labelSA
 	s.visitor = identity{User: id.Visitor.Username, Groups: append(append([]string{}, id.Visitor.Groups...), "system:authenticated"), Label: labelVisitor}
-	// §8: the one Secret, synthesised; the snapshot holds none. It is a bearer-token credential
+	// §8: two objects are synthesised, never served from the snapshot (doc.go): this Secret and the
+	// frontend ConfigMap below. The one Secret, synthesised; the snapshot holds none. It is a bearer-token credential
 	// under the visitor's exact name (credsecret.For's first, preferred name: the session name, or
 	// the step-up one for a step-up identity), owned through the username annotation
 	// (plumbing endpoints.OwnsSecret's annotation arm), so snowplow's own-credential readers serve
@@ -197,6 +203,10 @@ func New(o Options) (*Server, error) {
 	// browser's fetch cannot present a client certificate, so the fake authenticates the visitor by
 	// the token.
 	name := credsecret.For(id.Visitor.Username, id.Visitor.Groups)[0]
+	// one rule for both synthesised objects: a snapshot that holds one is refused, never overwritten
+	if _, ok := s.bucket("/secrets")[id.AuthnNamespace+"/"+name]; ok {
+		return nil, fmt.Errorf("objects: Secret %s/%s is in the snapshot, and the fake env synthesises it (§8, the visitor's clientconfig): the snapshot must not hold it", id.AuthnNamespace, name)
+	}
 	s.bucket("/secrets")[id.AuthnNamespace+"/"+name] = map[string]any{
 		"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
 		"metadata": map[string]any{"name": name, "namespace": id.AuthnNamespace, "uid": o.NewUID(), "resourceVersion": s.snap.ResourceVersion, "creationTimestamp": s.now(),
@@ -209,11 +219,56 @@ func New(o Options) (*Server, error) {
 	if sec, err := normalize(s.bucket("/secrets")[id.AuthnNamespace+"/"+name]); err == nil {
 		s.bucket("/secrets")[id.AuthnNamespace+"/"+name] = sec
 	}
+	// §8: and the frontend ConfigMap, synthesised from the config the SPA itself gets (Options
+	// FrontendConfig), never from a cluster's: Phase 1's navigation roots are read from it
+	// (dispatchers phase1_roots.go), under the name Phase 1 reads (frontendconfig.ConfigMapName)
+	// in the authn namespace, as snowplow reads it on a cluster. Its readers' access is the
+	// snapshot's RBAC over configmaps, as for any other: no rule of its own.
+	if err := s.frontendConfigMap(id.AuthnNamespace); err != nil {
+		return nil, err
+	}
 	if s.authz, err = newAuthorizer(objects); err != nil {
 		return nil, err
 	}
 	s.rules = s.snap.Scripted.ApplyStatus
 	return s, nil
+}
+
+// frontendConfigMap synthesises the frontend ConfigMap (§8) at <namespace>/<frontendconfig
+// ConfigMapName>, its data[frontendconfig.DataKey] exactly Options.FrontendConfig. Refused: no
+// config, a config that is not a JSON object (the config the SPA and Phase 1 parse), and a snapshot that also holds an
+// object under that key (a synthesised object is never one a cluster's snapshot supplied).
+func (s *Server) frontendConfigMap(namespace string) error {
+	if len(s.o.FrontendConfig) == 0 {
+		return errors.New("Options.FrontendConfig is empty: the frontend ConfigMap is synthesised from the config the SPA gets, and there is none")
+	}
+	if !isJSONObject(s.o.FrontendConfig) {
+		return errors.New("Options.FrontendConfig is not a JSON object: the frontend ConfigMap's " + frontendconfig.DataKey + " is the config object the SPA and Phase 1 parse")
+	}
+	name := frontendconfig.ConfigMapName()
+	key := namespace + "/" + name
+	if _, ok := s.bucket("/configmaps")[key]; ok {
+		return fmt.Errorf("objects: ConfigMap %s is in the snapshot, and the fake env synthesises it (§8, from Options.FrontendConfig): the snapshot must not hold it", key)
+	}
+	cm, err := normalize(map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap",
+		"metadata": map[string]any{"name": name, "namespace": namespace, "uid": s.o.NewUID(),
+			"resourceVersion": s.snap.ResourceVersion, "creationTimestamp": s.now()},
+		"data": map[string]any{frontendconfig.DataKey: string(s.o.FrontendConfig)},
+	})
+	if err != nil {
+		return fmt.Errorf("the frontend ConfigMap %s: %w", key, err)
+	}
+	s.bucket("/configmaps")[key] = cm
+	return nil
+}
+
+// isJSONObject says whether b is one JSON object: config.json is an object (Phase 1 unmarshals it into
+// its frontendConfig struct, the SPA reads its fields). json.Valid would also take null, an array or a
+// string; a nil map after decoding is the JSON null.
+func isJSONObject(b []byte) bool {
+	var m map[string]json.RawMessage
+	return json.Unmarshal(b, &m) == nil && m != nil
 }
 
 func newUID() string {

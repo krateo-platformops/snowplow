@@ -4,7 +4,7 @@
 #   1. the whole program compiles for js/wasm;
 #   2. go vet passes for js/wasm on the packages that carry browser-only code;
 #   3. the browser bridge's and the sandbox fake apiserver's tests run for js/wasm under Go's
-#      own wasm runner (Node.js);
+#      own wasm runner (Node.js), and Phase 1's frontend ConfigMap read against the fake;
 #   4. the egress tests run under both of net/http's js/wasm modes, the fetch-mode
 #      ones against a real Node HTTP server through Node's real fetch;
 #   5. the fake apiserver's field selectors equal kube-apiserver's, labels and value paths
@@ -30,6 +30,11 @@ echo "== js/wasm: bridge and fake apiserver tests under Node"
 command -v node >/dev/null || { echo "node is required to run the js/wasm tests" >&2; exit 1; }
 GOOS=js GOARCH=wasm go test -count=1 -timeout 120s \
   -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/browserbridge ./internal/sandbox/...
+# Phase 1's own frontend-ConfigMap reader against the fake apiserver (the ConfigMap the fake synthesises,
+# fakeapiserver §8): the one dispatchers test that runs in the browser build
+echo "== js/wasm: Phase 1's frontend ConfigMap read against the fake apiserver"
+GOOS=js GOARCH=wasm go test -count=1 -timeout 120s -run '^TestPhase1ReadsINITFromTheFakeEnvsFrontendConfigMap$' \
+  -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/handlers/dispatchers
 
 # The egress tests under both of net/http's js/wasm modes: plain `node` (argv0
 # "node": Go's in-process network, where BrowserEgress must

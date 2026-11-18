@@ -33,3 +33,9 @@ dd3b8b1c73acc2f6ee3e9d85121ae9cd24113dc1:go/snowplow/internal/resolvers/restacti
 # adds it. Exactly these two findings; no path or rule allowlist.
 8e5a52f5ea5bd71627659deeb357ac97d7be47e6:go/snowplow/e2e/bench/tests/test_1297_data606_parity.py:generic-api-key:43
 8a395c45f4e591f00fcc7d1d710d4cc7c58e6385:go/snowplow/e2e/bench/tests/test_1297_data606_parity.py:generic-api-key:38
+
+# Synthetic Secret fixture (#1528): the fake apiserver test that a snapshot holding the visitor's
+# clientconfig Secret is refused needed only a Secret at that key; commit a7a40580 gave it a
+# token-shaped base64 placeholder. Not a credential; the value is a plain one-byte placeholder at
+# head, so no later commit adds it. Exactly this one finding; no path or rule allowlist.
+a7a4058025967c897260d02c7ffefe14f6a77ef1:go/snowplow/internal/sandbox/fakeapiserver/frontendconfig_test.go:generic-api-key:120
