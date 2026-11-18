@@ -69,6 +69,14 @@ func newCollector(t *testing.T, block <-chan struct{}) *collector {
 // mux (rum.RegisteredRoutes), as newRUMIngest derives it from main's.
 func telemetryRouter(t *testing.T, url string) http.Handler {
 	t.Helper()
+	h, _ := telemetryRouterFwd(t, url)
+	return h
+}
+
+// telemetryRouterFwd is telemetryRouter with its forwarder, whose own counts a test reads (#1546: the process-wide
+// counters move with every forwarder in the package, a previous test's draining at its shutdown included).
+func telemetryRouterFwd(t *testing.T, url string) (http.Handler, *rum.Forwarder) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	fwd, err := rum.NewForwarder(url)
@@ -83,7 +91,7 @@ func telemetryRouter(t *testing.T, url string) http.Handler {
 	mountCallWriteRoutes(newRouteTable(mux), use.NewChain(), func(http.Handler) http.Handler { return stub })
 	mountTelemetryRoute(newRouteTable(mux), use.NewChain(), debugAuthTestKeys, rum.NewIngest(fwd, rum.RegisteredRoutes(mux)))
 	t.Cleanup(cache.ResetRouteScopeRegistryForTest)
-	return mux
+	return mux, fwd
 }
 
 func mintRUMToken(t *testing.T, user string) string {
@@ -434,6 +442,11 @@ func TestS1015_ForwardedPayloadIsAllowlistOnly(t *testing.T) {
 // once the collector is back); one that hangs fills the queue, and every
 // further batch is counted forward_overflow.
 //
+// Every count it judges is its own forwarder's (Forwarder.Counts, #1546), never the process-wide counters a
+// previous test's forwarder can still move while it drains at its shutdown. How often that happened on the global
+// counters depended on the host's load: 4 of 10 runs on the loaded build VM, 1 of 50 on a quieter one, 10 of 10 passing
+// for reviewer-1486; with its own forwarder's counts, 50 of 50.
+//
 // MUTATION (RED): Forwarder.enqueue made a blocking send; the batch dropped on
 // the first refused connection (the behaviour before #1533).
 func TestS1015_CollectorDownNeverBlocksAndIsCounted(t *testing.T) {
@@ -445,14 +458,13 @@ func TestS1015_CollectorDownNeverBlocksAndIsCounted(t *testing.T) {
 	addr := dead.Listener.Addr().String()
 	deadURL := dead.URL + "/v1/traces"
 	dead.Close()
-	h := telemetryRouter(t, deadURL)
-	before := rum.Read()
+	h, fwd := telemetryRouterFwd(t, deadURL)
 	start := time.Now()
 	if rec := postRUM(t, h, mintRUMToken(t, "down-user"), otlpBody(t, rum.ServiceName, nil, widgetFetch())); rec.Code != http.StatusOK || time.Since(start) > time.Second {
 		t.Fatalf("status %d after %v with the collector down, want 200 at once", rec.Code, time.Since(start))
 	}
 	time.Sleep(300 * time.Millisecond)
-	if d := rum.Read().Spans["forward_failed"] - before.Spans["forward_failed"]; d != 0 {
+	if d := fwd.Counts().Failed; d != 0 {
 		t.Fatalf("forward_failed moved by %d with the collector refusing connections: the batch was dropped, not held", d)
 	}
 	l, err := net.Listen("tcp", addr)
@@ -469,13 +481,13 @@ func TestS1015_CollectorDownNeverBlocksAndIsCounted(t *testing.T) {
 	back.Start()
 	t.Cleanup(back.Close)
 	deadline := time.Now().Add(15 * time.Second)
-	for rum.Read().Spans["forwarded"] == before.Spans["forwarded"] {
+	for fwd.Counts().Forwarded == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the held batch was not delivered once the collector was back")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if d := rum.Read().Spans["forward_failed"] - before.Spans["forward_failed"]; d != 0 || backHits.Load() == 0 {
+	if d := fwd.Counts().Failed; d != 0 || backHits.Load() == 0 {
 		t.Fatalf("after the collector came back: forward_failed moved by %d, %d POSTs reached it", d, backHits.Load())
 	}
 
@@ -486,8 +498,7 @@ func TestS1015_CollectorDownNeverBlocksAndIsCounted(t *testing.T) {
 	hung := newCollector(t, block)
 	t.Cleanup(hung.srv.Close)
 	t.Cleanup(func() { close(block) })
-	h = telemetryRouter(t, hung.srv.URL+"/v1/traces")
-	before = rum.Read()
+	h, fwd = telemetryRouterFwd(t, hung.srv.URL+"/v1/traces")
 	body := otlpBody(t, rum.ServiceName, nil, widgetFetch())
 	sent := 0
 	for u := 0; sent < rum.ForwardQueue+rum.PerUserBurst; u++ {
@@ -504,7 +515,7 @@ func TestS1015_CollectorDownNeverBlocksAndIsCounted(t *testing.T) {
 			sent++
 		}
 	}
-	if d := rum.Read().Spans["forward_overflow"] - before.Spans["forward_overflow"]; d == 0 {
+	if d := fwd.Counts().Overflow; d == 0 {
 		t.Fatalf("%d batches against a hung collector and forward_overflow did not move", sent)
 	}
 }

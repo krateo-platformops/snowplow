@@ -185,7 +185,7 @@ func (in *Ingest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		out, err := proto.Marshal(envelope(f.spans))
 		if err != nil || !in.fwd.enqueue(batch{body: out, spans: n}) {
-			spansForwardOverflow.Add(uint64(n))
+			in.fwd.countOverflow(uint64(n))
 			rejected += n
 		}
 	}

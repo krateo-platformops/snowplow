@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
@@ -61,7 +62,25 @@ type Forwarder struct {
 	queue  chan batch
 	// sleep waits d, false when ctx ended first (the worker's own wait; a test replaces it)
 	sleep func(ctx context.Context, d time.Duration) bool
+	// own counts the spans of THIS forwarder, beside the process-wide counters every forwarder adds to (#1546: a
+	// test reads its own forwarder's, which no other forwarder in the process can move)
+	own struct{ forwarded, failed, overflow atomic.Uint64 }
 }
+
+// ForwarderCounts is one forwarder's own span counts: the process-wide forwarded / forward_failed /
+// forward_overflow (Read) are the sum over every forwarder.
+type ForwarderCounts struct {
+	Forwarded, Failed, Overflow uint64
+}
+
+// Counts returns this forwarder's own span counts.
+func (f *Forwarder) Counts() ForwarderCounts {
+	return ForwarderCounts{Forwarded: f.own.forwarded.Load(), Failed: f.own.failed.Load(), Overflow: f.own.overflow.Load()}
+}
+
+func (f *Forwarder) countForwarded(n uint64) { spansForwarded.Add(n); f.own.forwarded.Add(n) }
+func (f *Forwarder) countFailed(n uint64)    { spansForwardFailed.Add(n); f.own.failed.Add(n) }
+func (f *Forwarder) countOverflow(n uint64)  { spansForwardOverflow.Add(n); f.own.overflow.Add(n) }
 
 // NewForwarder returns a forwarder for the collector at collectorURL (the full
 // .../v1/traces URL). Start runs its worker. Its client comes from credhttp
@@ -127,7 +146,7 @@ func (f *Forwarder) Start(ctx context.Context) {
 				for {
 					select {
 					case b := <-f.queue:
-						spansForwardFailed.Add(uint64(b.spans))
+						f.countFailed(uint64(b.spans))
 					default:
 						return
 					}
@@ -148,10 +167,10 @@ func (f *Forwarder) deliver(ctx context.Context, b batch) {
 		o, retryAfter := f.post(ctx, b)
 		switch o {
 		case forwardDelivered:
-			spansForwarded.Add(uint64(b.spans))
+			f.countForwarded(uint64(b.spans))
 			return
 		case forwardRefused:
-			spansForwardFailed.Add(uint64(b.spans))
+			f.countFailed(uint64(b.spans))
 			return
 		}
 		if wait == 0 {
@@ -164,7 +183,7 @@ func (f *Forwarder) deliver(ctx context.Context, b batch) {
 			d = retryAfter
 		}
 		if ctx.Err() != nil || !f.sleep(ctx, d) {
-			spansForwardFailed.Add(uint64(b.spans)) // shut down while it was held: accepted, never delivered
+			f.countFailed(uint64(b.spans)) // shut down while it was held: accepted, never delivered
 			return
 		}
 	}
