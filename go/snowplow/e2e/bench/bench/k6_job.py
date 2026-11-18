@@ -369,7 +369,7 @@ def _renderer_sampler(sessions: int) -> str:
     threads: the time they were runnable and waited for a CPU), KEYED BY (pid, starttime) (/proc/<pid>/stat field
     22: a reused pid is another series, never the old one's continuation), timed by /proc/uptime (node-wide: the
     browser container's cpu_start anchor places it), into /out/browser-renderers.jsonl: {"kind": "renderer", "t",
-    "rd": {"<pid>:<starttime>": ns}, "th": {"<pid>:<starttime>": {"<tid>:<thread starttime>": ns}}}, and once per
+    "t_end" (the uptime again after the sample's files were read), "rd": {"<pid>:<starttime>": ns}, "th": {"<pid>:<starttime>": {"<tid>:<thread starttime>": ns}}}, and once per
     series its Chrome's --user-data-dir ({"kind": "renderer_udd", "pid", "start", "udd"}), which the evaluator
     matches against the CDP endpoint that named the pid. "th" is each THREAD's own run_delay, keyed by its tid and
     its own starttime (/proc/<pid>/task/<tid>/stat field 22: a reused tid is another thread), and "rd" is their sum:
@@ -420,9 +420,12 @@ rsample() {{
   # starttime, field 22) and its schedstat (field 2: the thread's run_delay, and summed into the process's "rd"). A
   # thread whose stat could not be read (it exited between the listing and the read) is in neither. Paths are read
   # from their END (.../proc/<pid>/stat, .../proc/<pid>/task/<tid>/(sched)stat), so the program is tested on a tree
-  # of files outside /proc (test_the_sampler_counts_no_thread_whose_stat_it_could_not_read)
+  # of files outside /proc (test_the_sampler_counts_no_thread_whose_stat_it_could_not_read). The sample's start "t"
+  # is the uptime read before its files, its end "t_end" the uptime read again after them (#1529 review: about two
+  # files per thread lie between; the evaluator brackets a load by the lower sample's end and the upper's start).
+  # null when the second read fails
   # shellcheck disable=SC2086
-  awk -v t="$up" 'FNR == 1 {{ n = split(FILENAME, a, "/"); k = (a[n - 2] == "task"); p = k ? a[n - 3] : a[n - 1]
+  awk -v t="$up" -v uf=/proc/uptime 'FNR == 1 {{ n = split(FILENAME, a, "/"); k = (a[n - 2] == "task"); p = k ? a[n - 3] : a[n - 1]
                              tid = k ? a[n - 1] : "" }}
     FILENAME ~ /\\/proc\\/[0-9]+\\/stat$/ {{ x = $0; sub(/^.*\\) /, "", x); split(x, f, " "); st[p] = f[20]; next }}
     FILENAME ~ /\\/task\\/[0-9]+\\/stat$/ {{ x = $0; sub(/^.*\\) /, "", x); split(x, f, " "); tst[p, tid] = f[20]; next }}
@@ -432,7 +435,8 @@ rsample() {{
           o = ""; h = ""
           for (p in s) if (p in st) {{ o = o (o == "" ? "" : ", ") "\\"" p ":" st[p] "\\": " s[p]
                                      h = h (h == "" ? "" : ", ") "\\"" p ":" st[p] "\\": {{" th[p] "}}" }}
-          printf "{{\\"kind\\": \\"renderer\\", \\"t\\": %s, \\"rd\\": {{%s}}, \\"th\\": {{%s}}}}\\n", t, o, h }}' \\
+          te = "null"; if ((getline u < uf) > 0) {{ split(u, uu, " "); te = uu[1] }}
+          printf "{{\\"kind\\": \\"renderer\\", \\"t\\": %s, \\"t_end\\": %s, \\"rd\\": {{%s}}, \\"th\\": {{%s}}}}\\n", t, te, o, h }}' \\
     $files 2>/dev/null >> /out/browser-renderers.jsonl
 }}
 rknown=""; rnot=""

@@ -4056,6 +4056,10 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
         threads = {"loads_measured": len(measured),
                    "loads_with_thread_exit": sum(1 for g in measured if g["exited"]),
                    "loads_with_thread_start": sum(1 for g in measured if g["started"]),
+                   # each new thread in a load's bracket, counted whole: exact (it started inside the bracket) or an
+                   # upper bound (an earlier start, or no clock to tell); summed over the loads
+                   "new_threads_exact": sum(g["started_exact"] for g in measured),
+                   "new_threads_upper_bound": sum(g["started_upper"] for g in measured),
                    "undercount_bound_ms_max": round(max(bounds), 1) if bounds else 0.0,
                    "undercount_bound_ms_total": round(sum(bounds), 1)}
     value = {"rule": rule, "rule_text": k6eval.RULE_TEXT[rule],
@@ -4077,7 +4081,8 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
     # #1529 review: the exit bound (an exited renderer thread's run_delay after its last sample, up to one sample
     # gap) swamps a ~150 ms load, so measured + bound would excuse every load with an exit. It decides nothing
     # unless it could flip a verdict: the judgement again on measured + bound; where the two disagree, the outcome
-    # is not known, named with the bound and the loads that carry it
+    # is not known, named with the bound and the loads that carry it. Where they agree (the measured stall alone
+    # already decides an outcome, or neither does) the bound changes nothing and the verdict below stands
     if per_load_upper is not None and per_load_upper != delays:
         _, without_upper = _starvation_judgement(navs, per_load_upper, th, browser, k6th, wt)
         flip = [c for c in WALL_TIME_CHECKS if c in as_seen and without.get(c) != without_upper.get(c)]
@@ -4092,7 +4097,6 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
                             + "; ".join(f"{c} ({without[c]} without the measured stall, {without_upper[c]} without it "
                                         f"and the bound)" for c in flip)
                             + f": whether the load generator slowed a judged page is unknown (rule: {rule})")}
-    decided = [c for c in WALL_TIME_CHECKS if c in as_seen and as_seen.get(c) != without.get(c)]
     decided = [c for c in WALL_TIME_CHECKS if c in as_seen and as_seen.get(c) != without.get(c)]
     if decided:
         return {"check": name, "value": value, "bar": "no judged outcome decided by the stall",

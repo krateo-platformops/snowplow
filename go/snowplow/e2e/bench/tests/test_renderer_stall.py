@@ -32,7 +32,8 @@ def _uptime(epoch: float) -> float:
 
 
 def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, stall=None, lost=(), idle=None,
-          ops=None, node=True, helper_cpu=True, watch=None, omit=(), per_thread=False, exiting=(), churn=(), spawn=()):
+          ops=None, node=True, helper_cpu=True, watch=None, omit=(), per_thread=False, exiting=(), churn=(), spawn=(),
+          stall_rate=1.0):
     """Warm loads at 600 ms (over the 500 ms bar) for 3 sessions, inside 20 s of browser-container stall (every
     window stalled 5 s: the container rule explains the FAIL away). `renderer`: the run also recorded per-renderer
     evidence: each session's renderer (PIDS) read by renderers.js before and (`map_after`) after its loads, and
@@ -74,7 +75,8 @@ def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, s
             t = T_POINTS - 15 + i
             # a stalled renderer waits for a CPU all the time its loads run (1 s of run_delay per second); every
             # renderer's counter is live: it advanced (2 ms) while its page first rendered, before the loads
-            main = {s: (int(1e9 * min(max(0.0, t - (first - 1)), last + 1 - (first - 1))) if s in stalled else 0)
+            main = {s: (int(stall_rate * 1e9 * min(max(0.0, t - (first - 1)), last + 1 - (first - 1)))
+                        if s in stalled else 0)
                     + (1000 if t < first - 8 else 2001000) for s in SESSIONS}
             th = {s: {f"{PIDS[s]}:{START}": main[s]} for s in SESSIONS}
             for s in exiting:
@@ -254,6 +256,21 @@ def test_old_evidence_with_only_the_summed_run_delay_keeps_the_exit_unknown(tmp_
     assert _check(v["checks"], "warm_nav_p95_ms")["result"] == "INCONCLUSIVE"
 
 
+def test_when_the_measured_stall_alone_decides_an_exit_bound_that_agrees_leaves_it_decided(tmp_path):
+    """reviewer-1480's B1: every renderer waited for a CPU 0.2 s per second through its loads (200-400 ms of each
+    600 ms load's bracket), so the measured stall alone flips warm p95 (FAIL as measured, PASS without it); s1's
+    renderer also loses a thread mid-loads, a 1 s bound on its loads. Judged again with the bound, warm p95 is PASS
+    without the stall too: the two passes agree, so the verdict stands, DECIDED: FAIL (INVALID by environment), never
+    UNMEASURED (mutation R4: comparing the as-measured outcome with the bound pass, instead of the two passes, reads
+    UNMEASURED)."""
+    _, v = _case(tmp_path, per_thread=True, stalled=SESSIONS, stall_rate=0.2, exiting=("s1",))
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "FAIL" and "warm_nav_p95_ms" in c["why"], c
+    assert c["why"].startswith("the load generator's CPU stall could have decided"), c["why"]
+    th = c["value"]["renderer_threads"]
+    assert th["loads_with_thread_exit"] >= 1 and th["undercount_bound_ms_max"] > 0, th
+
+
 def test_an_exit_bound_that_could_flip_a_verdict_leaves_the_check_unmeasured_and_named(tmp_path):
     """Every renderer starts a thread at every sample that is gone by the next: every load's bracket holds an exited
     thread whose run_delay after its last sample is unknown, up to 1 s each (2 s for a load whose bracket spans two
@@ -334,6 +351,34 @@ def test_each_threads_own_delta_is_summed_with_the_bound_stated(extra, want):
     assert got["upper_ms"] == pytest.approx(min(LOAD["wall_ms"], got["ms"] + want["bound_ms"]))
 
 
+def test_a_new_thread_is_exact_when_it_started_inside_the_bracket_and_an_upper_bound_otherwise():
+    """reviewer-1480's N2, from the sampler's own records through renderer_state (CLK_TCK 100, epoch = uptime here):
+    over LOAD's bracket (samples 5, 6, 7) two threads are first seen at 6; one started at 5.5 (after the previous
+    sample's start: inside the bracket, its whole value exact), the other at 2.0 (it existed before, unseen: its whole
+    value an upper bound). Both are counted whole (mutations: judging by the sample it was first seen in, or calling
+    every new thread exact, turn this RED)."""
+    rows = [{"kind": "renderer_clock", "hz": 100}, {"kind": "renderer_udd", "pid": 7, "start": "1", "udd": "u"}]
+    for t in range(0, 21):
+        th = {"7:1": 1000 * t}
+        if t >= 6:
+            th.update({"11:550": 300, "12:200": 400})
+        rows.append({"kind": "renderer", "t": float(t), "rd": {"7:1": sum(th.values())}, "th": {"7:1": th}})
+    r = k6eval.renderer_state({"renderers": rows, "renderer_map": [_read(1), _read(9)]}, 0.0)
+    got = k6eval.renderer_delay(LOAD, {"slack_s": 0.0, "renderer": r})
+    assert got["why"] == "" and got["ms"] == pytest.approx((2000 + 300 + 400) / 1e6), got
+    assert (got["started"], got["started_exact"], got["started_upper"], got["bound_ms"]) == (2, 1, 1, 0.0), got
+
+
+def test_the_lower_sample_brackets_by_its_end_and_the_upper_by_its_start():
+    """reviewer-1480's point 4: a sample's values are read between its start and its end. The sample that started at
+    5.0 ended at 5.3, after LOAD began (5.0): its values may be from inside the load, so the lower bracket is the
+    sample before it (4, ended 4.3); the upper is the first that STARTED at or after the load's end (7). 1000 ns/s
+    from 4 to 7: 3000 ns (mutation: bracketing the lower sample by its start reads 2000 ns, an under-count)."""
+    st = _st([_read(1), _read(9)])
+    st["renderer"]["ends"] = {float(t): t + 0.3 for t in range(0, 21)}
+    assert k6eval.renderer_delay_ms(LOAD, st) == (pytest.approx(3000 / 1e6), "")
+
+
 def test_a_threads_own_run_delay_going_backwards_stays_unknown():
     """The same tid AND starttime with a lower run_delay at a later sample is a broken counter, not an exit: UNKNOWN,
     never clamped (mutation: clamping the decrease to 0 reads MEASURED)."""
@@ -355,9 +400,26 @@ def test_renderer_state_reads_each_threads_key_and_value():
                        {"kind": "renderer", "t": 6.0, "rd": {"10:500": 3}, "th": {"10:500": {"10:500": 3}}}]}
     r = k6eval.renderer_state(o, 100.0)
     assert r["per_thread"] is True
-    assert r["threads"] == {(10, "500"): {105.0: {("10", "500"): 3, ("11", "530"): 4}, 106.0: {("10", "500"): 3}}}
+    got = {k: {t: k6eval._thread_snap(v) for t, v in by_t.items()} for k, by_t in r["threads"].items()}
+    assert got == {(10, "500"): {105.0: {("10", "500"): 3, ("11", "530"): 4}, 106.0: {("10", "500"): 3}}}
     old = {"renderers": [{k: v for k, v in r_.items() if k != "th"} for r_ in o["renderers"]]}
     assert k6eval.renderer_state(old, 100.0)["per_thread"] is False
+
+
+def test_the_renderer_file_is_read_compactly_and_reads_back_the_same(tmp_path):
+    """#1529 review point 5: browser-renderers.jsonl read line by line, each sample's threads held as one shared key
+    tuple per thread set and an array of values: the same thread set at two samples shares one key tuple, and every
+    sample reads back exactly as written (a cut last line skipped)."""
+    rows = [{"kind": "renderer", "t": float(t), "rd": {"10:500": 3 + t},
+             "th": {"10:500": {"10:500": 1 + t, "11:530": 2}}} for t in range(3)]
+    f = tmp_path / "browser-renderers.jsonl"
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows) + '{"kind": "renderer", "t": 9')
+    got = k6eval._renderer_records(str(f))
+    assert len(got) == 3
+    assert got[0]["th"]["10:500"][0] is got[2]["th"]["10:500"][0]          # one key tuple for the thread set
+    assert [{k: k6eval._thread_snap(v) for k, v in r["th"].items()} for r in got] == \
+        [{"10:500": {("10", "500"): 1 + t, ("11", "530"): 2}} for t in range(3)]
+    assert k6eval._renderer_records(str(tmp_path / "absent.jsonl")) is None
 
 
 def test_a_reused_tid_read_from_the_samples_is_another_thread():
@@ -600,8 +662,9 @@ def test_the_sampler_keys_each_renderer_by_pid_and_starttime_and_reads_its_run_d
         assert p.returncode == 0, p.stderr
         rows = [json.loads(x) for x in (tmp_path / "browser-renderers.jsonl").read_text().splitlines()]
     finally:
-        fake.kill()
-        other.kill()
+        for proc in (fake, other):
+            proc.kill()
+            proc.wait(timeout=30)
     # judged on this test's own two processes only: the host's /proc holds whatever else runs beside it (a shared
     # build VM: another job's fake renderers), where the pod's own process namespace would not
     mine = (fake.pid, other.pid)
@@ -658,8 +721,10 @@ def test_the_sampler_records_each_thread_by_tid_and_its_own_starttime_and_drops_
         assert p.returncode == 0, p.stderr
         rows = [json.loads(x) for x in (tmp_path / "browser-renderers.jsonl").read_text().splitlines()]
     finally:
-        fake.kill()
-        hog.kill()
+        # reaped before the test ends: the #1170 guard fails a test that leaves a process behind
+        for proc in (fake, hog):
+            proc.kill()
+            proc.wait(timeout=30)
     key = f"{fake.pid}:{start}"
     samples = [r for r in rows if r["kind"] == "renderer" and key in r["rd"]]
     assert len(samples) == 2, rows
@@ -690,12 +755,13 @@ def _stat_line(pid: int, start: int) -> str:
 def test_the_sampler_counts_no_thread_whose_stat_it_could_not_read(tmp_path):
     """reviewer-1480's Q7: a thread whose stat could not be read (it exited between the listing and the read) but
     whose schedstat was is in neither "th" nor "rd": the sampler's own awk program on a tree of files shaped as
-    /proc (mutation: counting every schedstat line, the stat guard dropped, turns this RED)."""
+    /proc (mutation: counting every schedstat line, the stat guard dropped, turns this RED). Its end time is the
+    uptime read again after the files (a stand-in uptime file here: 2.5 after the start's 1.5)."""
     import subprocess
 
     from bench import k6_job
-    script = k6_job._renderer_sampler(1)
-    prog = script.split("awk -v t=\"$up\" '", 1)[1].split("' \\\n", 1)[0]
+    prog = _sampler_awk(k6_job)
+    (tmp_path / "uptime").write_text("2.5 9.0\n")
     root = tmp_path / "proc"
     (root / "10" / "task" / "10").mkdir(parents=True)
     (root / "10" / "task" / "11").mkdir(parents=True)
@@ -705,10 +771,16 @@ def test_the_sampler_counts_no_thread_whose_stat_it_could_not_read(tmp_path):
     (root / "10" / "task" / "11" / "schedstat").write_text("1 999 3\n")        # its stat could not be read
     files = [root / "10" / "stat", root / "10" / "task" / "10" / "stat", root / "10" / "task" / "10" / "schedstat",
              root / "10" / "task" / "11" / "schedstat"]
-    p = subprocess.run(["awk", "-v", "t=1.5", prog, *map(str, files)], capture_output=True, text=True, timeout=30)
+    p = subprocess.run(["awk", "-v", "t=1.5", "-v", f"uf={tmp_path / 'uptime'}", prog, *map(str, files)],
+                       capture_output=True, text=True, timeout=30)
     assert p.returncode == 0, p.stderr
-    assert json.loads(p.stdout) == {"kind": "renderer", "t": 1.5, "rd": {"10:500": 777},
+    assert json.loads(p.stdout) == {"kind": "renderer", "t": 1.5, "t_end": 2.5, "rd": {"10:500": 777},
                                     "th": {"10:500": {"10:500": 777}}}, p.stdout
+
+
+def _sampler_awk(k6_job) -> str:
+    """The sampler's awk program, as the rendered script holds it."""
+    return k6_job._renderer_sampler(1).split("awk -v t=\"$up\" -v uf=/proc/uptime '", 1)[1].split("' \\\n", 1)[0]
 
 
 #: The kernel premise of a new thread's measure (reviewer-1480, #1529): a new task's schedstat run_delay starts at 0
@@ -744,6 +816,7 @@ c.start()
 c.join()
 for h in hogs:
     h.kill()
+    h.wait()
 print(json.dumps({"parent_ns": parent, "child_first_ns": out["first"], "child_first_after_s": out["first_after_s"],
                   "child_later_ns": out["later"]}))
 """

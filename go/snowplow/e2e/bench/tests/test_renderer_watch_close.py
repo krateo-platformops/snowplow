@@ -5,8 +5,10 @@ wrote as a renderer_map line with pid null. The close is now the watcher's event
 read running at the close is the only read it fails, on its own line; an ask still queued is never read.
 
 k6/renderers.js runs under the k6 image's own k6 (Docker), against a scripted CDP server (a stdlib websocket
-server, below) standing in for Chrome: it closes its connection with no read running, and in the middle of a read
-with a second ask queued.
+server, below) standing in for Chrome: it closes its connection with no read running, right after a read
+completed (rehf1's real case: each Chrome closed after its session's after-read), and in the middle of a read with a
+second ask queued. Every case first asserts the fake received the calls it expects, so a watcher that never reached
+it (Docker Desktop's --network host does not reach the host's loopback) fails loudly instead of passing vacuously.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import threading
 
 import pytest
@@ -25,17 +28,26 @@ import pytest
 from tests.test_k6_830 import BENCH_DIR, needs_docker
 
 _GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#: where the k6 container reaches the fake: the host's own loopback on Linux (--network host); Docker Desktop
+#: (macOS) gives containers no such network, they reach the host as host.docker.internal
+_MAC = sys.platform == "darwin"
+_BIND, _HOST = ("0.0.0.0", "host.docker.internal") if _MAC else ("127.0.0.1", "127.0.0.1")
+_NET = [] if _MAC else ["--network", "host"]
+#: the calls the watcher makes before any ask: discovery, then attaching the page and giving it its binding
+_SETUP = ["Target.setDiscoverTargets", "Target.attachToTarget", "Runtime.enable", "Runtime.addBinding"]
 
 
 class _FakeChrome:
     """One CDP websocket endpoint: answers the calls renderers.js makes, then closes as `close_at` says: "idle" once
-    the page has its binding (no ask), "mid-read" when the first read starts its trace (two asks queued before)."""
+    the page has its binding (no ask), "after-read" once a read completed (one ask, answered in full: the marker, a
+    trace naming the page's main frame in process 4242, the stamp), "mid-read" when the first read starts its trace
+    (two asks queued before)."""
 
     def __init__(self, close_at: str):
         self.close_at = close_at
         self.srv = socket.socket()
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.srv.bind(("127.0.0.1", 0))
+        self.srv.bind((_BIND, 0))
         self.srv.listen(1)
         self.port = self.srv.getsockname()[1]
         self.seen: list[str] = []
@@ -108,14 +120,27 @@ class _FakeChrome:
             self._send(c, {"id": m["id"], "result": {}, "sessionId": sid})
             if self.close_at == "idle":
                 return True
-            for ask in ("bench-read:login:1", "bench-read:after:2"):
+            asks = ("bench-read:after:1",) if self.close_at == "after-read" else ("bench-read:login:1",
+                                                                                     "bench-read:after:2")
+            for ask in asks:
                 self._send(c, {"method": "Runtime.bindingCalled", "sessionId": "S1",
                                "params": {"name": "__benchRead", "payload": ask}})
+        elif meth == "Runtime.evaluate" and "__benchMapped" in m["params"].get("expression", ""):
+            self._send(c, {"id": m["id"], "sessionId": sid, "result": {"result": {"type": "number", "value": 1}}})
+            return self.close_at == "after-read"     # the read is complete: Chrome closes at its session's end
         elif meth == "Runtime.evaluate":
             self._send(c, {"id": m["id"], "sessionId": sid, "result": {"result": {
                 "type": "string", "value": json.dumps({"session": "s1", "class": "0"})}}})
         elif meth == "Tracing.start":
-            return True                              # Chrome closes in the middle of the read
+            if self.close_at == "mid-read":
+                return True                          # Chrome closes in the middle of the read
+            self._send(c, {"id": m["id"], "result": {}, "sessionId": sid})
+        elif meth == "Tracing.end":
+            self._send(c, {"id": m["id"], "result": {}, "sessionId": sid})
+            self._send(c, {"method": "Tracing.dataCollected", "sessionId": sid, "params": {"value": [
+                {"name": "TracingStartedInBrowser", "args": {"data": {"frames": [
+                    {"frame": "T1", "isOutermostMainFrame": True, "processId": 4242}]}}}]}})
+            self._send(c, {"method": "Tracing.tracingComplete", "sessionId": sid, "params": {}})
         else:
             self._send(c, {"id": m["id"], "result": {}, "sessionId": sid})
         return False
@@ -128,8 +153,8 @@ def _run_watcher(tmp_path, chrome: _FakeChrome) -> list[dict]:
     out.mkdir(mode=0o777)
     out.chmod(0o777)
     shutil.copy(BENCH_DIR / "k6" / "renderers.js", k6dir / "renderers.js")
-    targets = json.dumps([{"udd": "/tmp/k6browser-data-s1", "url": f"ws://127.0.0.1:{chrome.port}/devtools/browser/x"}])
-    p = subprocess.run(["docker", "run", "--rm", "--network", "host", "-v", f"{k6dir}:/opt/k6:ro", "-v", f"{out}:/out",
+    targets = json.dumps([{"udd": "/tmp/k6browser-data-s1", "url": f"ws://{_HOST}:{chrome.port}/devtools/browser/x"}])
+    p = subprocess.run(["docker", "run", "--rm", *_NET, "-v", f"{k6dir}:/opt/k6:ro", "-v", f"{out}:/out",
                         "-e", f"CDP_TARGETS={targets}", "-e", "READ_MS=3000", "--entrypoint", "k6",
                         k6_job.K6_BROWSER_IMAGE, "run", "--quiet", "--log-format", "raw",
                         "--console-output", "/out/renderer-map.jsonl", "/opt/k6/renderers.js"],
@@ -142,8 +167,11 @@ def _run_watcher(tmp_path, chrome: _FakeChrome) -> list[dict]:
 @needs_docker
 def test_a_chrome_closing_with_no_read_running_leaves_no_failed_read(tmp_path):
     """The session ended and its Chrome closed the connection; no read was running: no renderer_map line at all,
-    and one close event saying so (mutation: emitting the close as a failed read, rehf1's lines, turns this RED)."""
-    rows = _run_watcher(tmp_path, _FakeChrome("idle"))
+    and one close event saying so (mutations: emitting the close as a failed read, rehf1's lines; a watcher that
+    never reaches the fake, a dead port)."""
+    chrome = _FakeChrome("idle")
+    rows = _run_watcher(tmp_path, chrome)
+    assert chrome.seen == _SETUP, chrome.seen                              # it did reach Chrome
     assert [r for r in rows if r.get("kind") == "renderer_map"] == [], rows
     closes = [r for r in rows if r.get("kind") == "renderer_cdp" and r.get("event") == "close"]
     assert len(closes) == 1 and closes[0]["read_in_flight"] is False and closes[0]["asks_unread"] == 0, rows
@@ -156,6 +184,7 @@ def test_a_chrome_closing_mid_read_fails_that_read_only_and_reads_nothing_after(
     (mutations: reading on after the close; the close as a line of its own)."""
     chrome = _FakeChrome("mid-read")
     rows = _run_watcher(tmp_path, chrome)
+    assert chrome.seen == _SETUP + ["Runtime.evaluate", "Tracing.start"], chrome.seen
     maps = [r for r in rows if r.get("kind") == "renderer_map"]
     assert len(maps) == 1, rows
     m = maps[0]
@@ -164,3 +193,17 @@ def test_a_chrome_closing_mid_read_fails_that_read_only_and_reads_nothing_after(
     closes = [r for r in rows if r.get("kind") == "renderer_cdp" and r.get("event") == "close"]
     assert len(closes) == 1 and closes[0]["read_in_flight"] is True and closes[0]["asks_unread"] == 1, rows
     assert chrome.seen[-1] == "Tracing.start", chrome.seen                 # nothing reached Chrome after it
+
+
+@needs_docker
+def test_a_chrome_closing_after_a_completed_read_leaves_no_read_in_flight(tmp_path):
+    """rehf1's actual case: the session's after-read completed (the page's main frame in process 4242), then its
+    Chrome closed. One read line, the completed one; the close finds no read in flight and fails nothing (mutation:
+    a finished read left as the in-flight one, inFlight not cleared, reads read_in_flight true and could fail it)."""
+    chrome = _FakeChrome("after-read")
+    rows = _run_watcher(tmp_path, chrome)
+    assert chrome.seen == _SETUP + ["Runtime.evaluate", "Tracing.start", "Tracing.end", "Runtime.evaluate"], chrome.seen
+    maps = [r for r in rows if r.get("kind") == "renderer_map"]
+    assert len(maps) == 1 and maps[0]["pid"] == 4242 and maps[0]["ask"] == "after" and "why" not in maps[0], rows
+    closes = [r for r in rows if r.get("kind") == "renderer_cdp" and r.get("event") == "close"]
+    assert len(closes) == 1 and closes[0]["read_in_flight"] is False and closes[0]["asks_unread"] == 0, rows
