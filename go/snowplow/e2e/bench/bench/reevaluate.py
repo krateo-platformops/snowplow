@@ -42,7 +42,7 @@ EVALUATE_GLOBS = ("nav-*.jsonl", "fresh-*.jsonl", "preflight.jsonl", "pod-*.json
                   "top-boot.jsonl", "boot.jsonl", "flowcontrol-config.jsonl", "image-digest.jsonl", "job-pods.jsonl",
                   "cluster-shape*.jsonl", "api-outages*.jsonl", "platform-definitions.jsonl", "command-failures.jsonl",
                   "cert-manager*.jsonl", "host-load.jsonl", "incluster-placement.jsonl", "observer-pod.jsonl",
-                  "netns*.jsonl", "frontend-digest*.jsonl")
+                  "netns*.jsonl", "frontend-digest*.jsonl", "collect-copies*.jsonl")
 
 
 class Refused(ValueError):

@@ -2780,6 +2780,8 @@ RESOLVE_MEMO_COUNTERS = ("hits_total", "misses_total", "stale_misses_total", "wo
 STALE_TO_PUSH_PREFIX = "snowplow_stale_to_push"         # _to_push_ms {layer: hist}
 STALE_SERVE_PREFIX = "snowplow_stale_serve"             # _serves_total, _serves_open, _serve_closes_total
 STALE_UNREPLACED_PREFIX = "snowplow_stale_unreplaced"   # _unreplaced_total {layer: n}
+# #1322's external fetches and their coalescing (flights): every snowplow_external_fetch_* expvar
+EXTERNAL_FETCH_PREFIX = "snowplow_external_fetch"
 # The /debug/vars prefixes memwatch must capture so every key above is seen.
 # run606's MEM_VARS_PREFIXES default IS this tuple (printed by `prefixes`), and
 # `check-prefixes` refuses a run-8 run whose prefixes miss any RUN8_KEYS value.
@@ -2838,6 +2840,11 @@ RUN8_VARS_PREFIXES = (
     EGRESS_KEYS["connections"],
     "snowplow_endpoint_retries",
     RESOLVE_MEMO_KEY,                     # snowplow #1284: memo lookups and would-joins (resolve_memo_report)
+    # Diego 2026-11-18 (reviewer-1486: run29's "doubling" was the denominator, 1.12.74 sending HALF the stage
+    # requests): #1322's external-fetch counters, so a pair can tell coalescing from lost reads:
+    # snowplow_external_fetch_total / _by_driver_total / _abandoned_*, _flight_total, _flight_unwaited_panics_total,
+    # _conversion_* (resolvers/restactions/api external_fetch_metrics.go, external_fetch_cache.go)
+    EXTERNAL_FETCH_PREFIX,
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
@@ -4052,7 +4059,9 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
         per_load = [g["ms"] or 0.0 for g in got]
         per_load_upper = [g["upper_ms"] or 0.0 for g in got]
         measured = [g for g in got if g["ms"] is not None]
-        bounds = [g["bound_ms"] for g in measured if g["bound_ms"]]
+        # the exit bound and (Gap 2, run29) a new renderer's wait before its first sample, apart: each is a bound
+        bounds = [g.get("exit_bound_ms", g["bound_ms"]) for g in measured if g.get("exit_bound_ms", g["bound_ms"])]
+        pre = [g["pre_ms"] for g in measured if g.get("lower") == "process_start"]
         threads = {"loads_measured": len(measured),
                    "loads_with_thread_exit": sum(1 for g in measured if g["exited"]),
                    "loads_with_thread_start": sum(1 for g in measured if g["started"]),
@@ -4061,7 +4070,12 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
                    "new_threads_exact": sum(g["started_exact"] for g in measured),
                    "new_threads_upper_bound": sum(g["started_upper"] for g in measured),
                    "undercount_bound_ms_max": round(max(bounds), 1) if bounds else 0.0,
-                   "undercount_bound_ms_total": round(sum(bounds), 1)}
+                   "undercount_bound_ms_total": round(sum(bounds), 1),
+                   # Gap 2: loads with no renderer sample before them, bracketed below by the renderer's process
+                   # start; what it waited before its first sample is a bound, never measured stall
+                   "loads_bracketed_by_process_start": len(pre),
+                   "process_start_bound_ms_max": round(max(pre), 1) if pre else 0.0,
+                   "process_start_bound_ms_total": round(sum(pre), 1)}
     value = {"rule": rule, "rule_text": k6eval.RULE_TEXT[rule],
              "stall_share": st["stall_share"], "saturated_windows": st["saturated_windows"],
              "windows": len(st["windows"]), "node_cpus": st["node_cpus"],
@@ -4087,13 +4101,22 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
         _, without_upper = _starvation_judgement(navs, per_load_upper, th, browser, k6th, wt)
         flip = [c for c in WALL_TIME_CHECKS if c in as_seen and without.get(c) != without_upper.get(c)]
         if flip:
-            bounded = sum(1 for d, u in zip(delays, per_load_upper) if u > d)
+            exits = sum(1 for g in got if g["ms"] is not None and g.get("exit_bound_ms", g["bound_ms"]))
+            parts = []
+            if exits:
+                parts.append(f"the under-count bound of {exits} page load(s) whose renderer lost a "
+                             f"thread inside it (up to {threads['undercount_bound_ms_max']} ms each, "
+                             f"{threads['undercount_bound_ms_total']} ms in all: an exited thread's run_delay after "
+                             f"its last sample)")
+            if threads["loads_bracketed_by_process_start"]:
+                parts.append(f"the bound of {threads['loads_bracketed_by_process_start']} page load(s) bracketed "
+                             f"below by their new renderer's process start (up to "
+                             f"{threads['process_start_bound_ms_max']} ms each, "
+                             f"{threads['process_start_bound_ms_total']} ms in all: what the renderer waited before "
+                             f"its first sample, which may lie before the load)")
             return {"check": name, "value": value, "bar": "measured: no judged outcome decided by the stall",
                     "result": "UNMEASURED",
-                    "why": (f"UNMEASURED: the under-count bound of {bounded} page load(s) whose renderer lost a "
-                            f"thread inside it (up to {threads['undercount_bound_ms_max']} ms each, "
-                            f"{threads['undercount_bound_ms_total']} ms in all: an exited thread's run_delay after "
-                            f"its last sample) could flip "
+                    "why": ("UNMEASURED: " + " and ".join(parts) + " could flip "
                             + "; ".join(f"{c} ({without[c]} without the measured stall, {without_upper[c]} without it "
                                         f"and the bound)" for c in flip)
                             + f": whether the load generator slowed a judged page is unknown (rule: {rule})")}
@@ -4133,7 +4156,8 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
              k6: dict | None = None,
              churns: list[dict] | None = None,
              api_outages: list[dict] | None = None,
-             profile_dir: str | None = None) -> dict:
+             profile_dir: str | None = None,
+             collect_copies: list[dict] | None = None) -> dict:
     """North-star verdict from the run's JSONL records.
 
     Returns {"verdict": PASS|FAIL|INVALID, "checks": [...], "economics": ...}.
@@ -4147,6 +4171,9 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
     `churns`: fresh606's churn records (the per-phase reports' schedule).
     `profile_dir`: where mem606's CPU profiles were copied (the run's heap/
     dir), for the #871 work-class CPU report; None = not attributed.
+    `collect_copies`: run606 collect_copy's records (collect-copies.jsonl): a copy that came out short or failed is
+    collect.copies FAIL, the run INVALID (its streams are not what the pods held); none recorded (evidence from
+    before it): no such check.
     """
     if k6 is not None:
         # operator side only: this file also runs alone inside the Job pods
@@ -4295,6 +4322,11 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
             MEM_FRAMING, mem_streams,
             required=any(r.get("job") == "mem606" for r in job_pods or [])))
     validity.extend(job_pod_checks(job_pods or []))
+    # Diego 2026-11-18 (run 29 N2): every collected copy verified against its pod, a short one named
+    from bench import collect_copy as _collect_copy
+    copies, copy_warnings = _collect_copy.copies_check(collect_copies or [])
+    if copies is not None:
+        validity.append(copies)
     storm = cpu_storm_check(cpu_profile_windows(mem or []))
     if storm is not None:
         validity.append(storm)
@@ -4378,6 +4410,7 @@ def evaluate(navs: list[dict], fresh: list[dict], vars_series: list[dict],
         [(f"{LIST_NARROW_KEY} absent in all {report['list_narrow_shadow_report_only']['mem_samples']} "
           f"mem samples: the #765 B shadow report is missing, not zero")]
         if report["list_narrow_shadow_report_only"]["status"] == LIST_NARROW_ABSENT else [])
+    report["report_warnings"] += copy_warnings
     report["content_fill_by_gvr_report_only"] = content_fill_report(mem or [])
     report["list_incremental_report_only"] = list_incremental_report(mem or [], phase_src)
     report["store_verification_report_only"] = sv = store_verification_report(mem or [], phase_src)
@@ -6779,7 +6812,8 @@ def _cmd_evaluate(a) -> int:
                       k6=k6,
                       churns=[r for r in recs if r.get("kind") == "churn"],
                       api_outages=[r for r in recs if r.get("kind") == "api_unreachable"],
-                      profile_dir=a.profile_dir)
+                      profile_dir=a.profile_dir,
+                      collect_copies=[r for r in recs if r.get("kind") == "collect_copy"])
     result["report"]["missing_inputs"] = missing_inputs
     for name in missing_inputs:
         result["report"].setdefault("report_warnings", []).append(

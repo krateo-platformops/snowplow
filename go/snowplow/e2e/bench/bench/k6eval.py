@@ -500,7 +500,9 @@ def renderer_delay(n: dict, st: dict) -> dict:
     or that was not read on both sides, is not known), resolved to the one (pid, starttime) series the sampler
     recorded through both reads, under the --user-data-dir of the Chrome whose endpoint named it. Its stall: that
     series' run_delay between the last sample at or before the load's start and the first at or after its end (each
-    side widened OUTWARD by the anchor's error, st["slack_s"]), capped at the load's own time. With per-thread samples
+    side widened OUTWARD by the anchor's error, st["slack_s"]), capped at the load's own time. With no sample before
+    the load, a renderer sampled per thread is bracketed below by its own process start, where every thread's
+    run_delay is 0 ("lower": "process_start"; a class's first page, its renderer new: run29). With per-thread samples
     (a sampler since 2026-11-18) the stall is the sum of each thread's own delta (_thread_delta): a thread that exits
     is a stated under-count bound, never UNKNOWN; a thread whose own run_delay went backwards is UNKNOWN. Without
     them (older evidence) the series' summed run_delay, and a sum that decreased across the load is UNKNOWN (a
@@ -550,25 +552,60 @@ def renderer_delay(n: dict, st: dict) -> dict:
     ends = r.get("ends") or {}
     lo = [i for i, (t, _) in enumerate(s) if ends.get(t, t) <= s0 - slack]
     hi = [i for i, (t, _) in enumerate(s) if t >= s1 + slack]
-    if not lo or not hi:
+    # Gap 2 (run29: every unbracketed load a class's first page, its renderer started ~2.1 s before it but first
+    # sampled only once the load had begun): with no sample ended before the load, the renderer's PROCESS START is
+    # its lower bracket, every thread at run_delay 0 there. A new task's run_delay starts at 0 (#1529's new-thread
+    # rule: test_the_kernel_starts_a_new_threads_run_delay_at_zero) and no thread of a process starts before the
+    # process, so at its start the process's whole run_delay is 0: exact, not an estimate. Only with per-thread
+    # samples (each thread's own start proves it began at or after the process, so _thread_delta counts it from 0),
+    # only when the process started before the load (widened by the anchor's error, like a sample), and only when
+    # every thread the bracket holds has a start on the clock at or after the process's.
+    born = None
+    if not lo and hi and r.get("per_thread"):
+        born = (r.get("started") or {}).get(k1)
+        if born is None or born > s0 - slack:
+            born = None
+    if (not lo and born is None) or not hi:
         return unknown("no renderer sample brackets it")
-    if lo[-1] >= hi[0]:
+    if lo and lo[-1] >= hi[0]:
         # with consistent clocks the lower sample ends before the load and the upper starts after it, so the lower
         # comes first; one at or after the upper means a sample's end and start are on different clocks (#1529
         # review: an empty bracket would read a stall of 0, a silent "not starved")
         return unknown("its bracket is empty or inverted: the samples' end and start times disagree (a clock slip)")
-    win = s[lo[-1]:hi[0] + 1]
+    win = s[lo[-1]:hi[0] + 1] if lo else s[:hi[0] + 1]
     if r.get("per_thread"):
         at = (r.get("threads") or {}).get(k1) or {}
         if any(t not in at for t, _ in win):
             return unknown("a sample of its renderer that brackets it has no per-thread record")
-        got, why = _thread_delta([t for t, _ in win], [_thread_snap(at[t]) for t, _ in win], r.get("thread_start"))
+        times, snaps = [t for t, _ in win], [_thread_snap(at[t]) for t, _ in win]
+        pre_ms = 0.0
+        if born is not None:
+            tstart = r.get("thread_start") or (lambda key: None)
+            late = [k for k in {k for sn in snaps for k in sn} if (tstart(k) is None or tstart(k) < born)]
+            if late:
+                return unknown(f"no renderer sample brackets it, and its process start cannot: {len(late)} of its "
+                               "threads have no start on the clock at or after the process's")
+            # the process start as the bracket's first sample: every thread absent, i.e. all at 0. What the
+            # renderer waited between its process start and its first sample may lie before the load (run29: ~2.1 s
+            # before it), so it is never charged to the load as measured: the measured stall is from the first
+            # sample on, and that earlier wait is a stated BOUND (pre_ms), judged like an exit bound (load606
+            # starvation_check: it decides nothing unless it could flip a judged outcome, and then the check is
+            # UNMEASURED with the bound named)
+            whole, why = _thread_delta([born] + times, [{}] + snaps, tstart)
+            if whole is None:
+                return unknown(why)
+        got, why = _thread_delta(times, snaps, r.get("thread_start"))
         if got is None:
             return unknown(why)
+        if born is not None:
+            pre_ms = max(0.0, (whole["ns"] - got["ns"]) / 1e6)
         ms = min(n["wall_ms"], got["ns"] / 1e6)
-        return {"ms": ms, "bound_ms": got["bound_ms"], "upper_ms": min(n["wall_ms"], ms + got["bound_ms"]),
+        bound = got["bound_ms"] + pre_ms
+        return {"ms": ms, "bound_ms": bound, "upper_ms": min(n["wall_ms"], ms + bound),
                 "exited": got["exited"], "started": got["started"], "started_exact": got["started_exact"],
-                "started_upper": got["started_upper"], "why": ""}
+                "started_upper": got["started_upper"], "why": "",
+                **({"lower": "process_start", "pre_ms": pre_ms, "exit_bound_ms": got["bound_ms"]}
+                   if born is not None else {})}
     d = win[-1][1] - win[0][1]
     if d < 0:
         return unknown("its renderer's summed run_delay decreased across it (a thread exited with its run_delay)")
@@ -945,14 +982,18 @@ def read_viewer_out(d: str) -> dict | None:
     path, exitf = os.path.join(d, "viewer.jsonl"), os.path.join(d, "viewer-exit.json")
     if not (os.path.exists(path) or os.path.exists(exitf)):
         return None
-    out = {"records": [], "truncated": False, "exit": None}
+    # final_newline: the file ends with a whole line (or is empty): a copy cut short ends mid-line (run 29 N2)
+    out = {"records": [], "truncated": False, "exit": None, "final_newline": True}
     try:
         with open(path) as fh:
+            last = ""
             for line in fh:
+                last = line
                 try:
                     out["records"].append(json.loads(line))
                 except ValueError:
                     out["truncated"] = True
+            out["final_newline"] = last == "" or last.endswith("\n")
     except OSError:
         pass
     try:
@@ -985,14 +1026,23 @@ def viewer_checks(v: dict | None, k6o: dict | None, th: dict | None = None) -> l
     kinds = [r.get("kind") for r in recs]
     end = next((r for r in reversed(recs) if r.get("kind") == "viewer_end"), None)
     why = []
+    # run 29 N2: the sidecar exited rc 0 in its pod (it finished), but the collected file has no viewer_end or no
+    # final newline: the COPY is cut short (collect.copies names it), not a sidecar that did not finish
+    cut_copy = (v["exit"] or {}).get("rc") == 0 and (end is None or not v.get("final_newline", True))
     if not recs or kinds[0] != "viewer_start":
         why.append("no viewer_start first: the stream's head is missing")
     if end is None:
-        why.append("no viewer_end: the sidecar did not finish, or the tail is missing")
+        why.append("no viewer_end in the collected file although the sidecar exited rc 0: a truncated copy (COLLECT), "
+                   "not a sidecar that did not finish" if cut_copy
+                   else "no viewer_end: the sidecar did not finish, or the tail is missing")
     elif end.get("ended_by") != "feed_end":
         why.append(f"the viewers stopped on: {end.get('ended_by')}")
+    if not v.get("final_newline", True) and end is not None and cut_copy:
+        why.append("the collected file lacks its final newline although the sidecar exited rc 0: a truncated copy "
+                   "(COLLECT)")
     if v["truncated"]:
-        why.append("the stream is cut (an unreadable line)")
+        why.append("the collected copy is cut mid-record (an unreadable line)" if cut_copy
+                   else "the stream is cut (an unreadable line)")
     if v["exit"] is None:
         why.append("no exit record: the sidecar died before its wrapper recorded the exit code")
     elif v["exit"].get("rc") != 0:

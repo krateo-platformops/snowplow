@@ -283,7 +283,7 @@ def test_run606_starts_the_sampler_with_the_platform_and_collects_its_file():
     assert "bench.netns606 render --every-s \"$TOP_POLL_S\"" in start and "kapply" in start
     assert "|| log" in start                                               # report only: never fails the run
     coll = src[src.index("s_collect() {"):src.index("mem_stop() {")]
-    assert "job-name=netns606" in coll and ':/out/netns.jsonl" "$OUT/netns.jsonl"' in coll
+    assert "job-name=netns606" in coll and '/out/netns.jsonl "$OUT/netns.jsonl" file' in coll
     ev = src[src.index("s_evaluate() {"):]
     # a glob, so nullglob drops it when no file was collected (a literal path is passed as is, and
     # evaluate stops on a file that is not there: test_run606_real_sequence runs that case)
