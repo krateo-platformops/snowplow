@@ -496,27 +496,26 @@ func TestIssue1509_Chain_AHandshakeStillReceivingBytesIsNotRaced(t *testing.T) {
 	}
 }
 
-// A live attempt keeps covering its waiter when the chain flips out of
-// answering and back (#1521 review: dropping earlier attempts as cover on the
-// flip back doubled a healthy burst's setups). A connected attempt covers
-// until it ends (rule B). Trigger T = 50 ms:
+// Cover across a flip out of answering and back, rule D (#1521): a
+// connected attempt covers while its answering period lasts; when a new
+// period begins, attempts that connected before it stop covering and their
+// waiters get attempts of their own, counted (replacedAt). Trigger T = 50 ms:
 //
 //	0       W1, W2 join; attempt 1 (conn 1) comes up at 15 ms: W1 served,
-//	        answered; attempt 2 (conn 2) starts for W2: connected, its
+//	        period 1 begins; attempt 2 (conn 2) starts for W2: connected, its
 //	        handshake held by the server.
 //	65      interval check: the success is fresh evidence; still answering.
 //	90      W3 joins: attempt 3 (conn 3) starts for it: connected, held too.
 //	115     interval check: nothing came up and no bytes were read: the chain
-//	        races (attempt 4, conn 4, answers at once). Attempts 2 and 3 are
-//	        connected: they keep covering.
-//	~116    attempt 4 comes up: W2 served, answered again. W3 is covered by a
-//	        live attempt: no new attempt.
+//	        races (attempt 4, conn 4, answers at once).
+//	~116    attempt 4 comes up: W2 served; period 2 begins. Attempts 2 and 3
+//	        connected in period 1: they stop covering, and W3 gets attempt 5.
 //
-// The server must accept exactly 4 connections, and every connection beyond
-// one per waiter is the one race fired at this destination (exactly: accepted
-// - 3 == racesFiredAt). Dropping earlier attempts as cover on the flip back
-// (M-epoch), or every attempt at every check (M-dropall), starts another for
-// W3 that replaces the race's or adds a fifth.
+// Exactly: accepted == 3 waiters + races (1) + replaced at the new period
+// (1), read from the chain's own accounting. Keeping the earlier period's
+// attempts as cover (rule B) replaces none; dropping every attempt at every
+// check (M-dropall), or connected ones at the interval check (rule A), starts
+// W3's attempt outside the new period's replacement.
 func TestIssue1509_Chain_ALiveAttemptStillCoversAcrossAReRace(t *testing.T) {
 	resetConnectTimes(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -557,9 +556,9 @@ func TestIssue1509_Chain_ALiveAttemptStillCoversAcrossAReRace(t *testing.T) {
 		}
 	}
 	time.Sleep(2 * trigger) // a late attempt would be accepted by now
-	n, races := pl.accepted.Load(), racesFiredAt(addr)
-	if n != 4 || uint64(n-3) != races {
-		t.Fatalf("the server accepted %d connections with %d races fired; want 4 and exactly 1 (attempts 1-3, one per waiter, and the one race): a live attempt must keep covering its waiter when the chain answers again", n, races)
+	n, races, replaced := uint64(pl.accepted.Load()), racesFiredAt(addr), replacedAt(addr)
+	if races != 1 || replaced != 1 || n != 3+races+replaced {
+		t.Fatalf("the server accepted %d connections, with %d races fired and %d attempts replaced at a new answering period; want 1 race, 1 replaced and exactly 3 + 1 + 1 = 5 (rule D: the earlier period's attempts stop covering when the destination answers again)", n, races, replaced)
 	}
 }
 
@@ -743,33 +742,35 @@ func healthyBurst1521(t *testing.T, warm string, inject bool) error {
 		return prev(ctx, network, a)
 	}
 	defer func() { endpointDialFn = prev }()
-	racesBefore := racesFiredAt(addr)
+	racesBefore, replacedBefore := racesFiredAt(addr), replacedAt(addr)
 	burst(newRT(), during)
 	time.Sleep(20 * time.Millisecond) // a late attempt would have started by now
 	races := int(racesFiredAt(addr) - racesBefore)
+	replaced := int(replacedAt(addr) - replacedBefore)
 	if inject && racesFiredAt(otherAddr) == 0 {
 		t.Fatal("the other destination fired no race: the check below would prove nothing")
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	d, a := len(starts), int(accepted.Load()-acceptedBefore)
-	if warm == burstCold && (races != 0 || d != n || a != n) {
+	if warm == burstCold && (races != 0 || replaced != 0 || d != n || a != n) {
 		// A new destination's trigger is the cold default (3 s), which a
 		// burst of milliseconds never reaches: no race can fire, and the
 		// count is exact, independent of the race accounting below.
-		return fmt.Errorf("a healthy burst of %d requests to a new destination started %d connects, the server accepted %d, and %d races fired; want exactly %d, %d and 0 (trigger %v; connect starts %v)",
-			n, d, a, races, n, n, trigger, starts)
+		return fmt.Errorf("a healthy burst of %d requests to a new destination started %d connects, the server accepted %d, with %d races fired and %d replaced; want exactly %d, %d, 0 and 0 (trigger %v; connect starts %v)",
+			n, d, a, races, replaced, n, n, trigger, starts)
 	}
-	// One setup per request; every connect beyond that is a race this
-	// destination's chains fired (a setup ran past the measured trigger: the
-	// design's ~5 %), never an extra of its own. Doubling (a waiter's attempt
-	// replaced while alive) adds connects no race accounts for.
-	if d < n || d-n > races || a-n > races {
-		return fmt.Errorf("a healthy burst of %d requests started %d connects and the server accepted %d, with %d races fired at its destination; want %d each plus at most one per race (trigger %v; connect starts %v)",
-			n, d, a, races, n, trigger, starts)
+	// One setup per request; every connect beyond that is attributable: a
+	// race this destination's chains fired (a setup ran past the measured
+	// trigger, or the chain went quiet for an interval), or an attempt
+	// replaced when a new answering period began (rule D). Replacing a live
+	// attempt at any other time adds connects neither accounts for.
+	if d < n || d-n > races+replaced || a-n > races+replaced {
+		return fmt.Errorf("a healthy burst of %d requests started %d connects and the server accepted %d, with %d races fired and %d attempts replaced at a new period at its destination; want %d each plus at most one per race or replacement (trigger %v; connect starts %v)",
+			n, d, a, races, replaced, n, trigger, starts)
 	}
-	if races > 0 {
-		t.Logf("%d races fired (connects %d, accepted %d)", races, d, a)
+	if races+replaced > 0 {
+		t.Logf("%d races fired, %d replaced at a new period (connects %d, accepted %d)", races, replaced, d, a)
 	}
 	return nil
 }
@@ -868,14 +869,16 @@ func TestIssue1509_Chain_AStuckConnectThatCompletesCoversAgain(t *testing.T) {
 
 // The hung-TLS second stall (#1521 review): a busy destination answers a
 // joiner every 2 ms; for 300 ms it then accepts TCP but never answers a
-// ClientHello (its held handshakes are connected, so they keep covering their
-// waiters, rule B), and the last joiner arrives at its comeback. Every waiter
-// that joined during the stall must be served, and served together: once an
-// attempt comes up after the comeback, every waiter beyond the attempts
-// covering it gets one of its own at once. A serial handout — waiters left to
-// the race's own attempts — serves them at least a trigger interval apart
-// (the race schedule's shortest gap between two of its attempts), so p95 −
-// p50 of their serve times must stay below one trigger.
+// ClientHello (the handshakes it holds are connected and will never come up),
+// and joiners keep arriving after its comeback. Two properties, both read
+// from the chain, not from wall time:
+//
+//   - the schedule: whenever an answering period begins, every waiter is
+//     covered, and by no attempt that connected before that period (rule D):
+//     a held handshake from the stall covers nobody after the comeback, so no
+//     waiter is left to the race's attempts, one per interval;
+//   - every waiter, including those that joined after the comeback, is
+//     served: no deadline failure against a destination that came back.
 func TestIssue1509_Chain_AHungTLSStallsWaitersAreServedTogether(t *testing.T) {
 	resetConnectTimes(t)
 	srv, sl := stallTLSServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
@@ -885,56 +888,83 @@ func TestIssue1509_Chain_AHungTLSStallsWaitersAreServedTogether(t *testing.T) {
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caPEMOf(srv))
 	cfg := &tls.Config{RootCAs: pool, NextProtos: []string{"h2"}}
-	const stallAt, stall, every = 200 * time.Millisecond, 300 * time.Millisecond, 2 * time.Millisecond
-	comeback := stallAt + stall
+
+	var vmu sync.Mutex
+	var violations []string
+	periods := 0
+	onPeriod := func(c *setupChain) { // under c.mu
+		if c.k.tlsCfg != cfg {
+			return
+		}
+		stale := 0
+		for a := range c.attempts {
+			if a.covers && a.connected && a.period < c.period {
+				stale++
+			}
+		}
+		vmu.Lock()
+		defer vmu.Unlock()
+		periods++
+		if stale > 0 || (!c.done && c.covering < len(c.waiters)) {
+			violations = append(violations, fmt.Sprintf("period %d: %d waiters, %d covering, %d of them connected in an earlier period", c.period, len(c.waiters), c.covering, stale))
+		}
+	}
+	newPeriodForTest.Store(&onPeriod)
+	t.Cleanup(func() { newPeriodForTest.Store(nil) })
+
+	const stallAt, stall, after, every = 200 * time.Millisecond, 300 * time.Millisecond, 100 * time.Millisecond, 2 * time.Millisecond
 	type served struct {
-		joined, got time.Duration
-		err         error
+		joined time.Duration
+		err    error
 	}
 	var mu sync.Mutex
 	var out []served
 	t0 := time.Now()
 	time.AfterFunc(stallAt, func() { sl.stallFor(stall) })
 	var wg sync.WaitGroup
-	for i := 0; time.Duration(i)*every <= comeback; i++ {
+	for i := 0; time.Duration(i)*every <= stallAt+stall+after; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// Generous for a 2-CPU runner under -race: a waiter that misses it
+			// was not served at all, not served slowly.
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
 			j := time.Since(t0)
 			c, err := endpointDialTLS(ctx, "tcp", addr, cfg)
-			g := time.Since(t0)
 			if err == nil {
 				_ = c.Close()
 			}
 			mu.Lock()
-			out = append(out, served{j, g, err})
+			out = append(out, served{j, err})
 			mu.Unlock()
 		}()
 		time.Sleep(every)
 	}
 	wg.Wait()
-	var got []time.Duration
+	newPeriodForTest.Store(nil)
+	failed := 0
+	var first error
 	for _, s := range out {
-		if s.joined < stallAt+every || s.joined > comeback {
-			continue
-		}
 		if s.err != nil {
-			t.Fatalf("a waiter that joined %v (during the stall) failed: %v", s.joined, s.err)
+			if first == nil {
+				first = fmt.Errorf("a waiter that joined at %v: %w", s.joined, s.err)
+			}
+			failed++
 		}
-		got = append(got, s.got)
 	}
-	if len(got) < 100 {
-		t.Fatalf("only %d waiters joined during the stall; the arm needs its stream", len(got))
+	vmu.Lock()
+	defer vmu.Unlock()
+	if failed > 0 {
+		t.Errorf("%d of %d waiters were never served (first: %v); want every one served once the destination is back", failed, len(out), first)
 	}
-	slices.Sort(got)
-	p50, p95 := got[len(got)/2], got[len(got)*95/100]
-	if p95-p50 >= trigger {
-		t.Fatalf("the %d waiters that joined during the stall were served from %v to %v (p50 %v, p95 %v): p95 - p50 = %v, not below one trigger (%v): a serial handout",
-			len(got), got[0], got[len(got)-1], p50, p95, p95-p50, trigger)
+	if periods < 2 {
+		t.Errorf("only %d answering periods began; the arm needs the stall and the comeback", periods)
 	}
-	t.Logf("%d stall-joined waiters served by p50 %v, p95 %v after start (comeback at %v); %d handshakes held", len(got), p50, p95, comeback, sl.held.Load())
+	if len(violations) > 0 {
+		t.Errorf("an answering period began with waiters left to the race (want every waiter covered, by no attempt from an earlier period): %v", violations)
+	}
+	t.Logf("%d waiters, %d answering periods, %d handshakes held through the stall", len(out), periods, sl.held.Load())
 }
 
 // No waiter is ever added to a done chain (#1521 review: the chain could
@@ -965,17 +995,18 @@ func TestIssue1521_AJoinOntoAChainThatJustFinishedStartsAFreshOne(t *testing.T) 
 		}
 		time.Sleep(time.Millisecond)
 	}
-	joinGapForTest = func(c *setupChain) {
+	finishInTheGap := func(c *setupChain) {
 		c.mu.Lock()
 		c.finishLocked() // an attempt's result finishing the chain, in the gap
 		c.mu.Unlock()
 	}
-	t.Cleanup(func() { joinGapForTest = nil })
+	joinGapForTest.Store(&finishInTheGap)
+	t.Cleanup(func() { joinGapForTest.Store(nil) })
 	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel2()
 	start := time.Now()
 	conn, err := raceDial(ctx2, "tcp", addr)
-	joinGapForTest = nil
+	joinGapForTest.Store(nil)
 	if err != nil {
 		t.Fatalf("a dial whose chain finished as it joined failed after %v: %v (it joined the done chain)", time.Since(start), err)
 	}
@@ -1024,5 +1055,69 @@ func TestIssue1521_ConcurrentTLSSetupsAreNeverStranded(t *testing.T) {
 	}
 	if failed > 0 {
 		t.Fatalf("%d of %d TLS setups to a healthy destination failed (first: %v): a setup was stranded", failed, n, first)
+	}
+}
+
+// Rule D's property, deterministic (#1521 review B3; the reviewer's arm,
+// rewritten for rule D): a connected attempt covers its waiter across an
+// evidence-free interval while its answering period lasts, and stops at the
+// next one. Trigger T = 100 ms:
+//
+//	0     W1, W2, W3 join; attempt 1 (accept 1) answers at 15 ms: W1 served,
+//	      period 1 begins; attempts 2 and 3 start for W2 and W3, connect at
+//	      once, and the server holds their handshakes 400 ms (accepts 2, 3).
+//	~115  interval check: the success is fresh evidence; still answering.
+//	~215  interval check: nothing came up and no bytes were read: the chain
+//	      races (accept 4, answers at once). Attempts 2 and 3 are connected:
+//	      the check does not drop them.
+//	~216  the race comes up: W2 served, period 2 begins. Attempts 2 and 3
+//	      connected in period 1: they stop covering, and W3 gets one new
+//	      attempt (accept 5), counted as replaced.
+//
+// At 300 ms, exactly: accepted == 3 waiters + races (1) + replaced (1).
+// Dropping connected attempts at the interval check (rule A), never marking
+// the connect (M-noconnmark), or dropping every attempt (M-dropall) leaves
+// nothing to replace at the new period (replaced 0, accepted 5); keeping the
+// earlier period's attempts (rule B) replaces none (accepted 4).
+func TestIssue1509_Chain_ConnectedAttemptsCoverWithinTheirPeriodAndAreReplacedAtTheNext(t *testing.T) {
+	resetConnectTimes(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const trigger = 100 * time.Millisecond
+	pl := &paceListener{
+		Listener: ln,
+		delay:    map[int32]time.Duration{1: 15 * time.Millisecond, 2: 4 * trigger, 3: 4 * trigger},
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.Listener = pl
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	addr := ln.Addr().String()
+	seedConnectTimes(setupKey(addr, true), trigger)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEMOf(srv))
+	cfg := &tls.Config{RootCAs: pool, NextProtos: []string{"h2"}}
+	errs := make(chan error, 3)
+	for range 3 {
+		go func() {
+			c, err := endpointDialTLS(context.Background(), "tcp", addr, cfg)
+			if err == nil {
+				t.Cleanup(func() { _ = c.Close() })
+			}
+			errs <- err
+		}()
+	}
+	time.Sleep(300 * time.Millisecond)
+	n, races, replaced := uint64(pl.accepted.Load()), racesFiredAt(addr), replacedAt(addr)
+	for range 3 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if races != 1 || replaced != 1 || n != 3+races+replaced {
+		t.Fatalf("at 300 ms the server had accepted %d connections, with %d races fired and %d attempts replaced at a new answering period; want 1, 1 and exactly 3 + 1 + 1 = 5 (rule D: connected attempts cover within their period, and are replaced at the next)", n, races, replaced)
 	}
 }

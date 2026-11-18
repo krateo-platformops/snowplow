@@ -7,6 +7,7 @@ package credhttp
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -106,4 +107,57 @@ func TestIssue1521_RetryReserveStillReadsAPartialWindowsMaximum(t *testing.T) {
 	if d, measured := r.reserve(); !measured || d != 40*time.Millisecond {
 		t.Fatalf("a 3-sample reserve is %v (measured %v); want the partial window's maximum 40ms, measured", d, measured)
 	}
+}
+
+// Rule D stamps an attempt's answering period when it CONNECTS (#1521
+// review): an attempt started before the comeback that is still connecting
+// when the new period begins keeps covering, and once it connects it belongs
+// to the new period; only an attempt that had connected before the period
+// began stops covering. Driven on the chain's own state, step by step.
+func TestIssue1521_RuleDStampsThePeriodAtConnect(t *testing.T) {
+	resetConnectTimes(t)
+	c := newSetupChain(tlsChains, chainKey{network: "tcp", addr: "127.0.0.1:1", tlsCfg: &tls.Config{}}, nil)
+	connectedEarly := &attemptState{covers: true, evidence: true}
+	stillConnecting := &attemptState{covers: true, evidence: true}
+	c.mu.Lock()
+	c.period = 1 // answering
+	c.attempts = map[*attemptState]struct{}{connectedEarly: {}, stillConnecting: {}}
+	c.covering = 2
+	c.waiters = []*chainWaiter{{ch: make(chan racedConn, 1)}, {ch: make(chan racedConn, 1)}}
+	c.mu.Unlock()
+	c.onAttemptConnected(connectedEarly) // connects in period 1
+
+	// The destination answers after a stall: period 2 begins.
+	c.mu.Lock()
+	c.beginPeriodLocked()
+	early, still, period := connectedEarly.covers, stillConnecting.covers, c.period
+	c.mu.Unlock()
+	if period != 2 || early || !still {
+		t.Fatalf("at period %d: the attempt connected in period 1 covers=%v (want false), the one still connecting covers=%v (want true)", period, early, still)
+	}
+	if got := replacedAt("127.0.0.1:1"); got != 1 {
+		t.Fatalf("replaced at the new period: %d; want 1 (one waiter lost its cover)", got)
+	}
+
+	// The still-connecting attempt connects after the comeback: it belongs to
+	// period 2 and keeps covering.
+	c.onAttemptConnected(stillConnecting)
+	c.mu.Lock()
+	stamped, still := stillConnecting.period, stillConnecting.covers
+	c.mu.Unlock()
+	if stamped != 2 || !still {
+		t.Fatalf("an attempt started before the comeback that connected after it: period %d covers=%v; want period 2, covering", stamped, still)
+	}
+
+	// The next period: it connected before that one, so it stops covering.
+	c.mu.Lock()
+	c.beginPeriodLocked()
+	still = stillConnecting.covers
+	c.mu.Unlock()
+	if still {
+		t.Fatal("at period 3 the attempt connected in period 2 still covers; want it dropped")
+	}
+	c.mu.Lock()
+	c.finishLocked()
+	c.mu.Unlock()
 }

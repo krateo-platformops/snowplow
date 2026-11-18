@@ -32,11 +32,16 @@ package credhttp
 //   - once a connection has come up, the destination is ANSWERING (#1521):
 //     every waiter left, and every one that joins, is covered by an attempt —
 //     a live one, or a new one started at once, exactly as net/http dials one
-//     connection per waiting request — and no race attempt is added. So a
-//     healthy destination sees one setup per waiter plus the race's own
-//     attempts (racesFiredAt; a setup slower than the trigger is raced, the
-//     design's ~5 %), and many waiters are served in parallel, not one after
-//     another;
+//     connection per waiting request — and no race attempt is added while
+//     the destination answers. So the setups a destination sees beyond one
+//     per waiting request are at most the race's own attempts (racesFiredAt:
+//     each fired after a trigger interval with no evidence — before the
+//     first answer, a setup slower than the trigger; while answering, an
+//     interval in which nothing came up and no handshake read bytes), plus
+//     the attempts replaced when an answering period begins (replacedAt,
+//     below), plus stuck connects that stopped covering and later completed
+//     (see raceCounts); and many waiters are served in parallel, not one
+//     after another;
 //   - "answering" holds only on FRESH evidence: within every trigger interval
 //     some attempt must come up or show progress (a TLS attempt reading its
 //     server's handshake bytes in that interval: a handshake still receiving
@@ -46,18 +51,29 @@ package credhttp
 //     the chain empty — and the chain returns to racing
 //     for the waiters still waiting, with the same bound, from the trigger. No
 //     new number: the interval is the measured trigger;
-//   - demand is covered per ATTEMPT (owner decision on #1521, "rule B"): an
-//     attempt whose TCP connect has completed covers a waiter until it comes
-//     up, fails, is cancelled or reaches its own bound — whatever state the
-//     chain passes through. An attempt still connecting stops covering after
+//   - demand is covered per ATTEMPT (owner decision on #1521, "rule D"). The
+//     chain's answering PERIODS are numbered: one begins each time the
+//     destination answers after not answering (its first answer, and each
+//     answer after the chain returned to racing). An attempt whose TCP
+//     connect has completed covers a waiter while the period it connected in
+//     lasts — until it comes up, fails, is cancelled or reaches its own
+//     bound, whatever intervals pass. When a new period begins, every
+//     attempt that connected before it stops covering, and the waiters it
+//     covered get attempts of their own at once (the replaced attempts are
+//     counted, replacedAt). An attempt still connecting stops covering after
 //     a trigger interval with no evidence of its own (it neither started nor
 //     connected in it: a connect stuck in SYN backoff through a stall), and
-//     covers again if its connect completes. So a connected handshake waiting
-//     on a busy server is never replaced (#1521 review: dropping such
-//     handshakes as cover started a replacement for each, up to doubling a
-//     healthy burst's setups: 37 of 200 solo-warmed bursts, 97 % of the
-//     dropped handshakes later completing), while a stuck connect's waiter
-//     gets an attempt of its own once the destination answers again;
+//     covers again when its connect completes. So within a period a
+//     connected handshake waiting on a busy server is never replaced (#1521
+//     review: dropping such handshakes as cover at every interval started a
+//     replacement for each: 37 of 200 solo-warmed bursts), and a handshake
+//     the destination never answered during a stall covers nobody after the
+//     comeback (#1521 review: under "rule B", which kept it, up to 15
+//     waiters per run were left to the race's attempts one at a time and 118
+//     of them hit their deadline in 12 of 30 runs on 2 CPUs; rule D: 0 in
+//     30). The cost: a burst whose chain goes quiet for an interval mid-burst
+//     replaces its live handshakes once at the next answer (2 of 200
+//     solo-warmed bursts, 0 of 200 warm ones);
 //   - each waiter leaves at its own deadline or cancellation, whatever the
 //     chain does; a connection that comes up with nobody waiting is closed
 //     (counted as opened, noteRacedConnectionUp); and when the last waiter
@@ -123,30 +139,45 @@ import (
 // the address and the level), each one an attempt started because the setups
 // before it ran past the trigger with no evidence (onTimer). Every other
 // attempt is a waiter's own: the chain's first, or one covering a waiter, of
-// which a waiter gets a second only when its first stopped covering while
-// still connecting (a connect stuck through an interval). So the setups a
-// destination sees beyond one per waiting request are at most the races
-// fired AT THAT DESTINATION (racesFiredAt) plus such stuck connects that
-// later completed; a count across destinations would let another
-// destination's races excuse this one's extra setups.
+// which a waiter gets a second only when its first stopped covering — while
+// still connecting (a connect stuck through an interval), or because it
+// connected before a new answering period began (counted in replaceCounts,
+// replacedAt). So the setups a destination sees beyond one per waiting
+// request are at most the races fired AT THAT DESTINATION (racesFiredAt),
+// plus the attempts replaced there at a new period (replacedAt), plus stuck
+// connects that later completed; a count across destinations would let
+// another destination's races excuse this one's extra setups.
 var raceCounts sync.Map // setupKey → *atomic.Uint64
 
-func noteRaceFired(key string) {
-	v, _ := raceCounts.LoadOrStore(key, new(atomic.Uint64))
-	v.(*atomic.Uint64).Add(1)
+// replaceCounts counts, per destination window, the attempts started at a new
+// answering period because attempts that connected before it stopped
+// covering (rule D): the starts beyond what the waiters needed without that.
+var replaceCounts sync.Map // setupKey → *atomic.Uint64
+
+func noteRaceFired(key string) { countAt(&raceCounts, key, 1) }
+
+func countAt(m *sync.Map, key string, n uint64) {
+	v, _ := m.LoadOrStore(key, new(atomic.Uint64))
+	v.(*atomic.Uint64).Add(n)
 }
 
-// racesFiredAt is how many race attempts addr's chains have fired, connect
-// and TLS levels together.
-func racesFiredAt(addr string) uint64 {
+func countsAt(m *sync.Map, addr string) uint64 {
 	var n uint64
 	for _, key := range []string{setupKey(addr, false), setupKey(addr, true)} {
-		if v, ok := raceCounts.Load(key); ok {
+		if v, ok := m.Load(key); ok {
 			n += v.(*atomic.Uint64).Load()
 		}
 	}
 	return n
 }
+
+// racesFiredAt is how many race attempts addr's chains have fired, connect
+// and TLS levels together.
+func racesFiredAt(addr string) uint64 { return countsAt(&raceCounts, addr) }
+
+// replacedAt is how many attempts addr's chains started at a new answering
+// period to replace attempts that connected before it, both levels.
+func replacedAt(addr string) uint64 { return countsAt(&replaceCounts, addr) }
 
 // connectTimes is the per-destination setup-time window.
 var connectTimes = &destinationConnectTimes{rings: map[string]*reserveRing{}}
@@ -269,8 +300,8 @@ func (s *setupChains) dial(ctx context.Context, k chainKey, connect dialFunc) (n
 	var w *chainWaiter
 	c := s.chains[k]
 	if c != nil {
-		if joinGapForTest != nil {
-			joinGapForTest(c)
+		if f := joinGapForTest.Load(); f != nil {
+			(*f)(c)
 		}
 		w = c.join(ctx)
 	}
@@ -359,6 +390,7 @@ type setupChain struct {
 	firstConn error
 	firstTLS  error
 	countCtx  context.Context // a waiter's ctx: its connection counting (connections.go)
+	period    int             // answering periods begun (rule D)
 }
 
 func newSetupChain(s *setupChains, k chainKey, connect dialFunc) *setupChain {
@@ -368,16 +400,18 @@ func newSetupChain(s *setupChains, k chainKey, connect dialFunc) *setupChain {
 }
 
 // attemptState is one outstanding attempt's cover state (see the file
-// comment): connected is whether its TCP connect has completed; evidence is
-// whether it started since the chain's last interval check (it only matters
-// while connecting); covers is whether it counts as a waiter's cover.
+// comment): connected is whether its TCP connect has completed, and period
+// the chain's answering period then; evidence is whether it started since the
+// chain's last interval check (it only matters while connecting); covers is
+// whether it counts as a waiter's cover.
 type attemptState struct {
 	connected, evidence, covers bool
+	period                      int // the chain's answering period when it connected
 }
 
 // joinGapForTest, when set (tests only), runs between dial finding a chain and
 // joining it: where a chain could once finish unseen.
-var joinGapForTest func(*setupChain)
+var joinGapForTest atomic.Pointer[func(*setupChain)]
 
 // join adds a waiter; the first one starts the chain. It refuses (nil) a
 // chain that is done: no waiter is ever added to a done chain.
@@ -585,7 +619,12 @@ func (c *setupChain) result(r racedConn, a *attemptState) {
 		c.deliverLocked(w, r)
 		// The destination answered: every waiter left is covered by an attempt
 		// (a live one, or a new one), and the timer now watches for fresh
-		// evidence (onTimer).
+		// evidence (onTimer). If it was not answering, a new answering period
+		// begins: attempts that connected before it stop covering (rule D).
+		began := !c.answered
+		if began {
+			c.beginPeriodLocked()
+		}
 		c.answered = true
 		c.progress = true
 		if c.timer != nil {
@@ -596,6 +635,9 @@ func (c *setupChain) result(r racedConn, a *attemptState) {
 			c.finishLocked()
 		} else {
 			c.coverDemandLocked()
+		}
+		if f := newPeriodForTest.Load(); began && f != nil {
+			(*f)(c)
 		}
 		c.mu.Unlock()
 		return
@@ -622,6 +664,29 @@ func (c *setupChain) result(r racedConn, a *attemptState) {
 	}
 	c.mu.Unlock()
 }
+
+// beginPeriodLocked starts a new answering period: every attempt that
+// connected before it stops covering, and the starts that costs (beyond what
+// the waiters needed anyway) are counted as replacements (replacedAt).
+func (c *setupChain) beginPeriodLocked() {
+	c.period++
+	before := c.covering
+	for a := range c.attempts {
+		if a.covers && a.connected && a.period < c.period {
+			a.covers = false
+			c.covering--
+		}
+	}
+	need := func(covering int) int { return max(0, len(c.waiters)-covering) }
+	if n := need(c.covering) - need(before); n > 0 {
+		countAt(&replaceCounts, c.ringKey, uint64(n))
+	}
+}
+
+// newPeriodForTest, when set (tests only), runs (under c.mu) once a new
+// answering period has begun and its waiters are covered: at the end of the
+// result that began it.
+var newPeriodForTest atomic.Pointer[func(*setupChain)]
 
 func (c *setupChain) onTimer() {
 	c.mu.Lock()
@@ -668,11 +733,11 @@ func (c *setupChain) onProgress() {
 }
 
 // onAttemptConnected records attempt a's TCP connect completing: from now on
-// it covers a waiter until it ends (rule B), again if it had stopped while
-// connecting.
+// it covers a waiter for the rest of the current answering period (rule D),
+// again if it had stopped while connecting.
 func (c *setupChain) onAttemptConnected(a *attemptState) {
 	c.mu.Lock()
-	a.connected = true
+	a.connected, a.period = true, c.period
 	if _, live := c.attempts[a]; live && !a.covers {
 		a.covers = true
 		c.covering++
@@ -712,6 +777,7 @@ func closeLoser(countCtx context.Context, conn net.Conn, withTLS bool) {
 // from another's counts).
 func resetChainsForTest() {
 	raceCounts.Clear()
+	replaceCounts.Clear()
 	for _, s := range []*setupChains{connectChains, tlsChains} {
 		s.mu.Lock()
 		for _, c := range s.chains {
