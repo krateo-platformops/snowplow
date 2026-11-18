@@ -115,10 +115,13 @@ func TestSeedTokenSource_DegradesOnProviderError(t *testing.T) {
 	t.Cleanup(func() { SetSeedLoopbackTokenProvider(nil) })
 	before := SeedLoopbackTokenErrTotal()
 	SetSeedLoopbackTokenProvider(func(context.Context) (string, error) {
-		return "", errors.New("authn returned 403: no allowlist CR")
+		return "", errors.New("authn returned 403: refused")
 	})
-	src := loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))
-	tok, err := src(shortCtx(t, 400*time.Millisecond))
+	var tok string
+	var err error
+	within(t, "a stage asking within 400 ms", 1400*time.Millisecond, func() {
+		tok, err = loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))(shortCtx(t, 400*time.Millisecond))
+	})
 	if err == nil || tok != "" {
 		t.Fatalf("a failing authn must leave the asking stage token-less, with an error; got (%q, %v)", tok, err)
 	}
@@ -134,7 +137,11 @@ func TestSeedTokenSource_DegradesOnEmptyToken(t *testing.T) {
 	SetSeedLoopbackTokenProvider(func(context.Context) (string, error) {
 		return "", nil // no error but empty — still a failure (counted)
 	})
-	tok, err := loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))(shortCtx(t, 400*time.Millisecond))
+	var tok string
+	var err error
+	within(t, "a stage asking within 400 ms", 1400*time.Millisecond, func() {
+		tok, err = loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))(shortCtx(t, 400*time.Millisecond))
+	})
 	if err == nil || tok != "" {
 		t.Fatalf("an empty token must reach the stage as an error, never an empty bearer; got (%q, %v)", tok, err)
 	}
@@ -191,7 +198,11 @@ func TestSeedTokenSource_CtxBoundedDegrades(t *testing.T) {
 	})
 	before := SeedLoopbackTokenErrTotal()
 	start := time.Now()
-	tok, err := loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))(shortCtx(t, 600*time.Millisecond))
+	var tok string
+	var err error
+	within(t, "a stage asking within 600 ms", 1600*time.Millisecond, func() {
+		tok, err = loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))(shortCtx(t, 600*time.Millisecond))
+	})
 	elapsed := time.Since(start)
 	if tok != "" || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got (%q, %v), want token-less at the stage's own deadline", tok, err)
@@ -204,16 +215,32 @@ func TestSeedTokenSource_CtxBoundedDegrades(t *testing.T) {
 	}
 }
 
-// TestSeedTokenSource_AMissingTokenFileIsNotRetried: no projected authn-audience token file (the sandbox): no wait
-// can fix it, so the acquisition ends at once and the stage runs token-less without waiting out its context
-// (mutation: retrying it makes the stage wait its whole context).
+// TestSeedTokenSource_AMissingTokenFileIsNotRetried: no projected authn-audience token file (the sandbox's shape): no
+// wait can fix it, so the first ask ends at once and the failure is memoised for the process (#1531 review N5): five
+// bearer needs, one exchange attempt, one WARN, every stage token-less at once (mutations: retrying it makes the stage
+// wait its whole context; not memoising it logs one WARN per need).
 func TestSeedTokenSource_AMissingTokenFileIsNotRetried(t *testing.T) {
+	logs := captureLogs(t)
 	t.Cleanup(func() { SetSeedLoopbackTokenProvider(nil) })
 	SetSeedLoopbackTokenProvider(authn.New("http://authn.invalid:8082", filepath.Join(t.TempDir(), "absent")).Token)
-	start := time.Now()
-	tok, err := loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))(shortCtx(t, 5*time.Second))
-	if tok != "" || !errors.Is(err, fs.ErrNotExist) || time.Since(start) > time.Second {
-		t.Fatalf("got (%q, %v) after %v, want token-less at once with the missing file's error", tok, err, time.Since(start))
+	before := SeedLoopbackTokenErrTotal()
+	for i := 1; i <= 5; i++ {
+		start := time.Now()
+		var tok string
+		var err error
+		within(t, fmt.Sprintf("bearer need %d", i), time.Second, func() {
+			tok, err = loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))(shortCtx(t, 5*time.Second))
+		})
+		if tok != "" || !errors.Is(err, fs.ErrNotExist) || time.Since(start) > 500*time.Millisecond {
+			t.Fatalf("need %d: got (%q, %v) after %v, want token-less at once with the missing file's error", i, tok, err,
+				time.Since(start))
+		}
+	}
+	if n := strings.Count(logs(), "prewarm.seed_loopback_token_unavailable"); n != 1 {
+		t.Fatalf("five bearer needs logged %d WARN(s), want one per boot", n)
+	}
+	if got := SeedLoopbackTokenErrTotal() - before; got != 1 {
+		t.Fatalf("five bearer needs counted %d failed exchange(s), want 1", got)
 	}
 }
 
@@ -291,10 +318,48 @@ func TestSeedTokenSource_AHungAuthnHoldsNoStagePastItsDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	tok, err := loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(ctx))(ctx)
+	var tok string
+	var err error
+	within(t, "stage B (200 ms)", 1200*time.Millisecond, func() {
+		tok, err = loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(ctx))(ctx)
+	})
 	elapsed := time.Since(start)
 	if tok != "" || !errors.Is(err, context.DeadlineExceeded) || elapsed > 450*time.Millisecond {
 		t.Fatalf("stage B got (%q, %v) after %v, want token-less at its own 200 ms deadline", tok, err, elapsed)
+	}
+}
+
+// TestSeedTokenSource_TheAcquisitionOutlivesAShortFirstAsker (#1531 review N4, probe F): the exchange takes 500 ms;
+// a stage asking within 200 ms starts it, a stage asking within 3 s joins 50 ms later. The first leaves at its
+// deadline, the acquisition goes on for the second, which gets the token, in one exchange (mutation Q8: the
+// acquisition bound to its first asker's context ends with it, and the second is token-less).
+func TestSeedTokenSource_TheAcquisitionOutlivesAShortFirstAsker(t *testing.T) {
+	var calls atomic.Int64
+	t.Cleanup(func() { SetSeedLoopbackTokenProvider(nil) })
+	SetSeedLoopbackTokenProvider(func(ctx context.Context) (string, error) {
+		calls.Add(1)
+		select {
+		case <-time.After(500 * time.Millisecond):
+			return "authn-jwt-slow", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	})
+	src := loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))
+	first := make(chan error, 1)
+	go func() {
+		_, err := src(shortCtx(t, 200*time.Millisecond))
+		first <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	var tok string
+	var err error
+	within(t, "the 3 s stage", 4*time.Second, func() { tok, err = src(shortCtx(t, 3*time.Second)) })
+	if tok != "authn-jwt-slow" || err != nil || calls.Load() != 1 {
+		t.Fatalf("the 3 s stage got (%q, %v) after %d exchange(s), want the token from the one exchange", tok, err, calls.Load())
+	}
+	if e := <-first; !errors.Is(e, context.DeadlineExceeded) {
+		t.Fatalf("the 200 ms stage: %v, want its own deadline", e)
 	}
 }
 
@@ -343,14 +408,12 @@ func TestSeedTokenSource_AuthnLateBoot_TheBearerStagesGetTheTokenWithinTheBoot(t
 	t.Logf("authn late by 1.2 s: 8 bearer stages got the token after %v, %d exchange(s)", elapsed, n.Load())
 }
 
-// TestSeedTokenSource_TheTokenIsNeverLogged (#1531 review N1): a successful acquisition and a failing one, with every
-// log line captured at debug: neither the token nor authn's answer body reaches the log.
+// TestSeedTokenSource_TheTokenIsNeverLogged (#1531 review N1, N2): a healthy acquisition, then a refusing authn whose
+// error body echoes BOTH the projected SA token snowplow presented (read from its token file) and an issued JWT,
+// with every log line captured at debug. Neither the issued token nor either echoed credential is in the returned
+// error, the WARN or any log line; the status class's diagnostic is (mutation: the body back in authn's error).
 func TestSeedTokenSource_TheTokenIsNeverLogged(t *testing.T) {
-	var buf bytes.Buffer
-	var mu sync.Mutex
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(lockedWriter{&mu, &buf}, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	logs := captureLogs(t)
 	jwt := testJWT(time.Now().Add(time.Hour))
 	ok, _, okFile := standInAuthn(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprintf(w, `{"accessToken":%q}`, jwt)
@@ -360,23 +423,67 @@ func TestSeedTokenSource_TheTokenIsNeverLogged(t *testing.T) {
 	if tok, _ := loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))(shortCtx(t, 5*time.Second)); tok != jwt {
 		t.Fatalf("no token from a healthy authn: %q", tok)
 	}
-	bad, _, badFile := standInAuthn(t, func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "denied: no allowlist CR for User \"tenant-x\"", http.StatusForbidden)
+	var presented string
+	bad, _, badFile := standInAuthn(t, func(w http.ResponseWriter, r *http.Request) {
+		presented = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		http.Error(w, "no allowlist CR for "+presented+"; last issued "+jwt, http.StatusForbidden)
 	})
+	saToken, err := os.ReadFile(badFile)
+	if err != nil {
+		t.Fatal(err)
+	}
 	SetSeedLoopbackTokenProvider(authn.New(bad.URL, badFile).Token)
-	_, _ = loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))(shortCtx(t, 400*time.Millisecond))
-	mu.Lock()
-	out := buf.String()
-	mu.Unlock()
-	if !strings.Contains(out, "prewarm.seed_loopback_token_unavailable") {
-		t.Fatalf("the failing acquisition logged nothing: the scan below would be vacuous\n%s", out)
+	var askErr error
+	within(t, "a stage asking within 400 ms", 1400*time.Millisecond, func() {
+		_, askErr = loopbacktoken.SourceFrom(installSeedLoopbackTokenSource(context.Background()))(shortCtx(t, 400*time.Millisecond))
+	})
+	out := logs()
+	if presented != string(saToken) {
+		t.Fatalf("premise: the stand-in authn saw %q presented, want the token file's %q", presented, saToken)
 	}
-	if strings.Contains(out, jwt) || strings.Contains(out, "projected-sa") {
-		t.Fatalf("the token (or the projected SA token) reached the log:\n%s", out)
+	if !strings.Contains(out, "prewarm.seed_loopback_token_unavailable") ||
+		!strings.Contains(out, "refused the service account (not authenticated, or not on authn's allowlist)") {
+		t.Fatalf("the refusal's WARN, with its status-class diagnostic, is not in the log:\n%s", out)
 	}
-	// authn's answer is logged redacted (#1531 review N2): the identity it names is not
-	if strings.Contains(out, "tenant-x") || !strings.Contains(out, "no allowlist CR") {
-		t.Fatalf("authn's answer was not logged redacted:\n%s", out)
+	for _, secret := range []string{jwt, string(saToken)} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("a credential reached the log (%q):\n%s", secret, out)
+		}
+	}
+	if askErr == nil {
+		t.Fatal("the refused stage got no error")
+	}
+}
+
+// within runs f and fails the test, by name, when it has not returned by limit: a regression that blocks (an asker
+// waiting on the acquisition instead of its own context, a context build that asks authn) fails in about a second
+// with a message, never after the test binary's timeout.
+func within(t *testing.T, what string, limit time.Duration, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f()
+	}()
+	select {
+	case <-done:
+	case <-time.After(limit):
+		t.Fatalf("%s did not return within %v: it waited past its own context", what, limit)
+	}
+}
+
+// captureLogs sends every log line, at debug, to a buffer for the test's life and returns its reader.
+func captureLogs(t *testing.T) func() string {
+	t.Helper()
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(lockedWriter{&mu, &buf}, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.String()
 	}
 }
 
@@ -396,7 +503,7 @@ func (l lockedWriter) Write(p []byte) (int, error) {
 // Phase 1 SA context must return at once, ask nothing, and hand back a context
 // that is not done. Before #1530 it retried the exchange until this context's
 // deadline and returned it expired (mutation: asking the provider while the
-// context is built turns this RED).
+// context is built fails this by name within a second).
 func TestWithPhase1SAContext_NeverWaitsForAuthn(t *testing.T) {
 	t.Cleanup(func() { SetSeedLoopbackTokenProvider(nil) })
 	asked := make(chan struct{}, 64)
@@ -408,16 +515,14 @@ func TestWithPhase1SAContext_NeverWaitsForAuthn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	got := withPhase1SAContext(ctx, testSAEndpoint(), nil)
+	var got context.Context
+	within(t, "building the Phase 1 SA context", time.Second, func() { got = withPhase1SAContext(ctx, testSAEndpoint(), nil) })
 	elapsed := time.Since(start)
 	if len(asked) != 0 {
 		t.Fatalf("building the Phase 1 SA context asked authn %d time(s)", len(asked))
 	}
 	if got.Err() != nil {
 		t.Fatalf("the Phase 1 SA context came back done (%v) after %v", got.Err(), elapsed)
-	}
-	if elapsed > time.Second {
-		t.Fatalf("building the Phase 1 SA context took %v: it waited for authn", elapsed)
 	}
 	if loopbacktoken.SourceFrom(got) == nil {
 		t.Fatal("the Phase 1 SA context carries no loopback token source")

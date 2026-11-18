@@ -22,16 +22,18 @@ import (
 // is cancelled. The backoff's state outlives the acquisition (the failure memo): a stage asking after a failure
 // does not try again before the backoff says, so a failing authn is not hit once per ask. A success clears it.
 //
-// A failure no wait can fix ends the acquisition at once: the projected authn-audience token file missing or
-// unreadable (the kubelet mounts it before the container starts; the sandbox has none). Each failed exchange is
+// A failure no wait can fix ends the acquisition at once and is memoised for the process: the projected
+// authn-audience token file missing or unreadable (the kubelet mounts it before the container starts; the sandbox
+// has none). Every later ask returns it at once, with no exchange and no log line. Each failed exchange is
 // counted (SeedLoopbackTokenErrTotal: per failed exchange, not per asking stage) and logged with its error redacted.
 type seedTokenAcquirer struct {
 	fn func(context.Context) (string, error)
 
-	mu      sync.Mutex
-	cur     *seedTokenAcquisition // the acquisition in flight, nil when none
-	delay   time.Duration         // the backoff's wait after the last failure (0: no failure since the last success)
-	nextTry time.Time             // the failure memo: no exchange before this
+	mu       sync.Mutex
+	cur      *seedTokenAcquisition // the acquisition in flight, nil when none
+	terminal error                 // a failure no wait can fix: every later ask returns it, no exchange, no log
+	delay    time.Duration         // the backoff's wait after the last failure (0: no failure since the last success)
+	nextTry  time.Time             // the failure memo: no exchange before this
 }
 
 type seedTokenAcquisition struct {
@@ -58,6 +60,11 @@ func newSeedTokenAcquirer(fn func(context.Context) (string, error)) *seedTokenAc
 // acquisition, which is cancelled when nobody waits for it any more).
 func (a *seedTokenAcquirer) ask(ctx context.Context) (string, error) {
 	a.mu.Lock()
+	if a.terminal != nil {
+		err := a.terminal
+		a.mu.Unlock()
+		return "", err
+	}
 	acq := a.cur
 	if acq == nil {
 		actx, cancel := context.WithCancel(context.Background())
@@ -136,6 +143,11 @@ func (a *seedTokenAcquirer) run(actx context.Context, acq *seedTokenAcquisition)
 				"else waits for it (#1530). A missing or unreadable token file is not retried"),
 		)
 		if terminal {
+			// memoised for the process (#1531 review N5): the projected token file is mounted before the
+			// container starts, so it will not appear later; one WARN per boot, not one per bearer need
+			a.mu.Lock()
+			a.terminal = err
+			a.mu.Unlock()
 			finish("", err)
 			return
 		}
