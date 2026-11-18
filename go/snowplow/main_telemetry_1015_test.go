@@ -71,7 +71,10 @@ func telemetryRouter(t *testing.T, url string) http.Handler {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	fwd := rum.NewForwarder(url)
+	fwd, err := rum.NewForwarder(url)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fwd.Start(ctx)
 	mux := http.NewServeMux()
 	stub := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })

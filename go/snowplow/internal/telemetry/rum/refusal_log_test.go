@@ -47,7 +47,7 @@ func TestS1015_RefusalLogIsSampled(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	in := NewIngest(NewForwarder("http://127.0.0.1:1/v1/traces"), nil)
+	in := NewIngest(mustForwarder(t, "http://127.0.0.1:1/v1/traces"), nil)
 	frozen := time.Unix(1_761_800_000, 0)
 	in.now = func() time.Time { return frozen }
 

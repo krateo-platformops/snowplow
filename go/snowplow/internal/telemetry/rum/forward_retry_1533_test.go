@@ -109,7 +109,7 @@ func TestForward1533_AHealthyCollectorCostsOnePostPerBatch(t *testing.T) {
 	c := &collector1533{}
 	srv := httptest.NewServer(c.handler())
 	defer srv.Close()
-	f, w := NewForwarder(srv.URL+"/v1/traces"), &waits1533{}
+	f, w := mustForwarder(t, srv.URL+"/v1/traces"), &waits1533{}
 	f.sleep = w.sleep
 	before := Read()
 	startForwarder(t, f)
@@ -175,7 +175,7 @@ func refusedThenUp1533(t *testing.T, outage time.Duration) []time.Duration {
 			srv.Close()
 		}
 	}()
-	f, w := NewForwarder("http://"+addr+"/v1/traces"), &waits1533{}
+	f, w := mustForwarder(t, "http://"+addr+"/v1/traces"), &waits1533{}
 	w.onWait = func(total time.Duration) {
 		if total >= outage {
 			up.Do(func() {
@@ -214,7 +214,7 @@ func scripted(t *testing.T, answer func(n int64, w http.ResponseWriter)) (*Forwa
 	c := &collector1533{answer: answer}
 	srv := httptest.NewServer(c.handler())
 	t.Cleanup(srv.Close)
-	f, w := NewForwarder(srv.URL+"/v1/traces"), &waits1533{}
+	f, w := mustForwarder(t, srv.URL+"/v1/traces"), &waits1533{}
 	f.sleep = w.sleep
 	return f, c, w
 }
@@ -285,7 +285,7 @@ func TestForward1533_AnUntrustedCertificateIsOneAttempt(t *testing.T) {
 	srv.Config.ErrorLog = log.New(io.Discard, "", 0) // the server's own "TLS handshake error" line
 	srv.StartTLS()
 	defer srv.Close()
-	f, w := NewForwarder(srv.URL+"/v1/traces"), &waits1533{}
+	f, w := mustForwarder(t, srv.URL+"/v1/traces"), &waits1533{}
 	f.sleep = w.sleep
 	// the arm's site: this client's failure against this server is a certificate verification failure
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/traces", bytes.NewReader([]byte("x")))
@@ -322,7 +322,7 @@ func TestForward1533_AnUntrustedCertificateIsOneAttempt(t *testing.T) {
 // failure retried reads a wait).
 func TestForward1533_ADeniedDestinationIsOneAttempt(t *testing.T) {
 	url := "http://169.254.169.254/v1/traces"
-	f, w := NewForwarder(url), &waits1533{}
+	f, w := mustForwarder(t, url), &waits1533{}
 	f.sleep = w.sleep
 	// the arm's site: this client's failure is the destination policy's refusal, made before any packet is sent
 	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader([]byte("x")))
@@ -346,7 +346,9 @@ func TestForward1533_ADeniedDestinationIsOneAttempt(t *testing.T) {
 // a whole answer, then answers 200. OTLP/HTTP: "If the server disconnects without returning a response, the client
 // SHOULD retry and send the same request." Each way of going away is two POSTs, one wait, forwarded: closed
 // without a byte (the client reads EOF), reset (SO_LINGER 0: ECONNRESET, a collector process killed), cut in the
-// middle of the headers (an unexpected EOF) (mutations: each of those not transient reads forward_failed).
+// middle of the headers (an unexpected EOF), cut in the middle of the status line (Go's client: `malformed HTTP
+// status code`, no type, no EOF in its chain: retried because only an identified failure is permanent) (mutations:
+// each of those made permanent, or every unidentified error made permanent, reads forward_failed).
 func TestForward1533_ADisconnectWithoutAnAnswerIsRetried(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -361,6 +363,10 @@ func TestForward1533_ADisconnectWithoutAnAnswerIsRetried(t *testing.T) {
 		}},
 		{"cut mid-answer", func(conn net.Conn) {
 			_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n"))
+			_ = conn.Close()
+		}},
+		{"status line cut before its code", func(conn net.Conn) {
+			_, _ = conn.Write([]byte("HTTP/1.1 20"))
 			_ = conn.Close()
 		}},
 	} {
@@ -388,35 +394,47 @@ func TestForward1533_ADisconnectWithoutAnAnswerIsRetried(t *testing.T) {
 	}
 }
 
-// TestForward1533_AStatusLineCutBeforeItsCodeIsOneAttempt pins today's limitation (transientTransport): a collector
-// that disconnects in the middle of the status line ("HTTP/1.1 20") is, to Go's client, a malformed answer
-// (`malformed HTTP status code`, no EOF in the error's chain), so the batch is one attempt and forward_failed, no
-// wait, although the specification would retry a disconnect without a response. A change that retries it changes
-// this arm on purpose.
-func TestForward1533_AStatusLineCutBeforeItsCodeIsOneAttempt(t *testing.T) {
-	f, c, w := scripted(t, func(_ int64, rw http.ResponseWriter) {
-		conn, _, err := rw.(http.Hijacker).Hijack()
-		if err != nil {
-			t.Errorf("hijack: %v", err)
-			return
+// TestForward1533_ACollectorClosingIdleConnectionsLosesNothing is the restart race (#1535 review D1): the forwarder
+// keeps its connection to the collector alive between batches, and a collector going away closes it as the next POST
+// is written. net/http then answers `http: server closed idle connection`, an error with no type, no errno and no
+// EOF, and does not replay a POST. Here the collector closes every connection as soon as it goes idle after an
+// answer, so the race is run on each of 2000 batches: every batch is delivered, forward_failed 0 (mutations: that
+// error, or any unidentified error, made permanent reads forward_failed above 0).
+func TestForward1533_ACollectorClosingIdleConnectionsLosesNothing(t *testing.T) {
+	const batches = 2000
+	c := &collector1533{}
+	srv := httptest.NewUnstartedServer(c.handler())
+	srv.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		if state == http.StateIdle {
+			_ = conn.Close() // the collector goes away under the kept-alive connection
 		}
-		_, _ = conn.Write([]byte("HTTP/1.1 20"))
-		_ = conn.Close()
-	})
+	}
+	srv.Start()
+	defer srv.Close()
+	f, w := mustForwarder(t, srv.URL+"/v1/traces"), &waits1533{}
+	f.sleep = w.sleep
 	before := Read()
 	startForwarder(t, f)
-	f.enqueue(batch{body: []byte("spans"), spans: 10})
-	until(t, "10 spans failed", func() bool { return spansDelta(before, "forward_failed") == 10 })
-	time.Sleep(50 * time.Millisecond) // a retry, were there one, would have been made by now
-	if c.posts.Load() != 1 || len(w.list()) != 0 {
-		t.Fatalf("a status line cut before its code: %d POSTs, waits %v; want exactly 1 attempt and no wait",
-			c.posts.Load(), w.list())
+	for i := 0; i < batches; {
+		if len(f.queue) < cap(f.queue) && f.enqueue(batch{body: []byte("spans"), spans: 1}) {
+			i++
+			continue
+		}
+		time.Sleep(100 * time.Microsecond) // the test is the only producer: wait for room, never overflow
 	}
+	untilWithin(t, "2000 spans forwarded or failed", time.Minute, func() bool {
+		return spansDelta(before, "forwarded")+spansDelta(before, "forward_failed") == batches
+	})
+	if failed := spansDelta(before, "forward_failed"); failed != 0 || spansDelta(before, "forward_overflow") != 0 {
+		t.Fatalf("%d batches through a collector closing idle connections: forward_failed %d, forward_overflow %d; "+
+			"want 0 (every batch delivered)", batches, failed, spansDelta(before, "forward_overflow"))
+	}
+	t.Logf("%d batches delivered; %d attempts failed without an answer and were retried", batches, len(w.list()))
 }
 
 // TestForward1533_AnAttemptTimingOutIsRetried: the collector holds the first POST past ForwardTimeout (real time,
 // 5 s), then answers the next at once: the timed-out attempt is retried, two POSTs, one wait, forwarded (mutation: a
-// timeout not transient reads forward_failed).
+// timeout made permanent reads forward_failed).
 func TestForward1533_AnAttemptTimingOutIsRetried(t *testing.T) {
 	var posts atomic.Int64
 	release := make(chan struct{})
@@ -432,7 +450,7 @@ func TestForward1533_AnAttemptTimingOutIsRetried(t *testing.T) {
 	}))
 	defer srv.Close()
 	defer close(release) // before srv.Close, which waits for the held handler
-	f, w := NewForwarder(srv.URL+"/v1/traces"), &waits1533{}
+	f, w := mustForwarder(t, srv.URL+"/v1/traces"), &waits1533{}
 	f.sleep = w.sleep
 	before := Read()
 	startForwarder(t, f)
@@ -492,7 +510,7 @@ func TestForward1533_TheQueueFillsDuringAnOutageAndShutdownCountsWhatItHolds(t *
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
-	f := NewForwarder("http://" + addr + "/v1/traces")
+	f := mustForwarder(t, "http://"+addr+"/v1/traces")
 	waiting := make(chan struct{}, 1)
 	f.sleep = func(ctx context.Context, _ time.Duration) bool {
 		select {
@@ -561,7 +579,7 @@ func TestForward1533_ShutdownCutsAHugeRetryAfter(t *testing.T) {
 	}}
 	srv := httptest.NewServer(c.handler())
 	defer srv.Close()
-	f := NewForwarder(srv.URL + "/v1/traces") // its own, real sleep
+	f := mustForwarder(t, srv.URL+"/v1/traces") // its own, real sleep
 	before := Read()
 	cancel := startForwarder(t, f)
 	f.enqueue(batch{body: []byte("spans"), spans: 7})
