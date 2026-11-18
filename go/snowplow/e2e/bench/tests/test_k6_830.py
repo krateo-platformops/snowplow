@@ -2169,7 +2169,8 @@ def test_run606_k6_without_viewers(harness):
 
 
 def test_run606_k6_missing_browser_output_is_invalid(harness):
-    p, _, out = _run606_k6(harness, FAKE_K6_OUT="nobrowser")
+    # the copy fails every attempt: it is retried for COLLECT_TIMEOUT_S
+    p, _, out = _run606_k6(harness, FAKE_K6_OUT="nobrowser", COLLECT_TIMEOUT_S="10")
     assert p.returncode == 0, (p.stdout + p.stderr)[-4000:]
     assert "could not copy k6browser's results (/out)" in (out / "run.log").read_text()
     v = json.loads((out / "verdict.json").read_text())

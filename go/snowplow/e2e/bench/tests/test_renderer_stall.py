@@ -33,7 +33,7 @@ def _uptime(epoch: float) -> float:
 
 def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, stall=None, lost=(), idle=None,
           ops=None, node=True, helper_cpu=True, watch=None, omit=(), per_thread=False, exiting=(), churn=(), spawn=(),
-          stall_rate=1.0):
+          stall_rate=1.0, new_renderer=(), born_after_s=-2.1):
     """Warm loads at 600 ms (over the 500 ms bar) for 3 sessions, inside 20 s of browser-container stall (every
     window stalled 5 s: the container rule explains the FAIL away). `renderer`: the run also recorded per-renderer
     evidence: each session's renderer (PIDS) read by renderers.js before and (`map_after`) after its loads, and
@@ -47,7 +47,9 @@ def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, s
     the whole stall; the renderers of `exiting` sessions also had a thread holding 3 s of run_delay (accrued before
     the loads) that exits halfway through them, so their summed "rd" drops by 3 s; those of `churn` sessions start a
     thread at every sample that is gone by the next (no run_delay of its own); those of `spawn` sessions start 20
-    threads at once halfway through the loads, 1 ms of run_delay each, which stay."""
+    threads at once halfway through the loads, 1 ms of run_delay each, which stay. `new_renderer` (run29, Gap 2): those
+    sessions' renderers are new processes, started `born_after_s` from their first load (CLK_TCK 100 recorded), read
+    once they exist and first sampled only at or after their first load's start, as a class's first page is."""
     k6dir, bdir = tmp_path / "k6", tmp_path / "browser"
     _write_out(k6dir, "k6", _k6_points(20), _k6_summary(20), 0)
     _write_viewer(k6dir)
@@ -69,7 +71,10 @@ def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, s
         loads = [p["data"]["tags"] for p in pts if p["metric"] == "browser_page_load_ms"]
         first, last = min(int(t["t0"]) for t in loads) / 1000, max(int(t["t0"]) for t in loads) / 1000 + 1
         udd = {s: f"/tmp/k6browser-data-{s}" for s in SESSIONS}
-        rows = [{"kind": "renderer_udd", "pid": PIDS[s], "start": START, "udd": (udd_of or udd)[s]} for s in SESSIONS]
+        # a new renderer's own starttime (clock ticks at CLK_TCK 100, on the samples' uptime): its series key
+        born = {s: str(round(_uptime(first + born_after_s) * 100)) if s in new_renderer else START for s in SESSIONS}
+        rows = ([{"kind": "renderer_clock", "hz": 100}] if new_renderer else []) + [
+            {"kind": "renderer_udd", "pid": PIDS[s], "start": born[s], "udd": (udd_of or udd)[s]} for s in SESSIONS]
         mid = (first + last) / 2
         for i in range(60):                                   # every second from T_POINTS - 15
             t = T_POINTS - 15 + i
@@ -77,8 +82,9 @@ def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, s
             # renderer's counter is live: it advanced (2 ms) while its page first rendered, before the loads
             main = {s: (int(stall_rate * 1e9 * min(max(0.0, t - (first - 1)), last + 1 - (first - 1)))
                         if s in stalled else 0)
-                    + (1000 if t < first - 8 else 2001000) for s in SESSIONS}
-            th = {s: {f"{PIDS[s]}:{START}": main[s]} for s in SESSIONS}
+                    + (1000 if t < first - 8 else 2001000)
+                    + (int(1000 * (t - first)) if s in new_renderer and t >= first else 0) for s in SESSIONS}
+            th = {s: {f"{PIDS[s]}:{born[s]}": main[s]} for s in SESSIONS}
             for s in exiting:
                 if t < mid:
                     th[s][f"{PIDS[s] + 5000}:{int(START) + 7}"] = 3_000_000_000
@@ -87,15 +93,18 @@ def _case(tmp_path, *, renderer=True, stalled=(), map_after=True, udd_of=None, s
             for s in spawn:
                 if t >= mid:
                     th[s].update({f"{30000 + j}:{int(START) + 900}": 1_000_000 for j in range(20)})
+            # a new renderer is first sampled at or after its first load's start (run29: +0.00 .. +0.27 s)
+            present = [s for s in SESSIONS if s not in new_renderer or t >= first]
             row = {"kind": "renderer", "t": _uptime(t),
-                   "rd": {f"{PIDS[s]}:{START}": sum(th[s].values()) for s in SESSIONS}}
+                   "rd": {f"{PIDS[s]}:{born[s]}": sum(th[s].values()) for s in present}}
             if per_thread:
-                row["th"] = {f"{PIDS[s]}:{START}": th[s] for s in SESSIONS}
+                row["th"] = {f"{PIDS[s]}:{born[s]}": th[s] for s in present}
             rows.append(row)
         (bdir / "browser-renderers.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
         maps = []
         for s in SESSIONS:
-            maps.append({"kind": "renderer_map", "t0": first - 6, "t1": first - 5.9, "udd": udd[s], "target": "T" + s,
+            r0 = first - 0.6 if s in new_renderer else first - 6      # a new renderer is read once it exists
+            maps.append({"kind": "renderer_map", "t0": r0, "t1": r0 + 0.1, "udd": udd[s], "target": "T" + s,
                          "session": s, "class": "0", "pid": PIDS[s]})
             if map_after:
                 maps.append({"kind": "renderer_map", "t0": last + 2, "t1": last + 2.1, "udd": udd[s],
@@ -878,3 +887,139 @@ def test_the_kernel_starts_a_new_threads_run_delay_at_zero():
     r = json.loads(p.stdout)
     print("PREMISE", json.dumps(r))
     check_premise(r)
+
+
+# ─── Gap 2 (run29): a new renderer's process start is its lower bracket ─────────────────────────────────────────────
+# In all three run29 arms browser.cpu_starvation was UNMEASURED, "no renderer sample brackets it", on 1-3 loads, each a
+# class's first page (method login): the renderer process started ~2.1 s before the load, and the sampler's first
+# sample of it ended +0.00 .. +0.27 s after the load started. A new task's run_delay starts at 0 and no thread of a
+# process starts before it, so the process start, every thread at 0, is an exact lower bracket.
+
+def _new_renderer_rows(load_start: float, *, born: float, first_t: float, threads: dict, hz: int = 100,
+                       step: float = 1.0, n: int = 4) -> list[dict]:
+    """The sampler's records of one new renderer (pid 7, started at uptime `born`, epoch = uptime): samples every
+    `step` s from `first_t` (each ending 0.09 s after its start, as run29's), each holding `threads`
+    {(tid, start tick): fn(t) -> ns} for the threads alive at t (fn returns None before the thread exists)."""
+    key = f"7:{round(born * hz)}"
+    rows = [{"kind": "renderer_clock", "hz": hz}, {"kind": "renderer_udd", "pid": 7, "start": key[2:], "udd": "u"}]
+    for i in range(n):
+        t = first_t + i * step
+        th = {f"{tid}:{tick}": fn(t) for (tid, tick), fn in threads.items() if fn(t) is not None}
+        rows.append({"kind": "renderer", "t": t, "t_end": t + 0.09, "rd": {key: sum(th.values())}, "th": {key: th}})
+    return rows
+
+
+def _login_load(start: float, wall_ms: float) -> dict:
+    return {"session": "s", "class": "0", "start": start, "wall_ms": wall_ms}
+
+
+# run29's real cases, synthetic (no identities), as k6eval reads them with this change (a read-only probe of run29's
+# evidence): (load wall ms, process start before the load s, first sample start after it s, threads, their run_delay
+# at the first sample ms (all before it: pre), what they added by the first sample after the load ms, want ms, want
+# upper ms)
+RUN29 = [
+    (635.7, 2.05, 0.11, 17, 1039.3, 24.7, 24.7, 635.7),      # N2 class#0: the bound alone exceeds the load: capped
+    (707.6, 2.104, 0.086, 18, 433.0, 120.4, 120.4, 553.4),   # N2 class#1
+    (647.7, 2.087, -0.087, 19, 54.7, 2.3, 2.3, 57.0),        # N2 class#2: its first sample started BEFORE the load
+    #                                                          and ended after it: no lower bracket
+    (1137.0, 2.065, 0.005, 16, 197.1, 268.2, 268.2, 465.3),  # N1 class#0
+    (767.5, 2.123, 0.097, 18, 130.1, 22.5, 22.5, 152.6),     # N1B class#0
+    (825.7, 2.094, 0.066, 17, 646.9, 24.6, 24.6, 671.5),     # N1B class#1
+]
+
+
+@pytest.mark.parametrize("wall_ms,born_before,first_after,n_threads,pre_ms,add_ms,want,want_upper", RUN29,
+                         ids=["n2-c0-capped", "n2-c1", "n2-c2-first-sample-straddles", "n1-c0", "n1b-c0", "n1b-c1"])
+def test_a_new_renderers_first_load_is_bracketed_below_by_its_process_start(wall_ms, born_before, first_after,
+                                                                            n_threads, pre_ms, add_ms, want,
+                                                                            want_upper):
+    """run29's unbracketed login loads, now bracketed: below by the renderer's process start (every thread at 0), above
+    by the first sample that started after the load. What the renderer waited before its first sample (`pre_ms`,
+    ~2.1 s of its life, most of it before the load) is a BOUND, never measured stall: the measured stall is from the
+    first sample on, and the upper bound adds the earlier wait, capped at the load's time (mutations: the
+    process-start bracket not used reads UNKNOWN; the earlier wait charged as measured reads n2-c0 a 635.7 ms stall
+    of a 635.7 ms load, a false "starved")."""
+    s0 = 100.0
+    born = s0 - born_before
+    first = s0 + first_after
+    upper_t = s0 + wall_ms / 1000 + 0.2
+    tick = round(born * 100)
+    # each thread starts at the process start + i ticks; at the first sample it holds its share of pre_ms, at the
+    # first sample after the load its share of pre_ms + add_ms
+    threads = {(str(7 + i), tick + i):
+               (lambda t: None if t < born else
+                int((pre_ms + (add_ms if t >= upper_t - 1e-6 else 0)) / n_threads * 1e6))
+               for i in range(n_threads)}
+    step = upper_t - first
+    rows = _new_renderer_rows(s0, born=born, first_t=first, threads=threads, step=step)
+    after = _read(first + 2 * step + 0.01, first + 2 * step + 0.05)
+    r = k6eval.renderer_state({"renderers": rows, "renderer_map": [_read(s0 - 0.6), after]}, 0.0)
+    got = k6eval.renderer_delay(_login_load(s0, wall_ms), {"slack_s": 0.01, "renderer": r})
+    assert got["why"] == "" and got.get("lower") == "process_start", got
+    assert got["ms"] == pytest.approx(want, abs=0.05), got
+    assert got["pre_ms"] == pytest.approx(pre_ms, abs=0.05) and got["exit_bound_ms"] == 0.0, got
+    assert got["bound_ms"] == pytest.approx(pre_ms, abs=0.05), got
+    assert got["upper_ms"] == pytest.approx(want_upper, abs=0.05), got
+    assert got["started_upper"] == 0, got
+
+
+@pytest.mark.parametrize("born,slack", [(100.0, 0.01), (99.99, 0.02)],
+                         ids=["at-the-loads-start", "inside-the-anchors-error"])
+def test_a_renderer_whose_process_started_after_the_load_began_stays_unknown(born, slack):
+    """A process start that is not before the load (at its start, or within the anchor's error of it) is no bracket
+    BEFORE the load: UNKNOWN, named, never a stall counted from a start inside it (mutation: the before-the-load
+    condition dropped reads a measured stall). Its renderer was read as it started (t1 = the load's start)."""
+    s0 = 100.0
+    threads = {("7", round(born * 100)): lambda t: None if t < born else int(5e6 * (t - born + 1))}
+    rows = _new_renderer_rows(s0, born=born, first_t=s0 + 0.1, threads=threads)
+    r = k6eval.renderer_state({"renderers": rows, "renderer_map": [_read(born, s0), _read(s0 + 2.15)]}, 0.0)
+    got = k6eval.renderer_delay(_login_load(s0, 600.0), {"slack_s": slack, "renderer": r})
+    assert got["ms"] is None and got["why"] == "no renderer sample brackets it", got
+
+
+def test_the_process_start_cannot_bracket_a_thread_that_is_not_new():
+    """A thread whose own start is before its process's (inconsistent keys: not a thread born in it) cannot be read as
+    0 at the process start: UNKNOWN, named (mutation: the process start used when the threads are not all new reads a
+    measured stall)."""
+    s0, born = 100.0, 97.9
+    threads = {("7", round(born * 100)): lambda t: int(2e6 * (t - born)),
+               ("8", round(born * 100) - 50): lambda t: int(3e6)}          # 0.5 s before the process
+    rows = _new_renderer_rows(s0, born=born, first_t=s0 + 0.1, threads=threads)
+    r = k6eval.renderer_state({"renderers": rows, "renderer_map": [_read(s0 - 0.6), _read(s0 + 2.15)]}, 0.0)
+    got = k6eval.renderer_delay(_login_load(s0, 600.0), {"slack_s": 0.01, "renderer": r})
+    assert got["ms"] is None and got["why"].startswith("no renderer sample brackets it, and its process start "
+                                                       "cannot: 1 of its threads"), got
+
+
+def test_without_per_thread_samples_the_process_start_brackets_nothing():
+    """Older evidence (only the summed run_delay, no thread starts): the process start is not used, the load stays
+    UNKNOWN as before (mutation: the per-thread requirement dropped reads a stall from the summed series)."""
+    s0, born = 100.0, 97.9
+    key = f"7:{round(born * 100)}"
+    rows = [{"kind": "renderer_clock", "hz": 100}, {"kind": "renderer_udd", "pid": 7, "start": key[2:], "udd": "u"}]
+    rows += [{"kind": "renderer", "t": s0 + 0.1 + i, "t_end": s0 + 0.19 + i, "rd": {key: int(1e6) * (i + 1)}}
+             for i in range(4)]
+    r = k6eval.renderer_state({"renderers": rows, "renderer_map": [_read(s0 - 0.6), _read(s0 + 2.15)]}, 0.0)
+    got = k6eval.renderer_delay(_login_load(s0, 600.0), {"slack_s": 0.01, "renderer": r})
+    assert got["ms"] is None and got["why"] == "no renderer sample brackets it", got
+
+
+def test_through_the_cli_a_new_renderers_first_loads_are_measured_and_the_check_decided(tmp_path):
+    """The evaluate CLI over a run whose every session's renderer is new (started 2.1 s before its first load, first
+    sampled at it: run29's shape): every load is measured, the check is DECIDED (PASS: idle renderers take nothing from
+    the 600 ms loads) and warm p95 FAILs as measured, where run29 read UNMEASURED and INCONCLUSIVE."""
+    _, v = _case(tmp_path, per_thread=True, new_renderer=SESSIONS)
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "PASS", c
+    assert c["value"]["renderer_threads"]["loads_measured"] == 63, c["value"]
+    assert _check(v["checks"], "warm_nav_p95_ms")["result"] == "FAIL"
+
+
+def test_through_the_cli_older_evidence_of_new_renderers_leaves_the_check_unmeasured(tmp_path):
+    """The same run recorded without per-thread samples (only the summed run_delay): the process start brackets
+    nothing, those first loads stay UNKNOWN, named, the check UNMEASURED and the wall-time checks INCONCLUSIVE, as run29
+    read (mutation: the per-thread requirement dropped decides it from the summed series)."""
+    _, v = _case(tmp_path, per_thread=False, new_renderer=SESSIONS)
+    c = _check(v["validity"], "browser.cpu_starvation")
+    assert c["result"] == "UNMEASURED" and "no renderer sample brackets it" in c["why"], c
+    assert _check(v["checks"], "warm_nav_p95_ms")["result"] == "INCONCLUSIVE"

@@ -330,6 +330,7 @@ def test_run606_says_why_a_head_cut_stream_is_invalid(harness):
 def test_run606_missing_driver_file_is_loud(harness):
     env, state, ambient, tmp = harness
     env["FAKE_DRIVE_STREAM"] = "nofile"
+    env["COLLECT_TIMEOUT_S"] = "10"      # the copy fails every attempt: it is retried for COLLECT_TIMEOUT_S
     _run606(env)
     log = (tmp / "out" / "run.log").read_text()
     assert "could not copy the driver's results (/out/nav.jsonl) from load606-0" in log

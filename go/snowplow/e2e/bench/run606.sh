@@ -2755,8 +2755,8 @@ data606_finish() {
   pod="$(incluster_pod data606)"
   mkdir -p "$OUT/data606"
   if [[ -n "$pod" ]]; then
-    "${KR[@]}" -n bench-loadgen cp -c data606 "$pod:/out" "$OUT/data606" >/dev/null 2>"$KERR" \
-      || log "could not copy data606's /out from $pod ($(kerr_line)): its proof and log may be missing"
+    collect_copy "data606's proof and log" "$pod" data606 /out "$OUT/data606" dir \
+      || log "could not copy data606's /out from $pod whole: its proof and log may be missing"
     "${KR[@]}" -n bench-loadgen logs "$pod" -c tools > "$OUT/data606/tools.log" 2>/dev/null || true
     "${KR[@]}" -n bench-loadgen exec "$pod" -c data606 -- touch /out/collected >/dev/null 2>&1 || true
   else
@@ -2872,9 +2872,8 @@ collect_observer() {
       log "could not ask observe606 to end its samples ($(kerr_line)): copying them as they are"
     fi
     mkdir -p "$OUT/observe606"
-    bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen \
-        cp -c observe "$pod:/out" "$OUT/observe606" >/dev/null 2>"$KERR" \
-      || log "could not copy observe606's /out ($(kerr_line)): the APF, top and log streams will read missing"
+    collect_copy "observe606's samples and log stream" "$pod" observe /out "$OUT/observe606" dir \
+      || log "could not copy observe606's /out whole: the APF, top and log streams will read missing or incomplete"
     for f in $OBSERVE_FILES; do
       [[ -f "$OUT/observe606/$f" ]] && mv "$OUT/observe606/$f" "$OUT/$f"
     done
@@ -2897,6 +2896,80 @@ incluster_teardown() {
   [[ -f "$OUT/.observer-started" ]] && incluster_delete observe606
   return 0
 }
+# collect_copy <what> <pod> <container or ""> <remote path> <local path> <dir|file>: COLLECT's one way to copy a
+# file or a directory out of a bench pod (Diego 2026-11-18, "Fix both bench gaps": run 29 N2's k6 /out copy failed
+# 11 s in, its stderr discarded, no retry, and the cut viewer.jsonl it left read as a sidecar that did not finish).
+# Before the copy the pod lists what it holds (each file's size and the sha256 of exactly that many bytes:
+# bench/collect_copy.py's script); kubectl's stderr is kept in the run log (identities redacted, kerr_line); the copy
+# is verified file by file (at least the pod's size, its first <size> bytes hashing to the pod's: a stream still
+# appended to is whole, one cut short is not); a failed or short copy is tried again, every attempt and the waits
+# between them inside COLLECT_TIMEOUT_S (the bound one copy already had: no new knob; the listing before it is one
+# more read, bounded by its own COLLECT_TIMEOUT_S like every collect read); what the last attempt left
+# is kept, as before, and the copy is recorded (collect-copies.jsonl: evaluate's collect.copies names a short or
+# failed copy; a pod that could not list its files leaves the copy "unverified", a report warning).
+collect_copy() {
+  local what="$1" pod="$2" ctr="$3" remote="$4" dest="$5" kind="$6"
+  local cflag=() deadline left attempts=0 rc vrc outcome="" manifest_ok=1 errs=() stage
+  local man="$OUT/.collect-manifest" ver="$OUT/.collect-verify.json" script
+  [[ -n "$ctr" ]] && cflag=(-c "$ctr")
+  stage="$dest.part"
+  rm -f "$ver"
+  script="$(python3 -m bench.collect_copy script)"
+  if ! bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen \
+        exec "$pod" ${cflag[@]+"${cflag[@]}"} -- sh -c "$script" _ "$remote" > "$man" 2>"$KERR"; then
+    manifest_ok=0
+    errs+=("manifest: $(kerr_line | head -n 1)")
+    log "COLLECT: $what: $pod could not list what it holds at $remote ($(kerr_line)): the copy will not be verified"
+  fi
+  deadline=$(( $(date +%s) + COLLECT_TIMEOUT_S ))
+  while true; do
+    left=$(( deadline - $(date +%s) ))
+    (( left > 0 )) || break
+    attempts=$(( attempts + 1 ))
+    rm -rf "$stage"
+    rm -f "$ver"
+    [[ "$kind" == "dir" ]] && mkdir -p "$stage"
+    rc=0
+    bounded "$left" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen cp ${cflag[@]+"${cflag[@]}"} \
+        "$pod:$remote" "$stage" >/dev/null 2>"$KERR" || rc=$?
+    if (( rc != 0 )); then
+      errs+=("attempt $attempts: kubectl cp rc=$rc: $(kerr_line | head -n 1)")
+      log "COLLECT: $what: copying $remote from $pod failed (attempt $attempts, rc=$rc): $(kerr_line)"
+    elif (( manifest_ok == 0 )); then
+      outcome=unverified
+      break
+    else
+      vrc=0
+      python3 -m bench.collect_copy verify --manifest "$man" --local "$stage" --kind "$kind" > "$ver" || vrc=$?
+      if (( vrc == 0 )); then outcome=verified; break; fi
+      errs+=("attempt $attempts: copied short")
+      log "COLLECT: $what: the copy of $remote from $pod is short (attempt $attempts): $(python3 -c 'import json,sys; print("; ".join(json.load(open(sys.argv[1]))["short"]))' "$ver" 2>/dev/null)"
+    fi
+    left=$(( deadline - $(date +%s) ))
+    (( left > 5 )) || break
+    sleep 5
+  done
+  if [[ -z "${outcome:-}" ]]; then
+    if [[ -s "$ver" ]]; then outcome=short; else outcome=failed; fi
+    log "COLLECT: $what: $remote from $pod is $outcome after $attempts attempt(s) within ${COLLECT_TIMEOUT_S}s: kept as copied"
+  fi
+  # what the last attempt left, in place (a directory merged into an existing one, as kubectl cp did)
+  if [[ "$kind" == "dir" ]]; then
+    mkdir -p "$dest"
+    [[ -d "$stage" ]] && cp -R "$stage/." "$dest/" 2>/dev/null
+    rm -rf "$stage"
+  elif [[ -e "$stage" ]]; then
+    mv -f "$stage" "$dest"
+  fi
+  local eargs=() e
+  for e in ${errs[@]+"${errs[@]}"}; do eargs+=(--error "$e"); done
+  [[ -s "$ver" ]] && eargs+=(--checked "$ver")
+  python3 -m bench.collect_copy record --what "$what" --pod "$pod" --remote "$remote" --attempts "$attempts" \
+      --outcome "$outcome" --manifest-ok "$manifest_ok" ${eargs[@]+"${eargs[@]}"} \
+      >> "$OUT/collect-copies.jsonl" || log "COLLECT: $what: could not record the copy"
+  rm -f "$man" "$ver"
+  [[ "$outcome" == "verified" || "$outcome" == "unverified" ]]
+}
 s_collect() {
   local p
   if [[ "$DRY" == "1" ]]; then
@@ -2918,8 +2991,8 @@ s_collect() {
   # log: the kubelet rotates that, and `kubectl logs` returns only the current
   # file. The log keeps the driver's diagnostics.
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=load606 -o name); do
-    "${KR[@]}" -n bench-loadgen cp "${p#pod/}:/out/nav.jsonl" "$OUT/nav-${p#pod/}.jsonl" >/dev/null 2>&1 \
-      || log "could not copy the driver's results (/out/nav.jsonl) from ${p#pod/}: the verdict will say the stream is missing or incomplete"
+    collect_copy "the driver's results" "${p#pod/}" "" /out/nav.jsonl "$OUT/nav-${p#pod/}.jsonl" file \
+      || log "could not copy the driver's results (/out/nav.jsonl) from ${p#pod/} whole: the verdict will say the stream is missing or incomplete"
     "${KR[@]}" -n bench-loadgen logs "$p" > "$OUT/driver-${p#pod/}.log" \
       || log "could not read the driver's diagnostics log from ${p#pod/}"
   done
@@ -2930,8 +3003,8 @@ s_collect() {
     dir="$OUT/$([[ "$j" == "k6load" ]] && echo k6 || echo browser)"
     for p in $("${KR[@]}" -n bench-loadgen get pods -l "job-name=$j" -o name); do
       mkdir -p "$dir"
-      "${KR[@]}" -n bench-loadgen cp "${p#pod/}:/out" "$dir" >/dev/null 2>&1 \
-        || log "could not copy $j's results (/out) from ${p#pod/}: the verdict will say the stream is missing or incomplete"
+      collect_copy "$j's results" "${p#pod/}" "" /out "$dir" dir \
+        || log "could not copy $j's results (/out) from ${p#pod/} whole: the verdict will say the stream is missing or incomplete"
       "${KR[@]}" -n bench-loadgen logs "$p" --all-containers > "$OUT/driver-${p#pod/}.log" \
         || log "could not read $j's diagnostics log from ${p#pod/}"
     done
@@ -2948,8 +3021,8 @@ s_collect() {
   # #1089: the netns606 samples (the TCP path under snowplow), report only;
   # flushed per line, so a copy at any moment holds whole samples
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=netns606 -o name); do
-    "${KR[@]}" -n bench-loadgen cp "${p#pod/}:/out/netns.jsonl" "$OUT/netns.jsonl" >/dev/null 2>&1 \
-      || log "could not copy the netns606 samples from ${p#pod/}: the TCP path under snowplow will read UNMEASURED"
+    collect_copy "the netns606 samples" "${p#pod/}" "" /out/netns.jsonl "$OUT/netns.jsonl" file \
+      || log "could not copy the netns606 samples from ${p#pod/} whole: the TCP path under snowplow will read UNMEASURED"
   done
   # How every in-cluster Job pod ended, for the verdict (#817 review): a pod
   # that died (OOMKilled, evicted, a crash), never ran (Pending / Unknown) or
@@ -2995,8 +3068,8 @@ s_collect() {
   for p in $("${KR[@]}" -n bench-loadgen get pods -l job-name=mem606 -o name); do
     mem_stop "${p#pod/}"
     mkdir -p "$OUT/heap"
-    "${KR[@]}" -n bench-loadgen cp "${p#pod/}:/out" "$OUT/heap" >/dev/null 2>&1 \
-      || log "could not copy heap profiles from ${p#pod/}"
+    collect_copy "mem606's trajectory and heap profiles" "${p#pod/}" "" /out "$OUT/heap" dir \
+      || log "could not copy mem606's trajectory and heap profiles (/out) from ${p#pod/} whole"
     if [[ -f "$OUT/heap/mem.jsonl" ]]; then
       mv "$OUT/heap/mem.jsonl" "$OUT/mem-${p#pod/}.jsonl"
     else
@@ -3055,7 +3128,7 @@ s_evaluate() {
                "$OUT"/image-digest.jsonl "$OUT"/job-pods.jsonl "$OUT"/cluster-shape*.jsonl
                "$OUT"/api-outages*.jsonl "$OUT"/platform-definitions.jsonl "$OUT"/command-failures.jsonl
                "$OUT"/cert-manager*.jsonl "$OUT"/host-load.jsonl "$OUT"/incluster-placement.jsonl "$OUT"/observer-pod.jsonl
-               "$OUT"/netns*.jsonl "$OUT"/frontend-digest*.jsonl)   # globs: nullglob drops them when no file is there (frontend-digest: run 26, only with FRONTEND_TAG)
+               "$OUT"/netns*.jsonl "$OUT"/frontend-digest*.jsonl "$OUT"/collect-copies*.jsonl)   # globs: nullglob drops them when no file is there (frontend-digest: run 26, only with FRONTEND_TAG)
   # #919: the API server's flow-control scrapes, read by evaluate as a stream
   # (a file that is not there is reported missing)
   local r8=() k6args=() apfargs=(--apf "$OUT/apf.jsonl.gz")
