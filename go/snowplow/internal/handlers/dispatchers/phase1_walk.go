@@ -100,11 +100,12 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/loopbacktoken"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/wait"
+	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/clock"
 )
@@ -196,6 +197,16 @@ type navigationRoot struct {
 // navigation kind, and both of those kinds have since been removed from the
 // platform.
 type rootsLister func(ctx context.Context) ([]navigationRoot, error)
+
+// phase1RootsLister is Phase 1's navigation-root lister: the frontend ConfigMap
+// and the root CRs it names, read under the SA-credentialed Phase 1 context
+// (withPhase1SAContext). Phase1Warmup's, and the js/wasm arm's against the
+// sandbox's fake apiserver (#1530), so the arm reads through the same wiring.
+func phase1RootsLister(saEP endpoints.Endpoint, rc *rest.Config, dynCli k8sdynamic.Interface, cfgNamespace string) rootsLister {
+	return func(lctx context.Context) ([]navigationRoot, error) {
+		return listNavigationRootsFromConfigMap(withPhase1SAContext(lctx, saEP, rc), dynCli, cfgNamespace)
+	}
+}
 
 // rootResolver abstracts resolving a single navigation-root CR (and, in
 // production, recursively walking its widget subtree). Production passes
@@ -384,10 +395,7 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 	// internal-dispatch context. So the lister runs under the same
 	// SA-credentialed context the per-root resolver uses — built here
 	// once via withPhase1SAContext.
-	lister := func(lctx context.Context) ([]navigationRoot, error) {
-		return listNavigationRootsFromConfigMap(
-			withPhase1SAContext(lctx, *saEP, rc), dynCli, cfgNamespace)
-	}
+	lister := phase1RootsLister(*saEP, rc, dynCli, cfgNamespace)
 
 	// Ship F2 (0.30.125): the content-prewarm harvester. When
 	// PREWARM_CONTENT_ENABLED is set, the discovery walk harvests every
@@ -1260,12 +1268,19 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	// The SA's apiserver token is the WRONG issuer for snowplow's
 	// jwtutil.Validate (§4); the seed must present an authn-ISSUED JWT.
 	// seedTokenProvider (wired from main.go to the authn.Client) fetches
-	// one. DEGRADE-not-fail (C-a): on a token-acquisition error or no
-	// provider wired, WARN + bump the expvar and proceed token-less —
-	// warmup is best-effort, the nested loopback stays cold this boot but
-	// the pod still serves. The token install is what lets the 3b
-	// self-loopback bearer-append (resolve.go) fire on the seed path.
-	rctx = installSeedLoopbackToken(rctx)
+	// one.
+	//
+	// #1530 — the context carries the token's SOURCE, not the token: the
+	// bearer-carrying stage asks it, under its own context, once the bearer
+	// decision says it carries one (restactions/api stageBearer). Before, the
+	// token was fetched HERE, with a backoff bounded only by this context: every
+	// SA context (the navigation-root read first) waited for authn as long as it
+	// lasted, and with authn unavailable for all of PHASE1_TIMEOUT the lister
+	// read the frontend ConfigMap on an expired context (the sandbox lost every
+	// boot's whole Phase 1 that way). DEGRADE-not-fail (C-a) is unchanged: a
+	// stage whose token cannot be had runs token-less (WARN + the expvar), and
+	// the next stage that needs it, and the next config-vars re-drive, ask again.
+	rctx = installSeedLoopbackTokenSource(rctx)
 	// #720 — every phase-1 SA context is a PREWARM context: its callers are the
 	// boot discovery walk, the post-Ready apiRef pagination drain and its
 	// re-collection pass, the nav-root lister and the prewarm engine's re-walk.
@@ -1288,109 +1303,53 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	return rctx
 }
 
-// seedTokenProvider is the hook the seed path calls to obtain an authn-issued
-// JWT for the nested loopback /call. Wired ONCE at startup (main.go) to the
-// authn.Client's Token method; nil when authn is not configured (then the
-// seed runs token-less, the pre-#57 behaviour). Mirrors SetCustomerInflightHook
-// / SetRefreshHook — a package-level injection, not a threaded parameter.
+// seedTokenAcquirerCur is the shared acquisition of the seed's authn-issued JWT for the nested loopback /call
+// (seed_token_acquirer.go). Wired ONCE at startup (main.go) to the authn.Client's Token method; nil when authn is
+// not configured (then the seed runs token-less, the pre-#57 behaviour). Mirrors SetCustomerInflightHook /
+// SetRefreshHook — a package-level injection, not a threaded parameter.
 var (
-	seedTokenProviderMu sync.RWMutex
-	seedTokenProvider   func(ctx context.Context) (string, error)
+	seedTokenProviderMu  sync.RWMutex
+	seedTokenAcquirerCur *seedTokenAcquirer
 )
 
-// SetSeedLoopbackTokenProvider wires the seed's authn-token source. Safe to
-// call multiple times (later calls replace). A nil fn disables the install
-// (seed runs token-less — the pre-#57 degrade posture).
+// SetSeedLoopbackTokenProvider wires the seed's authn-token provider. Safe to call multiple times (later calls
+// replace, with a fresh acquisition state). A nil fn disables the source (seed runs token-less — the pre-#57
+// degrade posture).
 func SetSeedLoopbackTokenProvider(fn func(ctx context.Context) (string, error)) {
 	seedTokenProviderMu.Lock()
-	seedTokenProvider = fn
-	seedTokenProviderMu.Unlock()
+	defer seedTokenProviderMu.Unlock()
+	if fn == nil {
+		seedTokenAcquirerCur = nil
+		return
+	}
+	seedTokenAcquirerCur = newSeedTokenAcquirer(fn)
 }
 
-// seedLoopbackTokenErrTotal counts token-acquisition failures on the seed path
-// (C-a observability — "prewarm loopback ran token-less, nested RA cold").
+// seedLoopbackTokenErrTotal counts failed token exchanges on the seed path (C-a observability; #1531: one per failed
+// exchange of the shared acquisition, not one per asking stage nor per context build).
 var seedLoopbackTokenErrTotal atomic.Uint64
 
 // SeedLoopbackTokenErrTotal exposes the C-a degrade counter (expvar-published
 // in the metrics block + read by the falsifier).
 func SeedLoopbackTokenErrTotal() uint64 { return seedLoopbackTokenErrTotal.Load() }
 
-// installSeedLoopbackToken acquires an authn JWT via the wired provider and
-// installs it on ctx (xcontext.WithAccessToken). DEGRADE-not-fail: a missing
-// provider or a token error leaves ctx unchanged (token-less seed) + WARN +
-// counter — never fails the boot/warmup.
-func installSeedLoopbackToken(ctx context.Context) context.Context {
+// installSeedLoopbackTokenSource puts on ctx the source a bearer-carrying stage asks for the authn-issued token
+// (#1530), and asks nothing itself: building a prewarm context never waits for authn. No provider wired (authn not
+// configured) leaves ctx unchanged: such stages run token-less, the pre-#57 posture.
+//
+// The source is the shared acquisition (seedTokenAcquirer.ask): a stage that needs the token waits, within its own
+// context, for the one exchange every asking stage shares, tried again while authn is not yet serving (the rt8rv
+// boot race); the provider (authn.Client.Token) then serves later asks from its cache until shortly before the JWT
+// expires. A stage whose context ends first runs token-less (the C-a degrade); nothing that does not need the token
+// waits for it.
+func installSeedLoopbackTokenSource(ctx context.Context) context.Context {
 	seedTokenProviderMu.RLock()
-	fn := seedTokenProvider
+	acq := seedTokenAcquirerCur
 	seedTokenProviderMu.RUnlock()
-	if fn == nil {
+	if acq == nil {
 		return ctx // authn not configured — token-less seed (pre-#57 behaviour)
 	}
-
-	// BOOT-RACE-TOLERANT (shape A §2.3): bounded exponential backoff on the
-	// seed→authn token exchange. On a fresh install snowplow can boot before
-	// authn is serving on :8082 (the rt8rv 06:08:53 race — one connection-
-	// refused, no retry, token-less for the pod lifetime). The backoff retries
-	// the exchange until authn answers.
-	//
-	// STRICTLY CTX-BOUNDED, NO NEW ENV. wait.ExponentialBackoffWithContext
-	// stops the instant ctx is Done — ctx here is the seed/p1 ctx, itself a
-	// child of PHASE1_TIMEOUT_SECONDS (p1Ctx) / pipGlobalTimeout (seedCtx). The
-	// Steps are a SHAPE parameter (large enough that ctx, not Steps, is the
-	// true bound — Steps caps only the pathological ctx-never-cancels case),
-	// NOT a policy timeout (regression watch §4 / the 0.30.220 boot-stall
-	// lesson: a backoff that ignored ctx would re-introduce a boot-blocking
-	// stall).
-	//
-	// DEGRADE-NOT-FAIL. On budget/step exhaustion (or ctx cancel) it keeps the
-	// existing posture: WARN + bump seedLoopbackTokenErrTotal + return ctx
-	// unchanged (token-less) — never fatal. Behavioral neutrality when authn is
-	// already up: the first condition call succeeds → the loop exits after one
-	// iteration (byte-identical to the fire-once path, plus the same token
-	// install).
-	backoff := wait.Backoff{
-		Duration: 250 * time.Millisecond,
-		Factor:   2.0,
-		Jitter:   0.1,
-		// Steps caps the exponential growth; ctx is the real bound. 30 steps
-		// with Factor 2 (capped) fills any realistic phase budget — the loop
-		// exits on the first success or on ctx.Done long before Steps runs out
-		// in any non-pathological case.
-		Steps: 30,
-		// Cap the per-attempt sleep so late steps do not overshoot a
-		// still-arriving authn by minutes.
-		Cap: 30 * time.Second,
-	}
-
-	var tok string
-	waitErr := wait.ExponentialBackoffWithContext(ctx, backoff, func(cctx context.Context) (bool, error) {
-		t, err := fn(cctx)
-		if err == nil && t != "" {
-			tok = t
-			return true, nil // acquired — install it
-		}
-		// Transient (connection refused / authn not up yet / empty token):
-		// keep retrying. NEVER return the error (that would abort the backoff
-		// and drop us into the degrade path prematurely) — let ctx bound it.
-		return false, nil
-	})
-
-	if waitErr != nil || tok == "" {
-		// ctx cancelled, budget/steps exhausted, or (defensively) empty token:
-		// degrade to token-less, exactly as the pre-shape-A fire-once path did.
-		seedLoopbackTokenErrTotal.Add(1)
-		slog.WarnContext(ctx, "prewarm.seed_loopback_token_unavailable",
-			slog.String("subsystem", "cache"),
-			slog.Any("err", waitErr),
-			slog.String("effect", "prewarm loopback ran token-less after bounded retry; a nested loopback "+
-				"/call RA is not warmed this pass (degraded, not fatal — a config-vars re-drive re-attempts "+
-				"the token when authn is up)"),
-		)
-		return ctx
-	}
-	// xcontext.WithAccessToken is a BuildContext option (returns a
-	// WithContextFunc), not a direct ctx mutator — apply it via BuildContext.
-	return xcontext.BuildContext(ctx, xcontext.WithAccessToken(tok))
+	return loopbacktoken.WithSource(ctx, acq.ask)
 }
 
 func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester, navHarvester *navWidgetHarvester, pagCollector *apiRefPaginationCollector) error {

@@ -31,9 +31,11 @@ command -v node >/dev/null || { echo "node is required to run the js/wasm tests"
 GOOS=js GOARCH=wasm go test -count=1 -timeout 120s \
   -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/browserbridge ./internal/sandbox/...
 # Phase 1's own frontend-ConfigMap reader against the fake apiserver (the ConfigMap the fake synthesises,
-# fakeapiserver §8): the one dispatchers test that runs in the browser build
-echo "== js/wasm: Phase 1's frontend ConfigMap read against the fake apiserver"
-GOOS=js GOARCH=wasm go test -count=1 -timeout 120s -run '^TestPhase1ReadsINITFromTheFakeEnvsFrontendConfigMap$' \
+# fakeapiserver §8), and Phase 1 completing with the root INIT names while authn is unavailable, as in the sandbox
+# (#1530): the dispatchers tests that run in the browser build
+echo "== js/wasm: Phase 1's frontend ConfigMap read and roots against the fake apiserver"
+GOOS=js GOARCH=wasm go test -count=1 -timeout 120s -v \
+  -run '^(TestPhase1ReadsINITFromTheFakeEnvsFrontendConfigMap|TestPhase1CompletesWithTheRootFromINITAgainstTheFakeWithAuthnUnavailable)$' \
   -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/handlers/dispatchers
 
 # The egress tests under both of net/http's js/wasm modes: plain `node` (argv0
