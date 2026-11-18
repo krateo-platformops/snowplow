@@ -39,9 +39,10 @@ package credhttp
 //     first answer, a setup slower than the trigger; while answering, an
 //     interval in which nothing came up and no handshake read bytes), plus
 //     the attempts replaced when an answering period begins (replacedAt,
-//     below), plus stuck connects that stopped covering and later completed
-//     (see raceCounts); and many waiters are served in parallel, not one
-//     after another;
+//     below), plus the connects that stopped covering while still connecting
+//     (stuckDroppedAt: each can cost its waiter one more attempt, whether or
+//     not the stuck connect completes later); and many waiters are served in
+//     parallel, not one after another;
 //   - "answering" holds only on FRESH evidence: within every trigger interval
 //     some attempt must come up or show progress (a TLS attempt reading its
 //     server's handshake bytes in that interval: a handshake still receiving
@@ -144,15 +145,24 @@ import (
 // connected before a new answering period began (counted in replaceCounts,
 // replacedAt). So the setups a destination sees beyond one per waiting
 // request are at most the races fired AT THAT DESTINATION (racesFiredAt),
-// plus the attempts replaced there at a new period (replacedAt), plus stuck
-// connects that later completed; a count across destinations would let
-// another destination's races excuse this one's extra setups.
+// plus the attempts replaced there at a new period (replacedAt), plus the
+// connects that stopped covering there while still connecting
+// (stuckDroppedAt); a count across destinations would let another
+// destination's races excuse this one's extra setups.
 var raceCounts sync.Map // setupKey → *atomic.Uint64
 
 // replaceCounts counts, per destination window, the attempts started at a new
 // answering period because attempts that connected before it stopped
 // covering (rule D): the starts beyond what the waiters needed without that.
 var replaceCounts sync.Map // setupKey → *atomic.Uint64
+
+// stuckCounts counts, per destination window, the attempts that stopped
+// covering while still connecting (onTimer: a trigger interval with no
+// evidence of their own). Each leaves its waiter uncovered, so the waiter can
+// get one more attempt (coverDemandLocked), whether or not the stuck connect
+// completes later (#1536: the burst bound omitted this term, and a burst on 2
+// CPUs under -race, whose connects outlast the trigger, read as a doubling).
+var stuckCounts sync.Map // setupKey → *atomic.Uint64
 
 func noteRaceFired(key string) { countAt(&raceCounts, key, 1) }
 
@@ -178,6 +188,10 @@ func racesFiredAt(addr string) uint64 { return countsAt(&raceCounts, addr) }
 // replacedAt is how many attempts addr's chains started at a new answering
 // period to replace attempts that connected before it, both levels.
 func replacedAt(addr string) uint64 { return countsAt(&replaceCounts, addr) }
+
+// stuckDroppedAt is how many of addr's attempts stopped covering while still
+// connecting, both levels.
+func stuckDroppedAt(addr string) uint64 { return countsAt(&stuckCounts, addr) }
 
 // connectTimes is the per-destination setup-time window.
 var connectTimes = &destinationConnectTimes{rings: map[string]*reserveRing{}}
@@ -701,6 +715,7 @@ func (c *setupChain) onTimer() {
 		if !a.connected && !a.evidence && a.covers {
 			a.covers = false
 			c.covering--
+			countAt(&stuckCounts, c.ringKey, 1)
 		}
 		a.evidence = false
 	}
@@ -772,12 +787,14 @@ func closeLoser(countCtx context.Context, conn net.Conn, withTLS bool) {
 	_ = conn.Close()
 }
 
-// resetChainsForTest forgets every chain and every race count (each test's
+// resetChainsForTest forgets every chain and every count of the burst bound's
+// three terms (races, replacements, stuck connects dropped: each test's
 // destinations are its own; this keeps a test's leftovers, or a reused port's,
 // from another's counts).
 func resetChainsForTest() {
 	raceCounts.Clear()
 	replaceCounts.Clear()
+	stuckCounts.Clear()
 	for _, s := range []*setupChains{connectChains, tlsChains} {
 		s.mu.Lock()
 		for _, c := range s.chains {
