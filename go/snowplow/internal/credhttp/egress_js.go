@@ -49,6 +49,9 @@ var BrowserEgress transport.WrapperFunc = func(rt http.RoundTripper) http.RoundT
 	return guardedTransport
 }
 
+// browserBuild: this is the js/wasm build (egress.go has the server value).
+const browserBuild = true
+
 // usesFetch mirrors net/http's own choice on js/wasm (net/http/roundtrip_js.go,
 // jsFetchMissing and jsFetchDisabled): fetch is used when the global fetch
 // exists and the program is not running under Node.js, whose argv0 starts

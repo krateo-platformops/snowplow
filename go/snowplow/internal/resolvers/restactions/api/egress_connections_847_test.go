@@ -80,8 +80,10 @@ func TestEgressConnections847_StageFetchCountsUnderStage(t *testing.T) {
 }
 
 // The live clientconfig shape, concurrently: real stage fetches over the owned
-// dialer (credhttp.EndpointDialHolder) and TLS. opened is what the server
-// accepted, surplus dials included, and handovers is what it served.
+// setup (credhttp.NewEndpointTransport: the raced dialer, TLS included, #1509).
+// opened is every connection that came up on the server (its TLS handshake
+// completed), surplus dials and raced losers included, and handovers is what
+// it served.
 func TestEgressConnections847_ConcurrentStageMatchesTheServer(t *testing.T) {
 	const workers, perWorker = 16, 10
 	p := newPKI1088(t)

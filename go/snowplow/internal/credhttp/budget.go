@@ -23,6 +23,7 @@ package credhttp
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"math"
 	"net"
@@ -154,6 +155,17 @@ type budgetedAttempt struct {
 	wrote     bool
 	cut       bool
 	timer     *time.Timer
+	// conn is the connection httptrace reported (GotConnInfo.Conn); nil for an
+	// attempt answered by a request already on the wire (#1320). #1509 reads
+	// whether it closes (leaving_1509.go).
+	conn net.Conn
+}
+
+// connection is the attempt's connection, if httptrace reported one.
+func (x *budgetedAttempt) connection() net.Conn {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.conn
 }
 
 // errConnectCut is the cause of an attempt Send stopped waiting on because it
@@ -174,9 +186,10 @@ func beginBudgetedAttempt(ctx context.Context, b *pagebudget.Budget) (*budgetedA
 	// x.shared: the same two facts for an attempt answered by a request
 	// already on the wire (#1320, shared_attempt.go).
 	x.ctx = httptrace.WithClientTrace(withSharedAttemptSink(context.WithValue(cctx, budgetedExchangeKey{}, true), x.shared), &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) {
+		GotConn: func(i httptrace.GotConnInfo) {
 			x.mu.Lock()
 			x.gotConn = true
+			x.conn = i.Conn
 			x.mu.Unlock()
 		},
 		WroteHeaders: func() {
@@ -286,7 +299,8 @@ var EndpointDialHolder = &transport.DialHolder{Dial: endpointDial}
 // address, immediately before the connect.
 var endpointDialer = &net.Dialer{KeepAlive: 30 * time.Second, Control: dialguard.Control}
 
-// endpointDialFn is the dial the bound wraps (seamed in tests).
+// endpointDialFn is the dial the bound wraps (seamed in tests). #1509: one
+// call per racing attempt (race_1509.go).
 var endpointDialFn = endpointDialer.DialContext
 
 // dialNow is the dial clock (seamed in tests).
@@ -301,7 +315,22 @@ var dialNow = time.Now
 func endpointDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	dctx, cancel := context.WithDeadline(ctx, dialNow().Add(pagebudget.PageMaxGoal))
 	defer cancel()
-	return endpointDialFn(dctx, network, addr)
+	// #1509 (b) — a late connect is raced by another socket (race_1509.go),
+	// every attempt under this same bound and through the same guarded dialer.
+	// The connection is wrapped so an attempt can tell when it closes (#1509 a,
+	// leaving_1509.go).
+	return raceDial(dctx, network, addr)
+}
+
+// endpointDialTLS is endpointDial for an https connection: the connect AND the
+// TLS handshake (cfg), raced as one setup (#1509 b) under the same bound. A
+// connection is usable only once its handshake is done, so a handshake that
+// never answers is raced like a connect that never answers. It returns the
+// *tls.Conn net/http's TLSNextProto (HTTP/2) needs.
+func endpointDialTLS(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+	dctx, cancel := context.WithDeadline(ctx, dialNow().Add(pagebudget.PageMaxGoal))
+	defer cancel()
+	return raceDialTLS(dctx, network, addr, cfg)
 }
 
 // --- the retry reserve -----------------------------------------------------------
@@ -356,10 +385,21 @@ func (r *reserveRing) reserve() (d time.Duration, measured bool) {
 		return pagebudget.PageP95Goal, false
 	}
 	slices.Sort(s)
-	// The quantile's sample: skip the share above it (rounded down, so a
-	// partial window reads its maximum).
-	above := int(math.Floor(float64(n)*(1-reserveQuantile) + 1e-9))
-	return s[n-1-above], true
+	return s[n-1-quantileAbove(n)], true
+}
+
+// quantileAbove is how many of n sorted samples lie above the goal quantile's
+// sample: the share above it, rounded down, so a partial window reads its
+// maximum.
+func quantileAbove(n int) int {
+	return int(math.Floor(float64(n)*(1-reserveQuantile) + 1e-9))
+}
+
+// count is how many samples the ring holds (at most reserveWindow).
+func (r *reserveRing) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.n
 }
 
 func (r *reserveRing) resetForTest() {

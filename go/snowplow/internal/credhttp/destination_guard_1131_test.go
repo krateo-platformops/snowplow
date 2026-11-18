@@ -107,9 +107,15 @@ func hasKey(lit *ast.CompositeLit, field string) bool {
 	return false
 }
 
-// handedToCredhttpClient reports whether the literal at the top of stack is the
-// argument of credhttp.Client (from another package) or of Client (from this one).
-func handedToCredhttpClient(stack []ast.Node, imports map[string]string, inCredhttp bool) bool {
+// handedToCredhttp reports whether the literal at the top of stack is the
+// argument of credhttp.<fn> (from another package) or of <fn> (from this one).
+// Two constructors take an unguarded literal because they supply the guarded
+// part themselves: Client (an http.Client with no Transport gets
+// guardedTransport) and NewEndpointTransport (a transport.Config with no
+// DialHolder gets the raced guarded dialer, #1509). Only a literal passed
+// STRAIGHT to them is sanctioned: one built first and handed over later is
+// flagged, since the guard cannot follow it.
+func handedToCredhttp(stack []ast.Node, imports map[string]string, inCredhttp bool, fn string) bool {
 	i := len(stack) - 2
 	if i >= 0 {
 		if _, ok := stack[i].(*ast.UnaryExpr); ok {
@@ -126,9 +132,9 @@ func handedToCredhttpClient(stack []ast.Node, imports map[string]string, inCredh
 	switch f := call.Fun.(type) {
 	case *ast.SelectorExpr:
 		id, ok := f.X.(*ast.Ident)
-		return ok && imports[id.Name] == importCredhttp && f.Sel.Name == "Client"
+		return ok && imports[id.Name] == importCredhttp && f.Sel.Name == fn
 	case *ast.Ident:
-		return inCredhttp && f.Name == "Client"
+		return inCredhttp && f.Name == fn
 	}
 	return false
 }
@@ -181,7 +187,9 @@ func destinationScan(fset *token.FileSet, f *ast.File, rel string) (out []destin
 				return true
 			}
 			literals++
-			if hasKey(x, field) || (name == "http.Client" && handedToCredhttpClient(stack, imports, inCredhttp)) {
+			if hasKey(x, field) ||
+				(name == "http.Client" && handedToCredhttp(stack, imports, inCredhttp, "Client")) ||
+				(name == "transport.Config" && handedToCredhttp(stack, imports, inCredhttp, "NewEndpointTransport")) {
 				return true
 			}
 			add(name+"{} without "+field, x.Pos())
@@ -299,6 +307,11 @@ func TestIssue1131_GuardDetectsEveryShape(t *testing.T) {
 		"renamedDialer":    `import "net"; type D net.Dialer`,
 		"plumbingBuilder":  `import "github.com/krateo-platformops/plumbing/http/request"; func f() { request.HTTPClientForEndpoint(nil, nil) }`,
 		"plumbingDo":       `import "github.com/krateo-platformops/plumbing/http/request"; func f() { request.Do(nil, x) }`,
+		// #1509: a DialHolder-less config is sanctioned only when it goes
+		// straight into credhttp.NewEndpointTransport.
+		"configThenEndpointTransport": `import ("k8s.io/client-go/transport"; "github.com/krateo-platformops/snowplow/internal/credhttp"); func f() { c := &transport.Config{}; credhttp.NewEndpointTransport(c) }`,
+		"configIntoOtherFunc":         `import ("k8s.io/client-go/transport"; "github.com/krateo-platformops/snowplow/internal/credhttp"); func f() { credhttp.Client(&transport.Config{}) }`,
+		"configIntoTransportNew":      `import "k8s.io/client-go/transport"; func f() { transport.New(&transport.Config{}) }`,
 	} {
 		fset := token.NewFileSet()
 		f, err := parser.ParseFile(fset, "x.go", "package p\n"+body+"\n", parser.SkipObjectResolution)
@@ -311,13 +324,14 @@ func TestIssue1131_GuardDetectsEveryShape(t *testing.T) {
 	}
 	// And it must NOT flag the guarded forms.
 	for name, body := range map[string]string{
-		"transport":     `import "net/http"; var t = &http.Transport{DialContext: d}`,
-		"client":        `import "net/http"; var c = &http.Client{Transport: t}`,
-		"credhttp":      `import ("net/http"; "github.com/krateo-platformops/snowplow/internal/credhttp"); var c = credhttp.Client(&http.Client{Timeout: 1})`,
-		"dialer":        `import ("net"; "github.com/krateo-platformops/plumbing/dialguard"); var d = &net.Dialer{Control: dialguard.Control}`,
-		"config":        `import "k8s.io/client-go/transport"; var c = &transport.Config{DialHolder: h}`,
-		"pointerField":  `import "net/http"; type T struct{ c *http.Client }`,
-		"aResolverDial": `import "net"; var r = net.Resolver{}`,
+		"transport":         `import "net/http"; var t = &http.Transport{DialContext: d}`,
+		"client":            `import "net/http"; var c = &http.Client{Transport: t}`,
+		"credhttp":          `import ("net/http"; "github.com/krateo-platformops/snowplow/internal/credhttp"); var c = credhttp.Client(&http.Client{Timeout: 1})`,
+		"dialer":            `import ("net"; "github.com/krateo-platformops/plumbing/dialguard"); var d = &net.Dialer{Control: dialguard.Control}`,
+		"config":            `import "k8s.io/client-go/transport"; var c = &transport.Config{DialHolder: h}`,
+		"endpointTransport": `import ("k8s.io/client-go/transport"; "github.com/krateo-platformops/snowplow/internal/credhttp"); func f() { credhttp.NewEndpointTransport(&transport.Config{TLS: x}) }`,
+		"pointerField":      `import "net/http"; type T struct{ c *http.Client }`,
+		"aResolverDial":     `import "net"; var r = net.Resolver{}`,
 	} {
 		fset := token.NewFileSet()
 		f, err := parser.ParseFile(fset, "x.go", "package p\n"+body+"\n", parser.SkipObjectResolution)
@@ -340,5 +354,17 @@ func TestIssue1131_GuardDetectsEveryShape(t *testing.T) {
 	}
 	if got, _ := destinationScan(fset, f, "internal/credhttp/x.go"); len(got) != 0 {
 		t.Errorf("Client inside credhttp: want it allowed, got %+v", got)
+	}
+	// And NewEndpointTransport(...) unqualified, likewise (#1509).
+	body = "package p\nimport \"k8s.io/client-go/transport\"\nvar r, _ = NewEndpointTransport(&transport.Config{})\n"
+	f, err = parser.ParseFile(fset, "y.go", body, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := destinationScan(fset, f, "internal/other/y.go"); len(got) != 1 {
+		t.Errorf("an unqualified NewEndpointTransport outside credhttp: want it flagged, got %+v", got)
+	}
+	if got, _ := destinationScan(fset, f, "internal/credhttp/y.go"); len(got) != 0 {
+		t.Errorf("NewEndpointTransport inside credhttp: want it allowed, got %+v", got)
 	}
 }
