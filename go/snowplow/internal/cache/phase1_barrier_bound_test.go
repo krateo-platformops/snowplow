@@ -23,6 +23,7 @@ package cache_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -70,11 +71,39 @@ func barrierBoundListKinds() map[schema.GroupVersionResource]string {
 // stuckListReactor returns a LIST reactor that always errors (never holds
 // the shared Fake lock across a block), so the stuck GVR's informer never
 // reaches HasSynced while every other informer syncs normally.
+//
+// The error is TRANSIENT (503), a stall the reflector's retry could heal:
+// since #1532 a terminal refusal (NotFound / Forbidden) ends the barrier's
+// wait for that informer by itself, so a Forbidden here would no longer
+// exercise the good-enough bound these arms are about
+// (phase1_barrier_refused_1532_test.go covers the refused path).
 func stuckListReactor() k8stesting.ReactionFunc {
 	return func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
-		return true, nil, apierrors.NewForbidden(
-			schema.GroupResource{Group: stuckGVR().Group, Resource: stuckGVR().Resource},
-			"", context.Canceled)
+		return true, nil, apierrors.NewServiceUnavailable("stuck: the LIST stalls")
+	}
+}
+
+// requireGoodEnoughExit fails unless the barrier left through its good-enough
+// exit, naming the stuck GVR, no sooner than one pass grace (#1541 review: an
+// arm named for that exit must prove it took it; a refusal-shaped stub, a 403,
+// ends the wait through the refused path instead, and the arm would pass
+// without ever reaching the code it is about).
+func requireGoodEnoughExit(t *testing.T, logs string, elapsed, grace time.Duration) {
+	t.Helper()
+	line := ""
+	for _, l := range strings.Split(logs, "\n") {
+		if strings.Contains(l, "msg=cache.phase1.sync_wait_good_enough") {
+			line = l
+			break
+		}
+	}
+	if line == "" || !strings.Contains(line, stuckGVR().String()) {
+		t.Fatalf("the barrier did not leave through its good-enough exit naming %s (line %q); a stuck informer must be "+
+			"deferred there, not refused", stuckGVR(), line)
+	}
+	if elapsed < grace {
+		t.Fatalf("the barrier returned after %v, before one pass grace (%v): the good-enough exit is reached only "+
+			"after a pass", elapsed, grace)
 	}
 }
 
@@ -121,11 +150,13 @@ func TestWaitAllInformersSynced_GoodEnoughBoundsAStuckInformer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	logs := captureInfo1532(t)
 	start := time.Now()
 	if err := rw.WaitAllInformersSynced(ctx); err != nil {
 		t.Fatalf("barrier must return nil (good enough) with a stuck informer; got %v", err)
 	}
 	elapsed := time.Since(start)
+	requireGoodEnoughExit(t, logs.String(), elapsed, 3*time.Second)
 
 	// DISCRIMINATING ceiling: ~ grace(1s)+quiescence(1s) plus pass/poll
 	// slack. A pre-1b (outer-ctx-only) implementation returns at ~60s and
@@ -243,13 +274,16 @@ func TestWaitAllInformersSynced_RaceWithStuckAndLateRegistrations(t *testing.T) 
 	// still landing and one informer is permanently stuck.
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	logs := captureInfo1532(t)
 	start := time.Now()
 	if err := rw.WaitAllInformersSynced(ctx); err != nil {
 		t.Fatalf("barrier must return nil (good enough) under concurrent registration + stuck informer; got %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 30*time.Second {
+	elapsed := time.Since(start)
+	if elapsed > 30*time.Second {
 		t.Fatalf("barrier returned in %v under concurrent registration — expected the bounded grace/quiescence policy, not the outer budget", elapsed)
 	}
+	requireGoodEnoughExit(t, logs.String(), elapsed, 1*time.Second)
 	wg.Wait()
 
 	// CONTRACT under good-enough: the barrier does NOT guarantee every
