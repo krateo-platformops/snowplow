@@ -396,6 +396,12 @@ def test_a_bracket_inverted_by_a_clock_slip_is_unknown_never_zero():
     got = k6eval.renderer_delay(LOAD, st)
     assert got["ms"] is None and got["why"] == ("its bracket is empty or inverted: the samples' end and start times "
                                                 "disagree (a clock slip)"), got
+    # the boundary (reviewer-1480's B3): end times only 0.5 s behind, a 150 ms load at 5.6 s: the sample at 6 both
+    # "ended" (5.5) before the load and started after it (5.75), so it is the lower AND the upper bracket at once, an
+    # empty window (mutation S11, the guard's >= made >, reads a measured 0)
+    st["renderer"]["ends"] = {float(t): t - 0.5 for t in range(0, 21)}
+    got = k6eval.renderer_delay({"session": "s", "class": "0", "start": 5.6, "wall_ms": 150.0}, st)
+    assert got["ms"] is None and got["why"].startswith("its bracket is empty or inverted"), got
 
 
 def test_the_lower_sample_brackets_by_its_end_and_the_upper_by_its_start():
