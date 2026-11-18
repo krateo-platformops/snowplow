@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -186,4 +187,63 @@ func raceCountAt(key string) uint64 {
 		return v.(*atomic.Uint64).Load()
 	}
 	return 0
+}
+
+// TestRaceCounters_APeriodsReplacementsAreChargedInFull (#1545 review B1): a destination that answers, stalls for 300
+// ms (TCP accepted, no ClientHello answered: the handshakes it holds are connected and never come up) and comes back,
+// with a stage request joining every 2 ms throughout (the rule-D hung-TLS arm's shape). When it answers again a new
+// period begins and every attempt that connected before it stops covering: one period replaces several attempts at
+// once. Premise: the destination's replacedAt moves by at least 2. The stage cell's attempts_replaced moves by exactly
+// that, as do its races and stuck drops by the destination's, and no other egress moves (mutation: a period's
+// replacements charged as 1, not n, reads fewer in stage).
+func TestRaceCounters_APeriodsReplacementsAreChargedInFull(t *testing.T) {
+	resetConnectTimes(t)
+	srv, sl := stallTLSServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	addr := sl.Addr().String()
+	const trigger = 100 * time.Millisecond
+	seedConnectTimes(setupKey(addr, true), trigger)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEMOf(srv))
+	cfg := &tls.Config{RootCAs: pool, NextProtos: []string{"h2"}}
+
+	dest := func() [3]uint64 { return [3]uint64{racesFiredAt(addr), replacedAt(addr), stuckDroppedAt(addr)} }
+	destBefore := dest()
+	before := EgressRacesSnapshot()
+	const stallAt, stall, after, every = 200 * time.Millisecond, 300 * time.Millisecond, 100 * time.Millisecond, 2 * time.Millisecond
+	time.AfterFunc(stallAt, func() { sl.stallFor(stall) })
+	var wg sync.WaitGroup
+	var failed atomic.Int32
+	for i := 0; time.Duration(i)*every <= stallAt+stall+after; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			req := httptest.NewRequest(http.MethodGet, "https://"+addr+"/", nil).WithContext(tctx)
+			c, err := endpointDialTLS(countConnections(req, EgressStage), "tcp", addr, cfg)
+			if err != nil {
+				failed.Add(1)
+				return
+			}
+			_ = c.Close()
+		}()
+		time.Sleep(every)
+	}
+	wg.Wait()
+	time.Sleep(2 * trigger) // the chain's last checks have run
+	d := dest()
+	got := raceDeltas(before, EgressRacesSnapshot())
+	want := [3]uint64{d[0] - destBefore[0], d[1] - destBefore[1], d[2] - destBefore[2]}
+	if want[1] < 2 {
+		t.Fatalf("the destination replaced %d attempts (races %d, stuck %d, %d waiters failed); want at least 2 in a "+
+			"period (the arm proves nothing about n against 1 otherwise)", want[1], want[0], want[2], failed.Load())
+	}
+	if got[EgressStage] != want {
+		t.Fatalf("stage's cell moved by %v (races, replaced, stuck); want the destination's %v", got[EgressStage], want)
+	}
+	for _, e := range Egresses {
+		if e != EgressStage && got[e] != ([3]uint64{}) {
+			t.Fatalf("%s's cell moved by %v; only stage's waiters dialed", e, got[e])
+		}
+	}
 }
