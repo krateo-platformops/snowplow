@@ -8,6 +8,12 @@ package credhttp
 // retryPolicyTranscribedFrom (the TestUserConfigMirror_PlumbingVersionPin
 // precedent). The parts plumbing exports are read from it, not copied: the
 // base and max backoff come from util.NewRetryClient, and are pinned here too.
+//
+// #1509: the whole RetryClient.Do loop is transcribed now (sendRetrying,
+// retry_loop_1509.go) and deviates from plumbing in one place only: a 429
+// whose connection is closing is redone at once on a fresh connection instead
+// of waiting Retry-After (see retryPolicyTranscribedFrom's comment). The
+// deviation is pinned by retry_loop_1509_test.go; this test pins the rest.
 
 import (
 	"os"

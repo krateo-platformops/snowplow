@@ -35,7 +35,9 @@ import (
 // builds them.
 func x1131Clients(t *testing.T) map[string]*http.Client {
 	t.Helper()
-	owned, err := transport.New(&transport.Config{Proxy: http.ProxyFromEnvironment, DialHolder: EndpointDialHolder})
+	// #1509: the owned branch's transport (NewEndpointTransport), whose http://
+	// and https:// setups are both raced through the guarded dialer.
+	owned, err := NewEndpointTransport(&transport.Config{Proxy: http.ProxyFromEnvironment})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,20 +100,28 @@ func x1131Put(t *testing.T, base string) *http.Request {
 
 func TestIssue1131_EveryDeniedSpellingIsRefused(t *testing.T) {
 	for name, cli := range x1131Clients(t) {
-		for _, host := range x1131Spellings {
-			for _, verb := range []string{http.MethodGet, http.MethodPut} {
-				t.Run(name+"/"+verb+"/"+host, func(t *testing.T) {
-					req, err := http.NewRequest(verb, "http://"+host+"/x1131-path?x=x1131-query", nil)
-					if err != nil {
-						t.Fatal(err)
-					}
-					resp, err := Send(SendSiteStage, cli, req)
-					if err == nil {
-						_ = resp.Body.Close()
-						t.Fatalf("RED: %s answered %d", host, resp.StatusCode)
-					}
-					x1131RequireRefused(t, err)
-				})
+		// #1509: the owned chain sets up https:// connections through its own
+		// raced TLS dialer (DialTLSContext), so that path is driven too.
+		schemes := []string{"http"}
+		if name == "owned" {
+			schemes = append(schemes, "https")
+		}
+		for _, scheme := range schemes {
+			for _, host := range x1131Spellings {
+				for _, verb := range []string{http.MethodGet, http.MethodPut} {
+					t.Run(name+"/"+scheme+"/"+verb+"/"+host, func(t *testing.T) {
+						req, err := http.NewRequest(verb, scheme+"://"+host+"/x1131-path?x=x1131-query", nil)
+						if err != nil {
+							t.Fatal(err)
+						}
+						resp, err := Send(SendSiteStage, cli, req)
+						if err == nil {
+							_ = resp.Body.Close()
+							t.Fatalf("RED: %s answered %d", host, resp.StatusCode)
+						}
+						x1131RequireRefused(t, err)
+					})
+				}
 			}
 		}
 	}

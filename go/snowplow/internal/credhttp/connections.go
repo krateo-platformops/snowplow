@@ -158,7 +158,35 @@ func connProtocol(c net.Conn) string {
 var egressConnections = newConnectionCounter()
 
 // connectionsCountedKey marks a context whose requests are already counted.
+// Its value is the counting the hooks do (#1509: a raced connection that came
+// up and lost is counted through it, race_1509.go).
 type connectionsCountedKey struct{}
+
+// connectionCounting is what countConnections installed: the egress, and
+// whether a connection is up at its TLS handshake (https) or its connect.
+type connectionCounting struct {
+	egress string
+	https  bool
+}
+
+// noteRacedConnectionUp counts, as opened, a connection a raced setup brought
+// up and then closed because another attempt won (#1509). It is a connection
+// the server accepted and the cost was paid, which is what opened counts; the
+// winner is counted by the hooks as before. tlsUp is whether the connection
+// completed TLS (proto its negotiated protocol), as an https connection must
+// to be up; a connect alone counts only for a plain http:// request.
+func noteRacedConnectionUp(ctx context.Context, tlsUp bool, negotiated string) {
+	c, ok := ctx.Value(connectionsCountedKey{}).(connectionCounting)
+	if !ok {
+		return
+	}
+	switch {
+	case c.https && tlsUp:
+		egressConnections.cell(c.egress, alpnProtocol(negotiated)).opened.Add(1)
+	case !c.https && !tlsUp:
+		egressConnections.cell(c.egress, ConnProtocolHTTP1).opened.Add(1)
+	}
+}
 
 // countConnections returns req's context with the connection hooks for egress,
 // or that context itself when it already has them: the outermost egress wins,
@@ -187,7 +215,8 @@ func countConnections(req *http.Request, egress string) context.Context {
 			}
 		}
 	}
-	return httptrace.WithClientTrace(context.WithValue(ctx, connectionsCountedKey{}, true), trace)
+	counting := connectionCounting{egress: egress, https: req.URL != nil && req.URL.Scheme == "https"}
+	return httptrace.WithClientTrace(context.WithValue(ctx, connectionsCountedKey{}, counting), trace)
 }
 
 // countConnectionsTransport wraps rt so its requests count under egress.

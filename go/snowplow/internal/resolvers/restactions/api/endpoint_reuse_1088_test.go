@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -38,6 +39,7 @@ func TestReuse1088_SameIdentity100Fetches_OneConnection(t *testing.T) {
 	cs := newConnServer1088(t, p, true)
 	ep := certEndpoint1088(t, p, cs.srv.URL, "user-a")
 	ctx, dials := dialCounting1088(credhttp.WithHeldCredential(context.Background()))
+	before := stageOpened1088()
 	for i := 0; i < 50; i++ {
 		if err := fetch1088(t, ctx, ep, http.MethodGet); err != nil {
 			t.Fatalf("fetch %d: %v", i, err)
@@ -62,9 +64,12 @@ func TestReuse1088_SameIdentity100Fetches_OneConnection(t *testing.T) {
 	if got := cs.reqs.Load(); got != 100 {
 		t.Fatalf("server saw %d requests, want 100", got)
 	}
-	if c, d := cs.connections(), dials.Load(); c != 1 || d != 1 {
-		t.Fatalf("100 fetches by one identity opened %d connections (%d dials), want 1", c, d)
+	// One dial (the request's trace sees one setup per dial, raced or not),
+	// all 100 requests on one connection, and any raced loser closed unused.
+	if d := dials.Load(); d != 1 {
+		t.Fatalf("100 fetches by one identity dialled %d times, want 1", d)
 	}
+	assertConnections1088(t, cs, 1, before)
 	if h2 := cs.h2.Load(); h2 != 100 {
 		t.Fatalf("%d of 100 requests were HTTP/2, want all", h2)
 	}
@@ -320,6 +325,7 @@ func TestReuse1088_TwoIdentities_NeverShareConnectionOrCredential(t *testing.T) 
 		a := certEndpoint1088(t, p, cs.srv.URL, "user-a")
 		b := certEndpoint1088(t, p, cs.srv.URL, "user-b")
 		ctx := credhttp.WithHeldCredential(context.Background())
+		before := stageOpened1088()
 		for i := 0; i < 20; i++ {
 			for _, ep := range []*endpoints.Endpoint{a, b} {
 				if err := fetch1088(t, ctx, ep, http.MethodGet); err != nil {
@@ -327,7 +333,7 @@ func TestReuse1088_TwoIdentities_NeverShareConnectionOrCredential(t *testing.T) 
 				}
 			}
 		}
-		assertOneIdentityPerConn(t, cs, 2)
+		assertConnections1088(t, cs, 2, before)
 	})
 	t.Run("bearer tokens", func(t *testing.T) {
 		cs := newConnServer1088(t, p, false)
@@ -335,6 +341,7 @@ func TestReuse1088_TwoIdentities_NeverShareConnectionOrCredential(t *testing.T) 
 		a := &endpoints.Endpoint{ServerURL: cs.srv.URL, CertificateAuthorityData: ca, Token: "token-a"}
 		b := &endpoints.Endpoint{ServerURL: cs.srv.URL, CertificateAuthorityData: ca, Token: "token-b"}
 		ctx := credhttp.WithHeldCredential(context.Background())
+		before := stageOpened1088()
 		for i := 0; i < 20; i++ {
 			for _, ep := range []*endpoints.Endpoint{a, b} {
 				if err := fetch1088(t, ctx, ep, http.MethodGet); err != nil {
@@ -342,22 +349,58 @@ func TestReuse1088_TwoIdentities_NeverShareConnectionOrCredential(t *testing.T) 
 				}
 			}
 		}
-		assertOneIdentityPerConn(t, cs, 2)
+		assertConnections1088(t, cs, 2, before)
 	})
 }
 
-func assertOneIdentityPerConn(t *testing.T, cs *connServer1088, wantConns int) {
-	t.Helper()
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	if cs.conns != wantConns {
-		t.Fatalf("%d connections for %d identities, want one each", cs.conns, wantConns)
-	}
-	for addr, ids := range cs.ids {
-		if len(ids) != 1 {
-			t.Fatalf("connection %s carried %d identities, want exactly 1", addr, len(ids))
+// ARM 2b (#1509): the same properties when a setup IS raced, on every run.
+// Twenty other identities' fetches measure the destination's setup time (the
+// trigger is measured only once its window holds enough setups, #1521);
+// identity b's first setup is then held by the server well past it, so b's
+// setup is raced on a new socket (the production trigger, nothing seeded),
+// which wins. The held attempt is the raced loser: it must carry no request
+// and be closed by the client, and no identity's requests may leave its own
+// connection.
+func TestReuse1088_RacedSetup_LoserClosedUnusedIdentitiesApart(t *testing.T) {
+	p := newPKI1088(t)
+	cs := newConnServer1088(t, p, false)
+	ca := base64.StdEncoding.EncodeToString(p.caPEM)
+	a := &endpoints.Endpoint{ServerURL: cs.srv.URL, CertificateAuthorityData: ca, Token: "token-a"}
+	b := &endpoints.Endpoint{ServerURL: cs.srv.URL, CertificateAuthorityData: ca, Token: "token-b"}
+	ctx := credhttp.WithHeldCredential(context.Background())
+	before := stageOpened1088()
+	const warm = 20 // ≥ credhttp's trigger threshold (20 for its 0.95 quantile)
+	for i := range warm {
+		w := &endpoints.Endpoint{ServerURL: cs.srv.URL, CertificateAuthorityData: ca, Token: fmt.Sprintf("token-warm-%d", i)}
+		if err := fetch1088(t, ctx, w, http.MethodGet); err != nil {
+			t.Fatal(err)
 		}
 	}
+	if err := fetch1088(t, ctx, a, http.MethodGet); err != nil {
+		t.Fatal(err)
+	}
+	cs.mu.Lock()
+	acceptedBefore := cs.accepted
+	cs.holdNth, cs.hold = cs.accepted+1, 300*time.Millisecond
+	cs.mu.Unlock()
+	start := time.Now()
+	for i := 0; i < 10; i++ {
+		for _, ep := range []*endpoints.Endpoint{b, a} {
+			if err := fetch1088(t, ctx, ep, http.MethodGet); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if took := time.Since(start); took >= 300*time.Millisecond {
+		t.Errorf("the fetches took %v: b's setup waited out the held attempt (300 ms) instead of being raced", took)
+	}
+	cs.mu.Lock()
+	accepted := cs.accepted - acceptedBefore
+	cs.mu.Unlock()
+	if accepted < 2 {
+		t.Fatalf("the server accepted %d connections for b; want at least 2 (b's held attempt, b's raced one)", accepted)
+	}
+	assertConnections1088(t, cs, warm+2, before)
 }
 
 // ARM 4: a genuinely external endpoint (a named endpointRef: token-auth, no
