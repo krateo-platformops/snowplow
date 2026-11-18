@@ -418,10 +418,13 @@ rsample() {{
   read -r up _ < /proc/uptime
   # each pid's own stat first (its starttime: the series key), then per thread its stat (the thread's own
   # starttime, field 22) and its schedstat (field 2: the thread's run_delay, and summed into the process's "rd"). A
-  # thread whose stat could not be read (it exited between the listing and the read) is in neither
+  # thread whose stat could not be read (it exited between the listing and the read) is in neither. Paths are read
+  # from their END (.../proc/<pid>/stat, .../proc/<pid>/task/<tid>/(sched)stat), so the program is tested on a tree
+  # of files outside /proc (test_the_sampler_counts_no_thread_whose_stat_it_could_not_read)
   # shellcheck disable=SC2086
-  awk -v t="$up" 'FNR == 1 {{ n = split(FILENAME, a, "/"); p = a[3]; tid = (a[4] == "task") ? a[5] : "" }}
-    FILENAME ~ /^\\/proc\\/[0-9]+\\/stat$/ {{ x = $0; sub(/^.*\\) /, "", x); split(x, f, " "); st[p] = f[20]; next }}
+  awk -v t="$up" 'FNR == 1 {{ n = split(FILENAME, a, "/"); k = (a[n - 2] == "task"); p = k ? a[n - 3] : a[n - 1]
+                             tid = k ? a[n - 1] : "" }}
+    FILENAME ~ /\\/proc\\/[0-9]+\\/stat$/ {{ x = $0; sub(/^.*\\) /, "", x); split(x, f, " "); st[p] = f[20]; next }}
     FILENAME ~ /\\/task\\/[0-9]+\\/stat$/ {{ x = $0; sub(/^.*\\) /, "", x); split(x, f, " "); tst[p, tid] = f[20]; next }}
     ((p, tid) in tst) {{ s[p] += $2; trd[p, tid] = $2 }}
     END {{ for (k in trd) {{ split(k, q, SUBSEP)

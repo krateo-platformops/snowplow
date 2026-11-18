@@ -3949,6 +3949,38 @@ def nav_checks(navs: list[dict], th: dict) -> list[dict]:
     return out
 
 
+def _starvation_judgement(navs: list[dict], delays: list[float], th: dict | None, browser: dict | None,
+                          k6th: dict | None, wt: dict) -> tuple[dict, dict]:
+    """browser.cpu_starvation's judgement for one set of per-load delays: each WALL_TIME_CHECKS outcome as measured
+    and without the delays (the loads' times less them)."""
+    from bench import k6eval             # operator side only (this file also runs alone in Job pods)
+    fastest = [dict(n, wall_ms=n["wall_ms"] - d) for n, d in zip(navs, delays)]
+    as_seen = {c["check"]: c["result"] for c in nav_checks(navs, th)}
+    without = {c["check"]: c["result"] for c in nav_checks(fastest, th)}
+    # a load past its bound (a page timeout, a sign-in failure): the same subtraction as the four bars (#1508).
+    # Without the stall it was within its bound only when how long it really took is KNOWN (it completed) and
+    # that time less the stall is within the bound; one that never completed, or one a browser.js before #1508
+    # stopped watching at its bound (its time censored there), cannot be flipped
+    def flips(n: dict, d: float) -> bool:
+        return n.get("completed") is True and n.get("bound_ms") is not None and n["wall_ms"] - d <= n["bound_ms"]
+
+    for chk, signin in (("browser.page_timeouts", False), ("browser.signin_failures", True)):
+        late = [(n, d) for n, d in zip(navs, delays) if n.get("timeout") and (n.get("nav") == "login") == signin]
+        as_seen[chk] = "FAIL" if late else "PASS"
+        without[chk] = "FAIL" if any(not flips(n, d) for n, d in late) else "PASS"
+    # a widget that timed out, in a load a stall overlapped: the same
+    if browser is not None:
+        wc = k6eval.widget_error_check(browser, k6th)
+        as_seen["browser.widget_errors"] = wc["result"]
+        stalled = {(n.get("session"), n.get("t0")) for n, d in zip(navs, delays) if d}
+        dropped = sum(c for k, c in wt.items() if k in stalled)
+        v = wc["value"]
+        share = (v["loads_with_error_state"] - dropped) / v["loads"] if v["loads"] else None
+        cap = dict(k6eval.K6_THRESHOLDS, **(k6th or {}))["max_widget_error_share"]
+        without["browser.widget_errors"] = "PASS" if share is not None and share <= cap else "FAIL"
+    return as_seen, without
+
+
 def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None = None,
                      k6th: dict | None = None) -> dict:
     """browser.cpu_starvation (Diego's ruling, the browser-starvation issue):
@@ -4005,6 +4037,7 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
     # its own renderer's stall; a load whose renderer is not known is UNKNOWN, never the container's bound
     rule = st.get("rule") or k6eval.RULE_CONTAINER
     per_load: list[float] | None = None
+    per_load_upper: list[float] | None = None
     threads: dict | None = None
     if rule == k6eval.RULE_RENDERER:
         got = [k6eval.renderer_delay(n, st) for n in navs]
@@ -4012,10 +4045,12 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
         if why_unknown:
             missing.append(f"the renderer of {sum(why_unknown.values())} page load(s) ("
                            + "; ".join(f"{k}: {v}" for k, v in why_unknown.most_common()) + ")")
-        # a renderer thread that exited (or started) inside a load's bracket is measured, with what the sum cannot
-        # hold stated as an under-count bound; the load's stall is judged at its upper end (measured + bound): the
-        # most of the load the load generator may have taken, never the least
-        per_load = [g["upper_ms"] or 0.0 for g in got]
+        # a renderer thread that exited inside a load's bracket is measured, and what it accrued after its last
+        # sample is stated as an under-count bound (k6eval._thread_delta; a thread that STARTED inside it is
+        # measured whole: its run_delay began at 0). The judgement below runs twice, on the measured stall and on
+        # measured + bound: a bound decides nothing unless it could flip a verdict
+        per_load = [g["ms"] or 0.0 for g in got]
+        per_load_upper = [g["upper_ms"] or 0.0 for g in got]
         measured = [g for g in got if g["ms"] is not None]
         bounds = [g["bound_ms"] for g in measured if g["bound_ms"]]
         threads = {"loads_measured": len(measured),
@@ -4034,34 +4069,30 @@ def starvation_check(navs: list[dict], st: dict, th: dict, browser: dict | None 
                        + " was not sampled: whether the load generator slowed a judged page is unknown "
                          f"(unmeasured, not 'not starved'; rule: {rule})"}
     delays = per_load if per_load is not None else [k6eval.possible_delay_ms(n["start"], n["wall_ms"], st) for n in navs]
-    fastest = [dict(n, wall_ms=n["wall_ms"] - d) for n, d in zip(navs, delays)]
     shares = sorted(d / n["wall_ms"] for n, d in zip(navs, delays) if n["wall_ms"])
     value.update({"page_delay_ms_max": round(max(delays), 1) if delays else None,
                   "page_delay_share_p95": round(pct(shares, 95), 4) if shares else None,
                   "slack_s": st.get("slack_s")})
-    as_seen = {c["check"]: c["result"] for c in nav_checks(navs, th)}
-    without = {c["check"]: c["result"] for c in nav_checks(fastest, th)}
-    # a load past its bound (a page timeout, a sign-in failure): the same subtraction as the four bars (#1508).
-    # Without the stall it was within its bound only when how long it really took is KNOWN (it completed) and
-    # that time less the stall is within the bound; one that never completed, or one a browser.js before #1508
-    # stopped watching at its bound (its time censored there), cannot be flipped
-    def flips(n: dict, d: float) -> bool:
-        return n.get("completed") is True and n.get("bound_ms") is not None and n["wall_ms"] - d <= n["bound_ms"]
-
-    for chk, signin in (("browser.page_timeouts", False), ("browser.signin_failures", True)):
-        late = [(n, d) for n, d in zip(navs, delays) if n.get("timeout") and (n.get("nav") == "login") == signin]
-        as_seen[chk] = "FAIL" if late else "PASS"
-        without[chk] = "FAIL" if any(not flips(n, d) for n, d in late) else "PASS"
-    # a widget that timed out, in a load a stall overlapped: the same
-    if browser is not None:
-        wc = k6eval.widget_error_check(browser, k6th)
-        as_seen["browser.widget_errors"] = wc["result"]
-        stalled = {(n.get("session"), n.get("t0")) for n, d in zip(navs, delays) if d}
-        dropped = sum(c for k, c in wt.items() if k in stalled)
-        v = wc["value"]
-        share = (v["loads_with_error_state"] - dropped) / v["loads"] if v["loads"] else None
-        cap = dict(k6eval.K6_THRESHOLDS, **(k6th or {}))["max_widget_error_share"]
-        without["browser.widget_errors"] = "PASS" if share is not None and share <= cap else "FAIL"
+    as_seen, without = _starvation_judgement(navs, delays, th, browser, k6th, wt)
+    # #1529 review: the exit bound (an exited renderer thread's run_delay after its last sample, up to one sample
+    # gap) swamps a ~150 ms load, so measured + bound would excuse every load with an exit. It decides nothing
+    # unless it could flip a verdict: the judgement again on measured + bound; where the two disagree, the outcome
+    # is not known, named with the bound and the loads that carry it
+    if per_load_upper is not None and per_load_upper != delays:
+        _, without_upper = _starvation_judgement(navs, per_load_upper, th, browser, k6th, wt)
+        flip = [c for c in WALL_TIME_CHECKS if c in as_seen and without.get(c) != without_upper.get(c)]
+        if flip:
+            bounded = sum(1 for d, u in zip(delays, per_load_upper) if u > d)
+            return {"check": name, "value": value, "bar": "measured: no judged outcome decided by the stall",
+                    "result": "UNMEASURED",
+                    "why": (f"UNMEASURED: the under-count bound of {bounded} page load(s) whose renderer lost a "
+                            f"thread inside it (up to {threads['undercount_bound_ms_max']} ms each, "
+                            f"{threads['undercount_bound_ms_total']} ms in all: an exited thread's run_delay after "
+                            f"its last sample) could flip "
+                            + "; ".join(f"{c} ({without[c]} without the measured stall, {without_upper[c]} without it "
+                                        f"and the bound)" for c in flip)
+                            + f": whether the load generator slowed a judged page is unknown (rule: {rule})")}
+    decided = [c for c in WALL_TIME_CHECKS if c in as_seen and as_seen.get(c) != without.get(c)]
     decided = [c for c in WALL_TIME_CHECKS if c in as_seen and as_seen.get(c) != without.get(c)]
     if decided:
         return {"check": name, "value": value, "bar": "no judged outcome decided by the stall",

@@ -388,10 +388,12 @@ def _thread_delta(times: list[float], snaps: list[dict]) -> tuple[dict | None, s
     """A load's renderer run_delay from each THREAD's own samples (k6_job._renderer_sampler's "th"), over the samples
     that bracket the load (`times`, `snaps`: {(tid, thread starttime): ns} per sample): the sum over threads of each
     thread's last sampled value less its first. A thread that exits keeps its last sampled value (the sum never
-    decreases because of an exit), one first seen after the first sample counts from its first sample. What the sum
-    cannot hold, it bounds: an exited thread's run_delay after its last sample, and a new thread's before its first,
-    are each at most the time between that sample and its neighbour (one thread waits at most the wall time). A
-    thread (the same tid AND starttime) whose run_delay went backwards is a broken instrument: (None, why)."""
+    decreases because of an exit). A thread first seen after the bracket's first sample started inside it: a new
+    task's run_delay starts at 0, so its last sampled value is all of it (exact when it started after the previous
+    sample; were it only missed there, still an upper bound, never an under-count). What the sum cannot hold, it
+    bounds: an exited thread's run_delay after its last sample is at most the time to the next sample (one thread
+    waits at most the wall time), the "bound_ms" the caller decides with (load606: only where it could flip a
+    verdict). A thread (the same tid AND starttime) whose run_delay went backwards is a broken instrument: (None, why)."""
     total, bound_s, exited, started = 0, 0.0, 0, 0
     for key in sorted({k for s in snaps for k in s}):
         idx = [i for i, s in enumerate(snaps) if key in s]
@@ -399,19 +401,23 @@ def _thread_delta(times: list[float], snaps: list[dict]) -> tuple[dict | None, s
         if any(b < a for a, b in pairwise(vals)):
             return None, (f"thread {key[0]} (starttime {key[1]}) of its renderer: its own run_delay went backwards "
                           "across it (a broken counter, not an exit)")
-        total += vals[-1] - vals[0]
+        if idx[0] > 0:
+            # not there at the bracket's earlier samples: started inside it, its run_delay from 0 (the kernel
+            # zeroes a new task's sched_info: test_the_kernel_starts_a_new_threads_run_delay_at_zero), so its last
+            # sampled value is its whole run_delay, all of it inside the bracket: measured, nothing to bound
+            started += 1
+            total += vals[-1]
+        else:
+            total += vals[-1] - vals[0]
         if idx[-1] < len(snaps) - 1:
             exited += 1
             bound_s += times[idx[-1] + 1] - times[idx[-1]]
-        if idx[0] > 0:
-            started += 1
-            bound_s += times[idx[0]] - times[idx[0] - 1]
     return {"ns": total, "bound_ms": bound_s * 1000, "exited": exited, "started": started}, ""
 
 
 def renderer_delay(n: dict, st: dict) -> dict:
     """{"ms": at most how much of page load `n` was its OWN renderer waiting for a CPU, "bound_ms": what that may
-    under-count (threads that exited or started inside its bracket: _thread_delta), "upper_ms": the two together
+    under-count (threads that exited inside its bracket: _thread_delta), "upper_ms": the two together
     (capped at the load's time), "exited", "started": those threads, "why": ""}, or "ms" None and why it is UNKNOWN.
 
     Its renderer: the pid Chrome's frame->process record named for the load's session and identity class in a read
