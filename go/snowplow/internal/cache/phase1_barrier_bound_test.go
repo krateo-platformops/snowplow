@@ -70,11 +70,15 @@ func barrierBoundListKinds() map[schema.GroupVersionResource]string {
 // stuckListReactor returns a LIST reactor that always errors (never holds
 // the shared Fake lock across a block), so the stuck GVR's informer never
 // reaches HasSynced while every other informer syncs normally.
+//
+// The error is TRANSIENT (503), a stall the reflector's retry could heal:
+// since #1532 a terminal refusal (NotFound / Forbidden) ends the barrier's
+// wait for that informer by itself, so a Forbidden here would no longer
+// exercise the good-enough bound these arms are about
+// (phase1_barrier_refused_1532_test.go covers the refused path).
 func stuckListReactor() k8stesting.ReactionFunc {
 	return func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
-		return true, nil, apierrors.NewForbidden(
-			schema.GroupResource{Group: stuckGVR().Group, Resource: stuckGVR().Resource},
-			"", context.Canceled)
+		return true, nil, apierrors.NewServiceUnavailable("stuck: the LIST stalls")
 	}
 }
 

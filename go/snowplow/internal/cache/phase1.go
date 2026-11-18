@@ -297,8 +297,8 @@ func (rw *ResourceWatcher) RegisterMetaQuerySeeds(ctx context.Context) int {
 }
 
 // WaitAllInformersSynced blocks until EVERY registered informer reaches
-// HasSynced AND no new informer was registered DURING the wait, or ctx
-// is cancelled. This is the Phase 1 sync barrier: after the SA-credentialed
+// HasSynced or has its LIST refused (#1532, below), AND no new informer was
+// registered DURING the wait, or ctx is cancelled. This is the Phase 1 sync barrier: after the SA-credentialed
 // resolution walk has fanned out (registering an informer per touched
 // GVR via lazyRegisterInnerCallPaths) AND every templated apiserver
 // path has invoked cache.DiscoverGroupResources to spawn composition
@@ -315,10 +315,33 @@ func (rw *ResourceWatcher) RegisterMetaQuerySeeds(ctx context.Context) int {
 // prevent. So this loop re-snapshots after every WaitForCacheSync pass
 // and only returns when a full pass completed with the registered-
 // informer count UNCHANGED across it (no registration occurred during
-// the wait). client-go's HasSynced is monotonic — once true it stays
-// true — so a stable count across a pass means every informer observed
-// at the start of the pass is synced AND nothing new appeared, hence
-// every informer is synced.
+// the wait). A pass ends when one poll of client-go's WaitForCacheSync
+// finds every informer in its snapshot synced or LIST-refused. The poll
+// evaluates the informers one after another, not atomically, so "the
+// pass ended" means: each informer was synced or refused at the instant
+// that poll read it. A stable count across the pass means nothing new
+// appeared.
+//
+// A REFUSED LIST ENDS THE WAIT FOR THAT INFORMER (#1532, owner ruling
+// "stop waiting on refused feeds"). The reflector's latest List/Watch
+// error being NotFound or Forbidden (rw.listRefused, #796, set by the
+// watch-error handler) means the LIST does not heal by the reflector's own
+// retry: only a CRD version or an RBAC grant heals it. HasSynced is set
+// only by a successful LIST (client-go's FIFO `populated`), so waiting on
+// such an informer could only run out a bound. WaitForGVRSync stops on the
+// same predicate. The predicate is not monotonic: listRefused follows the
+// LATEST error, so a later non-terminal error removes it (servable.go's
+// watch-error handler) and so does a successful relist. That is enough for
+// the exit: an informer read as refused that turns transient right after
+// is simply unsynced, which is the state "good enough" below already lets
+// readiness flip with (HasSynced is the only thing that ever makes an
+// informer servable, so an unsynced one, refused or not, is served by the
+// lazy-register fallthrough from the apiserver, and the reflector plus the
+// discovery ticker heal it once it is served). The barrier therefore never
+// claims every informer synced: its complete line names the refused ones
+// (refused_count, refused_gvrs), and nothing downstream reads a nil return
+// as "every informer warm" (Phase1Done gates readiness and the pre/post
+// boundary of the boot writes, never servability).
 //
 // BOUNDED EXIT POLICY (Fix 1b, task #43) — the outer ctx
 // (PHASE1_TIMEOUT_SECONDS) remains the absolute backstop, but the loop no
@@ -393,7 +416,8 @@ func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
 		syncs := make([]clientcache.InformerSynced, 0, countBefore)
 		gvrs := make([]schema.GroupVersionResource, 0, countBefore)
 		for gvr, gi := range rw.informers {
-			syncs = append(syncs, gi.Informer().HasSynced)
+			inf := gi.Informer()
+			syncs = append(syncs, func() bool { return inf.HasSynced() || rw.listRefusedNow(gvr) }) // #1532
 			gvrs = append(gvrs, gvr)
 		}
 		rw.mu.RUnlock()
@@ -434,12 +458,25 @@ func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
 		setStable := countAfter == countBefore
 
 		if synced && setStable {
-			// Happy path: every informer in a stable set synced.
+			// Happy path: every informer in a stable set synced, or had its
+			// LIST refused (#1532: named here, the rest synced).
+			refused := make([]string, 0)
+			rw.mu.RLock()
+			for _, gvr := range gvrs {
+				if gi, ok := rw.informers[gvr]; ok && !gi.Informer().HasSynced() {
+					if _, r := rw.listRefused[gvr]; r {
+						refused = append(refused, gvr.String())
+					}
+				}
+			}
+			rw.mu.RUnlock()
 			slog.Info("cache.phase1.sync_wait_complete",
 				slog.String("subsystem", "cache"),
 				slog.Int("passes", pass),
 				slog.Int("informer_count", countAfter),
 				slog.Int64("waited_ms", time.Since(start).Milliseconds()),
+				slog.Int("refused_count", len(refused)),
+				slog.Any("refused_gvrs", refused),
 			)
 			return nil
 		}
