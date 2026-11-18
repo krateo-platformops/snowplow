@@ -514,3 +514,22 @@ def test_the_profiler_records_the_profiles_window_and_flags_a_slow_request(tmp_p
         + recs + [{"kind": "mem_end", "t": 200.0}])
     assert win["slow_requests"] == 1
     assert win["profiles"][1]["t_start"] == recs[1]["prof_start"]
+
+
+def test_the_default_capture_records_the_external_fetch_counters():
+    """Diego 2026-11-18: the next pair records #1322's counters (snowplow_external_fetch_total and _flight_total among
+    them), so halved stage requests can be told apart as coalescing or lost reads: run606's default prefixes capture
+    every snowplow_external_fetch_* expvar, and nothing else under that name is dropped (mutation: the prefix left out
+    of RUN8_VARS_PREFIXES leaves the sample without them)."""
+    assert load606.EXTERNAL_FETCH_PREFIX in load606.RUN8_VARS_PREFIXES
+    keys = {"snowplow_external_fetch_total": {"external": 12},
+            "snowplow_external_fetch_flight_total": {"leader": 5, "joined": 7},
+            "snowplow_external_fetch_by_driver_total": {"apiref": 3},
+            "snowplow_external_fetch_conversion_held": 2,
+            "snowplow_unrelated": 1}
+    r = load606.mem_sample(SampleSnow(keys), TOKEN, load606.RUN8_VARS_PREFIXES)
+    assert {k for k in r["extra"] if k.startswith("snowplow_external_fetch")} == {
+        "snowplow_external_fetch_total", "snowplow_external_fetch_flight_total",
+        "snowplow_external_fetch_by_driver_total", "snowplow_external_fetch_conversion_held"}, r["extra"]
+    assert r["extra"]["snowplow_external_fetch_flight_total"] == {"leader": 5, "joined": 7}
+    assert "snowplow_unrelated" not in r["extra"]

@@ -2780,6 +2780,8 @@ RESOLVE_MEMO_COUNTERS = ("hits_total", "misses_total", "stale_misses_total", "wo
 STALE_TO_PUSH_PREFIX = "snowplow_stale_to_push"         # _to_push_ms {layer: hist}
 STALE_SERVE_PREFIX = "snowplow_stale_serve"             # _serves_total, _serves_open, _serve_closes_total
 STALE_UNREPLACED_PREFIX = "snowplow_stale_unreplaced"   # _unreplaced_total {layer: n}
+# #1322's external fetches and their coalescing (flights): every snowplow_external_fetch_* expvar
+EXTERNAL_FETCH_PREFIX = "snowplow_external_fetch"
 # The /debug/vars prefixes memwatch must capture so every key above is seen.
 # run606's MEM_VARS_PREFIXES default IS this tuple (printed by `prefixes`), and
 # `check-prefixes` refuses a run-8 run whose prefixes miss any RUN8_KEYS value.
@@ -2838,6 +2840,11 @@ RUN8_VARS_PREFIXES = (
     EGRESS_KEYS["connections"],
     "snowplow_endpoint_retries",
     RESOLVE_MEMO_KEY,                     # snowplow #1284: memo lookups and would-joins (resolve_memo_report)
+    # Diego 2026-11-18 (reviewer-1486: run29's "doubling" was the denominator, 1.12.74 sending HALF the stage
+    # requests): #1322's external-fetch counters, so a pair can tell coalescing from lost reads:
+    # snowplow_external_fetch_total / _by_driver_total / _abandoned_*, _flight_total, _flight_unwaited_panics_total,
+    # _conversion_* (resolvers/restactions/api external_fetch_metrics.go, external_fetch_cache.go)
+    EXTERNAL_FETCH_PREFIX,
 )
 # The identity-class inputs whose movement rotates every identity-bound key
 # that folds them (rbac/identity_class.go IdentityClassOf), and the refresher's
