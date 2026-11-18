@@ -20,7 +20,9 @@ package authn
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -133,7 +135,7 @@ func (c *Client) exchange(ctx context.Context) (string, time.Time, error) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", time.Time{}, fmt.Errorf("authn returned %d: %s", resp.StatusCode, string(body))
+		return "", time.Time{}, authnError(resp.StatusCode, body)
 	}
 
 	var out struct {
@@ -189,4 +191,24 @@ func splitJWT(token string) []string {
 	}
 	out = append(out, token[start:])
 	return out
+}
+
+// authnError is authn's error answer as an error carries it, and so as it is logged (#1531 review N2): fixed text
+// for the status class and the body's length and sha256 prefix, never the body (it may echo a credential: the
+// projected SA token snowplow presented, or a token authn issued). The digest lets an operator match the answer
+// to authn's own log; the class says what kind of refusal it was.
+func authnError(status int, body []byte) error {
+	var class string
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		class = "refused the service account (not authenticated, or not on authn's allowlist)"
+	case status == http.StatusNotFound:
+		class = "has no /serviceaccount/login (not found)"
+	case status >= 500:
+		class = "unavailable"
+	default:
+		class = "answered an unexpected status"
+	}
+	sum := sha256.Sum256(body)
+	return fmt.Errorf("authn returned %d: %s (body %d bytes, sha256 %s)", status, class, len(body), hex.EncodeToString(sum[:])[:12])
 }

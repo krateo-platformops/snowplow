@@ -38,9 +38,11 @@ import (
 	"strings"
 	"sync/atomic"
 
+	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/ptr"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/loopbacktoken"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
@@ -232,4 +234,25 @@ func bearerAppendForStage(apiCall *templates.API, ep endpoints.Endpoint, isSA bo
 	// #57 is unaffected).
 	return ptr.Deref(apiCall.ExportJWT, false) ||
 		parsedHostEqualsSelf(ep.ServerURL)
+}
+
+// stageBearer is the token a stage that bearerAppendForStage says carries a
+// bearer presents (resolve.go calls it only then, with the stage's own
+// context): the requester's own token on a customer /call
+// (xcontext.WithAccessToken); else, on a prewarm context, the authn-issued
+// token its loopbacktoken source fetches now (#1530: the token is asked for
+// when a stage needs it, never while the context is built). "" when there is
+// neither or the source cannot answer: the stage runs token-less, the
+// degrade a prewarm context without a token always had (the source's owner
+// logs and counts the failure; the next stage that needs it asks again).
+func stageBearer(ctx context.Context) string {
+	if tok, _ := xcontext.AccessToken(ctx); tok != "" {
+		return tok
+	}
+	if src := loopbacktoken.SourceFrom(ctx); src != nil {
+		if tok, err := src(ctx); err == nil {
+			return tok
+		}
+	}
+	return ""
 }
