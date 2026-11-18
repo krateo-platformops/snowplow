@@ -123,11 +123,12 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 		// source (what restactions/api stageBearer does) within its own
 		// context (2 s here); building the pass's SA context asks nothing,
 		// and each pass asks again
-		rctx := withPhase1SAContext(ctx, testSAEndpoint(), nil)
+		var rctx context.Context
+		within(t, "building the pass's SA context", time.Second, func() { rctx = withPhase1SAContext(ctx, testSAEndpoint(), nil) })
 		tok := ""
 		if src := loopbacktoken.SourceFrom(rctx); src != nil {
 			sctx, cancel := context.WithTimeout(rctx, 2*time.Second)
-			tok, _ = src(sctx)
+			within(t, "the pass's bearer stage (2 s)", 3*time.Second, func() { tok, _ = src(sctx) })
 			cancel()
 		}
 		lastToken.Store(&tok)
@@ -285,7 +286,7 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 	}
 
 	if tok := lastToken.Load(); tok == nil || *tok == "" {
-		t.Fatalf("token self-heal FAIL: the config-vars-driven re-walk's bearer-carrying stage got no token "+
+		t.Fatalf("token self-heal FAIL: the config-vars-driven re-walk's bearer-carrying stage got no token " +
 			"once authn was reachable — the #57 nested loopback would stay cold")
 	}
 	if SeedLoopbackTokenErrTotal() != errBeforeHeal {

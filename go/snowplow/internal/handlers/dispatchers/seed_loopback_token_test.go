@@ -63,8 +63,12 @@ func TestPhase1RootsRead_NeverWaitsForAnUnavailableTokenSource(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	cfg, err := readFrontendConfig(withPhase1SAContext(ctx, testSAEndpoint(), nil), dyn, "krateo-system",
-		frontendConfigConfigMapName())
+	var cfg frontendConfig
+	var err error
+	within(t, "the eager read", 2*time.Second, func() {
+		cfg, err = readFrontendConfig(withPhase1SAContext(ctx, testSAEndpoint(), nil), dyn, "krateo-system",
+			frontendConfigConfigMapName())
+	})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("the eager read failed after %v: %v", elapsed, err)
@@ -286,7 +290,7 @@ func TestSeedTokenSource_AFailingAuthnIsNotHitOncePerAsk(t *testing.T) {
 			}
 		}(i)
 	}
-	wg.Wait()
+	within(t, "64 stages asking within 1.2 s", 3*time.Second, wg.Wait)
 	if got.Load() != 0 {
 		t.Fatalf("%d stage(s) got a token from a failing authn", got.Load())
 	}
@@ -395,7 +399,7 @@ func TestSeedTokenSource_AuthnLateBoot_TheBearerStagesGetTheTokenWithinTheBoot(t
 			toks[i], _ = loopbacktoken.SourceFrom(rctx)(rctx)
 		}(i)
 	}
-	wg.Wait()
+	within(t, "8 bearer stages asking within the walk", 10*time.Second, wg.Wait)
 	elapsed := time.Since(start)
 	for i, tok := range toks {
 		if tok != jwt {
