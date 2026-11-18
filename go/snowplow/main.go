@@ -524,12 +524,14 @@ func main() {
 
 	// #57 — wire the prewarm seed's authn token source + the self-loopback
 	// host once at startup. The authn.Client exchanges snowplow's projected
-	// (audience=authn) SA token for an authn-issued JWT; the seed installs it
-	// on the prewarm ctx so a nested loopback /call carries a bearer
-	// snowplow's own middleware accepts (rca-prewarm-nested-loopback-jwt §5).
-	// Both are additive + degrade-safe: if URL_SELF is empty the self-loopback
-	// bearer arm never fires (pre-#57 gate); if the token exchange fails the
-	// seed runs token-less (WARN+expvar, not fatal — phase1_walk C-a).
+	// (audience=authn) SA token for an authn-issued JWT, which a nested
+	// loopback /call presents as a bearer snowplow's own middleware accepts
+	// (rca-prewarm-nested-loopback-jwt §5). #1530: the prewarm ctx carries
+	// this as a token SOURCE, asked by such a stage when it needs the token,
+	// never while the ctx is built. Both are additive + degrade-safe: if
+	// URL_SELF is empty the self-loopback bearer arm never fires (pre-#57
+	// gate); if the token exchange fails that stage runs token-less
+	// (WARN+expvar, not fatal — phase1_walk C-a).
 	authnClient := authn.New(*urlAuthn, *saTokenPath)
 	dispatchers.SetSeedLoopbackTokenProvider(authnClient.Token)
 	// R (composition-resources loopback guard) — install the SAME URL_SELF host

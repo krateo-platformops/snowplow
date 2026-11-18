@@ -38,8 +38,8 @@ import (
 	"testing"
 	"time"
 
-	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/loopbacktoken"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -112,12 +112,22 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 		rootsSeen     atomic.Int64 // roots discovered by the last boot-scope run
 		bootRuns      atomic.Int64 // rePrewarmBoot-equivalent invocations
 		lastListErr   atomic.Bool  // last run hit the roots_list_failed path
+		lastToken     atomic.Pointer[string]
 	)
 	handler := func(ctx context.Context, s prewarmScope) error {
 		if s.kind != scopeKindBoot {
 			return nil
 		}
 		bootRuns.Add(1)
+		// #1530: a bearer-carrying stage of this pass asks the pass's token
+		// source (what restactions/api stageBearer does); building the pass's
+		// SA context asks nothing, and each pass asks again
+		rctx := withPhase1SAContext(ctx, testSAEndpoint(), nil)
+		tok := ""
+		if src := loopbacktoken.SourceFrom(rctx); src != nil {
+			tok, _ = src(rctx)
+		}
+		lastToken.Store(&tok)
 		if !configPresent.Load() {
 			// Models rePrewarmBoot's roots_list_failed branch: config-vars
 			// absent → 0 roots → give up THIS pass (softened: no terminal
@@ -155,23 +165,13 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 	// The token exchange must fail (SeedLoopbackTokenErrTotal climbs), and the
 	// informer must NOT have fired a re-enqueue yet (no ConfigMap).
 	errBefore := SeedLoopbackTokenErrTotal()
-	// Wire an UNREACHABLE authn provider and run the token install under a
-	// short ctx so the bounded backoff exhausts fast (degrade-not-fail).
+	// Wire an UNREACHABLE authn provider: the t0 pass's bearer-carrying stage
+	// asks it and runs token-less (degrade-not-fail).
 	unreachable := func(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("dial tcp 10.0.0.1:8082: connect: connection refused")
 	}
 	SetSeedLoopbackTokenProvider(unreachable)
 	t.Cleanup(func() { SetSeedLoopbackTokenProvider(nil) })
-	tctx, tcancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
-	got := installSeedLoopbackToken(tctx)
-	tcancel()
-	if got != tctx {
-		t.Fatalf("t0 token race: expected token-less ctx returned unchanged on unreachable authn (degrade-not-fail)")
-	}
-	if SeedLoopbackTokenErrTotal() <= errBefore {
-		t.Fatalf("t0 token race NOT armed: SeedLoopbackTokenErrTotal did not climb (%d -> %d) — "+
-			"the seed→authn token race did not actually run", errBefore, SeedLoopbackTokenErrTotal())
-	}
 	if ConfigVarsEnqueuedTotal() != 0 {
 		t.Fatalf("t0 config-vars race NOT armed: a config-vars re-enqueue fired before the ConfigMap "+
 			"exists (%d) — the informer must be silent until the object appears", ConfigVarsEnqueuedTotal())
@@ -182,6 +182,14 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 	}
 	if rootsSeen.Load() != 0 {
 		t.Fatalf("t0: expected 0 roots discovered with config-vars absent, got %d", rootsSeen.Load())
+	}
+	if tok := lastToken.Load(); tok == nil || *tok != "" {
+		t.Fatalf("t0 token race: the pass's bearer-carrying stage must run token-less on unreachable authn "+
+			"(degrade-not-fail), got %v", tok)
+	}
+	if SeedLoopbackTokenErrTotal() <= errBefore {
+		t.Fatalf("t0 token race NOT armed: SeedLoopbackTokenErrTotal did not climb (%d -> %d) — "+
+			"the seed→authn token race did not actually run", errBefore, SeedLoopbackTokenErrTotal())
 	}
 	t.Logf("t0 race ARMED: SeedLoopbackTokenErrTotal %d->%d, configVarsEnqueued=0, roots=0 (cold)",
 		errBefore, SeedLoopbackTokenErrTotal())
@@ -256,6 +264,12 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 	if !ok || scope.kind != scopeKindBoot {
 		t.Fatalf("expected a boot scope dequeued for the re-walk")
 	}
+	// Token axis: authn is reachable by the re-walk (mimics its real arrival):
+	// the re-walk's bearer-carrying stage asks again and gets the token.
+	SetSeedLoopbackTokenProvider(func(ctx context.Context) (string, error) {
+		return mkFakeAuthnJWT(t), nil
+	})
+	errBeforeHeal := SeedLoopbackTokenErrTotal()
 	if err := handler(engineCtx, scope); err != nil {
 		t.Fatalf("self-heal re-walk returned error with config-vars present: %v", err)
 	}
@@ -267,27 +281,15 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 		t.Fatalf("SELF-HEAL FAIL: the re-walk still hit roots_list_failed with config-vars present")
 	}
 
-	// Token axis self-heal: authn now reachable → the backoff acquires on the
-	// first attempt (behavioral neutrality when up). Assert the error counter
-	// STOPS climbing and the token installs.
-	reachable := func(ctx context.Context) (string, error) {
-		return mkFakeAuthnJWT(t), nil
-	}
-	SetSeedLoopbackTokenProvider(reachable)
-	errBeforeHeal := SeedLoopbackTokenErrTotal()
-	healed := installSeedLoopbackToken(context.Background())
-	if healed == nil {
-		t.Fatalf("token self-heal: installSeedLoopbackToken returned nil ctx")
-	}
-	if tok, _ := xcontext.AccessToken(healed); tok == "" {
-		t.Fatalf("token self-heal FAIL: no access token installed on ctx after authn became reachable — " +
-			"the #57 nested loopback would stay cold")
+	if tok := lastToken.Load(); tok == nil || *tok == "" {
+		t.Fatalf("token self-heal FAIL: the config-vars-driven re-walk's bearer-carrying stage got no token "+
+			"once authn was reachable — the #57 nested loopback would stay cold")
 	}
 	if SeedLoopbackTokenErrTotal() != errBeforeHeal {
-		t.Fatalf("token self-heal FAIL: error counter climbed (%d -> %d) after authn reachable — "+
-			"the backoff should acquire first try", errBeforeHeal, SeedLoopbackTokenErrTotal())
+		t.Fatalf("token self-heal FAIL: error counter climbed (%d -> %d) with authn reachable",
+			errBeforeHeal, SeedLoopbackTokenErrTotal())
 	}
-	t.Logf("token self-heal: acquired token first-try after authn reachable; err counter steady at %d",
+	t.Logf("token self-heal: the re-walk asked again and got the token; err counter steady at %d",
 		SeedLoopbackTokenErrTotal())
 
 	if bootRuns.Load() < 2 {
@@ -296,7 +298,7 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 }
 
 // mkFakeAuthnJWT builds a syntactically-valid-enough token string for the
-// install path (installSeedLoopbackToken only checks non-empty; jwt validation
+// install path (the token source only checks non-empty; jwt validation
 // is a downstream concern not exercised here).
 func mkFakeAuthnJWT(t *testing.T) string {
 	t.Helper()
@@ -348,94 +350,10 @@ func TestBootRace_RED_OneShotGivesUpWithoutTrigger(t *testing.T) {
 	t.Logf("RED arm PASS: on HEAD (no informer) the one-shot re-walk gives up and never re-drives — the defect")
 }
 
-// TestBootRace_TokenBackoff_RetriesThenAcquires proves the §2.3 bounded backoff:
-// a provider that fails the first N attempts then succeeds must be RETRIED (not
-// fire-once), and the token must install. RED against HEAD's fire-once
-// installSeedLoopbackToken: the first (failing) attempt would degrade token-less.
-func TestBootRace_TokenBackoff_RetriesThenAcquires(t *testing.T) {
-	bootRaceTestMu.Lock()
-	defer bootRaceTestMu.Unlock()
-
-	var attempts atomic.Int64
-	const failFor = 3
-	provider := func(ctx context.Context) (string, error) {
-		n := attempts.Add(1)
-		if n <= failFor {
-			return "", fmt.Errorf("dial tcp: connection refused (attempt %d)", n)
-		}
-		return mkFakeAuthnJWT(t), nil
-	}
-	SetSeedLoopbackTokenProvider(provider)
-	t.Cleanup(func() { SetSeedLoopbackTokenProvider(nil) })
-
-	errBefore := SeedLoopbackTokenErrTotal()
-	// Generous ctx so the backoff has room to retry past failFor.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	got := installSeedLoopbackToken(ctx)
-
-	if attempts.Load() <= failFor {
-		t.Fatalf("TOKEN BACKOFF FAIL: provider was called %d times (<= %d) — fire-once, not retried "+
-			"(RED = HEAD installSeedLoopbackToken)", attempts.Load(), failFor)
-	}
-	if tok, _ := xcontext.AccessToken(got); tok == "" {
-		t.Fatalf("TOKEN BACKOFF FAIL: no token installed after the backoff acquired one on attempt %d",
-			attempts.Load())
-	}
-	// On a successful acquire the degrade counter must NOT climb.
-	if SeedLoopbackTokenErrTotal() != errBefore {
-		t.Fatalf("TOKEN BACKOFF FAIL: degrade counter climbed (%d -> %d) despite a successful acquire",
-			errBefore, SeedLoopbackTokenErrTotal())
-	}
-	t.Logf("token backoff: acquired on attempt %d (after %d transient failures); no degrade counted",
-		attempts.Load(), failFor)
-}
-
-// TestBootRace_TokenBackoff_CtxBoundedDegrades proves the backoff is STRICTLY
-// ctx-bounded and degrades-not-fails on exhaustion: an always-failing provider
-// under a short ctx must return token-less (unchanged ctx) + bump the counter,
-// and MUST NOT block past the ctx deadline (the 0.30.220 boot-stall regression
-// watch).
-func TestBootRace_TokenBackoff_CtxBoundedDegrades(t *testing.T) {
-	bootRaceTestMu.Lock()
-	defer bootRaceTestMu.Unlock()
-
-	var attempts atomic.Int64
-	provider := func(ctx context.Context) (string, error) {
-		attempts.Add(1)
-		return "", fmt.Errorf("dial tcp: connection refused (forever)")
-	}
-	SetSeedLoopbackTokenProvider(provider)
-	t.Cleanup(func() { SetSeedLoopbackTokenProvider(nil) })
-
-	errBefore := SeedLoopbackTokenErrTotal()
-	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
-	defer cancel()
-
-	start := time.Now()
-	got := installSeedLoopbackToken(ctx)
-	elapsed := time.Since(start)
-
-	// STRICTLY CTX-BOUNDED: it must return at/near the ctx deadline, not run
-	// to the full Steps=30 exponential (which would be minutes).
-	if elapsed > 3*time.Second {
-		t.Fatalf("CTX-BOUND FAIL: installSeedLoopbackToken ran %v past a 600ms ctx — the backoff is not "+
-			"ctx-bounded (0.30.220 boot-stall regression)", elapsed)
-	}
-	// DEGRADE-NOT-FAIL: ctx returned unchanged (token-less) + counter bumped.
-	if got != ctx {
-		t.Fatalf("DEGRADE FAIL: expected the original ctx returned unchanged (token-less) on exhaustion")
-	}
-	if SeedLoopbackTokenErrTotal() <= errBefore {
-		t.Fatalf("DEGRADE FAIL: SeedLoopbackTokenErrTotal did not climb on backoff exhaustion (%d -> %d)",
-			errBefore, SeedLoopbackTokenErrTotal())
-	}
-	if attempts.Load() < 1 {
-		t.Fatalf("expected at least one attempt before ctx-bounded exhaustion")
-	}
-	t.Logf("token backoff ctx-bounded: %d attempts in %v, degraded token-less (counter climbed)",
-		attempts.Load(), elapsed)
-}
+// The §2.3 token backoff tests (RetriesThenAcquires, CtxBoundedDegrades) are
+// gone with the backoff (#1530): the context carries a token source, each need
+// asks once (seed_loopback_token_test.go TestSeedTokenSource_EachNeedAsksAgain)
+// and building the context never waits (TestWithPhase1SAContext_NeverWaitsForAuthn).
 
 // --- content-level cohort scoping (C-d: cached-identity == served-identity) ---
 
