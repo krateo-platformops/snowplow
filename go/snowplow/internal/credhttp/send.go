@@ -42,6 +42,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptrace"
 	"strconv"
@@ -382,29 +383,54 @@ func firstBackoff(base, maxB time.Duration) time.Duration {
 	return transcribedBackoff(0, base, maxB)
 }
 
+// retryAfterHeader parses a Retry-After header: delay-seconds (secs, isSecs) or an HTTP date (at, isDate); neither
+// when it is absent or holds neither. The module's one Retry-After parser: retryAfter (the apiserver send path) and
+// RetryAfter (the RUM forwarder, #1533) both read it, each with its own conversion.
+func retryAfterHeader(resp *http.Response) (secs int, isSecs bool, at time.Time, isDate bool) {
+	ra := resp.Header.Get("Retry-After")
+	if ra == "" {
+		return 0, false, time.Time{}, false
+	}
+	if n, err := strconv.Atoi(ra); err == nil {
+		return n, true, time.Time{}, false
+	}
+	if t, err := http.ParseTime(ra); err == nil {
+		return 0, false, t, true
+	}
+	return 0, false, time.Time{}, false
+}
+
 // retryAfter is RetryClient's 429 wait (plumbing's parseRetryAfter): the
-// Retry-After seconds or date, else 2 s.
+// Retry-After seconds or date, else 2 s. Its conversion is plumbing's as
+// transcribed, unchanged (#1533 keeps this path byte-identical).
 func retryAfter(resp *http.Response) time.Duration {
-	if d, ok := RetryAfter(resp); ok {
-		return d
+	secs, isSecs, at, isDate := retryAfterHeader(resp)
+	switch {
+	case isSecs:
+		return time.Duration(secs) * time.Second
+	case isDate:
+		return time.Until(at)
 	}
 	return 2 * time.Second
 }
 
-// RetryAfter is the wait a response's Retry-After header asks for, in seconds
-// or as an HTTP date (time.Until it), and whether it holds one this parses.
-// The one Retry-After parser of the module: credhttp's retry loop and the RUM
-// forwarder (#1533) both read it here.
+// RetryAfter is the wait a response's Retry-After header asks for, and whether it holds one (seconds or an HTTP
+// date); absent or unparsable: (0, false), never a default. The wait is never negative (a past date, or negative
+// seconds: 0) and never overflows (seconds past the largest time.Duration: the largest time.Duration), so a
+// caller can wait it as it is, cut only by its own context (#1533).
 func RetryAfter(resp *http.Response) (time.Duration, bool) {
-	ra := resp.Header.Get("Retry-After")
-	if ra == "" {
-		return 0, false
-	}
-	if secs, err := strconv.Atoi(ra); err == nil {
+	secs, isSecs, at, isDate := retryAfterHeader(resp)
+	switch {
+	case isSecs:
+		if secs <= 0 {
+			return 0, true
+		}
+		if int64(secs) > int64(math.MaxInt64/time.Second) {
+			return time.Duration(math.MaxInt64), true
+		}
 		return time.Duration(secs) * time.Second, true
-	}
-	if t, err := http.ParseTime(ra); err == nil {
-		return time.Until(t), true
+	case isDate:
+		return max(0, time.Until(at)), true
 	}
 	return 0, false
 }

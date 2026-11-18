@@ -20,12 +20,13 @@ const ForwardQueue = 64
 // ForwardTimeout bounds one POST to the collector (one attempt).
 const ForwardTimeout = 5 * time.Second
 
-// The wait between attempts at one batch (#1533): the OTel Go OTLP/HTTP exporter's own default retry shape
+// The wait between attempts at one batch (#1533): the OTel Go OTLP/HTTP exporter's backoff INTERVALS
 // (go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.47.0 internal/retry: InitialInterval 5 s,
 // MaxInterval 30 s; github.com/cenkalti/backoff/v5 v5.0.3 DefaultMultiplier 1.5, DefaultRandomizationFactor 0.5),
-// so the numbers are the exporter's, not ours. Its MaxElapsedTime (1 min, after which the exporter drops the batch)
-// is deliberately not taken: a batch is held until it is delivered, refused, or snowplow shuts down; the queue
-// (ForwardQueue) and the per-attempt timeout (ForwardTimeout) stay the only bounds.
+// so the numbers are the exporter's, not ours, WITHOUT its MaxElapsedTime: the exporter's default shape also gives
+// up after 1 min and drops the batch; here a batch is held at the head of the queue until it is delivered, refused,
+// or snowplow shuts down (shutdown cuts any wait). The queue (ForwardQueue) and the per-attempt timeout
+// (ForwardTimeout) stay the only bounds.
 const (
 	retryInitial    = 5 * time.Second
 	retryMax        = 30 * time.Second
@@ -113,8 +114,8 @@ func (f *Forwarder) Start(ctx context.Context) {
 }
 
 // deliver tries b until the collector takes it (forwarded), refuses it for good (forward_failed, after one
-// attempt), or ctx ends (forward_failed). Between attempts it waits the exporter's backoff, or the collector's
-// Retry-After when that is longer.
+// attempt), or ctx ends (forward_failed). Between attempts it waits the exporter's backoff interval, or the
+// collector's Retry-After when that is longer; ctx's end cuts the wait.
 func (f *Forwarder) deliver(ctx context.Context, b batch) {
 	wait := time.Duration(0)
 	for {
@@ -151,11 +152,17 @@ const (
 	forwardTransient                       // try again later
 )
 
-// forwardClass is the OTLP/HTTP rule for one answer (OpenTelemetry Protocol specification, OTLP/HTTP, "Failures":
-// "The client SHOULD only retry requests that fail with one of the following HTTP status codes: 429, 502, 503,
-// 504"; and a transport failure, the request never answered, may be retried). Everything else is a permanent
-// refusal: in particular a 500, the collector judging this payload itself, is not retried. A collector that is
-// restarting (the daemonset roll this was reported on, #1533) refuses the connection: a transport failure, retried.
+// forwardClass is the OTLP/HTTP rule for one answer (OpenTelemetry Protocol specification, OTLP/HTTP Response,
+// "Retryable Response Codes": "The requests that receive a response status code listed in following table SHOULD
+// be retried." (429, 502, 503, 504) "All other 4xx or 5xx response status codes MUST NOT be retried."). So a 500,
+// the collector judging this payload itself, is a permanent refusal.
+//
+// A request that never got an answer (post's transport failure) is retried too, by the same specification, not by
+// upstream parity: OTLP/HTTP Connection, "If the client cannot connect to the server, the client SHOULD retry the
+// connection using an exponential backoff strategy between retries.", and OTLP/HTTP Response, "If the server
+// disconnects without returning a response, the client SHOULD retry and send the same request." (The OTel Go
+// exporter does NOT retry a refused connection: its url.Error is not Temporary.) A refused connection is exactly a
+// restarting node-local collector, the daemonset roll this was reported on (#1533).
 func forwardClass(status int) forwardOutcome {
 	switch {
 	case status/100 == 2:
@@ -169,7 +176,10 @@ func forwardClass(status int) forwardOutcome {
 }
 
 // post is one attempt at b, bounded by ForwardTimeout: its outcome, and the collector's Retry-After on a transient
-// answer that carries one (credhttp.RetryAfter, the module's one parser).
+// answer that carries one (credhttp.RetryAfter, the module's one parser: an absent or unparsable header is no
+// Retry-After, a past date or negative seconds is 0, a value past the largest time.Duration is the largest; such a
+// wait is cut by shutdown like any other). OTLP/HTTP Throttling: "The client SHOULD honour the value specified in
+// the "Retry-After" header if it is present."
 func (f *Forwarder) post(ctx context.Context, b batch) (forwardOutcome, time.Duration) {
 	ctx, cancel := context.WithTimeout(ctx, ForwardTimeout)
 	defer cancel()

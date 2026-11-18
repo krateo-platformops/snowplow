@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -239,6 +240,12 @@ func TestForward1533_RetryAfterIsHonoured(t *testing.T) {
 	}{
 		{"40", 40 * time.Second, 40*time.Second + time.Millisecond},
 		{"1", 2500 * time.Millisecond, 7500 * time.Millisecond}, // the exporter's 5 s ±50 %
+		// #1533 pre-review: a huge value is the largest wait, never an overflow (shutdown cuts it: below); a negative
+		// one, a past date and garbage are no wait of their own, so the backoff decides
+		{"1000000000000", time.Duration(math.MaxInt64), time.Duration(math.MaxInt64)},
+		{"-5", 2500 * time.Millisecond, 7500 * time.Millisecond},
+		{"Wed, 21 Oct 2015 07:28:00 GMT", 2500 * time.Millisecond, 7500 * time.Millisecond},
+		{"soon", 2500 * time.Millisecond, 7500 * time.Millisecond},
 	} {
 		f, c, w := scripted(t, func(n int64, rw http.ResponseWriter) {
 			if n == 1 {
@@ -327,5 +334,29 @@ func TestForward1533_TheQueueFillsDuringAnOutageAndShutdownCountsWhatItHolds(t *
 	})
 	if spansDelta(before, "forwarded") != 0 {
 		t.Fatalf("forwarded %d during an outage", spansDelta(before, "forwarded"))
+	}
+}
+
+// TestForward1533_ShutdownCutsAHugeRetryAfter: the real wait, not a recorded one. The collector answers 503 with
+// Retry-After: 1e12 seconds (the largest wait); shutdown 100 ms into it ends the wait at once and counts the held
+// batch forward_failed: no Retry-After stalls delivery past shutdown.
+func TestForward1533_ShutdownCutsAHugeRetryAfter(t *testing.T) {
+	c := &collector1533{answer: func(_ int64, rw http.ResponseWriter) {
+		rw.Header().Set("Retry-After", "1000000000000")
+		rw.WriteHeader(http.StatusServiceUnavailable)
+	}}
+	srv := httptest.NewServer(c.handler())
+	defer srv.Close()
+	f := NewForwarder(srv.URL + "/v1/traces") // its own, real sleep
+	before := Read()
+	cancel := startForwarder(t, f)
+	f.enqueue(batch{body: []byte("spans"), spans: 7})
+	until(t, "the first POST", func() bool { return c.posts.Load() == 1 })
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	cancel()
+	until(t, "the held batch counted at shutdown", func() bool { return spansDelta(before, "forward_failed") == 7 })
+	if took := time.Since(start); took > time.Second || c.posts.Load() != 1 {
+		t.Fatalf("shutdown took %v to end the wait (%d POSTs), want at once", took, c.posts.Load())
 	}
 }
