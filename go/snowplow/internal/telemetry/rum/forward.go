@@ -68,9 +68,14 @@ type Forwarder struct {
 // like every client the module builds (#723/#724): it refuses redirects, so a
 // collector address can never bounce the browser's spans elsewhere.
 //
-// A URL that is not http or https is refused here, at configuration (#1535
-// review): no attempt to it could ever succeed, so it never reaches the worker,
-// where every failure without an answer is retried (permanentTransport).
+// A URL that is not http or https, or that names no host, is refused here, at
+// configuration (#1535 review, #1539): no attempt to it could ever succeed, so it
+// never reaches the worker, where every failure without an answer is retried
+// (permanentTransport). The host is the name, not the authority: ":4318" or
+// "user:pw@:4318" names a port and no host (u.Host is not empty, u.Hostname()
+// is), and an empty host fails every batch at runtime (net/http's untyped "no
+// Host in request URL", held at the head of the queue for good; with only a
+// port, the dial policy's refusal per batch).
 func NewForwarder(collectorURL string) (*Forwarder, error) {
 	u, err := url.Parse(collectorURL)
 	if err != nil {
@@ -78,6 +83,9 @@ func NewForwarder(collectorURL string) (*Forwarder, error) {
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("rum: collector endpoint scheme %q: only http and https can carry OTLP/HTTP", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return nil, errors.New("rum: collector endpoint has no host")
 	}
 	return &Forwarder{
 		url:    collectorURL,

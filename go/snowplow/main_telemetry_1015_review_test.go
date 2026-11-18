@@ -386,6 +386,7 @@ func TestS1015_DefaultOffContract(t *testing.T) {
 		{"per-signal on + endpoint", "", "true", c.srv.URL, true},
 		// #1535: an endpoint no attempt could reach is refused at start (one ERROR), the route stays off
 		{"tracing on + an endpoint that is not http(s)", "true", "", "ftp://collector:4318", false},
+		{"tracing on + an endpoint with no host (#1539)", "true", "", "http:///v1/traces", false},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
