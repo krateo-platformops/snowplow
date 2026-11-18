@@ -21,6 +21,7 @@ each with its reason. The north-star bars apply to the BROWSER page loads.
 from __future__ import annotations
 
 import gzip
+from array import array
 import json
 import os
 import re
@@ -179,13 +180,65 @@ def read_k6_out(d: str, name: str) -> dict | None:
     if name == "browser":
         # 2026-11-17 ("Measure it precisely"): each renderer's run-queue wait, and which renderer renders each
         # session's page (None: not recorded, a bench before it)
-        out["renderers"] = _jsonl(os.path.join(d, "browser-renderers.jsonl"))
+        out["renderers"] = _renderer_records(os.path.join(d, "browser-renderers.jsonl"))
         out["renderer_map"] = _jsonl(os.path.join(d, "renderer-map.jsonl"))
     try:
         with open(os.path.join(d, f"{name}-forward.json")) as fh:
             out["forward"] = json.load(fh)   # the browser wrapper's wait for its forwards
     except (OSError, ValueError):
         out["forward"] = None
+    return out
+
+
+def _renderer_records(path: str) -> list[dict] | None:
+    """browser-renderers.jsonl, read line by line (a cut last line skipped; None when there is no such file), each
+    sample's per-thread run_delays ("th") held compactly (#1529 review: rehf1's shape, 15863 samples x 15 renderers x
+    ~18 threads, held as dicts took ~10x the per-process evaluate's memory): per renderer, the tuple of its thread keys
+    (one object for every sample with the same thread set) and an array of their values, in that order. renderer_state
+    reads it; _thread_snap turns one sample of it back into {(tid, thread starttime): ns} for a load's bracket only."""
+    try:
+        fh = open(path, errors="replace")
+    except OSError:
+        return None
+    shared: dict[tuple[str, ...], tuple[str, ...]] = {}
+    out = []
+    with fh:
+        for ln in fh:
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            if not isinstance(r, dict):
+                continue
+            th = r.get("th")
+            if isinstance(th, dict):
+                compact = {}
+                for k, ths in th.items():
+                    if isinstance(ths, dict):
+                        keys = tuple(str(x) for x in ths)
+                        compact[k] = (shared.setdefault(keys, keys), array("q", (int(v) for v in ths.values())))
+                    else:
+                        compact[k] = ths
+                r["th"] = compact
+            out.append(r)
+    return out
+
+
+_THREAD_KEYS: dict[str, tuple[str, str]] = {}
+
+
+def _thread_snap(entry) -> dict:
+    """One renderer's threads at one sample as {(tid, thread starttime): ns}: from _renderer_records' compact
+    (keys, values) pair, or a dict already in that shape (a state built by hand)."""
+    if isinstance(entry, dict):
+        return entry
+    keys, vals = entry
+    out = {}
+    for k, v in zip(keys, vals):
+        kk = _THREAD_KEYS.get(k)
+        if kk is None:
+            kk = _THREAD_KEYS[k] = tuple(k.partition(":")[::2])
+        out[kk] = v
     return out
 
 
@@ -330,17 +383,36 @@ def renderer_state(o: dict | None, off: float | None) -> dict:
     """The per-renderer evidence of one browser run: each renderer's run_delay series on the epoch, KEYED BY
     (pid, starttime) (`off`: the CPU samples' realtime - uptime offset; None: not anchored, nothing can be placed),
     each series' --user-data-dir, and every renderer read (k6/renderers.js), the failed ones too (pid null: they
-    break a chain of agreeing reads)."""
+    break a chain of agreeing reads). A sample is timed by its start ("t", /proc/uptime read before its files) and,
+    from a sampler since #1529's review, its end ("t_end", read after them): "ends" maps each sample's start to its
+    end, for bracketing a load by the right one."""
     series: dict[tuple[int, str], list[tuple[float, int]]] = {}
+    threads: dict[tuple[int, str], dict[float, dict[tuple[str, str], int]]] = {}
+    ends: dict[float, float] = {}
     udd: dict[tuple[int, str], str | None] = {}
+    per_thread = False
     for r in (o or {}).get("renderers") or []:
         if r.get("kind") == "renderer_udd" and isinstance(r.get("pid"), int):
             udd[(r["pid"], str(r.get("start")))] = r.get("udd")
         elif r.get("kind") == "renderer" and isinstance(r.get("t"), (int, float)) and off is not None:
+            per_thread = per_thread or "th" in r
+            t = float(r["t"]) + off
+            if isinstance(r.get("t_end"), (int, float)):
+                ends[t] = float(r["t_end"]) + off
             for k, v in (r.get("rd") or {}).items():
                 pid, _, start = str(k).partition(":")
                 if pid.isdigit() and start:
-                    series.setdefault((int(pid), start), []).append((float(r["t"]) + off, int(v)))
+                    series.setdefault((int(pid), start), []).append((t, int(v)))
+            for k, ths in (r.get("th") or {}).items():
+                pid, _, start = str(k).partition(":")
+                if not (pid.isdigit() and start):
+                    continue
+                if isinstance(ths, dict):       # a record not read by _renderer_records (a state built in a test)
+                    keys = tuple(str(x) for x in ths)
+                    ths = (keys, array("q", (int(v) for v in ths.values())))
+                if isinstance(ths, tuple) and len(ths) == 2:
+                    # held as read (compact); a load's bracket turns its own samples back into dicts (_thread_snap)
+                    threads.setdefault((int(pid), start), {})[t] = ths
     for s in series.values():
         s.sort(key=lambda x: x[0])
     # each series' process start on the epoch (its starttime / the sampler's CLK_TCK, on the same uptime the samples
@@ -348,10 +420,15 @@ def renderer_state(o: dict | None, off: float | None) -> dict:
     hz = next((r.get("hz") for r in (o or {}).get("renderers") or [] if r.get("kind") == "renderer_clock"), None)
     started = ({k: int(k[1]) / hz + off for k in series if k[1].isdigit()}
                if isinstance(hz, int) and hz > 0 and off is not None else {})
+    # a thread's own start on the epoch, from its starttime in the same clock ticks (None: no clock recorded)
+    thread_start = ((lambda key: int(key[1]) / hz + off if key[1].isdigit() else None)
+                    if isinstance(hz, int) and hz > 0 and off is not None else (lambda key: None))
     reads = [m for m in (o or {}).get("renderer_map") or []
              if m.get("kind") == "renderer_map" and isinstance(m.get("t0"), (int, float))
              and isinstance(m.get("t1"), (int, float))]
-    return {"series": series, "udd": udd, "started": started, "reads": sorted(reads, key=lambda m: m["t0"]),
+    return {"series": series, "threads": threads, "per_thread": per_thread, "ends": ends,
+            "thread_start": thread_start, "udd": udd, "started": started,
+            "reads": sorted(reads, key=lambda m: m["t0"]),
             "anchored": off is not None, "recorded": {"renderers": (o or {}).get("renderers") is not None,
                                                      "renderer_map": (o or {}).get("renderer_map") is not None}}
 
@@ -370,7 +447,52 @@ def _series_of(r: dict, pid: int, t0: float, t1: float) -> tuple[tuple[int, str]
 
 
 def renderer_delay_ms(n: dict, st: dict) -> tuple[float | None, str]:
-    """(at most how much of page load `n` was its OWN renderer waiting for a CPU, "") or (None, why it is UNKNOWN).
+    """renderer_delay's (ms, why): the stall it measured (without its under-count bound), or None and why."""
+    d = renderer_delay(n, st)
+    return d["ms"], d["why"]
+
+
+def _thread_delta(times: list[float], snaps: list[dict], thread_start=None) -> tuple[dict | None, str]:
+    """A load's renderer run_delay from each THREAD's own samples (k6_job._renderer_sampler's "th"), over the samples
+    that bracket the load (`times`, `snaps`: {(tid, thread starttime): ns} per sample): the sum over threads of each
+    thread's last sampled value less its first. A thread that exits keeps its last sampled value (the sum never
+    decreases because of an exit). A thread first seen after the bracket's first sample counts its whole last value:
+    a new task's run_delay starts at 0. That is EXACT when the thread's own start (`thread_start`: its starttime on
+    the epoch) is at or after the previous sample's start (it began inside the bracket, all of its run_delay with
+    it); otherwise (an earlier start, or no clock to tell) it is an UPPER BOUND, never an under-count. Each new thread
+    is counted as one or the other ("started_exact", "started_upper"). What the sum cannot hold, it
+    bounds: an exited thread's run_delay after its last sample is at most the time to the next sample (one thread
+    waits at most the wall time), the "bound_ms" the caller decides with (load606: only where it could flip a
+    verdict). A thread (the same tid AND starttime) whose run_delay went backwards is a broken instrument: (None, why)."""
+    total, bound_s, exited, started, exact = 0, 0.0, 0, 0, 0
+    for key in sorted({k for s in snaps for k in s}):
+        idx = [i for i, s in enumerate(snaps) if key in s]
+        vals = [snaps[i][key] for i in idx]
+        if any(b < a for a, b in pairwise(vals)):
+            return None, (f"thread {key[0]} (starttime {key[1]}) of its renderer: its own run_delay went backwards "
+                          "across it (a broken counter, not an exit)")
+        if idx[0] > 0:
+            # not there at the bracket's earlier samples: started inside it, its run_delay from 0 (the kernel
+            # zeroes a new task's sched_info: test_the_kernel_starts_a_new_threads_run_delay_at_zero), so its last
+            # sampled value is its whole run_delay, all of it inside the bracket: measured, nothing to bound
+            started += 1
+            total += vals[-1]
+            born = thread_start(key) if thread_start is not None else None
+            if born is not None and born >= times[idx[0] - 1]:
+                exact += 1
+        else:
+            total += vals[-1] - vals[0]
+        if idx[-1] < len(snaps) - 1:
+            exited += 1
+            bound_s += times[idx[-1] + 1] - times[idx[-1]]
+    return {"ns": total, "bound_ms": bound_s * 1000, "exited": exited, "started": started, "started_exact": exact,
+            "started_upper": started - exact}, ""
+
+
+def renderer_delay(n: dict, st: dict) -> dict:
+    """{"ms": at most how much of page load `n` was its OWN renderer waiting for a CPU, "bound_ms": what that may
+    under-count (threads that exited inside its bracket: _thread_delta), "upper_ms": the two together
+    (capped at the load's time), "exited", "started": those threads, "why": ""}, or "ms" None and why it is UNKNOWN.
 
     Its renderer: the pid Chrome's frame->process record named for the load's session and identity class in a read
     that ENDED before the load started and in one that STARTED after it ended, the same pid and page target in
@@ -378,18 +500,25 @@ def renderer_delay_ms(n: dict, st: dict) -> tuple[float | None, str]:
     or that was not read on both sides, is not known), resolved to the one (pid, starttime) series the sampler
     recorded through both reads, under the --user-data-dir of the Chrome whose endpoint named it. Its stall: that
     series' run_delay between the last sample at or before the load's start and the first at or after its end (each
-    side widened OUTWARD by the anchor's error, st["slack_s"]), capped at the load's own time. UNKNOWN too: a
-    series whose run_delay never advanced over the run (the counter is not shown live), and one that decreased
-    across the load (a thread of the renderer exited with its run_delay: the known under-count, flagged)."""
+    side widened OUTWARD by the anchor's error, st["slack_s"]), capped at the load's own time. With per-thread samples
+    (a sampler since 2026-11-18) the stall is the sum of each thread's own delta (_thread_delta): a thread that exits
+    is a stated under-count bound, never UNKNOWN; a thread whose own run_delay went backwards is UNKNOWN. Without
+    them (older evidence) the series' summed run_delay, and a sum that decreased across the load is UNKNOWN (a
+    thread exited with its run_delay: #1517's known under-count, which only per-thread samples can resolve).
+    UNKNOWN too: a series whose run_delay never advanced over the run (the counter is not shown live)."""
+    def unknown(why: str) -> dict:
+        return {"ms": None, "bound_ms": None, "upper_ms": None, "exited": 0, "started": 0, "started_exact": 0,
+                "started_upper": 0, "why": why}
+
     r = st.get("renderer") or {}
     if not r.get("anchored"):
-        return None, "the renderer samples have no wall-clock anchor"
+        return unknown("the renderer samples have no wall-clock anchor")
     if not (r.get("recorded") or {}).get("renderers"):
-        return None, "no renderer samples were recorded (browser-renderers.jsonl)"
+        return unknown("no renderer samples were recorded (browser-renderers.jsonl)")
     if not (r.get("recorded") or {}).get("renderer_map"):
-        return None, "no renderer reads were recorded (renderer-map.jsonl)"
+        return unknown("no renderer reads were recorded (renderer-map.jsonl)")
     if n.get("start") is None:
-        return None, "the load has no start"
+        return unknown("the load has no start")
     s0, s1 = n["start"], n["start"] + n["wall_ms"] / 1000
     slack = st.get("slack_s") or 0.0
     key = (n.get("session"), n.get("class"))
@@ -397,32 +526,55 @@ def renderer_delay_ms(n: dict, st: dict) -> tuple[float | None, str]:
     before = [m for m in ok if m["t1"] <= s0]
     after = [m for m in ok if m["t0"] >= s1]
     if not before or not after:
-        return None, "its renderer was not read both before and after it"
+        return unknown("its renderer was not read both before and after it")
     b, a = max(before, key=lambda m: m["t1"]), min(after, key=lambda m: m["t0"])
     span = [m for m in ok if m["t0"] >= b["t0"] and m["t1"] <= a["t1"]]
     if len({m["pid"] for m in span}) != 1 or len({m.get("target") for m in span}) != 1:
-        return None, "its renderer changed while it loaded"
+        return unknown("its renderer changed while it loaded")
     if any(m.get("pid") is None and m.get("udd") == b.get("udd") and m["t0"] < a["t1"] and m["t1"] > b["t0"]
            for m in r["reads"]):
-        return None, "a read of its Chrome between the two failed"
+        return unknown("a read of its Chrome between the two failed")
     pid = b["pid"]
     k1, why1 = _series_of(r, pid, b["t0"], b["t1"])
     k2, why2 = _series_of(r, pid, a["t0"], a["t1"])
     if k1 is None or k2 is None or k1 != k2:
-        return None, why1 or why2 or f"pid {pid} was another process at the read after the load"
+        return unknown(why1 or why2 or f"pid {pid} was another process at the read after the load")
     if r["udd"].get(k1) != b.get("udd"):
-        return None, "the pid Chrome named is not a renderer the sampler saw under that Chrome's --user-data-dir"
+        return unknown("the pid Chrome named is not a renderer the sampler saw under that Chrome's --user-data-dir")
     s = r["series"][k1]
     if len(s) < 2 or max(v for _, v in s) == min(v for _, v in s):
-        return None, "its renderer's run_delay never advanced over the run: the counter is not shown live"
-    lo = [v for t, v in s if t <= s0 - slack]
-    hi = [v for t, v in s if t >= s1 + slack]
+        return unknown("its renderer's run_delay never advanced over the run: the counter is not shown live")
+    # #1529 review: a sample's values are read after its start ("t") and before its end ("t_end", when recorded):
+    # the lower sample must have ENDED before the load (all its values from before it), the upper must have STARTED
+    # after it (all its values from after it), so the bracket always covers the load
+    ends = r.get("ends") or {}
+    lo = [i for i, (t, _) in enumerate(s) if ends.get(t, t) <= s0 - slack]
+    hi = [i for i, (t, _) in enumerate(s) if t >= s1 + slack]
     if not lo or not hi:
-        return None, "no renderer sample brackets it"
-    d = hi[0] - lo[-1]
+        return unknown("no renderer sample brackets it")
+    if lo[-1] >= hi[0]:
+        # with consistent clocks the lower sample ends before the load and the upper starts after it, so the lower
+        # comes first; one at or after the upper means a sample's end and start are on different clocks (#1529
+        # review: an empty bracket would read a stall of 0, a silent "not starved")
+        return unknown("its bracket is empty or inverted: the samples' end and start times disagree (a clock slip)")
+    win = s[lo[-1]:hi[0] + 1]
+    if r.get("per_thread"):
+        at = (r.get("threads") or {}).get(k1) or {}
+        if any(t not in at for t, _ in win):
+            return unknown("a sample of its renderer that brackets it has no per-thread record")
+        got, why = _thread_delta([t for t, _ in win], [_thread_snap(at[t]) for t, _ in win], r.get("thread_start"))
+        if got is None:
+            return unknown(why)
+        ms = min(n["wall_ms"], got["ns"] / 1e6)
+        return {"ms": ms, "bound_ms": got["bound_ms"], "upper_ms": min(n["wall_ms"], ms + got["bound_ms"]),
+                "exited": got["exited"], "started": got["started"], "started_exact": got["started_exact"],
+                "started_upper": got["started_upper"], "why": ""}
+    d = win[-1][1] - win[0][1]
     if d < 0:
-        return None, "its renderer's summed run_delay decreased across it (a thread exited with its run_delay)"
-    return min(n["wall_ms"], d / 1e6), ""
+        return unknown("its renderer's summed run_delay decreased across it (a thread exited with its run_delay)")
+    ms = min(n["wall_ms"], d / 1e6)
+    return {"ms": ms, "bound_ms": 0.0, "upper_ms": ms, "exited": 0, "started": 0, "started_exact": 0,
+            "started_upper": 0, "why": ""}
 
 
 def possible_delay_ms(start: float, wall_ms: float, st: dict) -> float:

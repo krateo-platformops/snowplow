@@ -22,7 +22,9 @@
 // start and at once end a trace, take the outermost main frame's processId, stamp the page (window.__benchMapped:
 // the read's start). One line per read on stdout (--console-output): {"kind": "renderer_map", "t0", "t1"
 // (epoch s: the read lies between them), "udd", "target", "ask", "session", "class", "pid"}; a page whose marker
-// or frame cannot be read is a line with pid null and `why`. Nothing here is a guess: a load the evaluator cannot
+// or frame cannot be read is a line with pid null and `why`. The watcher's own events (its connection opening and
+// closing, each page attached) are kind renderer_cdp, never reads: a Chrome closes its connection when its session
+// ends, and only a read running at that moment fails (rehf1, 2026-11-18). Nothing here is a guess: a load the evaluator cannot
 // place between two reads of the same (pid, starttime) process has no renderer, and its stall is UNKNOWN.
 import { WebSocket } from 'k6/websockets'
 
@@ -43,7 +45,13 @@ function watch (target) {
   let id = 0
   const waiting = {}                // id -> callback(result, error)
   const traces = {}                 // sessionId -> callback(frames)
+  // the connection is closed (Chrome closes it when its session ends): nothing more is sent on it, and no read
+  // starts after it (rehf1, 2026-11-18: the close was emitted as a renderer_map line with pid null, a failed read
+  // that never was one; a read in flight at the close is the only read the close fails)
+  let closed = false
+  let inFlight = null               // the running read's finish(why), while it runs
   const call = (method, params, sessionId, cb) => {
+    if (closed) return              // its callback never fires: whoever waits on it has its READ_MS bound
     const n = ++id
     waiting[n] = cb
     ws.send(JSON.stringify(Object.assign({ id: n, method, params: params || {} }, sessionId ? { sessionId } : {})))
@@ -106,17 +114,19 @@ function watch (target) {
     const finish = (why) => {
       if (finished) return
       finished = true
+      inFlight = null
       delete traces[sid]
       if (why) row.why = why
       row.pid = why ? null : row.pid
       if (why || row.t1 === undefined) row.t1 = Date.now() / 1000
       emit(row)
-      if (!tracing || !why) return next()
+      if (closed || !tracing || !why) return next()
       let done = false
       const go = () => { if (!done) { done = true; next() } }
       setTimeout(go, READ_MS)                         // an end that never answers: the read is still over
       call('Tracing.end', {}, sid, go)
     }
+    inFlight = finish
     setTimeout(() => finish(`no answer within ${READ_MS} ms`), READ_MS)
     call('Runtime.evaluate', { expression: 'JSON.stringify(window.__benchSession || null)', returnByValue: true },
       sid, (ev, err2) => {
@@ -153,7 +163,7 @@ function watch (target) {
   const served = {}                 // sessionId -> the last ask read
   const queue = []
   const next = () => {
-    if (busy || !queue.length) return
+    if (closed || busy || !queue.length) return
     busy = true
     const [sid, ask] = queue.shift()
     readPage(sid, pages[sid], ask, () => { busy = false; next() })
@@ -179,7 +189,13 @@ function watch (target) {
     })
   }
   ws.onerror = (e) => note('error', { error: String((e && e.error) || e) })
-  ws.onclose = () => emit({ t0: Date.now() / 1000, t1: Date.now() / 1000, udd: target.udd, pid: null, why: 'the CDP connection closed' })
+  // The connection's close is the watcher's event, not a read (kind renderer_cdp): Chrome closes it when its
+  // session ends. Only a read running at that moment fails, on its own line; asks still queued are never read
+  ws.onclose = () => {
+    closed = true
+    note('close', { pages: Object.keys(pages).length, read_in_flight: inFlight !== null, asks_unread: queue.length })
+    if (inFlight) inFlight('the CDP connection closed during the read')
+  }
 }
 
 export default function () {

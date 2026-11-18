@@ -369,10 +369,13 @@ def _renderer_sampler(sessions: int) -> str:
     threads: the time they were runnable and waited for a CPU), KEYED BY (pid, starttime) (/proc/<pid>/stat field
     22: a reused pid is another series, never the old one's continuation), timed by /proc/uptime (node-wide: the
     browser container's cpu_start anchor places it), into /out/browser-renderers.jsonl: {"kind": "renderer", "t",
-    "rd": {"<pid>:<starttime>": ns}}, and once per series its Chrome's --user-data-dir ({"kind": "renderer_udd",
-    "pid", "start", "udd"}), which the evaluator matches against the CDP endpoint that named the pid.
-    KNOWN UNDER-COUNT: an exited thread's run_delay leaves the sum with it; a sum that decreases is flagged by the
-    evaluator, a decrease hidden by later growth is not. And renderer_watch: once `sessions` Chrome (one per k6 VU)
+    "t_end" (the uptime again after the sample's files were read), "rd": {"<pid>:<starttime>": ns}, "th": {"<pid>:<starttime>": {"<tid>:<thread starttime>": ns}}}, and once per
+    series its Chrome's --user-data-dir ({"kind": "renderer_udd", "pid", "start", "udd"}), which the evaluator
+    matches against the CDP endpoint that named the pid. "th" is each THREAD's own run_delay, keyed by its tid and
+    its own starttime (/proc/<pid>/task/<tid>/stat field 22: a reused tid is another thread), and "rd" is their sum:
+    the evaluator sums each thread's own delta, so a thread that exits keeps its last sampled value (the summed "rd"
+    loses it: #1517's known under-count), and what it accrued after that sample is at most one sampling period, a
+    bound the evaluator states. And renderer_watch: once `sessions` Chrome (one per k6 VU)
     wrote DevToolsActivePort (or RENDERER_WAIT_S passed), k6/renderers.js on their CDP endpoints, its lines into
     /out/renderer-map.jsonl."""
     return f"""# stof <pid>: ST = the process's starttime (/proc/<pid>/stat field 22, after the parenthesised comm)
@@ -408,17 +411,32 @@ rsample() {{
   for p in "$@"; do
     [ -r /proc/$p/stat ] || continue
     files="$files /proc/$p/stat"
-    for f in /proc/$p/task/*/schedstat; do [ -r "$f" ] && files="$files $f"; done
+    # each thread's own stat (its starttime: with its tid, the thread's key), then its schedstat
+    for d in /proc/$p/task/*; do [ -r "$d/stat" ] && [ -r "$d/schedstat" ] && files="$files $d/stat $d/schedstat"; done
   done
   [ -n "$files" ] || return 0
   read -r up _ < /proc/uptime
-  # each pid's own stat first (its starttime: the series key), then its threads' schedstat (field 2 summed)
+  # each pid's own stat first (its starttime: the series key), then per thread its stat (the thread's own
+  # starttime, field 22) and its schedstat (field 2: the thread's run_delay, and summed into the process's "rd"). A
+  # thread whose stat could not be read (it exited between the listing and the read) is in neither. Paths are read
+  # from their END (.../proc/<pid>/stat, .../proc/<pid>/task/<tid>/(sched)stat), so the program is tested on a tree
+  # of files outside /proc (test_the_sampler_counts_no_thread_whose_stat_it_could_not_read). The sample's start "t"
+  # is the uptime read before its files, its end "t_end" the uptime read again after them (#1529 review: about two
+  # files per thread lie between; the evaluator brackets a load by the lower sample's end and the upper's start).
+  # null when the second read fails
   # shellcheck disable=SC2086
-  awk -v t="$up" 'FNR == 1 {{ n = split(FILENAME, a, "/"); p = a[3] }}
-    FILENAME ~ /^\\/proc\\/[0-9]+\\/stat$/ {{ x = $0; sub(/^.*\\) /, "", x); split(x, f, " "); st[p] = f[20]; next }}
-    {{ s[p] += $2 }}
-    END {{ o = ""; for (p in s) if (p in st) o = o (o == "" ? "" : ", ") "\\"" p ":" st[p] "\\": " s[p];
-          printf "{{\\"kind\\": \\"renderer\\", \\"t\\": %s, \\"rd\\": {{%s}}}}\\n", t, o }}' \\
+  awk -v t="$up" -v uf=/proc/uptime 'FNR == 1 {{ n = split(FILENAME, a, "/"); k = (a[n - 2] == "task"); p = k ? a[n - 3] : a[n - 1]
+                             tid = k ? a[n - 1] : "" }}
+    FILENAME ~ /\\/proc\\/[0-9]+\\/stat$/ {{ x = $0; sub(/^.*\\) /, "", x); split(x, f, " "); st[p] = f[20]; next }}
+    FILENAME ~ /\\/task\\/[0-9]+\\/stat$/ {{ x = $0; sub(/^.*\\) /, "", x); split(x, f, " "); tst[p, tid] = f[20]; next }}
+    ((p, tid) in tst) {{ s[p] += $2; trd[p, tid] = $2 }}
+    END {{ for (k in trd) {{ split(k, q, SUBSEP)
+                            th[q[1]] = th[q[1]] (th[q[1]] == "" ? "" : ", ") "\\"" q[2] ":" tst[k] "\\": " trd[k] }}
+          o = ""; h = ""
+          for (p in s) if (p in st) {{ o = o (o == "" ? "" : ", ") "\\"" p ":" st[p] "\\": " s[p]
+                                     h = h (h == "" ? "" : ", ") "\\"" p ":" st[p] "\\": {{" th[p] "}}" }}
+          te = "null"; if ((getline u < uf) > 0) {{ split(u, uu, " "); te = uu[1] }}
+          printf "{{\\"kind\\": \\"renderer\\", \\"t\\": %s, \\"t_end\\": %s, \\"rd\\": {{%s}}, \\"th\\": {{%s}}}}\\n", t, te, o, h }}' \\
     $files 2>/dev/null >> /out/browser-renderers.jsonl
 }}
 rknown=""; rnot=""
