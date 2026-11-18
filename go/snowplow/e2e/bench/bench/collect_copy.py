@@ -10,10 +10,14 @@ finished cleanly (viewer-exit rc 0), so viewer.stream_complete blamed the sideca
   3. verifies the copy (`verify`): every file the pod held is there, at least as long, and its first <size> bytes
      hash to the pod's sha256 (a stream still appended to while copied is whole; one cut short is not);
   4. retries a failed or short copy within COLLECT_TIMEOUT_S (the bound one copy already had), and
-  5. records the copy (`record`, one collect_copy line per copy in collect-copies.jsonl): evaluate's
-     collect.copies names every short or failed copy (the run is INVALID: its streams are not what the pods held).
+  5. records the copy (`record`, collect-copies.jsonl): an "interrupted" record before its first attempt, its outcome
+     after the last, so a collect cap that ends a copy midway leaves it named; evaluate's collect.copies reads each
+     copy's LAST record and names every short, failed or interrupted copy (the run is INVALID: its streams are not
+     what the pods held).
 
-A copy the pod could not list (`manifest_ok` false) is recorded "unverified": a report warning, never "verified".
+A copy the pod could not list (`manifest_ok` false) is recorded "unverified": collect.copies is then UNMEASURED,
+naming it (reviewer-1480's ruling on #1542: a copy that could not be checked is no evidence it is whole), never
+PASS.
 """
 
 from __future__ import annotations
@@ -39,7 +43,7 @@ list | while IFS= read -r f; do
   printf '%s %s %s\n' "$s" "${h%% *}" "$f"
 done'''
 
-VERIFIED, SHORT, FAILED, UNVERIFIED = "verified", "short", "failed", "unverified"
+VERIFIED, SHORT, FAILED, UNVERIFIED, INTERRUPTED = "verified", "short", "failed", "unverified", "interrupted"
 
 
 def parse_manifest(text: str) -> list[dict]:
@@ -99,38 +103,48 @@ def verify(manifest: list[dict], local: str, kind: str) -> dict:
 
 
 def record(what: str, pod: str, remote: str, attempts: int, outcome: str, manifest_ok: bool,
-           checked: dict | None, errors: list[str]) -> dict:
+           checked: dict | None, errors: list[str], dest: str | None = None) -> dict:
     """One collect_copy record (collect-copies.jsonl)."""
-    return {"kind": "collect_copy", "what": what, "pod": pod, "remote": remote, "attempts": attempts,
+    return {"kind": "collect_copy", "what": what, "pod": pod, "remote": remote, "dest": dest, "attempts": attempts,
             "outcome": outcome, "manifest_ok": manifest_ok,
             "files": (checked or {}).get("files"), "short": (checked or {}).get("short") or [],
             "errors": [e for e in errors if e][-5:]}
 
 
 def copies_check(recs: list[dict]) -> tuple[dict | None, list[str]]:
-    """evaluate's collect.copies (a validity item: a short or failed copy means a stream is not what its pod held,
-    the run INVALID, each named) and the report warnings for unverified copies. (None, []) when the run recorded no
-    copies (evidence from before this check)."""
+    """evaluate's collect.copies, a validity item over each copy's LAST record (one copy: what, pod, remote, dest):
+    a short, failed or interrupted copy means a stream is not what its pod held: FAIL, the run INVALID, each named;
+    else an unverified copy (its pod could not list its files) leaves it UNMEASURED, each named; else PASS. (None, [])
+    when the run recorded no copies (evidence from before this check). The second value is kept for report warnings
+    (none since the ruling: an unverified copy is the check's own outcome)."""
     if not recs:
         return None, []
-    bad = [r for r in recs if r.get("outcome") in (SHORT, FAILED)]
+    last: dict[tuple, dict] = {}
+    for r in recs:
+        last[(r.get("what"), r.get("pod"), r.get("remote"), r.get("dest"))] = r
+    recs = list(last.values())
+    bad = [r for r in recs if r.get("outcome") in (SHORT, FAILED, INTERRUPTED)]
     unverified = [r for r in recs if r.get("outcome") == UNVERIFIED]
     value = {"copies": len(recs), "verified": sum(1 for r in recs if r.get("outcome") == VERIFIED),
              "short": sum(1 for r in recs if r.get("outcome") == SHORT),
-             "failed": sum(1 for r in recs if r.get("outcome") == FAILED), "unverified": len(unverified)}
+             "failed": sum(1 for r in recs if r.get("outcome") == FAILED),
+             "interrupted": sum(1 for r in recs if r.get("outcome") == INTERRUPTED),
+             "unverified": len(unverified)}
 
     def name(r: dict) -> str:
         detail = "; ".join(r.get("short") or []) or "; ".join(r.get("errors") or []) or "no detail recorded"
         return (f"{r.get('what')} ({r.get('remote')} from {r.get('pod')}): {r.get('outcome')} after "
                 f"{r.get('attempts')} attempt(s): {detail}")
 
-    check = {"check": "collect.copies", "value": value,
-             "bar": "every collected copy verified against its pod (each file's size and sha256)",
-             "result": "FAIL" if bad else "PASS",
-             **({"why": "COLLECT failed: " + " | ".join(name(r) for r in bad)} if bad else {})}
-    warnings = [f"COLLECT: {name(r)}: the pod could not list what it held, so this copy is not verified"
-                for r in unverified]
-    return check, warnings
+    bar = "every collected copy verified against its pod (each file's size and sha256)"
+    if bad:
+        return {"check": "collect.copies", "value": value, "bar": bar, "result": "FAIL",
+                "why": "COLLECT failed: " + " | ".join(name(r) for r in bad)}, []
+    if unverified:
+        return {"check": "collect.copies", "value": value, "bar": bar, "result": "UNMEASURED",
+                "why": "UNMEASURED: " + " | ".join(f"{name(r)}: its pod could not list what it held, so the copy "
+                                                   "could not be checked" for r in unverified)}, []
+    return {"check": "collect.copies", "value": value, "bar": bar, "result": "PASS"}, []
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -145,6 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     for k in ("what", "pod", "remote", "outcome"):
         r.add_argument(f"--{k}", required=True)
     r.add_argument("--attempts", type=int, required=True)
+    r.add_argument("--dest", default=None, help="the local path the copy goes to (one copy: what, pod, remote, dest)")
     r.add_argument("--manifest-ok", choices=("0", "1"), required=True)
     r.add_argument("--checked", help="verify's output (absent: not verified)")
     r.add_argument("--error", action="append", default=[], help="one redacted kubectl error line (repeatable)")
@@ -165,8 +180,8 @@ def main(argv: list[str] | None = None) -> int:
                 checked = json.load(fh)
         except (OSError, ValueError):
             checked = None
-    json.dump(record(a.what, a.pod, a.remote, a.attempts, a.outcome, a.manifest_ok == "1", checked, a.error),
-              sys.stdout)
+    json.dump(record(a.what, a.pod, a.remote, a.attempts, a.outcome, a.manifest_ok == "1", checked, a.error,
+                     a.dest), sys.stdout)
     sys.stdout.write("\n")
     return 0
 

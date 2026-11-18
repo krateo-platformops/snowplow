@@ -1011,7 +1011,13 @@ def test_through_the_cli_a_new_renderers_first_loads_are_measured_and_the_check_
     _, v = _case(tmp_path, per_thread=True, new_renderer=SESSIONS)
     c = _check(v["validity"], "browser.cpu_starvation")
     assert c["result"] == "PASS", c
-    assert c["value"]["renderer_threads"]["loads_measured"] == 63, c["value"]
+    th = c["value"]["renderer_threads"]
+    assert th["loads_measured"] == 63, c["value"]
+    # #1542 N3: the process-start bound in its own fields, never in the exit bound's statistics (no thread exits
+    # here: mutation R2, pooling the two, reads it as an exit bound)
+    assert th["loads_bracketed_by_process_start"] >= 1 and th["process_start_bound_ms_max"] > 0, th
+    assert th["undercount_bound_ms_max"] == 0.0 and th["undercount_bound_ms_total"] == 0.0, th
+    assert th["loads_with_thread_exit"] == 0, th
     assert _check(v["checks"], "warm_nav_p95_ms")["result"] == "FAIL"
 
 

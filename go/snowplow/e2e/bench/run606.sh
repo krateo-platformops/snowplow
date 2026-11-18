@@ -2914,6 +2914,10 @@ collect_copy() {
   [[ -n "$ctr" ]] && cflag=(-c "$ctr")
   stage="$dest.part"
   rm -f "$ver"
+  # first an "interrupted" record: a collect cap that ends this copy before its outcome leaves it named, never
+  # silent (copies_check reads each copy's LAST record)
+  python3 -m bench.collect_copy record --what "$what" --pod "$pod" --remote "$remote" --dest "$dest" --attempts 0 \
+      --outcome interrupted --manifest-ok 0 >> "$OUT/collect-copies.jsonl" || log "COLLECT: $what: could not record the copy"
   script="$(python3 -m bench.collect_copy script)"
   if ! bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n bench-loadgen \
         exec "$pod" ${cflag[@]+"${cflag[@]}"} -- sh -c "$script" _ "$remote" > "$man" 2>"$KERR"; then
@@ -2953,7 +2957,8 @@ collect_copy() {
     if [[ -s "$ver" ]]; then outcome=short; else outcome=failed; fi
     log "COLLECT: $what: $remote from $pod is $outcome after $attempts attempt(s) within ${COLLECT_TIMEOUT_S}s: kept as copied"
   fi
-  # what the last attempt left, in place (a directory merged into an existing one, as kubectl cp did)
+  # the final attempt's copy in place at once, before anything else can stop collect (a directory merged into an
+  # existing one, as kubectl cp did)
   if [[ "$kind" == "dir" ]]; then
     mkdir -p "$dest"
     [[ -d "$stage" ]] && cp -R "$stage/." "$dest/" 2>/dev/null
@@ -2961,7 +2966,7 @@ collect_copy() {
   elif [[ -e "$stage" ]]; then
     mv -f "$stage" "$dest"
   fi
-  local eargs=() e
+  local eargs=(--dest "$dest") e
   for e in ${errs[@]+"${errs[@]}"}; do eargs+=(--error "$e"); done
   [[ -s "$ver" ]] && eargs+=(--checked "$ver")
   python3 -m bench.collect_copy record --what "$what" --pod "$pod" --remote "$remote" --attempts "$attempts" \
