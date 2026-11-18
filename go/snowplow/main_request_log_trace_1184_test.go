@@ -88,7 +88,10 @@ func served1184(t *testing.T) (http.Handler, *lines1184) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	fwd := rum.NewForwarder("http://127.0.0.1:1")
+	fwd, err := rum.NewForwarder("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	fwd.Start(ctx)
 
 	chain := newRequestChain(log)

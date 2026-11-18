@@ -42,7 +42,10 @@ func TestS1020_RUMUploadGetsNoServerSpan(t *testing.T) {
 	defer c.srv.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	fwd := rum.NewForwarder(c.srv.URL + "/v1/traces")
+	fwd, err := rum.NewForwarder(c.srv.URL + "/v1/traces")
+	if err != nil {
+		t.Fatal(err)
+	}
 	fwd.Start(ctx)
 	mux := http.NewServeMux()
 	mux.Handle("GET /call", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))

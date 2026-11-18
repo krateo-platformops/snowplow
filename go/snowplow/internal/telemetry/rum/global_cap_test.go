@@ -54,7 +54,7 @@ func batchBody(t *testing.T, n int) []byte {
 // forwarded); the burst lowered to 2 batches (the 3rd is refused).
 func TestS1015_GlobalSpanRateCap(t *testing.T) {
 	const docBurst, docBatch = 2048, 512
-	in := NewIngest(NewForwarder("http://127.0.0.1:1/v1/traces"), nil)
+	in := NewIngest(mustForwarder(t, "http://127.0.0.1:1/v1/traces"), nil)
 	frozen := time.Unix(1_761_800_000, 0)
 	in.now = func() time.Time { return frozen }
 	body := batchBody(t, docBatch)

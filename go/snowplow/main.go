@@ -195,7 +195,13 @@ func newRUMIngest(ctx context.Context, mux *http.ServeMux) http.Handler {
 	if !ok {
 		return nil // an untyped nil: a typed (*rum.Ingest)(nil) would mount as "enabled"
 	}
-	fwd := rum.NewForwarder(url)
+	fwd, err := rum.NewForwarder(url)
+	if err != nil {
+		// #1535: an endpoint no attempt could reach is a configuration error, reported once at start like a
+		// failed tracing setup; the route stays off (404) rather than accepting spans it can never forward.
+		slog.ErrorContext(ctx, "rum ingest off: collector endpoint refused", slog.Any("err", err))
+		return nil
+	}
 	fwd.Start(ctx)
 	return rum.NewIngest(fwd, rum.RegisteredRoutes(mux))
 }
