@@ -552,6 +552,11 @@ def renderer_delay(n: dict, st: dict) -> dict:
     hi = [i for i, (t, _) in enumerate(s) if t >= s1 + slack]
     if not lo or not hi:
         return unknown("no renderer sample brackets it")
+    if lo[-1] >= hi[0]:
+        # with consistent clocks the lower sample ends before the load and the upper starts after it, so the lower
+        # comes first; one at or after the upper means a sample's end and start are on different clocks (#1529
+        # review: an empty bracket would read a stall of 0, a silent "not starved")
+        return unknown("its bracket is empty or inverted: the samples' end and start times disagree (a clock slip)")
     win = s[lo[-1]:hi[0] + 1]
     if r.get("per_thread"):
         at = (r.get("threads") or {}).get(k1) or {}

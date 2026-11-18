@@ -355,18 +355,47 @@ def test_a_new_thread_is_exact_when_it_started_inside_the_bracket_and_an_upper_b
     """reviewer-1480's N2, from the sampler's own records through renderer_state (CLK_TCK 100, epoch = uptime here):
     over LOAD's bracket (samples 5, 6, 7) two threads are first seen at 6; one started at 5.5 (after the previous
     sample's start: inside the bracket, its whole value exact), the other at 2.0 (it existed before, unseen: its whole
-    value an upper bound). Both are counted whole (mutations: judging by the sample it was first seen in, or calling
-    every new thread exact, turn this RED)."""
+    value an upper bound), a third one clock tick (0.01 s) before the previous sample's start: an upper bound too.
+    All are counted whole (mutations: judging by the sample it was first seen in, calling every new thread exact, or
+    calling one born up to a second before the previous sample exact, S10, turn this RED)."""
     rows = [{"kind": "renderer_clock", "hz": 100}, {"kind": "renderer_udd", "pid": 7, "start": "1", "udd": "u"}]
     for t in range(0, 21):
         th = {"7:1": 1000 * t}
         if t >= 6:
-            th.update({"11:550": 300, "12:200": 400})
+            th.update({"11:550": 300, "12:200": 400, "13:499": 50})
         rows.append({"kind": "renderer", "t": float(t), "rd": {"7:1": sum(th.values())}, "th": {"7:1": th}})
     r = k6eval.renderer_state({"renderers": rows, "renderer_map": [_read(1), _read(9)]}, 0.0)
     got = k6eval.renderer_delay(LOAD, {"slack_s": 0.0, "renderer": r})
-    assert got["why"] == "" and got["ms"] == pytest.approx((2000 + 300 + 400) / 1e6), got
-    assert (got["started"], got["started_exact"], got["started_upper"], got["bound_ms"]) == (2, 1, 1, 0.0), got
+    assert got["why"] == "" and got["ms"] == pytest.approx((2000 + 300 + 400 + 50) / 1e6), got
+    assert (got["started"], got["started_exact"], got["started_upper"], got["bound_ms"]) == (3, 1, 2, 0.0), got
+
+
+def test_renderer_state_places_end_times_on_the_epoch_and_brackets_by_them():
+    """reviewer-1480's B2 (a): the sampler's own records through renderer_state with a real offset (epoch = uptime +
+    100) and each sample's end recorded 0.3 s after its start (uptime). LOAD at epoch 105.0 .. 107.0: the lower
+    bracket is the sample that ENDED by 105.0 (uptime 4, ended 104.3 on the epoch), the upper the one that STARTED at
+    or after 107.0 (uptime 7): 1000 ns/s from 4 to 7, 3000 ns, exactly (mutation S8: leaving t_end on the uptime clock
+    reads every sample as ended before the load)."""
+    rows = [{"kind": "renderer_udd", "pid": 7, "start": "1", "udd": "u"}]
+    for t in range(0, 21):
+        rows.append({"kind": "renderer", "t": float(t), "t_end": t + 0.3, "rd": {"7:1": 1000 * t},
+                     "th": {"7:1": {"7:1": 1000 * t}}})
+    r = k6eval.renderer_state({"renderers": rows, "renderer_map": [_read(101), _read(109)]}, 100.0)
+    assert r["ends"][104.0] == pytest.approx(104.3), r["ends"]
+    load = dict(LOAD, start=105.0)
+    got = k6eval.renderer_delay(load, {"slack_s": 0.0, "renderer": r})
+    assert got["why"] == "" and got["ms"] == pytest.approx(3000 / 1e6), got
+
+
+def test_a_bracket_inverted_by_a_clock_slip_is_unknown_never_zero():
+    """reviewer-1480's B2 (b): end times on a clock 50 s behind the starts (a slip: every sample reads as ended before
+    the load, the lower bracket after the upper). The load is UNKNOWN, named, never a measured 0 (mutation: dropping the
+    guard reads 0 ms, a silent "not starved")."""
+    st = _st_thr({})                                      # per-thread samples: an empty window would sum to 0
+    st["renderer"]["ends"] = {float(t): t - 50.0 for t in range(0, 21)}
+    got = k6eval.renderer_delay(LOAD, st)
+    assert got["ms"] is None and got["why"] == ("its bracket is empty or inverted: the samples' end and start times "
+                                                "disagree (a clock slip)"), got
 
 
 def test_the_lower_sample_brackets_by_its_end_and_the_upper_by_its_start():
