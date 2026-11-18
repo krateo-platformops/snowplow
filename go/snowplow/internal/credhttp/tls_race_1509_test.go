@@ -590,6 +590,14 @@ const (
 // check: while another destination's chain fires races, three deliberate extra
 // connects to the burst's destination must still be flagged. A count across
 // destinations would let the other destination's races excuse it.
+//
+// Scope: the WARM shape only. A warm burst's own terms are ~0 (its trigger is
+// measured from concurrent setups), so the bound has no slack there and three
+// extra connects are flagged every time (#1538 review: k=1 flagged 30 of 30 on
+// 2 CPUs). A solo-warmed burst's own races, replacements and stuck connects
+// leave slack (up to 13 in the review's runs, 20 in #1536's), so k extra
+// connects are not reliably flagged in that shape (k=1: 5 of 30, k=3: 20 of
+// 30): this arm makes no claim about it.
 func TestIssue1509_Chain_ABurstsExtraConnectIsNotExcusedByAnotherDestinationsRaces(t *testing.T) {
 	err := healthyBurst1521(t, burstMixWarm, true)
 	if err == nil {
@@ -769,6 +777,22 @@ func healthyBurst1521(t *testing.T, warm string, inject bool) error {
 	// no evidence: on 2 CPUs under -race, #1536), whose waiter may get
 	// another. Replacing a live attempt at any other time adds connects none
 	// of the three accounts for.
+	//
+	// The bound is built from counters the code under test increments, so it
+	// loosens with them: a chain that drops cover too eagerly (#1538 review,
+	// K6: dropping an attempt that still has evidence) raises `stuck` with the
+	// connects it adds, and passes this bound in every shape (30 of 30 on 2
+	// CPUs). K6 is caught by a count the counters cannot excuse: the
+	// stuck-connect scenario's connects started by 330 ms, read at the dial
+	// (TestIssue1509_Chain_AStuckConnectThatCompletesCoversAgain: 5, want 4,
+	// 30 of 30). The cold and warm shapes add a fact of their own: no connect
+	// outlasts a trigger measured from concurrent setups, so none may be
+	// dropped there (stuck must be 0, below and above). It does not catch K6,
+	// which drops nothing in a warm burst.
+	if warm == burstMixWarm && stuck != 0 {
+		return fmt.Errorf("a healthy warm burst of %d requests dropped %d stuck connects; want 0: a warm burst's trigger is measured from concurrent setups, so no connect outlasts it (connects %d, accepted %d, races %d, replaced %d; trigger %v)",
+			n, stuck, d, a, races, replaced, trigger)
+	}
 	extra := races + replaced + stuck
 	if d < n || d-n > extra || a-n > extra {
 		return fmt.Errorf("a healthy burst of %d requests started %d connects and the server accepted %d, with %d races fired, %d attempts replaced at a new period and %d stuck connects dropped at its destination; want %d each plus at most one per race, replacement or dropped connect (trigger %v; connect starts %v)",
@@ -873,7 +897,11 @@ func TestIssue1509_Chain_AStuckConnectThatCompletesCoversAgain(t *testing.T) {
 	if len(by330) != 4 {
 		t.Fatalf("%d connects had started by 330 ms (%v); want 4: the stuck connect that completed must cover W3 or W4 again", len(by330), by330)
 	}
-	// #1536: the drop is counted, once (the burst bound's third term).
+	// #1536: the drop is counted, once (the burst bound's third term): neither
+	// lost nor double-counted. The burst bound reads this counter, so this
+	// exact count, and the connect count above (read at the dial, not from
+	// the counters: the one that catches a chain dropping cover too eagerly,
+	// #1538 review K6), are load-bearing for it.
 	if stuckBy250 != 1 {
 		t.Fatalf("stuck connects dropped by 250 ms: %d; want exactly 1 (attempt 2, at the ~215 ms check)", stuckBy250)
 	}

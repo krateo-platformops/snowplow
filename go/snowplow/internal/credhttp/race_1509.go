@@ -787,12 +787,14 @@ func closeLoser(countCtx context.Context, conn net.Conn, withTLS bool) {
 	_ = conn.Close()
 }
 
-// resetChainsForTest forgets every chain and every race count (each test's
+// resetChainsForTest forgets every chain and every count of the burst bound's
+// three terms (races, replacements, stuck connects dropped: each test's
 // destinations are its own; this keeps a test's leftovers, or a reused port's,
 // from another's counts).
 func resetChainsForTest() {
 	raceCounts.Clear()
 	replaceCounts.Clear()
+	stuckCounts.Clear()
 	for _, s := range []*setupChains{connectChains, tlsChains} {
 		s.mu.Lock()
 		for _, c := range s.chains {
