@@ -68,9 +68,11 @@ type Forwarder struct {
 // like every client the module builds (#723/#724): it refuses redirects, so a
 // collector address can never bounce the browser's spans elsewhere.
 //
-// A URL that is not http or https is refused here, at configuration (#1535
-// review): no attempt to it could ever succeed, so it never reaches the worker,
-// where every failure without an answer is retried (permanentTransport).
+// A URL that is not http or https, or that names no host, is refused here, at
+// configuration (#1535 review, #1539): no attempt to it could ever succeed, so it
+// never reaches the worker, where every failure without an answer is retried
+// (permanentTransport; a missing host fails as net/http's untyped "no Host in
+// request URL", which the worker would hold at the head of the queue for good).
 func NewForwarder(collectorURL string) (*Forwarder, error) {
 	u, err := url.Parse(collectorURL)
 	if err != nil {
@@ -78,6 +80,9 @@ func NewForwarder(collectorURL string) (*Forwarder, error) {
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("rum: collector endpoint scheme %q: only http and https can carry OTLP/HTTP", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, errors.New("rum: collector endpoint has no host")
 	}
 	return &Forwarder{
 		url:    collectorURL,

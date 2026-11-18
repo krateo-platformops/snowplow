@@ -99,11 +99,12 @@ func TestForward1535_PermanentTransportOnlyWhatIsIdentified(t *testing.T) {
 }
 
 // TestForward1535_ASchemeThatCanNeverBeSentIsRefusedAtConfiguration: NewForwarder refuses a collector URL that is
-// not http or https, so it never reaches the worker (where it would be retried); http and https are accepted
-// (mutation: the scheme check dropped reads a forwarder for ftp://).
+// not http or https, or that names no host (#1539), so it never reaches the worker (where it would be retried);
+// http and https with a host are accepted (mutations: the scheme check dropped reads a forwarder for ftp://; the host
+// check dropped reads one for http:///v1/traces).
 func TestForward1535_ASchemeThatCanNeverBeSentIsRefusedAtConfiguration(t *testing.T) {
 	for _, bad := range []string{"ftp://collector:4318/v1/traces", "unix:///run/otel.sock", "collector:4318/v1/traces",
-		"://collector"} {
+		"://collector", "http:///v1/traces", "https://", "http:/v1/traces"} {
 		if f, err := NewForwarder(bad); err == nil || f != nil {
 			t.Errorf("NewForwarder(%q): forwarder %v, error %v; want refused", bad, f != nil, err)
 		}
