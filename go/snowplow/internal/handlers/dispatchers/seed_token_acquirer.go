@@ -126,7 +126,7 @@ func (a *seedTokenAcquirer) run(actx context.Context, acq *seedTokenAcquisition)
 		last = err
 		terminal := errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission)
 		seedLoopbackTokenErrTotal.Add(1)
-		slog.Warn("prewarm.seed_loopback_token_unavailable",
+		slog.WarnContext(actx, "prewarm.seed_loopback_token_unavailable",
 			slog.String("subsystem", "cache"),
 			slog.String("err", redact.Err(err)),
 			slog.Bool("retried", !terminal),
