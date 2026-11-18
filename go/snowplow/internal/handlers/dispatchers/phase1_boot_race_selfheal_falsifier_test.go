@@ -120,12 +120,15 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 		}
 		bootRuns.Add(1)
 		// #1530: a bearer-carrying stage of this pass asks the pass's token
-		// source (what restactions/api stageBearer does); building the pass's
-		// SA context asks nothing, and each pass asks again
+		// source (what restactions/api stageBearer does) within its own
+		// context (2 s here); building the pass's SA context asks nothing,
+		// and each pass asks again
 		rctx := withPhase1SAContext(ctx, testSAEndpoint(), nil)
 		tok := ""
 		if src := loopbacktoken.SourceFrom(rctx); src != nil {
-			tok, _ = src(rctx)
+			sctx, cancel := context.WithTimeout(rctx, 2*time.Second)
+			tok, _ = src(sctx)
+			cancel()
 		}
 		lastToken.Store(&tok)
 		if !configPresent.Load() {

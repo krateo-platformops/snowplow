@@ -84,7 +84,6 @@ package dispatchers
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -1304,73 +1303,53 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	return rctx
 }
 
-// seedTokenProvider is the hook the seed path calls to obtain an authn-issued
-// JWT for the nested loopback /call. Wired ONCE at startup (main.go) to the
-// authn.Client's Token method; nil when authn is not configured (then the
-// seed runs token-less, the pre-#57 behaviour). Mirrors SetCustomerInflightHook
-// / SetRefreshHook — a package-level injection, not a threaded parameter.
+// seedTokenAcquirerCur is the shared acquisition of the seed's authn-issued JWT for the nested loopback /call
+// (seed_token_acquirer.go). Wired ONCE at startup (main.go) to the authn.Client's Token method; nil when authn is
+// not configured (then the seed runs token-less, the pre-#57 behaviour). Mirrors SetCustomerInflightHook /
+// SetRefreshHook — a package-level injection, not a threaded parameter.
 var (
-	seedTokenProviderMu sync.RWMutex
-	seedTokenProvider   func(ctx context.Context) (string, error)
+	seedTokenProviderMu  sync.RWMutex
+	seedTokenAcquirerCur *seedTokenAcquirer
 )
 
-// SetSeedLoopbackTokenProvider wires the seed's authn-token source. Safe to
-// call multiple times (later calls replace). A nil fn disables the install
-// (seed runs token-less — the pre-#57 degrade posture).
+// SetSeedLoopbackTokenProvider wires the seed's authn-token provider. Safe to call multiple times (later calls
+// replace, with a fresh acquisition state). A nil fn disables the source (seed runs token-less — the pre-#57
+// degrade posture).
 func SetSeedLoopbackTokenProvider(fn func(ctx context.Context) (string, error)) {
 	seedTokenProviderMu.Lock()
-	seedTokenProvider = fn
-	seedTokenProviderMu.Unlock()
+	defer seedTokenProviderMu.Unlock()
+	if fn == nil {
+		seedTokenAcquirerCur = nil
+		return
+	}
+	seedTokenAcquirerCur = newSeedTokenAcquirer(fn)
 }
 
-// seedLoopbackTokenErrTotal counts token-acquisition failures on the seed path
-// (C-a observability — "prewarm loopback ran token-less, nested RA cold").
+// seedLoopbackTokenErrTotal counts failed token exchanges on the seed path (C-a observability; #1531: one per failed
+// exchange of the shared acquisition, not one per asking stage nor per context build).
 var seedLoopbackTokenErrTotal atomic.Uint64
 
 // SeedLoopbackTokenErrTotal exposes the C-a degrade counter (expvar-published
 // in the metrics block + read by the falsifier).
 func SeedLoopbackTokenErrTotal() uint64 { return seedLoopbackTokenErrTotal.Load() }
 
-// installSeedLoopbackTokenSource puts on ctx the source a bearer-carrying stage
-// asks for the authn-issued token (#1530), and asks nothing itself: building a
-// prewarm context never waits for authn. No provider wired (authn not
-// configured) leaves ctx unchanged: such stages run token-less, the pre-#57
-// posture.
+// installSeedLoopbackTokenSource puts on ctx the source a bearer-carrying stage asks for the authn-issued token
+// (#1530), and asks nothing itself: building a prewarm context never waits for authn. No provider wired (authn not
+// configured) leaves ctx unchanged: such stages run token-less, the pre-#57 posture.
 //
-// The source asks the provider once per need. The provider (authn.Client.Token)
-// caches the token it gets until shortly before it expires, so once authn has
-// answered every later need is served from that cache. A failure (authn
-// unreachable or late, no projected token file, an empty token) is counted and
-// logged and returned: the asking stage runs token-less (its nested loopback RA
-// is not warmed this pass, the C-a degrade), and the next stage that needs a
-// token, or the next config-vars re-drive's walk, asks again. There is no retry
-// loop here: a wait for the token belongs to nobody but the stage that needs it,
-// and that stage's own context already bounds its one attempt.
+// The source is the shared acquisition (seedTokenAcquirer.ask): a stage that needs the token waits, within its own
+// context, for the one exchange every asking stage shares, tried again while authn is not yet serving (the rt8rv
+// boot race); the provider (authn.Client.Token) then serves later asks from its cache until shortly before the JWT
+// expires. A stage whose context ends first runs token-less (the C-a degrade); nothing that does not need the token
+// waits for it.
 func installSeedLoopbackTokenSource(ctx context.Context) context.Context {
 	seedTokenProviderMu.RLock()
-	fn := seedTokenProvider
+	acq := seedTokenAcquirerCur
 	seedTokenProviderMu.RUnlock()
-	if fn == nil {
+	if acq == nil {
 		return ctx // authn not configured — token-less seed (pre-#57 behaviour)
 	}
-	return loopbacktoken.WithSource(ctx, func(sctx context.Context) (string, error) {
-		tok, err := fn(sctx)
-		if err == nil && tok == "" {
-			err = errors.New("authn answered an empty token")
-		}
-		if err != nil {
-			seedLoopbackTokenErrTotal.Add(1)
-			slog.WarnContext(sctx, "prewarm.seed_loopback_token_unavailable",
-				slog.String("subsystem", "cache"),
-				slog.Any("err", err),
-				slog.String("effect", "this bearer-carrying prewarm stage runs token-less: its nested loopback "+
-					"/call RA is not warmed this pass (degraded, not fatal). The next stage that needs the token, "+
-					"and the next config-vars re-drive, ask authn again; nothing else waits for it (#1530)"),
-			)
-			return "", err
-		}
-		return tok, nil
-	})
+	return loopbacktoken.WithSource(ctx, acq.ask)
 }
 
 func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester, navHarvester *navWidgetHarvester, pagCollector *apiRefPaginationCollector) error {

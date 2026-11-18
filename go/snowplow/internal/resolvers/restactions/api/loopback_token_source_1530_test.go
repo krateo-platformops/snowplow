@@ -12,6 +12,7 @@ import (
 	"errors"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -59,26 +60,33 @@ func (s *t1530Source) asked() []string {
 }
 
 type t1530Env struct {
-	self, ext *x1106Srv
+	self, ext, own *x1106Srv
 }
 
-// t1530Setup: snowplow's own host (selfSrv, URL_SELF) and an external host (extSrv, another host and port), and three
+// t1530Setup: snowplow's own host (selfSrv, URL_SELF), an external host (extSrv, another host and port), and three
 // named endpointRef Secrets: self-ep -> snowplow itself, ext-ep and exp-ep -> the external host. None carries a token
-// of its own, so any Authorization on the wire is the appended bearer.
+// of its own, so any Authorization on the wire there is the appended bearer. And the requester's own clientconfig
+// (ownSrv, token own-tok), which a stage with no endpointRef dials (#292: never a Krateo JWT there).
 func t1530Setup(t *testing.T) t1530Env {
 	t.Helper()
-	e := t1530Env{self: newX1106Srv(t, false, x1106OK), ext: newX1106Srv(t, false, x1106OK)}
+	e := t1530Env{self: newX1106Srv(t, false, x1106OK), ext: newX1106Srv(t, false, x1106OK),
+		own: newX1106Srv(t, false, x1106OK)}
 	if !SetSelfHost(e.self.srv.URL) {
 		t.Fatalf("SetSelfHost(%q) did not take", e.self.srv.URL)
 	}
 	t.Cleanup(func() { SetSelfHost("") })
 	ext := x1106OtherURL(e.ext.srv)
-	x1106Env(t, "", map[string]map[string]string{
+	x1106Env(t, e.own.srv.URL, map[string]map[string]string{
 		"self-ep": {"server-url": e.self.srv.URL},
 		"ext-ep":  {"server-url": ext},
 		"exp-ep":  {"server-url": ext},
 	})
 	return e
+}
+
+// t1530Own is a stage with no endpointRef: it dials the requester's own clientconfig.
+func t1530Own(name, path string) *templates.API {
+	return &templates.API{Name: name, Verb: ptr.To("GET"), Path: path, ContinueOnError: ptr.To(true)}
 }
 
 func t1530Stage(name, ref, path string, exportJWT bool) *templates.API {
@@ -121,7 +129,8 @@ func t1530Auth(t *testing.T, z *x1106Srv, path string) []string {
 
 // TestLoopbackTokenSource_ReachesOnlyTheStagesTheDecisionAllows is the leak guard. One resolve, three stages on a
 // prewarm context (a source, no token): the self-loopback and the exportJwt opt-in present the source's token; the
-// plain external stage presents none, and the source is never asked for it. Every ask ran under the asking stage's
+// plain external stage presents none, the no-endpointRef stage presents its own clientconfig's token, and the source
+// is never asked for either (the SA-endpoint stage: loopback_token_source_sa_1530_test.go). Every ask ran under the asking stage's
 // own, live context (mutations: asking the source before bearerAppendForStage decides asks it for ext-ep too; asking
 // it under the resolve's root context loses the stage's endpointRef).
 func TestLoopbackTokenSource_ReachesOnlyTheStagesTheDecisionAllows(t *testing.T) {
@@ -130,7 +139,8 @@ func TestLoopbackTokenSource_ReachesOnlyTheStagesTheDecisionAllows(t *testing.T)
 	t1530Resolve(t, src.ask, "",
 		t1530Stage("self", "self-ep", "/call/self", false),
 		t1530Stage("ext", "ext-ep", "/ext", false),
-		t1530Stage("exp", "exp-ep", "/exp", true))
+		t1530Stage("exp", "exp-ep", "/exp", true),
+		t1530Own("own", "/api/v1/namespaces"))
 
 	if got := t1530Auth(t, e.self, "/call/self"); len(got) != 1 || got[0] != "Bearer "+t1530Token {
 		t.Fatalf("the self-loopback stage's Authorization: %q, want one request with the source's token", got)
@@ -140,6 +150,9 @@ func TestLoopbackTokenSource_ReachesOnlyTheStagesTheDecisionAllows(t *testing.T)
 	}
 	if got := t1530Auth(t, e.ext, "/ext"); len(got) != 1 || got[0] != "" {
 		t.Fatalf("THE LEAK: the plain external stage's Authorization: %q, want one request with none", got)
+	}
+	if got := t1530Auth(t, e.own, "/api/v1/namespaces"); len(got) != 1 || got[0] != "Bearer own-tok" {
+		t.Fatalf("THE LEAK (#292): the no-endpointRef stage's Authorization: %q, want its clientconfig's own token", got)
 	}
 	if got := src.asked(); len(got) != 2 || got[0] != "exp-ep" || got[1] != "self-ep" {
 		t.Fatalf("the source was asked under %q, want exactly once for each of exp-ep and self-ep, under their own "+
@@ -172,5 +185,32 @@ func TestLoopbackTokenSource_UnavailableTokenRunsTheStageTokenLess(t *testing.T)
 	}
 	if got := src.asked(); len(got) != 1 || got[0] != "self-ep" {
 		t.Fatalf("the source was asked %v, want once, for the self-loopback stage", got)
+	}
+}
+
+// TestLoopbackTokenSource_TheTokenIsNeverLogged (#1531 review N1): the leak test's resolve and the degrade, every log
+// line captured at debug: the source's token never reaches the log (mutation L5, logging it on the source path,
+// turns this RED). The resolve's own debug lines are there, so the scan is not vacuous.
+func TestLoopbackTokenSource_TheTokenIsNeverLogged(t *testing.T) {
+	w := &x1106Writer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	e := t1530Setup(t)
+	t1530Resolve(t, (&t1530Source{}).ask, "",
+		t1530Stage("self", "self-ep", "/call/self", false),
+		t1530Stage("ext", "ext-ep", "/ext", false),
+		t1530Stage("exp", "exp-ep", "/exp", true))
+	t1530Resolve(t, (&t1530Source{err: errors.New("dial tcp: connection refused")}).ask, "",
+		t1530Stage("self", "self-ep", "/call/self", false))
+	if got := t1530Auth(t, e.self, "/call/self"); len(got) != 2 || got[0] != "Bearer "+t1530Token {
+		t.Fatalf("premise: the self-loopback did not carry the token on the first resolve: %q", got)
+	}
+	out := w.String()
+	if !strings.Contains(out, "resolved endpoint for api call") {
+		t.Fatalf("the resolve logged no debug line: the scan would be vacuous\n%s", out)
+	}
+	if strings.Contains(out, t1530Token) {
+		t.Fatalf("the source's token reached the log:\n%s", out)
 	}
 }
