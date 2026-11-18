@@ -37,7 +37,7 @@ func TestForwarder847_CountsUnderItsEgress(t *testing.T) {
 		return m
 	}
 	before := cells()
-	f := NewForwarder(srv.URL)
+	f := mustForwarder(t, srv.URL)
 	for range 2 {
 		f.post(context.Background(), batch{body: []byte("spans"), spans: 1})
 	}

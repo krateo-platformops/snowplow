@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -70,7 +71,10 @@ func telemetryRouter(t *testing.T, url string) http.Handler {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	fwd := rum.NewForwarder(url)
+	fwd, err := rum.NewForwarder(url)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fwd.Start(ctx)
 	mux := http.NewServeMux()
 	stub := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
@@ -425,27 +429,54 @@ func TestS1015_ForwardedPayloadIsAllowlistOnly(t *testing.T) {
 	}
 }
 
-// Collector down: requests never block on it, and what cannot be delivered is
-// counted (forward_failed when it errors, forward_overflow when it hangs and
-// the queue is full).
+// Collector down: requests never block on it. A collector that refuses the
+// connection is retried (#1533: the batch is held, not dropped, and delivered
+// once the collector is back); one that hangs fills the queue, and every
+// further batch is counted forward_overflow.
 //
-// MUTATION (RED): Forwarder.enqueue made a blocking send.
+// MUTATION (RED): Forwarder.enqueue made a blocking send; the batch dropped on
+// the first refused connection (the behaviour before #1533).
 func TestS1015_CollectorDownNeverBlocksAndIsCounted(t *testing.T) {
-	// (1) Nothing listens: the post fails fast → forward_failed.
+	// (1) Nothing listens (the node's collector restarting): the request
+	// returns at once, the batch is held and retried, not counted failed, and
+	// it is delivered once a collector listens on that address again (after
+	// the exporter's first backoff interval, 5 s ±50 %).
 	dead := httptest.NewServer(http.NotFoundHandler())
+	addr := dead.Listener.Addr().String()
 	deadURL := dead.URL + "/v1/traces"
 	dead.Close()
 	h := telemetryRouter(t, deadURL)
 	before := rum.Read()
-	if rec := postRUM(t, h, mintRUMToken(t, "down-user"), otlpBody(t, rum.ServiceName, nil, widgetFetch())); rec.Code != http.StatusOK {
-		t.Fatalf("status %d with the collector down, want 200", rec.Code)
+	start := time.Now()
+	if rec := postRUM(t, h, mintRUMToken(t, "down-user"), otlpBody(t, rum.ServiceName, nil, widgetFetch())); rec.Code != http.StatusOK || time.Since(start) > time.Second {
+		t.Fatalf("status %d after %v with the collector down, want 200 at once", rec.Code, time.Since(start))
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for rum.Read().Spans["forward_failed"] == before.Spans["forward_failed"] {
+	time.Sleep(300 * time.Millisecond)
+	if d := rum.Read().Spans["forward_failed"] - before.Spans["forward_failed"]; d != 0 {
+		t.Fatalf("forward_failed moved by %d with the collector refusing connections: the batch was dropped, not held", d)
+	}
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("reopen the collector's address %s: %v", addr, err)
+	}
+	var backHits atomic.Int32
+	back := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	_ = back.Listener.Close()
+	back.Listener = l
+	back.Start()
+	t.Cleanup(back.Close)
+	deadline := time.Now().Add(15 * time.Second)
+	for rum.Read().Spans["forwarded"] == before.Spans["forwarded"] {
 		if time.Now().After(deadline) {
-			t.Fatal("forward_failed did not move with the collector down")
+			t.Fatal("the held batch was not delivered once the collector was back")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if d := rum.Read().Spans["forward_failed"] - before.Spans["forward_failed"]; d != 0 || backHits.Load() == 0 {
+		t.Fatalf("after the collector came back: forward_failed moved by %d, %d POSTs reached it", d, backHits.Load())
 	}
 
 	// (2) The collector accepts the connection and never answers: the worker

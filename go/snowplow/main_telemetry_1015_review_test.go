@@ -384,6 +384,9 @@ func TestS1015_DefaultOffContract(t *testing.T) {
 		{"master off, endpoint", "false", "", c.srv.URL, false},
 		{"tracing on + endpoint", "true", "", c.srv.URL, true},
 		{"per-signal on + endpoint", "", "true", c.srv.URL, true},
+		// #1535: an endpoint no attempt could reach is refused at start (one ERROR), the route stays off
+		{"tracing on + an endpoint that is not http(s)", "true", "", "ftp://collector:4318", false},
+		{"tracing on + an endpoint with no host (#1539)", "true", "", "http:///v1/traces", false},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -506,7 +509,10 @@ func TestS1015_AuthDropCountedOnce(t *testing.T) {
 	defer c.srv.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	fwd := rum.NewForwarder(c.srv.URL + "/v1/traces")
+	fwd, err := rum.NewForwarder(c.srv.URL + "/v1/traces")
+	if err != nil {
+		t.Fatal(err)
+	}
 	fwd.Start(ctx)
 	h := rum.CountAuthFailures(rum.NewIngest(fwd, nil))
 	before := rum.Read()
