@@ -100,17 +100,20 @@ func TestForward1535_PermanentTransportOnlyWhatIsIdentified(t *testing.T) {
 
 // TestForward1535_ASchemeThatCanNeverBeSentIsRefusedAtConfiguration: NewForwarder refuses a collector URL that is
 // not http or https, or that names no host (#1539), so it never reaches the worker (where it would be retried);
-// http and https with a host are accepted (mutations: the scheme check dropped reads a forwarder for ftp://; the host
-// check dropped reads one for http:///v1/traces).
+// http and https with a host are accepted, an IPv6 literal included (mutations: the scheme check dropped reads a
+// forwarder for ftp://; the host check dropped reads one for http:///v1/traces; a check on u.Host, the authority,
+// instead of the host name reads one for http://:4318/v1/traces).
 func TestForward1535_ASchemeThatCanNeverBeSentIsRefusedAtConfiguration(t *testing.T) {
 	for _, bad := range []string{"ftp://collector:4318/v1/traces", "unix:///run/otel.sock", "collector:4318/v1/traces",
-		"://collector", "http:///v1/traces", "https://", "http:/v1/traces"} {
+		"://collector", "http:///v1/traces", "https://", "http:/v1/traces",
+		"http://:4318/v1/traces", "http://:4318", "https://:4318/v1/traces", "http://@:4318/v1/traces",
+		"http://user:pw@:4318/v1/traces"} {
 		if f, err := NewForwarder(bad); err == nil || f != nil {
 			t.Errorf("NewForwarder(%q): forwarder %v, error %v; want refused", bad, f != nil, err)
 		}
 	}
 	for _, good := range []string{"http://10.0.0.1:4318/v1/traces", "https://collector.example/v1/traces",
-		"HTTP://10.0.0.1:4318/v1/traces"} {
+		"HTTP://10.0.0.1:4318/v1/traces", "http://[::1]:4318/v1/traces", "http://collector/v1/traces"} {
 		if _, err := NewForwarder(good); err != nil {
 			t.Errorf("NewForwarder(%q): %v, want accepted", good, err)
 		}
