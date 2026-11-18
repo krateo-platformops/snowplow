@@ -3,9 +3,12 @@ package rum
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
+	"syscall"
 	"time"
 
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
@@ -45,8 +48,9 @@ type batch struct {
 // tracing.WrapTransport'd: forwarding the browser's spans must not mint
 // snowplow Client spans of its own.
 //
-// #1533: a batch the collector cannot take NOW (a refused connection, a 429/502/503/504) stays at the head of the
-// queue and is tried again (forwardWait); one it refuses for good (any other answer) is counted forward_failed after
+// #1533: a batch the collector cannot take NOW (a 429/502/503/504, or no answer for a reason that heals: a refused
+// connection, a timeout; transientTransport) stays at the head of the queue and is tried again (deliver); one refused
+// for good (any other answer, or a transport failure that recurs on every attempt) is counted forward_failed after
 // that one attempt.
 type Forwarder struct {
 	url    string
@@ -157,12 +161,10 @@ const (
 // be retried." (429, 502, 503, 504) "All other 4xx or 5xx response status codes MUST NOT be retried."). So a 500,
 // the collector judging this payload itself, is a permanent refusal.
 //
-// A request that never got an answer (post's transport failure) is retried too, by the same specification, not by
-// upstream parity: OTLP/HTTP Connection, "If the client cannot connect to the server, the client SHOULD retry the
-// connection using an exponential backoff strategy between retries.", and OTLP/HTTP Response, "If the server
-// disconnects without returning a response, the client SHOULD retry and send the same request." (The OTel Go
-// exporter does NOT retry a refused connection: its url.Error is not Temporary.) A refused connection is exactly a
-// restarting node-local collector, the daemonset roll this was reported on (#1533).
+// A request that never got an answer is retried when the failure is one the same specification retries
+// (transientTransport: the server could not be reached, or went away without answering), not by upstream parity
+// (the OTel Go exporter does NOT retry a refused connection: its url.Error is not Temporary). A refused connection is
+// exactly a restarting node-local collector, the daemonset roll this was reported on (#1533).
 func forwardClass(status int) forwardOutcome {
 	switch {
 	case status/100 == 2:
@@ -190,7 +192,10 @@ func (f *Forwarder) post(ctx context.Context, b batch) (forwardOutcome, time.Dur
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return forwardTransient, 0
+		if transientTransport(err) {
+			return forwardTransient, 0
+		}
+		return forwardRefused, 0
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	_ = resp.Body.Close()
@@ -200,4 +205,38 @@ func (f *Forwarder) post(ctx context.Context, b batch) (forwardOutcome, time.Dur
 	}
 	ra, _ := credhttp.RetryAfter(resp)
 	return o, ra
+}
+
+// transientTransport reports whether a request that got no answer may be taken if sent again later (#1535
+// review): the transport failures the OTLP/HTTP specification retries, and only those. OTLP/HTTP Connection: "If the
+// client cannot connect to the server, the client SHOULD retry the connection using an exponential backoff strategy
+// between retries." OTLP/HTTP Response, All Other Responses: "If the server disconnects without returning a
+// response, the client SHOULD retry and send the same request." So: a connection refused, reset, aborted, a broken
+// pipe, a host or network unreachable (a collector restarting, a node network blip); the server gone without an
+// answer (EOF); the attempt timing out (ForwardTimeout, a dial or read timeout); a DNS failure the resolver calls
+// temporary. The specification has no word "transient" of its own: these two sentences are its retryable transport
+// cases. Every other failure recurs the same on every attempt however long the wait (a destination the dial policy
+// denies, a certificate the client does not trust, an unsupported scheme): held at the head of the queue it would
+// stall every later batch into forward_overflow, so it is a permanent refusal, one attempt and forward_failed, like
+// an answer outside the retryable set. (A refused redirect is an answer, a 3xx: forwardClass refuses it.)
+//
+// One disconnect shape is not retried, against the "disconnects without returning a response" sentence: a status
+// line cut before its code. Go's client reports a status line truncated by a disconnect ("HTTP/1.1 20", then EOF)
+// as `malformed HTTP status code`, an error with no type of its own and no EOF in its chain, so it cannot be told
+// from a server that answered garbage, which recurs. It is classified like that: permanent. A cut anywhere after the
+// status line reads as an unexpected EOF and is retried.
+func transientTransport(err error) bool {
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED), errors.Is(err, syscall.ECONNRESET),
+		errors.Is(err, syscall.ECONNABORTED), errors.Is(err, syscall.EPIPE),
+		errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH),
+		errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return dnsErr.IsTemporary || dnsErr.IsTimeout
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
