@@ -398,6 +398,12 @@ def test_in_chrome_each_sessions_page_maps_to_a_renderer_of_its_own_chrome(tmp_p
     samples = [r for r in o["renderers"] if r["kind"] == "renderer"]
     reads = [m for m in o["renderer_map"] if m.get("kind") == "renderer_map" and m.get("pid") is not None]
     assert samples and reads, (o["renderers"][:5], o["renderer_map"][:5])
+    # no failed read, at the sessions' end either: each Chrome closing its connection when its session ends is the
+    # watcher's close event, not a read (rehf1: 5 such closes were written as failed reads)
+    failed = [m for m in o["renderer_map"] if m.get("kind") == "renderer_map" and m.get("pid") is None]
+    assert failed == [], failed
+    closes = [m for m in o["renderer_map"] if m.get("kind") == "renderer_cdp" and m.get("event") == "close"]
+    assert all(c["read_in_flight"] is False for c in closes), closes
     assert all(":" in k for r in samples for k in r["rd"])     # (pid, starttime) keys
     for m in reads:
         assert m["udd"] in {u for (pid, _), u in udd.items() if pid == m["pid"]}, (m, udd)
