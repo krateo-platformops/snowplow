@@ -130,3 +130,60 @@ func TestRaceCounters_AChainWithoutCountingIsChargedToOther(t *testing.T) {
 		t.Fatalf("authn moved by %v; want {0, 2, 0}", d)
 	}
 }
+
+// TestRaceCounters_AConnectLevelRaceIsChargedToTheHTTPSWaitersEgress: the race fires in the address's CONNECT chain
+// (its trigger 5 ms, the first raw connect 60 ms; the TLS chain's own trigger 1 s, so it never races). The connect
+// chain's waiter is the TLS chain's attempt, which carries the stage request's connection counting into it, so the
+// connect-level race is charged to stage, not to "other" (mutation: the attempt not carrying the counting charges it
+// to "other").
+func TestRaceCounters_AConnectLevelRaceIsChargedToTheHTTPSWaitersEgress(t *testing.T) {
+	resetConnectTimes(t)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	addr := srv.Listener.Addr().String()
+	seedConnectTimes(setupKey(addr, true), time.Second)
+	seedConnectTimes(setupKey(addr, false), 5*time.Millisecond)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEMOf(srv))
+	cfg := &tls.Config{RootCAs: pool, NextProtos: []string{"h2"}}
+	var calls atomic.Int32
+	prev := endpointDialFn
+	endpointDialFn = func(ctx context.Context, network, a string) (net.Conn, error) {
+		if calls.Add(1) == 1 {
+			select {
+			case <-time.After(60 * time.Millisecond):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, a)
+	}
+	t.Cleanup(func() { endpointDialFn = prev })
+	ctx := countConnections(httptest.NewRequest(http.MethodGet, "https://"+addr+"/", nil), EgressStage)
+	connBefore := countsAt(&raceCounts, addr)
+	before := EgressRacesSnapshot()
+	c, err := endpointDialTLS(ctx, "tcp", addr, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	time.Sleep(150 * time.Millisecond) // the slow first connect has come up (or been cancelled) by now
+	if raceCountAt(setupKey(addr, false)) == 0 {
+		t.Fatal("the connect chain fired no race: the arm proves nothing about the connect level")
+	}
+	got := raceDeltas(before, EgressRacesSnapshot())
+	if want := countsAt(&raceCounts, addr) - connBefore; got[EgressStage][0] != want || got[EgressOther] != ([3]uint64{}) {
+		t.Fatalf("stage's races moved by %d, other's cell by %v; want stage = the destination's %d (both levels), "+
+			"other none", got[EgressStage][0], got[EgressOther], want)
+	}
+}
+
+// raceCountAt is one destination window's race count (one level).
+func raceCountAt(key string) uint64 {
+	if v, ok := raceCounts.Load(key); ok {
+		return v.(*atomic.Uint64).Load()
+	}
+	return 0
+}

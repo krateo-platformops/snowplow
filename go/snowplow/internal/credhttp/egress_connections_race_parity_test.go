@@ -4,8 +4,10 @@ package credhttp
 // over, per egress and protocol) through #1521's race, end to end through a stage client (CountConnectionsOn over
 // NewEndpointTransport), for https and plain http, a single setup, a raced one and one whose connect was dropped as
 // cover while stuck. Each scenario's cells are judged against the server's own count, an instrument outside the
-// client: opened in stage equals the connections the server completed (a handshake for https, an accept for http),
-// handovers equal the requests, and no other egress moves. It uses only what main had before the per-egress race
+// client: stage opened lies between the requests and the connections the server completed (a handshake for https,
+// an accept for http), handovers equal the requests, and no other egress moves. (Not "opened equals the server's
+// count": on main a raced TLS connection the server completed can go uncounted when its chain ends first, #1544.)
+// It uses only what main had before the per-egress race
 // counters, so the same arm runs on main and on the change: it shows the counting value the race's attempts now
 // carry into the address's connect chain changes no existing cell (no double count, nothing moved to or from
 // "other"). The deltas are logged for the record.
@@ -173,8 +175,9 @@ func parityArm(t *testing.T, https bool, tc parityCase) {
 	if https {
 		server = uint64(handshakes.Load())
 	}
-	if opened != server {
-		t.Fatalf("stage opened %d connections, the server completed %d (%s)", opened, server, raw)
+	if opened < uint64(tc.requests) || opened > server {
+		t.Fatalf("stage opened %d connections for %d requests, the server completed %d: want requests <= opened <= "+
+			"the server's (%s)", opened, tc.requests, server, raw)
 	}
 	if handovers != uint64(tc.requests) {
 		t.Fatalf("stage handed over %d connections for %d requests (%s)", handovers, tc.requests, raw)
