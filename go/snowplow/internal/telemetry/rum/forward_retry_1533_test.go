@@ -1,0 +1,331 @@
+package rum
+
+// forward_retry_1533_test.go — #1533: the forwarder follows the OTLP/HTTP rules for a collector that cannot take a
+// batch now (a refused connection, a 429/502/503/504: the batch is held at the head of the queue and tried again,
+// after the OTel exporter's backoff or the collector's Retry-After) and for one that refuses it for good (any other
+// answer: one attempt, forward_failed). The queue and the per-attempt timeout stay the only bounds; shutdown counts
+// what it holds as forward_failed. The waits are recorded, not slept (Forwarder.sleep), so no arm takes real
+// backoff time; the collector is a real httptest server (or a real closed port).
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
+)
+
+// collector1533 is a stand-in OTLP/HTTP collector: every POST counted, answered by `answer` (the POST's number,
+// from 1).
+type collector1533 struct {
+	posts  atomic.Int64
+	answer func(n int64, w http.ResponseWriter)
+}
+
+func (c *collector1533) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := c.posts.Add(1)
+		if c.answer == nil {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		c.answer(n, w)
+	})
+}
+
+// waits1533 records the forwarder's waits instead of sleeping them; onWait runs on each (the simulated time so far).
+type waits1533 struct {
+	mu     sync.Mutex
+	got    []time.Duration
+	total  time.Duration
+	onWait func(total time.Duration)
+}
+
+func (w *waits1533) sleep(ctx context.Context, d time.Duration) bool {
+	w.mu.Lock()
+	w.got = append(w.got, d)
+	w.total += d
+	total, hook := w.total, w.onWait
+	w.mu.Unlock()
+	if hook != nil {
+		hook(total)
+	}
+	return ctx.Err() == nil
+}
+
+func (w *waits1533) list() []time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]time.Duration(nil), w.got...)
+}
+
+func spansDelta(before Snapshot, key string) uint64 { return Read().Spans[key] - before.Spans[key] }
+
+// until polls cond for up to 5 s.
+func until(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: not within 5 s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func startForwarder(t *testing.T, f *Forwarder) context.CancelFunc {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	f.Start(ctx)
+	return cancel
+}
+
+// TestForward1533_AHealthyCollectorCostsOnePostPerBatch: with a collector that takes every batch, each batch is one
+// POST and no wait: the retry path costs nothing when nothing is wrong.
+func TestForward1533_AHealthyCollectorCostsOnePostPerBatch(t *testing.T) {
+	c := &collector1533{}
+	srv := httptest.NewServer(c.handler())
+	defer srv.Close()
+	f, w := NewForwarder(srv.URL+"/v1/traces"), &waits1533{}
+	f.sleep = w.sleep
+	before := Read()
+	startForwarder(t, f)
+	for i := 0; i < 20; i++ {
+		if !f.enqueue(batch{body: []byte("spans"), spans: 2}) {
+			t.Fatalf("batch %d: the queue refused it", i)
+		}
+	}
+	until(t, "40 spans forwarded", func() bool { return spansDelta(before, "forwarded") == 40 })
+	if p := c.posts.Load(); p != 20 {
+		t.Fatalf("20 batches made %d POSTs, want exactly 1 each", p)
+	}
+	if got := w.list(); len(got) != 0 || spansDelta(before, "forward_failed") != 0 {
+		t.Fatalf("a healthy collector: waits %v, forward_failed %d, want none", got, spansDelta(before, "forward_failed"))
+	}
+}
+
+// TestForward1533_ACollectorRefusingConnectionsThenUpLosesNothing is the daemonset roll (#1533, 057): the node-local
+// collector's port is closed (connections refused) for 12 s of backoff, then it serves. The five batches accepted
+// meanwhile are all forwarded, forward_failed and forward_overflow 0, one POST each once it is up; the waits follow
+// the exporter's backoff (5 s ±50 %, then x1.5, capped at 30 s) (mutation: dropping the batch on the first failure,
+// as before, reads forward_failed 15).
+func TestForward1533_ACollectorRefusingConnectionsThenUpLosesNothing(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close() // the port is closed: a connection is refused
+	c := &collector1533{}
+	var srv *httptest.Server
+	var up sync.Once
+	t.Cleanup(func() {
+		if srv != nil {
+			srv.Close()
+		}
+	})
+	f, w := NewForwarder("http://"+addr+"/v1/traces"), &waits1533{}
+	w.onWait = func(total time.Duration) {
+		if total >= 12*time.Second {
+			up.Do(func() {
+				l, err := net.Listen("tcp", addr)
+				if err != nil {
+					t.Errorf("reopen %s: %v", addr, err)
+					return
+				}
+				srv = httptest.NewUnstartedServer(c.handler())
+				_ = srv.Listener.Close()
+				srv.Listener = l
+				srv.Start()
+			})
+		}
+	}
+	f.sleep = w.sleep
+	before := Read()
+	for i := 0; i < 5; i++ {
+		f.enqueue(batch{body: []byte("spans"), spans: 3})
+	}
+	startForwarder(t, f)
+	until(t, "15 spans forwarded", func() bool { return spansDelta(before, "forwarded") == 15 })
+	if spansDelta(before, "forward_failed") != 0 || spansDelta(before, "forward_overflow") != 0 {
+		t.Fatalf("forward_failed %d, forward_overflow %d, want 0", spansDelta(before, "forward_failed"),
+			spansDelta(before, "forward_overflow"))
+	}
+	if p := c.posts.Load(); p != 5 {
+		t.Fatalf("the collector took %d POSTs once up, want 5", p)
+	}
+	got := w.list()
+	if len(got) < 2 {
+		t.Fatalf("waits %v: the outage was not retried through", got)
+	}
+	// the exporter's documented shape as literals (otlptracehttp v1.47.0 internal/retry, cenkalti/backoff v5.0.3), so a
+	// change to the forwarder's constants cannot loosen this arm with them
+	nominal := 5 * time.Second
+	for i, d := range got {
+		if d < nominal/2 || d > nominal*3/2 {
+			t.Fatalf("wait %d is %v, want the exporter's backoff %v ±50 %% (all: %v)", i, d, nominal, got)
+		}
+		if nominal = time.Duration(float64(nominal) * 1.5); nominal > 30*time.Second {
+			nominal = 30 * time.Second
+		}
+	}
+}
+
+func scripted(t *testing.T, answer func(n int64, w http.ResponseWriter)) (*Forwarder, *collector1533, *waits1533) {
+	t.Helper()
+	c := &collector1533{answer: answer}
+	srv := httptest.NewServer(c.handler())
+	t.Cleanup(srv.Close)
+	f, w := NewForwarder(srv.URL+"/v1/traces"), &waits1533{}
+	f.sleep = w.sleep
+	return f, c, w
+}
+
+// TestForward1533_ATransientAnswerIsRetriedUntilTaken: 503 three times, then 200: the batch is forwarded on the 4th
+// POST, nothing failed (mutation: a 503 not retried reads forward_failed 4).
+func TestForward1533_ATransientAnswerIsRetriedUntilTaken(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout} {
+		f, c, w := scripted(t, func(n int64, rw http.ResponseWriter) {
+			if n <= 3 {
+				rw.WriteHeader(status)
+				return
+			}
+			rw.WriteHeader(http.StatusOK)
+		})
+		before := Read()
+		startForwarder(t, f)
+		f.enqueue(batch{body: []byte("spans"), spans: 4})
+		until(t, fmt.Sprintf("%d: 4 spans forwarded", status), func() bool { return spansDelta(before, "forwarded") == 4 })
+		if c.posts.Load() != 4 || len(w.list()) != 3 || spansDelta(before, "forward_failed") != 0 {
+			t.Fatalf("%d: %d POSTs, %d waits, forward_failed %d; want 4, 3, 0", status, c.posts.Load(), len(w.list()),
+				spansDelta(before, "forward_failed"))
+		}
+	}
+}
+
+// TestForward1533_APermanentRefusalIsOneAttempt: a 400, and a 500 (the collector judging the payload itself: not in
+// the OTLP/HTTP retryable set), are each one POST and forward_failed, no wait (mutation: a 400 retried).
+func TestForward1533_APermanentRefusalIsOneAttempt(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusInternalServerError, http.StatusUnauthorized} {
+		f, c, w := scripted(t, func(_ int64, rw http.ResponseWriter) { rw.WriteHeader(status) })
+		before := Read()
+		startForwarder(t, f)
+		f.enqueue(batch{body: []byte("spans"), spans: 5})
+		until(t, fmt.Sprintf("%d: 5 spans failed", status), func() bool { return spansDelta(before, "forward_failed") == 5 })
+		time.Sleep(50 * time.Millisecond) // a retry, were there one, would have been made by now
+		if c.posts.Load() != 1 || len(w.list()) != 0 {
+			t.Fatalf("%d: %d POSTs, waits %v; want exactly 1 attempt and no wait", status, c.posts.Load(), w.list())
+		}
+	}
+}
+
+// TestForward1533_RetryAfterIsHonoured: a 503 with Retry-After: 40 waits at least 40 s (longer than any backoff
+// step: the header decides), then the batch is taken; a 503 with Retry-After: 1 waits the backoff (the longer of
+// the two) (mutation: Retry-After ignored reads a ~5 s wait).
+func TestForward1533_RetryAfterIsHonoured(t *testing.T) {
+	for _, tc := range []struct {
+		header   string
+		min, max time.Duration
+	}{
+		{"40", 40 * time.Second, 40*time.Second + time.Millisecond},
+		{"1", 2500 * time.Millisecond, 7500 * time.Millisecond}, // the exporter's 5 s ±50 %
+	} {
+		f, c, w := scripted(t, func(n int64, rw http.ResponseWriter) {
+			if n == 1 {
+				rw.Header().Set("Retry-After", tc.header)
+				rw.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			rw.WriteHeader(http.StatusOK)
+		})
+		before := Read()
+		startForwarder(t, f)
+		f.enqueue(batch{body: []byte("spans"), spans: 1})
+		until(t, "1 span forwarded", func() bool { return spansDelta(before, "forwarded") == 1 })
+		got := w.list()
+		if len(got) != 1 || got[0] < tc.min || got[0] > tc.max || c.posts.Load() != 2 {
+			t.Fatalf("Retry-After %s: waits %v after %d POSTs, want one wait in [%v, %v]", tc.header, got, c.posts.Load(),
+				tc.min, tc.max)
+		}
+	}
+}
+
+// TestForward1533_TheQueueFillsDuringAnOutageAndShutdownCountsWhatItHolds: the collector refuses connections; the
+// worker holds the first batch (its wait parked), the 64-batch queue fills behind it, and the next 10 portal
+// requests are answered at once with their spans counted forward_overflow (never held). Shutdown mid-retry counts
+// the held batch and the 64 queued ones forward_failed (mutation: the held batch not counted reads 64).
+func TestForward1533_TheQueueFillsDuringAnOutageAndShutdownCountsWhatItHolds(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	f := NewForwarder("http://" + addr + "/v1/traces")
+	waiting := make(chan struct{}, 1)
+	f.sleep = func(ctx context.Context, _ time.Duration) bool {
+		select {
+		case waiting <- struct{}{}:
+		default:
+		}
+		<-ctx.Done() // parked: the outage outlasts the test, until shutdown
+		return false
+	}
+	in := NewIngest(f, nil)
+	body := batchBody(t, 1)
+	post := func(i int) (int, time.Duration) {
+		req := httptest.NewRequest(http.MethodPost, Path, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req = req.WithContext(xcontext.BuildContext(context.Background(),
+			xcontext.WithUserInfo(jwtutil.UserInfo{Username: fmt.Sprintf("q1533-%d", i)})))
+		rec := httptest.NewRecorder()
+		start := time.Now()
+		in.ServeHTTP(rec, req)
+		return rec.Code, time.Since(start)
+	}
+	before := Read()
+	cancel := startForwarder(t, f)
+	if code, _ := post(0); code != http.StatusOK {
+		t.Fatalf("the first batch: %d", code)
+	}
+	select {
+	case <-waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker never began retrying the first batch")
+	}
+	for i := 1; i <= ForwardQueue+10; i++ {
+		done := make(chan [2]any, 1)
+		go func() {
+			code, took := post(i)
+			done <- [2]any{code, took}
+		}()
+		select {
+		case r := <-done:
+			if r[0].(int) != http.StatusOK || r[1].(time.Duration) > time.Second {
+				t.Fatalf("portal request %d: %v after %v, want answered at once", i, r[0], r[1])
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("portal request %d was held: the collector's outage reached the portal", i)
+		}
+	}
+	if o := spansDelta(before, "forward_overflow"); o != 10 {
+		t.Fatalf("forward_overflow %d, want the 10 past the %d-batch queue", o, ForwardQueue)
+	}
+	cancel()
+	until(t, "the held and queued batches counted", func() bool {
+		return spansDelta(before, "forward_failed") == ForwardQueue+1
+	})
+	if spansDelta(before, "forwarded") != 0 {
+		t.Fatalf("forwarded %d during an outage", spansDelta(before, "forwarded"))
+	}
+}

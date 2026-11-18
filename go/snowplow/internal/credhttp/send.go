@@ -385,17 +385,28 @@ func firstBackoff(base, maxB time.Duration) time.Duration {
 // retryAfter is RetryClient's 429 wait (plumbing's parseRetryAfter): the
 // Retry-After seconds or date, else 2 s.
 func retryAfter(resp *http.Response) time.Duration {
-	ra := resp.Header.Get("Retry-After")
-	if ra == "" {
-		return 2 * time.Second
-	}
-	if secs, err := strconv.Atoi(ra); err == nil {
-		return time.Duration(secs) * time.Second
-	}
-	if t, err := http.ParseTime(ra); err == nil {
-		return time.Until(t)
+	if d, ok := RetryAfter(resp); ok {
+		return d
 	}
 	return 2 * time.Second
+}
+
+// RetryAfter is the wait a response's Retry-After header asks for, in seconds
+// or as an HTTP date (time.Until it), and whether it holds one this parses.
+// The one Retry-After parser of the module: credhttp's retry loop and the RUM
+// forwarder (#1533) both read it here.
+func RetryAfter(resp *http.Response) (time.Duration, bool) {
+	ra := resp.Header.Get("Retry-After")
+	if ra == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(ra); err == nil {
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(ra); err == nil {
+		return time.Until(t), true
+	}
+	return 0, false
 }
 
 // sleepBudget waits d; false if the request's own context ended first or the
