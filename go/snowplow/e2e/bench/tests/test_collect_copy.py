@@ -134,6 +134,31 @@ def _phases(tmp_path: Path) -> Path:
     return _phases_file(tmp_path)
 
 
+def test_two_pods_copying_into_one_dest_are_two_copies(tmp_path):
+    """#1548 (reviewer-1480's N4c): a Job whose pod was replaced has two pods copying /out into the same dest. Each pod's
+    copy is its own: the second pod's verified copy does not hide the first pod's failed one, so collect.copies FAILs
+    naming the first pod's (mutation N4c: copies keyed without the pod read the second's record as the last word,
+    PASS). Through the evaluate CLI, as the verdict reads it."""
+    first = dict(_rec("interrupted", attempts=0, pod="k6load-aaaaa"), dest="/o/k6")
+    failed = dict(_rec("failed", attempts=3, pod="k6load-aaaaa",
+                       errors=["attempt 3: kubectl cp rc=1: error: unexpected EOF"]), dest="/o/k6")
+    second = dict(_rec("interrupted", attempts=0, pod="k6load-bbbbb"), dest="/o/k6")
+    verified = dict(_rec("verified", pod="k6load-bbbbb"), dest="/o/k6")
+    c, _ = collect_copy.copies_check([first, failed, second, verified])
+    assert c["result"] == "FAIL" and c["value"]["copies"] == 2, c
+    assert c["value"]["failed"] == 1 and c["value"]["verified"] == 1, c
+    assert "k6load's results (/out from k6load-aaaaa): failed after 3 attempt(s)" in c["why"], c
+    assert "k6load-bbbbb" not in c["why"], c
+    cc = tmp_path / "collect-copies.jsonl"
+    cc.write_text("".join(json.dumps(r) + "\n" for r in (first, failed, second, verified)))
+    p = subprocess.run([sys.executable, "-m", "bench.load606", "evaluate", str(_phases(tmp_path)), str(cc)],
+                       cwd=BENCH, capture_output=True, text=True, timeout=300)
+    v = json.loads(p.stdout)
+    cv = next(x for x in v["validity"] if x["check"] == "collect.copies")
+    assert cv["result"] == "FAIL" and "from k6load-aaaaa): failed" in cv["why"], cv
+    assert v["verdict"] == "INVALID", v["verdict"]
+
+
 @pytest.mark.parametrize("outcome", ["failed", "interrupted"])
 def test_through_the_cli_a_failed_or_interrupted_copy_makes_the_run_invalid_named(tmp_path, outcome):
     cc = tmp_path / "collect-copies.jsonl"
