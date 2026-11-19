@@ -616,15 +616,18 @@ def test_halt_tree_stops_a_step_before_it_can_start_its_next_command(shape):
     assert p.stdout.strip() == "CLEAN", (p.stdout, p.stderr[-2000:])
 
 
-# #1552: the evidence cap's line, with the copy's shell given time to reap its killed child before
-# its own kill arrives (`kill` wrapped to wait GAP_S after each kill, as above). kill_tree's
-# children-first walk let the shell report "Killed" into the err file the line is made of;
-# halt_tree freezes it first. publish_evidence, kill_tree and halt_tree are run606.sh's own.
+# #1552: the evidence cap's line, at run606's own timing (no-gap) and with the copy's shell given
+# time to reap its killed child before its own kill arrives (reap-window: `kill` wrapped to wait
+# GAP_S after each kill, as above). kill_tree's children-first walk let the shell report "Killed"
+# into the err file the line is made of, and run on into the publish; halt_tree freezes it first.
+# publish_evidence, kill_tree and halt_tree are run606.sh's own.
 _CAP_HARNESS = r"""
 set -u
 log() { echo "$*" >> "$OUT/run.log"; }
 %(fns)s
-kill() { builtin kill "$@"; local rc=$?; [[ "$1" == "-KILL" || "$1" == "-TERM" ]] && sleep "$GAP_S"; return $rc; }
+if [[ -n "$GAP_S" ]]; then
+  kill() { builtin kill "$@"; local rc=$?; [[ "$1" == "-KILL" || "$1" == "-TERM" ]] && sleep "$GAP_S"; return $rc; }
+fi
 DRY=0 VERDICT_MARK="$OUT/.no-verdict" EVIDENCE_RUN_ID=r EVIDENCE_CAP_S=1
 BENCH_606_HOLD_IN=evidence BENCH_606_HOLD_S="$TOKEN"
 publish_evidence before-teardown; echo "rc=$?"
@@ -633,7 +636,7 @@ if pgrep -f "sleep $TOKEN" >/dev/null; then echo SURVIVED; pkill -KILL -f "sleep
 """
 
 
-@pytest.mark.parametrize("gap_s", ["0", "0.5"], ids=["no-gap", "reap-window"])
+@pytest.mark.parametrize("gap_s", ["", "0.5"], ids=["no-gap", "reap-window"])
 def test_the_evidence_cap_line_is_its_own_even_when_the_copy_could_reap_first(tmp_path, gap_s):
     src = (BENCH_DIR / "run606.sh").read_text()
     fns = []
@@ -643,7 +646,7 @@ def test_the_evidence_cap_line_is_its_own_even_when_the_copy_could_reap_first(tm
         fns.append(m.group(0))
     out = tmp_path / "out"
     out.mkdir()
-    token = f"{700 + os.getpid() % 200}.{int(float(gap_s) * 10)}{os.getpid() % 1000}"
+    token = f"{700 + os.getpid() % 200}.{int(float(gap_s or 0) * 10)}{os.getpid() % 1000}"
     p = subprocess.run(["bash", "-c", _CAP_HARNESS % {"fns": "\n".join(fns)}],
                        env=dict(os.environ, OUT=str(out), EVIDENCE_DIR=str(tmp_path / "evidence"), TOKEN=token,
                                 GAP_S=gap_s), capture_output=True, text=True, timeout=60)
@@ -651,6 +654,7 @@ def test_the_evidence_cap_line_is_its_own_even_when_the_copy_could_reap_first(tm
     assert p.stdout.split() == ["rc=1", "CLEAN"], (p.stdout, p.stderr[-2000:], log)
     assert "EVIDENCE NOT SAFE (before-teardown, exit 124): stopped at its cap of 1s\n" in log, log
     assert "Killed" not in log, log
+    assert "evidence before-teardown:" not in log, log  # the copy stopped at its cap never ran on into the publish
 
 
 def test_an_out_left_by_an_earlier_run_is_refused_before_any_cloud_call(harness):  # noqa: F811
