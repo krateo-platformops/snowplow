@@ -104,6 +104,7 @@ func handshake1544(t *testing.T, atFinished bool, want int32) {
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	var completed atomic.Int32
+	closedByClient := make(chan error, 1) // what the server's first read after a completed handshake returned
 	go func() {
 		for {
 			raw, err := ln.Accept()
@@ -115,6 +116,11 @@ func handshake1544(t *testing.T, atFinished bool, want int32) {
 				sc := tls.Server(raw, &tls.Config{Certificates: srv.TLS.Certificates, MinVersion: tls.VersionTLS13})
 				if sc.HandshakeContext(context.Background()) == nil {
 					completed.Add(1) // the server's own count
+					// the client closed it (#1549 review): the server's next read ends, EOF or a reset (a TLS 1.3
+					// close with the server's session tickets unread is a RST), never a connection left open
+					_ = raw.SetReadDeadline(time.Now().Add(5 * time.Second))
+					_, err := sc.Read(make([]byte, 1))
+					closedByClient <- err
 				}
 			}(raw)
 		}
@@ -152,5 +158,21 @@ func handshake1544(t *testing.T, atFinished bool, want int32) {
 	if opened != uint64(completed.Load()) || d["stage/http1/opened"] != uint64(want) || len(d) > int(want) {
 		t.Fatalf("the cells moved by %v for the server's %d completed handshake(s); want stage/http1 opened %d and "+
 			"nothing else", d, completed.Load(), want)
+	}
+	if want == 1 {
+		// counted AND closed: the server's read after its handshake ends because the client closed the connection,
+		// not at its 5 s deadline (a counted connection left open would time out here). Whoever closes it: on this
+		// path crypto/tls's ctx watcher has already closed the raw connection (it is how the ctx's error got here),
+		// and closeLoser closes it again; this pins the property, not which close did it
+		select {
+		case err := <-closedByClient:
+			var ne net.Error
+			if err == nil || (errors.As(err, &ne) && ne.Timeout()) {
+				t.Fatalf("the server's read after the completed handshake returned %v; want it ended by the client's "+
+					"close (EOF or a reset)", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the server's read after the completed handshake never ended: the connection was left open")
+		}
 	}
 }
