@@ -556,14 +556,16 @@ kill_tree() {
   for c in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$sig" "$c"; done
   kill "-$sig" "$pid" 2>/dev/null || true
 }
-# halt_tree <pid>: TERM a tree none of which can react to it: each process is frozen before its
-# children are signalled, so a step whose command just died cannot start the next one, which
-# kill_tree's walk would miss (a collect, stopped in the teardown, ran on into the publish: #1194).
+# halt_tree <signal> <pid>: signal a tree none of which can react to it: each process is frozen
+# before its children are signalled, so a step whose command just died cannot start the next one,
+# which kill_tree's walk would miss (a collect, stopped in the teardown, ran on into the publish:
+# #1194), and a shell whose child just died cannot reap it and report it ("Killed") into the output
+# its caller reads (the evidence cap's line, #1552).
 halt_tree() {
-  local pid="$1" c
+  local sig="$1" pid="$2" c
   kill -STOP "$pid" 2>/dev/null || return 0
-  for c in $(pgrep -P "$pid" 2>/dev/null); do halt_tree "$c"; done
-  kill -TERM "$pid" 2>/dev/null || true
+  for c in $(pgrep -P "$pid" 2>/dev/null); do halt_tree "$sig" "$c"; done
+  kill "-$sig" "$pid" 2>/dev/null || true
   kill -CONT "$pid" 2>/dev/null || true
 }
 # At its bound the watchdog stops the command's whole tree; stopping the watchdog stops its own
@@ -610,7 +612,7 @@ capped() {
     if (( waited >= secs )) || [[ "$TD_SIGNALED" == "1" ]]; then
       CAPPED_HIT=1
       log "${label}: stopped after ${waited}s ($([[ "$TD_SIGNALED" == "1" ]] && echo 'signal during teardown' || echo "cap ${secs}s reached")); continuing"
-      halt_tree "$CAPPED_PID"
+      halt_tree TERM "$CAPPED_PID"
       break
     fi
     sleep 1 || true      # a process-group SIGINT kills sleep (130): never fatal here
@@ -625,14 +627,16 @@ on_teardown_signal() {
   TD_SIGNALED=1
   log "signal during teardown: collect/diagnostics cut short; proceeding to gke-down"
   if [[ -n "$CAPPED_PID" ]]; then
-    halt_tree "$CAPPED_PID"
+    halt_tree TERM "$CAPPED_PID"
   fi
 }
 
 # publish_evidence <stage>: OUT, copied and verified (bench/evidence.py). Shielded like gke-down: a
 # signal cuts collect and diagnostics short, but this copy is what the run was paid for. Under its
 # own bound, not `capped`, which stops at a signal; KILL, since the shield ignores TERM, so a hung
-# disk never holds gke-down. A failure says so and returns non-zero; the teardown goes on.
+# disk never holds gke-down; frozen first (halt_tree), so the shield cannot report its killed child
+# into the err file this function logs (#1552). A failure says so and returns non-zero; the
+# teardown goes on.
 publish_evidence() {
   local stage="$1" err="$OUT/.evidence-publish.log" pid t0 rc=0
   local cmd=(python3 -m bench.evidence publish --src "$OUT" --dest "$EVIDENCE_DIR"
@@ -650,7 +654,7 @@ publish_evidence() {
   t0=$SECONDS
   while kill -0 "$pid" 2>/dev/null; do
     if (( SECONDS - t0 >= EVIDENCE_CAP_S )); then
-      kill_tree KILL "$pid"
+      halt_tree KILL "$pid"
       rc=124
       echo "stopped at its cap of ${EVIDENCE_CAP_S}s" >> "$err"
       break
@@ -681,7 +685,7 @@ teardown() {
   stop_inflight_bounded   # a bounded call the signal or pair stop interrupted (#1170)
   # and a capped one (a step's collect): left running it would write into OUT beside the
   # teardown's own collect, and during the publish (#1194)
-  if [[ -n "$CAPPED_PID" ]]; then halt_tree "$CAPPED_PID"; CAPPED_PID=""; fi
+  if [[ -n "$CAPPED_PID" ]]; then halt_tree TERM "$CAPPED_PID"; CAPPED_PID=""; fi
   # #1297: no sampler runs here any more (they are in-cluster: incluster_teardown, below)
   # #1004: the full-widen stage's bodies and its password-bearing manifests
   # never outlive the run, whatever stopped it (no cluster call)
