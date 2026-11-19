@@ -7,10 +7,13 @@ package credhttp
 // channels and on the requests' joins), never timed. Each scenario's cells are judged against the server's own count, an instrument outside the
 // client: stage opened equals the connections the server completed (for https a handshake the server's own
 // HandshakeContext finished, client's Finished read; for http an accept), handovers equal the requests, and no other
-// egress moves. Equality holds since #1544 counts a raced TLS connection that completed as its chain ended. Its one
-// known exception (reviewer-1486, #1549): a TLS 1.3 close with the server's session tickets unread is a RST, which
-// can drop the client's Finished before the server reads it (counted opened, never completed on the server); not
-// observed in 45 events, and not allowed for here: the failure names it.
+// egress moves. Equality holds since #1544 counts a raced TLS connection that completed as its chain ended. Two known
+// exceptions, neither allowed for here (the failure names them): a TLS 1.3 close with the server's session tickets
+// unread is a RST, which can drop the client's Finished before the server reads it (counted opened, never completed
+// on the server; reviewer-1486, #1549; not observed in 45 events); and for plain http, net.Dialer turns a cancel
+// that lands as the connect completes into an error and closes the socket (golang/go#16523: accepted by the server,
+// never opened by the client), the connect-level twin of #1544, which this arm's connects cannot produce (a held
+// connect ignores its ctx once connected).
 // It uses only what main had before the per-egress race
 // counters, so the same arm runs on main and on the change: it shows the counting value the race's attempts now
 // carry into the address's connect chain changes no existing cell (no double count, nothing moved to or from
@@ -55,6 +58,7 @@ type parityCase struct {
 	name     string
 	trigger  time.Duration      // the destination's seeded trigger (0: cold, no race)
 	holds    map[int32]dialHold // what the n-th connect does; unlisted connects connect at once
+	cutFrom  int32              // when set, every connect from this one on is holdUntilCut (none reaches the server)
 	requests int
 	want     string // "race" | "stuck" | "loser" | "" : what the race must have done (the arm proves nothing otherwise)
 	httpOnly bool
@@ -79,22 +83,24 @@ const (
 func TestEgressConnections_UnchangedThroughTheRace(t *testing.T) {
 	cases := []parityCase{
 		{name: "single", requests: 1},
-		// the first connect never completes, the trigger 5 ms: the race fires and its attempt wins; the first is
-		// cut when the chain finishes and never reaches the server (nothing to count or close)
-		{name: "raced", trigger: 5 * time.Millisecond, holds: map[int32]dialHold{1: holdUntilCut},
+		// the first connect never completes, the trigger 5 ms: the race fires and its attempt (connect 2) wins;
+		// every later race attempt's connect (the trigger doubles, and under -race a handshake can outlast it) and
+		// the first are cut when the chain finishes: exactly one connection reaches the server
+		{name: "raced", trigger: 5 * time.Millisecond, holds: map[int32]dialHold{1: holdUntilCut}, cutFrom: 3,
 			requests: 1, want: "race"},
 		// two requests, one chain (the first connect waits for both to join), the trigger 100 ms: the first setup
 		// answers one; the other's own attempt never connects and, with no evidence for a whole interval, is
-		// dropped as cover; the race attempt that interval check starts serves it, and the stuck one is cut
+		// dropped as cover; the race attempt that interval check starts (connect 3) serves it; the stuck one and
+		// any later race attempt's connect are cut: exactly two connections reach the server
 		{name: "stuck", trigger: 100 * time.Millisecond, holds: map[int32]dialHold{1: holdUntilJoined, 2: holdUntilCut},
-			requests: 2, want: "stuck"},
+			cutFrom: 4, requests: 2, want: "stuck"},
 		// the first connect completes (the server accepts it) but its result is processed after the race's
 		// attempt served the request and the chain finished: a raced loser that came up, counted opened once
 		// (closeLoser) and closed unused. Plain http only: an https waiter's connect-level loser is no TLS
 		// connection and counted nowhere (the test below), and a TLS loser comes up only at the chain's cancel
-		// instant (#1544's arm)
+		// instant (#1544's arm). Later race attempts' connects are cut, as in raced: one loser, one winner
 		{name: "loser", trigger: 5 * time.Millisecond, holds: map[int32]dialHold{1: connectThenHoldUntilServed},
-			requests: 1, want: "loser", httpOnly: true},
+			cutFrom: 3, requests: 1, want: "loser", httpOnly: true},
 	}
 	for _, https := range []bool{true, false} {
 		for _, tc := range cases {
@@ -213,15 +219,21 @@ func parityArm(t *testing.T, https bool, tc parityCase) {
 		seedConnectTimes(setupKey(addr, false), tc.trigger)
 	}
 	var calls atomic.Int32
-	var dials sync.WaitGroup
+	// every connect the hook entered has returned (not a WaitGroup: a late race attempt's connect can enter after the
+	// wait begins, and a cut one, its ctx already ended, returns without dialling)
+	var returned atomic.Int32
 	joined, allJoined := atomic.Int32{}, make(chan struct{})
 	var racesAtJoin atomic.Uint64 // the races fired when the last request joined
 	served := make(chan struct{})
 	prev := endpointDialFn
 	endpointDialFn = func(ctx context.Context, network, a string) (net.Conn, error) {
-		dials.Add(1)
-		defer dials.Done()
-		switch tc.holds[calls.Add(1)] {
+		n := calls.Add(1)
+		defer returned.Add(1)
+		h := tc.holds[n]
+		if h == 0 && tc.cutFrom > 0 && n >= tc.cutFrom {
+			h = holdUntilCut
+		}
+		switch h {
 		case holdUntilCut:
 			<-ctx.Done()
 			return nil, ctx.Err()
@@ -285,12 +297,13 @@ func parityArm(t *testing.T, https bool, tc parityCase) {
 		t.Fatal(err)
 	}
 	close(served) // every request was served: the chain has finished (connectThenHoldUntilServed returns now)
-	dialsDone := make(chan struct{})
-	go func() { dials.Wait(); close(dialsDone) }()
-	select {
-	case <-dialsDone: // every connect of the arm has returned: nothing reaches the server after this
-	case <-time.After(10 * time.Second):
-		t.Fatal("a connect of the arm never returned (a held connect was not cut by its chain's finish)")
+	// every connect of the arm has returned: nothing reaches the server after this (a connect entering later is a
+	// cut one: its chain has finished, so it returns without dialling)
+	for deadline := time.Now().Add(10 * time.Second); returned.Load() != calls.Load(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of the arm's %d connects never returned (a held connect was not cut by its chain's finish)",
+				calls.Load()-returned.Load(), calls.Load())
+		}
 	}
 	if tc.want == "loser" {
 		select {
@@ -309,6 +322,10 @@ func parityArm(t *testing.T, https bool, tc parityCase) {
 		if racesFiredAt(addr) == racesBefore {
 			t.Fatal("no race fired: the arm proves nothing about a raced setup")
 		}
+		if accepted.Load() != 1 || (https && handshakes.Load() != 1) {
+			t.Fatalf("the server accepted %d and completed %d handshake(s); want exactly the race's one attempt",
+				accepted.Load(), handshakes.Load())
+		}
 	case "stuck":
 		if racesAtJoin.Load() != racesBefore {
 			t.Fatal("a race fired before both requests joined the chain: they were not one chain's waiters when " +
@@ -316,6 +333,10 @@ func parityArm(t *testing.T, https bool, tc parityCase) {
 		}
 		if stuckDroppedAt(addr) == stuckBefore {
 			t.Fatal("no connect was dropped as cover while stuck: the arm proves nothing about it")
+		}
+		if accepted.Load() != 2 || (https && handshakes.Load() != 2) {
+			t.Fatalf("the server accepted %d and completed %d handshake(s); want exactly the two that serve the "+
+				"requests", accepted.Load(), handshakes.Load())
 		}
 	case "loser":
 		if racesFiredAt(addr) == racesBefore || accepted.Load() != 2 {
@@ -343,9 +364,13 @@ func parityArm(t *testing.T, https bool, tc parityCase) {
 	}
 	if opened != server {
 		exception := ""
-		if https && opened > server {
-			exception = "; the one known exception (#1549): a TLS 1.3 close with the server's session tickets unread " +
+		switch {
+		case https && opened > server:
+			exception = "; a counting defect, unless it is the known exception (#1549): a TLS 1.3 close with the server's session tickets unread " +
 				"is a RST that can drop the client's Finished before the server reads it (counted, not completed)"
+		case !https && opened < server:
+			exception = "; a counting defect, unless it is the known exception (golang/go#16523): net.Dialer turns a cancel that lands as the " +
+				"connect completes into an error and closes the socket (accepted, never opened)"
 		}
 		t.Fatalf("stage opened %d connections, the server completed %d (for %d requests): want equal (%s)%s",
 			opened, server, tc.requests, raw, exception)
