@@ -215,7 +215,7 @@ func tokenRejected(w http.ResponseWriter, err error) error {
 // #1560 — a delegated token's refusal (missing, expired or a mismatch) is
 // session_credential_missing too: "the verified caller's own credential could
 // not be used", the closest reason the audit schema declares. It has no
-// delegated reason yet; the 401's cause carries the distinction.
+// delegated reason yet (#1562); the 401's cause carries the distinction.
 func credentialMissingReason(cred credsecret.Credential) string {
 	if cred.Kind == credsecret.KindStepUp {
 		return audit.DenialStepUpRequired
