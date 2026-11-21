@@ -37,11 +37,17 @@ func Resolve(ctx context.Context, items []templatesv1.ResourceRef) ([]templatesv
 		return nil, err
 	}
 
+	// #1564 — a ref that fails to resolve is NEVER dropped. Before, its error
+	// was joined into a value nothing read, so the ref vanished from
+	// status.resourcesRefs while the widget answered 200, with no log: a reader
+	// could not tell "this child failed" from "this widget has no such child".
+	// Now each failure is a failure entry in status (failedRef), a log line and
+	// a count, and the other refs resolve exactly as before.
 	results := []templatesv1.ResourceRefResult{}
 	for _, el := range items {
 		res, err2 := resolveOne(ctx, rc, &el)
 		if err2 != nil {
-			err = errors.Join(err, err2)
+			results = append(results, failedRef(ctx, &el, err2)...)
 			continue
 		}
 
@@ -61,7 +67,7 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 
 	gv, err := schema.ParseGroupVersion(in.APIVersion)
 	if err != nil {
-		return all, err
+		return all, &refError{class: FailedRefAPIVersionInvalid, err: err}
 	}
 	gvr := gv.WithResource(in.Resource)
 
@@ -92,7 +98,15 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 	}
 	kindStr, err := cache.KindForGVR(ctx, gvr, rc)
 	if err != nil {
-		return all, err
+		// #1564 — discovery said the type is not served (a typed answer), or
+		// discovery could not answer at all (unreachable, refused, the
+		// caller's credential): two different failures, told apart by type.
+		class := FailedRefDiscoveryFailed
+		var notServed *cache.KindNotServedError
+		if errors.As(err, &notServed) {
+			class = FailedRefTypeNotInstalled
+		}
+		return all, &refError{class: class, gvr: gvr, err: err}
 	}
 	gvk := gvr.GroupVersion().WithKind(kindStr)
 

@@ -121,6 +121,10 @@ var nonCacheInitPublishers = map[string][]string{
 	// resolve, cache on or off, so the refusal must stay observable with the
 	// cache off.
 	"internal/resolvers/restactions/api/per_user_ref.go": {"snowplow_endpointref_per_user_refused_total"},
+	// #1564 failed resourcesRef: a WIDGET-RESOLVER-path count — every widget
+	// resolve resolves its refs, cache on or off, so a ref that fails must stay
+	// observable with the cache off.
+	"internal/resolvers/widgets/resourcesrefs/failed.go": {"snowplow_resourcesrefs_failed_total"},
 	// #1116 reserved-extras refusal: same RESOLVER-path family — every
 	// RESTAction resolve, cache on or off, refuses extras that name a key the
 	// resolver writes, so the refusal must stay observable with the cache off.

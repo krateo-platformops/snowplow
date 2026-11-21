@@ -359,3 +359,78 @@ for, a widget's `apiRef`, and the target of a RESTAction stage with
 
 The top-level `reason`, `code` and `message` are unchanged by #1429, so the
 frontend's 424 state renders as before.
+
+## 7. A child reference that fails: a failure entry in `status.resourcesRefs` (#1564)
+
+Sections 1 to 6 are about a widget whose own `/call` fails. This section is
+about one **child reference** of a widget that answers 200.
+
+A widget lists its children in `status.resourcesRefs.items`. Each item has an
+`id`, a `verb`, `allowed`, and a `path` (the child's `/call`). A reference can
+fail to resolve for one of three reasons:
+
+| reason class | what happened |
+|---|---|
+| `api_version_invalid` | the reference's `apiVersion` does not parse |
+| `type_not_installed` | the apiserver's discovery says the type is not served: its group/version document is a 404, or it lists no such resource. Only this reference fails |
+| `discovery_failed` | discovery could not answer at all: unreachable, refused, or the caller's credential was refused. Every reference whose type snowplow has not already looked up fails the same way on that resolve |
+
+**Before #1564** such a reference was silently dropped. It was missing from
+`items`, the widget still answered 200, and nothing was logged. A reader that
+looks children up by `id` could not tell "this child failed" from "this
+widget has no such child".
+
+**From #1564 on** it is a **failure entry**, one per verb the reference
+declares, exactly where its working entry would be:
+
+```json
+{"id":"sider","verb":"GET","allowed":false,"error":{"kind":"Status","apiVersion":"v1","status":"Failure","message":"The type menus (widgets.templates.krateo.io/v1beta1) is not installed on this cluster.","reason":"FailedDependency","details":{"group":"widgets.templates.krateo.io","kind":"menus","causes":[{"reason":"TypeNotInstalled","message":"widgets.templates.krateo.io/v1beta1","field":"apiVersion"}]},"code":424}}
+```
+
+- **`error`** is present only on a failure entry. It is the same k8s-style
+  `Status` this document describes for a widget's own failure:
+  - `type_not_installed`: the section 6 type-not-installed body itself (424,
+    `FailedDependency`, one `TypeNotInstalled` cause).
+  - `discovery_failed`: discovery's own code and reason when it answered one
+    (401, 403, 429, 5xx), else 500 `InternalError`, with no `details`.
+  - `api_version_invalid`: 500 `InternalError`, as a resolve failure with no
+    HTTP status is (section 1).
+- **The message** is built from the reference's coordinates alone. It never
+  carries the apiserver's text or an identity.
+- **There is no `path`.** Nothing can fetch a failure entry as if it were a
+  working child.
+- **`allowed` is `false`**, because no action is possible. It is also what the
+  per-user re-check on a cached answer gives a path-less item, so the cold
+  and cached answers agree.
+- **Read `error` before `allowed`.** A failure entry is not an RBAC denial,
+  and an entry with `error` must not be read as one.
+
+Snowplow also:
+- logs one line per failed reference, with its class and the redacted error.
+  The line is a WARN when a customer's request resolves it, and Debug, with
+  the driver's origin, when a background driver does (the #563 rule);
+- counts it in `snowplow_resourcesrefs_failed_total{reason}` (expvar,
+  `/debug/vars`), with all three cells always present;
+- **serves the widget but does not cache it** (the #313 Put-gate). A
+  transient discovery failure is therefore never pinned for that identity:
+  the next request resolves the reference again. `KindForGVR` itself
+  remembers only successes.
+
+**What the portal at frontend `1.8.51` does with a failure entry** (traced at
+tag `1.8.51`; snowplow cannot change any of it):
+- `WidgetRenderer` puts every `allowed: false` item's id into
+  `deniedRefIds` and removes it from `resourcesRefs.items`.
+- `RefChild` renders nothing for a denied id ("a denial reads as absence",
+  X2). `Layout`'s slots render nothing for an id with no `path`.
+  `navModel.isNavEntryAllowed` hides an entry whose ref is absent while
+  another ref was denied.
+- Nothing in 1.8.51 reads an item's `error`. It knows the 424 vocabulary only
+  for a widget's own fetch (`WidgetDependencyMissing`).
+
+So **at 1.8.51 the page looks exactly as it did before #1564**. The failure
+is now visible in the `/call` body, in snowplow's log and in the counter, and
+it is no longer cached. It is not yet drawn. The portal shows "this part
+failed" once it reads `error` before its `allowed` filter. For example,
+`RefChild` and `Layout` could render the section 3a state (title "Data source
+unavailable", the entry's `error.message`) for an id whose entry carries
+`error`. That is a frontend change.

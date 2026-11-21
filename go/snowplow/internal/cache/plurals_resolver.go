@@ -62,6 +62,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -356,6 +357,12 @@ func discoverKindForGVR(ctx context.Context, gvr schema.GroupVersionResource, rc
 		return "", plurals.Info{}, fmt.Errorf("plurals discovery: %w", err)
 	}
 	list, err := dc.ServerResourcesForGroupVersion(gvr.GroupVersion().String())
+	if apierrors.IsNotFound(err) {
+		// #1564 — the group/version's discovery document is a 404: the
+		// apiserver does not serve the type. Typed, so a reader tells it from
+		// a discovery that could not be read; the text stays the apiserver's.
+		return "", plurals.Info{}, &KindNotServedError{GVR: gvr, err: err}
+	}
 	if err != nil {
 		return "", plurals.Info{}, err
 	}
@@ -375,8 +382,25 @@ func discoverKindForGVR(ctx context.Context, gvr schema.GroupVersionResource, rc
 			Shorts:   el.ShortNames,
 		}, nil
 	}
-	return "", plurals.Info{}, fmt.Errorf("plurals discovery: resource %q not found in %s", gvr.Resource, gvr.GroupVersion())
+	return "", plurals.Info{}, &KindNotServedError{GVR: gvr,
+		err: fmt.Errorf("plurals discovery: resource %q not found in %s", gvr.Resource, gvr.GroupVersion())}
 }
+
+// KindNotServedError is KindForGVR's answer when discovery says the apiserver
+// does not serve gvr (#1564): its group/version's discovery document is a 404,
+// or lists no such resource. Any other KindForGVR error means discovery could
+// not answer (unreachable, refused, no credential): an unknown, never "not
+// served". Its text is the underlying error's, unchanged.
+type KindNotServedError struct {
+	GVR schema.GroupVersionResource
+	err error
+}
+
+func (e *KindNotServedError) Error() string { return e.err.Error() }
+
+// Unwrap is the underlying error (an apiserver NotFound, or the
+// not-in-the-document error).
+func (e *KindNotServedError) Unwrap() error { return e.err }
 
 // containsSlash is a small inline helper — strings.ContainsRune
 // would be equivalent but a single-byte search is cheaper and the

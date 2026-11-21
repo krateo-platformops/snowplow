@@ -35,6 +35,7 @@
 package statusdetails
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/krateo-platformops/plumbing/http/response"
@@ -77,19 +78,35 @@ func (e *TypeNotInstalledError) Unwrap() error {
 	}}
 }
 
-// Status is the answer on the wire: the one place its body is built.
+// Status is the answer on the wire (TypeNotInstalledStatus).
 func (e *TypeNotInstalledError) Status() *response.Status {
+	return TypeNotInstalledStatus(e.GVR, e.Message)
+}
+
+// TypeNotInstalledMessage is the reader-facing sentence for a type that is not
+// installed: the type's coordinates and nothing else (no object, namespace or
+// identity, none of the apiserver's text).
+func TypeNotInstalledMessage(gvr schema.GroupVersionResource) string {
+	return fmt.Sprintf("The type %s (%s) is not installed on this cluster.", gvr.Resource, gvr.GroupVersion())
+}
+
+// TypeNotInstalledStatus is the type-not-installed body: the one place it is
+// built. A widget /call answers it whole (TypeNotInstalledError.Status), and
+// #1564 a widget's resourcesRefs entry carries it for one child reference
+// whose type discovery says is not served. Either way it is snowplow's own
+// decision, never recognised from an upstream body.
+func TypeNotInstalledStatus(gvr schema.GroupVersionResource, message string) *response.Status {
 	st := response.New(http.StatusFailedDependency, nil)
 	st.Status = response.StatusFailure
 	st.Reason = ReasonFailedDependency
-	st.Message = e.Message
+	st.Message = message
 	st.Details = &response.StatusDetails{
-		Group: e.GVR.Group,
-		Kind:  e.GVR.Resource,
+		Group: gvr.Group,
+		Kind:  gvr.Resource,
 		Causes: []response.StatusCause{{
 			Type:    CauseTypeNotInstalled,
 			Field:   "apiVersion",
-			Message: e.GVR.GroupVersion().String(),
+			Message: gvr.GroupVersion().String(),
 		}},
 	}
 	return st

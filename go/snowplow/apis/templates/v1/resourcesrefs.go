@@ -1,5 +1,7 @@
 package v1
 
+import "github.com/krateo-platformops/plumbing/http/response"
+
 type Slice struct {
 	Continue bool
 	Offset   int
@@ -73,6 +75,16 @@ type ResourceRefResult struct {
 	// (RawMessage-verbatim) encodes fine but is unsound here — it panics the
 	// unstructured deep-copy.
 	Rendered map[string]any `json:"rendered,omitempty"`
+	// Error is set, and only set, on a FAILURE entry (#1564): the reference
+	// could not be resolved (its apiVersion does not parse, discovery says its
+	// type is not served, or discovery could not answer). It is the same
+	// k8s-style Status a widget /call answers for a failed dependency
+	// (docs/howto-frontend-widget-dependency-status.md): code, reason, an
+	// identity-free message and, for a type that is not installed, the
+	// TypeNotInstalled details. A failure entry carries the ref's id and verb,
+	// allowed:false (no action is possible) and NO path, so nothing can fetch
+	// it as if it were a working child.
+	Error *response.Status `json:"error,omitempty"`
 }
 
 // ResourceRefPayload is the template action result payload.
