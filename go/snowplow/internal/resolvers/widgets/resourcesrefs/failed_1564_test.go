@@ -33,6 +33,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/env"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
@@ -83,6 +84,12 @@ type f1564API struct {
 
 func newF1564API(t *testing.T) *f1564API {
 	t.Helper()
+	// The caller's endpoint keeps its server URL only in test mode
+	// (credhttp.NewClientConfig rewrites it to the in-cluster apiserver
+	// otherwise), so discovery reaches this fake.
+	prevTM := env.TestMode()
+	env.SetTestMode(true)
+	t.Cleanup(func() { env.SetTestMode(prevTM) })
 	a := &f1564API{served: map[string][]string{}, fail: map[string]int{}}
 	a.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.gets.Add(1)
