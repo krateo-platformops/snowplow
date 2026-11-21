@@ -280,6 +280,7 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 		authnNS:    opts.AuthnNS,
 		username:   user.Username,
 		groups:     user.Groups,
+		act:        user.Act, // #1560: credsecret.Select reads it
 		rc:         opts.RC,
 		provenance: opts.Provenance,
 	}

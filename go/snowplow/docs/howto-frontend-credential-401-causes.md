@@ -1,4 +1,4 @@
-# Frontend integration: every 401 snowplow refuses before dispatch says why (#1029, #1076)
+# Frontend integration: every 401 snowplow refuses before dispatch says why (#1029, #1076, #1560)
 
 This guide is for a frontend session, and for any other client of snowplow
 (oasgen's RDC, scripts). It answers two questions about a 401 from snowplow:
@@ -6,14 +6,15 @@ This guide is for a frontend session, and for any other client of snowplow
 1. **Was anything dispatched?** Did snowplow refuse the request before sending
    anything upstream, or did the 401 come back from upstream, possibly after a
    write had already happened?
-2. **What should the portal do?** Log in again, step up again, or neither.
+2. **What should the portal do?** Log in again, step up again, exchange a
+   delegated token again, or none of these.
 
 The rule is short:
 
-- **A 401 whose `details.causes[0].reason` is one of the six in section 2**
+- **A 401 whose `details.causes[0].reason` is one of the eight in section 2**
   is a snowplow refusal **before dispatch**. Nothing was sent upstream: no
   apiserver call, no RESTAction stage, no write.
-- **Any other 401** (no `details`, or a reason outside the six) is one
+- **Any other 401** (no `details`, or a reason outside the eight) is one
   snowplow does **not** vouch for. It may have been relayed from upstream
   after the request was dispatched, and a write may already have happened. Do
   **not** drop the token and replay the request on it.
@@ -26,7 +27,8 @@ Everything below comes from the handler code:
   header-or-cookie token check);
 - `internal/handlers/middleware/credential_status.go` (the closed set and the
   Status it writes);
-- `internal/credsecret/credsecret.go` (which Secret a token reads, #994);
+- `internal/credsecret/credsecret.go` (which Secret a token reads, #994 and
+  #1560: `Select`);
 - `internal/handlers/call.go` and `internal/handlers/dispatchers/restactions.go`
   (the two relays of an upstream 401).
 
@@ -67,12 +69,31 @@ guards:
 - the `/debug/*` surface.
 
 Which credential Secret `UserConfig` reads depends only on the **validated
-JWT's `groups`**:
+JWT's `act` and `groups`**:
 
 | token | Secret read |
 |---|---|
-| `groups` contains `krateo:loa:2` (a step-up login, authn `POST /oidc/stepup`) | `<user>-clientconfig-stepup` |
+| carries `act` (a delegated token, authn `/delegate`, #1560) | the delegated credential for the person and the token's outermost actor (`act.sub`), named by plumbing's `endpoints.DelegatedSecretName`: `delegated-` and 64 hex digits |
+| no `act`, `groups` contains `krateo:loa:2` (a step-up login, authn `POST /oidc/stepup`) | `<user>-clientconfig-stepup` |
 | any other token | `<user>-clientconfig` |
+
+A delegated token has no step-up branch and no fallback: whatever its groups,
+it reads only its delegated credential, never the person's session Secret.
+The same choice is made by a RESTAction stage that dials the caller's own
+credential, so the middleware and the stage never use different credentials
+for one token.
+
+A delegated credential is used only when plumbing's
+`endpoints.CheckDelegatedCredential` holds for the token: its
+`authn.krateo.io/username` and `authn.krateo.io/actor` annotations name the
+token's subject and outermost actor; its client certificate's CN is the
+subject, the certificate is valid now, and its Organizations are exactly the
+token's `groups` as issued (compared as sets). authn writes this Secret with
+no labels, and snowplow reads none. If snowplow's informer copy fails the
+check (for example, it still holds the version a re-exchange just replaced),
+snowplow re-reads that Secret from the apiserver once and uses it if that
+copy passes. That happens only right after a re-exchange: while the informer
+is current it adds no apiserver read.
 
 `<user>` is the exact username when it is a valid Secret name (authn#140),
 and otherwise, or for a Secret written before authn#140, the username made
@@ -99,10 +120,16 @@ name.
     normally `TokenExpired`, not `StepUpRequired`.
 - **Session case.** The session Secret was deleted, for example by an admin or
   by a logout on another device.
+- **Delegated case.** The delegated credential is absent, or is not authn's
+  credential for this person through this actor
+  (`DelegatedCredentialMissing`); or it is theirs but has expired (authn
+  issues it for about 600 seconds) or carries other groups than the token
+  (`DelegatedCredentialMismatch`). Either way, the client exchanges the token
+  again through authn's `/delegate`.
 
 ## 2. The closed set
 
-Snowplow emits exactly these six reasons, and every one of them means
+Snowplow emits exactly these eight reasons, and every one of them means
 **nothing was dispatched**:
 
 | reason | emitted when | middleware | `WWW-Authenticate` | portal outcome |
@@ -113,6 +140,8 @@ Snowplow emits exactly these six reasons, and every one of them means
 | `KeyNotPublished` | the token names a signing key (`kid`) that authn no longer publishes: authn's key set, fetched after the token was issued, does not hold it. The key was retired, for example to revoke the tokens it signed. No retry makes the token valid | both | `Bearer error="invalid_token"` | **log in again** |
 | `SessionCredentialMissing` | a valid token without `krateo:loa:2`; its session credential Secret is missing | `UserConfig` | `Bearer error="invalid_token"` | **log in again** |
 | `StepUpRequired` | a valid token with `krateo:loa:2`; its step-up credential Secret is missing | `UserConfig` | `Bearer error="insufficient_user_authentication"` | **prompt to step up** |
+| `DelegatedCredentialMissing` | a valid token with `act`; its delegated credential Secret is missing, or is not authn's credential for this person through this actor | `UserConfig` | `Bearer error="invalid_token"` | **exchange the token again** (`/delegate`) |
+| `DelegatedCredentialMismatch` | a valid token with `act`; its delegated credential is this person's and actor's, but its certificate has expired or its groups are not the token's | `UserConfig` | `Bearer error="invalid_token"` | **exchange the token again** (`/delegate`) |
 
 `TokenExpired` is only reported once the signature has been verified. An
 expired token signed with the wrong key is `TokenInvalid`.
@@ -208,17 +237,49 @@ WWW-Authenticate: Bearer error="insufficient_user_authentication"
 {"kind":"Status","apiVersion":"v1","status":"Failure","message":"secrets \"alice-clientconfig-stepup\" not found","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"StepUpRequired","message":"the step-up credential is missing or expired; step up again"}]}}
 ```
 
-### 2g. What is guaranteed
+### 2g. DelegatedCredentialMissing
+
+`alice`'s delegated token, issued through the actor `my-agent`:
+
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+WWW-Authenticate: Bearer error="invalid_token"
+
+{"kind":"Status","apiVersion":"v1","status":"Failure","message":"secrets \"delegated-f1c3254e9f0b7f9d465f98290d8321af4b7f3445f8900e0fb6128aba88aac6da\" not found","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"DelegatedCredentialMissing","message":"the delegated credential is missing; exchange the token again"}]}}
+```
+
+The `message` names the delegated Secret, a SHA-256 of the username and the
+actor. It goes only to the caller holding that token. Snowplow scrubs the name
+from its own logs. A Secret that exists but is someone else's gets the same
+answer, under the same name.
+
+### 2h. DelegatedCredentialMismatch
+
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+WWW-Authenticate: Bearer error="invalid_token"
+
+{"kind":"Status","apiVersion":"v1","status":"Failure","message":"the delegated credential does not match the token's groups","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"DelegatedCredentialMismatch","message":"the delegated credential has expired or does not match the token; exchange the token again"}]}}
+```
+
+For an expired credential the `message` is `the delegated credential has
+expired`. Neither names a Secret or an identity.
+
+### 2i. What is guaranteed
 
 - **The body is the contract.** Read `details.causes[0].reason`.
 - **The set is closed.** Snowplow writes no other reason on a 401. A future
   reason would be a contract change, announced like this one.
 - **The cause is chosen by snowplow, never copied.** It comes from what the
   middleware itself established: whether a token was presented, the token
-  validator's typed error, and the validated token's groups (the same input
-  that chose the Secret). It is never taken from the request body or from an
-  upstream answer. A token without `krateo:loa:2` can never receive
-  `StepUpRequired`.
+  validator's typed error, and the validated token's groups and `act` (the same input
+  that chose the Secret), and, for a delegated token, the outcome of
+  `endpoints.CheckDelegatedCredential`. It is never taken from the request
+  body or from an upstream answer. A token without `krateo:loa:2` can never
+  receive `StepUpRequired`, and a token without `act` can never receive a
+  `Delegated*` cause.
 - **Existing readers are unaffected.** `kind`, `apiVersion`, `status`,
   `message`, `reason:"Unauthorized"` and `code:401` are byte-identical to the
   plumbing Status snowplow sent before, in the same order. `details` is
@@ -227,8 +288,9 @@ WWW-Authenticate: Bearer error="insufficient_user_authentication"
 - **`causes[0].message` is for humans.** It is a fixed English sentence with no
   identity in it. Do not branch on it.
 - **`message` is unchanged.** For the credential causes it still names the
-  caller's own Secret (as before, and only ever sent to that caller). Do not
-  parse it.
+  caller's own Secret (as before, and only ever sent to that caller), except
+  `DelegatedCredentialMismatch`, whose message names nothing. Do not parse
+  it.
 - **The header is optional.** A bare `Bearer` (no token presented) and
   `Bearer error="invalid_token"` (a token presented and refused) are the RFC
   6750 §3.1 challenges. `Bearer error="insufficient_user_authentication"` is the RFC 9470
@@ -245,7 +307,7 @@ WWW-Authenticate: Bearer error="insufficient_user_authentication"
 
 ## 3. A 401 without a snowplow cause: snowplow does not vouch that nothing was dispatched
 
-A 401 with no `details`, or with a reason outside the six, is one snowplow
+A 401 with no `details`, or with a reason outside the eight, is one snowplow
 does not vouch for. It may be an upstream 401 snowplow relayed, a route
 mounted without its auth middleware (no route is, today), or a hop in front
 of snowplow.
@@ -331,6 +393,8 @@ components. Keep them distinct; never collapse them into one.
 | `KeyNotPublished` | **snowplow** | 401 | log in again |
 | `SessionCredentialMissing` | **snowplow** | 401 | log in again (session resume) |
 | `StepUpRequired` | **snowplow** | 401 | **prompt to step up** |
+| `DelegatedCredentialMissing` | **snowplow** | 401 | the delegated client exchanges the token again |
+| `DelegatedCredentialMismatch` | **snowplow** | 401 | the delegated client exchanges the token again |
 | `InsufficientAssurance` | **authn** (`POST /oidc/stepup`) | 403 | prompt to step up |
 | `StaleAuthentication` | **authn** (`POST /oidc/stepup`) | 403 | **re-authenticate** |
 | `StepUpNotEnabled` | **authn** | 403 | **configuration fault**: tell the admin; never prompt |
@@ -435,7 +499,7 @@ A client that re-sends a request by itself must gate the replay on
 five reasons a fresh login fixes may trigger "drop the token, log in, replay":
 
 ```ts
-// The six snowplow pre-dispatch causes (#1029, #1076, plumbing v1.36.0): nothing was dispatched.
+// The eight snowplow pre-dispatch causes (#1029, #1076, plumbing v1.36.0, #1560): nothing was dispatched.
 export const SNOWPLOW_PRE_DISPATCH_CAUSES = [
   'TokenMissing',
   'TokenInvalid',
@@ -443,6 +507,8 @@ export const SNOWPLOW_PRE_DISPATCH_CAUSES = [
   'KeyNotPublished',
   'SessionCredentialMissing',
   'StepUpRequired',
+  'DelegatedCredentialMissing',
+  'DelegatedCredentialMismatch',
 ] as const
 
 // The five a fresh login fixes. StepUpRequired is NOT one of them: a login does
@@ -465,7 +531,7 @@ export function causeOf(body: unknown): string | null {
   return typeof r === 'string' && r.length > 0 ? r : null
 }
 
-/** True only for a 401 whose cause is one of snowplow's six: nothing was dispatched. */
+/** True only for a 401 whose cause is one of snowplow's eight: nothing was dispatched. */
 export function refusedBeforeDispatch(status: number, body: unknown): boolean {
   return status === 401 && has(SNOWPLOW_PRE_DISPATCH_CAUSES, causeOf(body))
 }
@@ -492,7 +558,14 @@ if (res.status === 401 && causeOf(body) === 'StepUpRequired') {
 At the two sites that hold the `Response` (`useWidgetQuery.ts`,
 `sseClient.ts`), you may additionally log
 `res.headers.get('WWW-Authenticate')` for diagnostics (same-origin only; see
-section 2g). Do not branch on it.
+section 2i). Do not branch on it.
+
+**A delegated client** (an agent holding a token from authn's `/delegate`)
+handles the two `Delegated*` causes the same way, with "exchange again" in
+place of "log in": nothing was dispatched, so it may exchange the person's
+token for a fresh delegated token and retry once. They are not in
+`LOGIN_REPLAY_CAUSES`, because a fresh login does not mint a delegated
+credential; only a new exchange does.
 
 ## 7. How to see it
 
@@ -539,4 +612,11 @@ The snowplow tests that pin all of the above:
 - `internal/handlers/dispatchers/predispatch_401_relay_1076_test.go` (a stage
   401 after a write carries no cause, even a forged one);
 - `internal/handlers/call_401_relay_1076_test.go` (a passthrough 401 carries
-  no cause, even a forged one).
+  no cause, even a forged one);
+- `internal/handlers/middleware/userconfig_delegated_1560_test.go` (a
+  delegated token reads its delegated credential from the informer and the
+  apiserver, a stale informer copy is re-read once, and each outcome gets its
+  cause);
+- `internal/resolvers/restactions/api/delegated_credential_1560_test.go` (a
+  RESTAction stage under a delegated token dials the same delegated
+  credential, and a named `endpointRef` to a delegated Secret is refused).

@@ -35,8 +35,10 @@ import (
 	"testing"
 )
 
-// suffixLiterals are the spellings no literal may carry.
-var suffixLiterals = []string{"-clientconfig", "-stepup"}
+// suffixLiterals are the spellings no literal may carry. #1560 — the
+// delegated credential's prefix too: its name is
+// endpoints.DelegatedSecretName's, never built here.
+var suffixLiterals = []string{"-clientconfig", "-stepup", "delegated-"}
 
 // derivationExempt maps "<module-relative file>|<literal>" to why that
 // literal is not a derivation. Each must still match.
@@ -44,6 +46,9 @@ var derivationExempt = map[string]string{
 	"internal/redact/redact.go|" + `(\\?")[^"]*-clientconfig[^"]*"`:                                                                "a redaction pattern that RECOGNISES a quoted credential Secret name in an error, to scrub it",
 	"internal/handlers/dispatchers/widgets_resolve_error.go|" + `-clientconfig\b`:                                                  "an identity-shape pattern that RECOGNISES a credential Secret name in a dependency message, to withhold it",
 	"internal/metrics/metrics.go|Every *-clientconfig Secret the registry sees: the denominator of the from_secrets alarm (#262).": "a metric's help text",
+	"internal/redact/redact.go|" + `\bdelegated-[0-9a-f]{64}\b`:                                                                    "a redaction pattern that RECOGNISES a delegated credential Secret name, to scrub it (#1560)",
+	"internal/redact/redact.go|delegated-":                                                                                         "the scrubber's pre-check for text that may hold a delegated credential Secret name (#1560)",
+	"internal/handlers/dispatchers/widgets_resolve_error.go|" + `\bdelegated-[0-9a-f]{64}\b`:                                       "an identity-shape pattern that RECOGNISES a delegated credential Secret name in a dependency message, to withhold it (#1560)",
 }
 
 // suffixConsts are plumbing's suffix constants; concatenating one builds a name.
@@ -236,6 +241,8 @@ func TestIssue1382_FenceCatchesEveryShape(t *testing.T) {
 		"stepup site elsewhere": {"internal/credsecret/credsecret.go", hdr + "func Other(n string) string { return n + ep.StepUpSuffix }\n", true},
 		"plumbing names":        {"internal/x/x.go", hdr + "func N(u string) []string { return ep.SessionSecretNames(u) }\n", false},
 		"dns1123 alone":         {"internal/x/x.go", hdr + "func N(u string) string { return kubeutil.MakeDNS1123Compatible(u) }\n", false},
+		"delegated prefix":      {"internal/x/x.go", hdr + "func N(h string) string { return \"delegated-\" + h }\n", true},
+		"delegated by plumbing": {"internal/x/x.go", hdr + "func N(u, a string) string { return ep.DelegatedSecretName(u, a) }\n", false},
 	}
 	for name, c := range cases {
 		fset := token.NewFileSet()

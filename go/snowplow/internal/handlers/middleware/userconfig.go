@@ -408,9 +408,18 @@ func userConfig(keys jwtutil.KeySource, authnNS string, public *PublicIdentity) 
 			// the NotFound 401 of a missing credential, never another
 			// user's credential (api.FromInformerOwnSecret,
 			// api.FromAPIServerOwnSecret).
-			secretNames := credsecret.For(userInfo.Username, userInfo.Groups)
+			//
+			// #1560 — credsecret.Select is the one selector, shared with
+			// every RESTAction own-credential stage. A token that carries
+			// `act` reads its delegated credential,
+			// endpoints.DelegatedSecretName(username, outermost act.sub),
+			// proven the token's by endpoints.CheckDelegatedCredential with
+			// the token's groups as issued; it has no step-up branch and no
+			// fallback to the person's session Secret. A token without `act`
+			// is chosen exactly as before.
+			cred := credsecret.Select(userInfo)
 
-			ep, served, ferr := api.FromInformerOwnSecret(req.Context(), authnNS, userInfo.Username, secretNames)
+			ep, served, ferr := api.FromInformerOwnSecret(req.Context(), authnNS, cred)
 			if !served {
 				if ferr != nil {
 					// (5.c) — cache HARD ERROR (Ship D.2's verbatim
@@ -464,7 +473,7 @@ func userConfig(keys jwtutil.KeySource, authnNS string, public *PublicIdentity) 
 				// #1115 — on the request's ctx: the re-read is a network exchange of
 				// this customer request and runs inside its page budget (a spent
 				// budget is never sent: 504 Timeout).
-				ep, ferr = api.FromAPIServerOwnSecret(req.Context(), sarc, authnNS, userInfo.Username, secretNames)
+				ep, ferr = api.FromAPIServerOwnSecret(req.Context(), sarc, authnNS, cred)
 				if ferr != nil {
 					// Upstream :68-75 — NotFound → 401, else → 500.
 					// PM load-bearing pin: the IsNotFound distinction
@@ -483,12 +492,22 @@ func userConfig(keys jwtutil.KeySource, authnNS string, public *PublicIdentity) 
 						audit.FailRoute(req.Context())
 						return
 					}
+					// #1560 — the token's delegated credential exists but
+					// is expired, or its groups are not the token's: 401
+					// DelegatedCredentialMismatch, so the client exchanges
+					// again. Nothing was sent.
+					var refused *credsecret.RefusedError
+					if errors.As(ferr, &refused) {
+						audit.DenyRoute(req.Context(), credentialMissingReason(cred))
+						credentialRefused(wri, ferr)
+						return
+					}
 					if apierrors.IsNotFound(ferr) {
 						// The verified caller's own credential is missing:
 						// snowplow refuses before anything is sent, and
 						// the audited route's record says why.
-						audit.DenyRoute(req.Context(), credentialMissingReason(userInfo.Groups))
-						credentialMissing(wri, userInfo.Groups, ferr)
+						audit.DenyRoute(req.Context(), credentialMissingReason(cred))
+						credentialMissing(wri, cred, ferr)
 						return
 					}
 					audit.FailRoute(req.Context())

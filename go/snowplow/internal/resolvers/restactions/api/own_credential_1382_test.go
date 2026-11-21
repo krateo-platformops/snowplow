@@ -357,11 +357,11 @@ func TestIssue1382_CacheKey_ExactOrLegacyNameSameEndpointKey(t *testing.T) {
 func TestIssue1382_Readers_MissIsFirstNamesNotFound(t *testing.T) {
 	oc1382Informer(t, nil)
 	t.Setenv("CACHE_ENABLED", "true")
-	if _, served, err := FromInformerOwnSecret(context.Background(), oc1382NS, oc1382X, credsecret.SessionNames(oc1382X)); served || err != nil {
+	if _, served, err := FromInformerOwnSecret(context.Background(), oc1382NS, ownCred(oc1382X)); served || err != nil {
 		t.Fatalf("an unservable informer served: %v %v", served, err)
 	}
 	rc, _ := oc1382APIServer(t, nil)
-	_, err := FromAPIServerOwnSecret(context.Background(), rc, oc1382NS, oc1382X, credsecret.SessionNames(oc1382X))
+	_, err := FromAPIServerOwnSecret(context.Background(), rc, oc1382NS, ownCred(oc1382X))
 	if !apierrors.IsNotFound(err) || !strings.Contains(err.Error(), `"john.doe-clientconfig"`) {
 		t.Fatalf("err = %v, want the exact name's NotFound", err)
 	}

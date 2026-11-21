@@ -36,8 +36,10 @@
 //
 // Each cause is chosen from what the middleware itself established — whether a
 // token was presented, jwtutil's typed validation error, the validated
-// token's groups (the same input credsecret.For chose the Secret from) — never
-// from the request body or an upstream answer. A failure that is OUR fault
+// token's groups and `act` (the same input credsecret.Select chose the Secret
+// from), and, for a delegated token, what endpoints.CheckDelegatedCredential
+// said of its Secret (#1560) — never from the request body or an upstream
+// answer. A failure that is OUR fault
 // stays a non-401 without a cause: an unresolvable signing key is plumbing's
 // 503, a credential re-read that failed for any reason but NotFound (403, 5xx)
 // is plumbing's 500.
@@ -85,6 +87,19 @@ const (
 	// CauseStepUpRequired — a valid token carrying krateo:loa:2 whose step-up
 	// credential Secret is missing.
 	CauseStepUpRequired = "StepUpRequired"
+	// CauseDelegatedCredentialMissing — a valid token carrying `act` whose
+	// delegated credential Secret (authn#167) is missing, or is not authn's
+	// credential for this person through this actor
+	// (endpoints.DelegatedCredentialNotOwned). The client exchanges again
+	// (#1560).
+	CauseDelegatedCredentialMissing = "DelegatedCredentialMissing"
+	// CauseDelegatedCredentialMismatch — a valid token carrying `act` whose
+	// delegated credential Secret is this person's and actor's, but its
+	// certificate is not valid now (endpoints.DelegatedCredentialExpired) or
+	// its Organizations are not the token's groups
+	// (endpoints.DelegatedCredentialMismatch). The client exchanges again
+	// (#1560).
+	CauseDelegatedCredentialMismatch = "DelegatedCredentialMismatch"
 )
 
 // stepUpChallenge is the RFC 9470 step-up challenge, bare: no acr_values, no
@@ -117,6 +132,10 @@ var preDispatchCauses = map[string]preDispatchCause{
 	CauseKeyNotPublished:          {"the bearer token's signing key is no longer published; log in again", invalidTokenChallenge},
 	CauseSessionCredentialMissing: {"the session credential is missing; log in again", invalidTokenChallenge},
 	CauseStepUpRequired:           {"the step-up credential is missing or expired; step up again", stepUpChallenge},
+	CauseDelegatedCredentialMissing: {"the delegated credential is missing; exchange the token again",
+		invalidTokenChallenge},
+	CauseDelegatedCredentialMismatch: {"the delegated credential has expired or does not match the token; exchange the token again",
+		invalidTokenChallenge},
 }
 
 type credentialStatusCause struct {
@@ -190,23 +209,40 @@ func tokenRejected(w http.ResponseWriter, err error) error {
 	return preDispatchUnauthorized(w, CauseTokenInvalid, err)
 }
 
-// credentialMissingReason is the audit denial reason of credentialMissing's
-// refusal, chosen from the same validated groups that chose the Secret:
-// step_up_required for a krateo:loa:2 token, session_credential_missing
-// otherwise (audit v0.12.0).
-func credentialMissingReason(groups []string) string {
-	if credsecret.IsStepUp(groups) {
+// credentialMissingReason is the audit denial reason of a credential refusal,
+// chosen from the same selection that chose the Secret: step_up_required for
+// a krateo:loa:2 token, session_credential_missing otherwise (audit v0.12.0).
+// #1560 — a delegated token's refusal (missing, expired or a mismatch) is
+// session_credential_missing too: "the verified caller's own credential could
+// not be used", the closest reason the audit schema declares. It has no
+// delegated reason yet (#1562); the 401's cause carries the distinction.
+func credentialMissingReason(cred credsecret.Credential) string {
+	if cred.Kind == credsecret.KindStepUp {
 		return audit.DenialStepUpRequired
 	}
 	return audit.DenialSessionCredentialMissing
 }
 
 // credentialMissing answers 401 for a per-user credential Secret that is not
-// there (the apiserver re-read said NotFound). groups are the VALIDATED
-// token's groups, the input credsecret.For chose the Secret from.
-func credentialMissing(w http.ResponseWriter, groups []string, err error) error {
-	if credsecret.IsStepUp(groups) {
+// there (the apiserver re-read said NotFound, or found only a Secret that is
+// not the token's). cred is credsecret.Select's choice for the VALIDATED
+// token: DelegatedCredentialMissing for a token with `act` (#1560),
+// StepUpRequired for a krateo:loa:2 token, SessionCredentialMissing
+// otherwise.
+func credentialMissing(w http.ResponseWriter, cred credsecret.Credential, err error) error {
+	switch cred.Kind {
+	case credsecret.KindDelegated:
+		return preDispatchUnauthorized(w, CauseDelegatedCredentialMissing, err)
+	case credsecret.KindStepUp:
 		return preDispatchUnauthorized(w, CauseStepUpRequired, err)
 	}
 	return preDispatchUnauthorized(w, CauseSessionCredentialMissing, err)
+}
+
+// credentialRefused answers 401 DelegatedCredentialMismatch for a delegated
+// credential that is the token's person's and actor's but cannot serve it:
+// expired, or its groups are not the token's (a *credsecret.RefusedError from
+// the apiserver re-read, #1560). err names no Secret and no identity.
+func credentialRefused(w http.ResponseWriter, err error) error {
+	return preDispatchUnauthorized(w, CauseDelegatedCredentialMismatch, err)
 }

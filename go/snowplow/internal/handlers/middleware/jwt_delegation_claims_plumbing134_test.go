@@ -43,9 +43,11 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/server/use"
+	corev1 "k8s.io/api/core/v1"
 
 	"github.com/krateo-platformops/snowplow/internal/credsecret"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
+	"github.com/krateo-platformops/snowplow/internal/testsupport/delegatedcred"
 )
 
 const (
@@ -54,6 +56,9 @@ const (
 	dlgGroup    = "dlg-devs"
 	dlgSubjURL  = "https://subject.dlg.example/k8s"
 	dlgActorURL = "https://actor.dlg.example/k8s"
+	// dlgDelegURL + "/" + actor is the subject's delegated credential for
+	// actor (#1560).
+	dlgDelegURL = "https://delegated.dlg.example/k8s"
 )
 
 // dlgToken signs, with key under kid, the claims CreateToken issues for
@@ -138,23 +143,48 @@ var (
 	}
 )
 
-// UserConfig: an accepted token reads the SUBJECT's credential Secret and puts
-// the subject in the request context — even with the actor's own Secret right
-// there in the informer.
+// UserConfig: an accepted token reads a credential of the SUBJECT and puts the
+// subject in the request context — never the actor's own Secret, which is
+// right there in the informer. #1560 — which of the subject's credentials
+// follows `act`: a token without one (no claim, or `act: null`) reads the
+// subject's session Secret; a token with one reads the subject's delegated
+// credential for its OUTERMOST actor (credsecret.Select), never the session
+// Secret.
 func TestUserConfig_DelegationClaims_IdentityStaysTheSubject(t *testing.T) {
+	delegated := func(actor string) *corev1.Secret {
+		return delegatedcred.Secret(t, delegatedcred.Spec{Namespace: su994SecretsNS, Username: dlgSubject, Actor: actor,
+			Groups: []string{dlgGroup}, ServerURL: dlgDelegURL + "/" + actor, Token: "tok-" + actor})
+	}
 	su994Informer(t,
 		su994Secret(credsecret.SessionNames(dlgSubject)[0], dlgSubjURL),
-		su994Secret(credsecret.SessionNames(dlgActor)[0], dlgActorURL))
+		su994Secret(credsecret.SessionNames(dlgActor)[0], dlgActorURL),
+		delegated(dlgActor),
+		delegated(dlgActor+"-a")) // dlgChain(8)'s outermost link
 	asked := su994APIServer(t)
 
+	// The credential each accepted arm must read: the outermost act.sub's
+	// delegated Secret, or the session Secret when there is no act.
+	wantURL := map[string]string{
+		"control: re-signed, no extra claim":               dlgSubjURL,
+		"delegated: act names the actor, principals known": dlgDelegURL + "/" + dlgActor,
+		"act null":                 dlgSubjURL,
+		"act chain exactly 8 deep": dlgDelegURL + "/" + dlgActor + "-a",
+		"principal unknown string": dlgSubjURL,
+		"principal not a string":   dlgSubjURL,
+		"actor principal unknown":  dlgDelegURL + "/" + dlgActor,
+	}
 	for _, tc := range dlgAccepted {
 		t.Run(tc.name, func(t *testing.T) {
+			want, ok := wantURL[tc.name]
+			if !ok {
+				t.Fatalf("no expected credential declared for arm %q", tc.name)
+			}
 			res := su994Serve(t, dlgToken(t, testPrivateKey, testKeyID, tc.extra))
 			if res.code != http.StatusOK || !res.reached {
 				t.Fatalf("want 200 reaching the handler; code=%d body=%s", res.code, res.body)
 			}
-			if res.ep.ServerURL != dlgSubjURL {
-				t.Fatalf("credential read = %q, want the subject's %q (never the actor's)", res.ep.ServerURL, dlgSubjURL)
+			if res.ep.ServerURL != want {
+				t.Fatalf("credential read = %q, want the subject's %q (never the actor's %q)", res.ep.ServerURL, want, dlgActorURL)
 			}
 			if res.user.Username != dlgSubject || len(res.user.Groups) != 1 || res.user.Groups[0] != dlgGroup {
 				t.Fatalf("ctx identity = %q %v, want the subject %q [%s]", res.user.Username, res.user.Groups, dlgSubject, dlgGroup)

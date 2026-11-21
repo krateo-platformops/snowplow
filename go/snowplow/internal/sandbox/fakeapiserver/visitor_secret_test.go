@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/rest"
@@ -80,7 +81,7 @@ func TestVisitorSecret_OwnedByTheVisitorOnly(t *testing.T) {
 // visitor's) gets the NotFound that the UserConfig middleware answers 401.
 func TestVisitorSecret_SnowplowsReaderServesTheVisitorOnly(t *testing.T) {
 	h := newHarness(t, opts{})
-	ep, err := api.FromAPIServerOwnSecret(context.Background(), saConfig(h), "krateo-system", visitor, credsecret.For(visitor, nil))
+	ep, err := api.FromAPIServerOwnSecret(context.Background(), saConfig(h), "krateo-system", credsecret.Select(jwtutil.UserInfo{Username: visitor}))
 	if err != nil {
 		t.Fatalf("the visitor's credential: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestVisitorSecret_SnowplowsReaderServesTheVisitorOnly(t *testing.T) {
 	if names[len(names)-1] != credsecret.For(visitor, nil)[0] {
 		t.Fatalf("the test's premise: %q's names %v reach the visitor's Secret", other, names)
 	}
-	_, err = api.FromAPIServerOwnSecret(context.Background(), saConfig(h), "krateo-system", other, names)
+	_, err = api.FromAPIServerOwnSecret(context.Background(), saConfig(h), "krateo-system", credsecret.Select(jwtutil.UserInfo{Username: other}))
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("another user is refused with the NotFound of a missing credential (401), got %v", err)
 	}
@@ -112,7 +113,7 @@ func TestVisitorSecret_StepUpName(t *testing.T) {
 		t.Fatalf("the step-up name %q", name)
 	}
 	visitorSecret(t, h, name)
-	ep, err := api.FromAPIServerOwnSecret(context.Background(), saConfig(h), "krateo-system", visitor, credsecret.For(visitor, groups))
+	ep, err := api.FromAPIServerOwnSecret(context.Background(), saConfig(h), "krateo-system", credsecret.Select(jwtutil.UserInfo{Username: visitor, Groups: groups}))
 	if err != nil || ep.Token != "visitor-token" {
 		t.Fatalf("the step-up visitor's credential: %v %q", err, ep.Token)
 	}

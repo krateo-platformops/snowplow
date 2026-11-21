@@ -12,6 +12,11 @@
 // only when endpoints.OwnsSecret(sec, requester) holds; anything else is a
 // miss, never another user's credential.
 //
+// #1560 — the names and the proof come from credsecret.Select, the one
+// selector: for a token with `act` the single name is its delegated
+// credential's, and the proof is endpoints.CheckDelegatedCredential
+// (credsecret.Credential.Check).
+//
 // Two sources, in this order:
 //
 //  1. The AUTHN_NAMESPACE Secrets informer (FromInformerOwnSecret): every
@@ -33,6 +38,7 @@ package api
 
 import (
 	"context"
+	"time"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	corev1 "k8s.io/api/core/v1"
@@ -41,28 +47,34 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	"github.com/krateo-platformops/snowplow/internal/credsecret"
 )
 
 // FromInformerOwnSecret is the informer half of the own-credential read: the
-// first of names whose Secret is in the snapshot and owned by username
-// (endpoints.OwnsSecret), as an Endpoint.
+// first of cred.Names whose Secret is in the snapshot and Held for the token
+// (cred.Check: endpoints.OwnsSecret for a session or step-up credential,
+// endpoints.CheckDelegatedCredential for a delegated one, #1560), as an
+// Endpoint.
 //
 // Returns, like FromInformerSecret:
-//   - (endpoint, true,  nil) — an owned Secret, content extracted;
+//   - (endpoint, true,  nil) — a Held Secret, content extracted;
 //   - (zero,     false, nil) — nothing servable: cache off, informer not
-//     servable, another namespace, or no name holds a Secret username owns.
-//     The caller asks the apiserver (FromAPIServerOwnSecret);
-//   - (zero,     false, err) — the first owned Secret is malformed (no
+//     servable, another namespace, or no name holds a Secret Held for the
+//     token (absent, someone else's, or a delegated credential that is
+//     expired or a mismatch in the snapshot, which may lag a newer exchange).
+//     The caller asks the apiserver (FromAPIServerOwnSecret), which decides;
+//   - (zero,     false, err) — the first Held Secret is malformed (no
 //     server-url): upstream's verbatim error.
-func FromInformerOwnSecret(ctx context.Context, namespace, username string, names []string) (endpoints.Endpoint, bool, error) {
+func FromInformerOwnSecret(ctx context.Context, namespace string, cred credsecret.Credential) (endpoints.Endpoint, bool, error) {
 	_ = ctx
 	snap := ownSecretSnapshot(namespace)
 	if snap == nil {
 		return endpoints.Endpoint{}, false, nil
 	}
-	for _, name := range names {
+	now := time.Now()
+	for _, name := range cred.Names {
 		sec, ok := snap.ByName[name]
-		if !ok || sec == nil || !endpoints.OwnsSecret(sec, username) {
+		if !ok || sec == nil || cred.Check(sec, now) != credsecret.Held {
 			continue
 		}
 		ep, err := extractEndpointFromSecret(sec)
@@ -83,18 +95,25 @@ func ownSecretSnapshot(namespace string) *cache.SecretsSnapshot {
 	return cache.SecretsSnapshotLoad()
 }
 
-// FromAPIServerOwnSecret is the apiserver half: names in order, one GET each
-// over rc (credhttp.GetSecret), until one returns a Secret username owns. A
-// NotFound, or a Secret username does not own, moves to the next name; any
-// other error is returned at once, unwrapped (a 403 or a 500 is not a miss,
-// and a spent page budget is the caller's to answer). When no name holds an
-// owned Secret the error is a NotFound for the first, preferred name: the
-// apiserver's own when that name was absent, else the same NotFound built
-// here, so a Secret that exists but is someone else's is reported exactly as
-// a missing one and never named.
-func FromAPIServerOwnSecret(ctx context.Context, rc *rest.Config, namespace, username string, names []string) (endpoints.Endpoint, error) {
+// FromAPIServerOwnSecret is the apiserver half: cred.Names in order, one GET
+// each over rc (credhttp.GetSecret), until one returns a Secret Held for the
+// token (cred.Check). A NotFound, or a Secret the token does not own, moves to
+// the next name; any other error is returned at once, unwrapped (a 403 or a
+// 500 is not a miss, and a spent page budget is the caller's to answer). When
+// no name holds a Held Secret:
+//   - #1560 — if a name held the token's delegated credential but its
+//     certificate is Expired or a Mismatch, the error is a
+//     *credsecret.RefusedError with that outcome (the client exchanges
+//     again);
+//   - otherwise it is a NotFound for the first, preferred name: the
+//     apiserver's own when that name was absent, else the same NotFound built
+//     here, so a Secret that exists but is someone else's is reported exactly
+//     as a missing one and never named.
+func FromAPIServerOwnSecret(ctx context.Context, rc *rest.Config, namespace string, cred credsecret.Credential) (endpoints.Endpoint, error) {
 	var firstMissing error
-	for i, name := range names {
+	var refused *credsecret.RefusedError
+	now := time.Now()
+	for i, name := range cred.Names {
 		sec, err := credhttp.GetSecret(ctx, rc, name, namespace)
 		if err != nil {
 			if !apierrors.IsNotFound(err) {
@@ -105,17 +124,24 @@ func FromAPIServerOwnSecret(ctx context.Context, rc *rest.Config, namespace, use
 			}
 			continue
 		}
-		if !endpoints.OwnsSecret(sec, username) {
-			continue
+		switch o := cred.Check(sec, now); o {
+		case credsecret.Held:
+			return extractEndpointFromSecret(sec)
+		case credsecret.Expired, credsecret.Mismatch:
+			if refused == nil {
+				refused = &credsecret.RefusedError{Outcome: o}
+			}
 		}
-		return extractEndpointFromSecret(sec)
+	}
+	if refused != nil {
+		return endpoints.Endpoint{}, refused
 	}
 	if firstMissing != nil {
 		return endpoints.Endpoint{}, firstMissing
 	}
 	first := ""
-	if len(names) > 0 {
-		first = names[0]
+	if len(cred.Names) > 0 {
+		first = cred.Names[0]
 	}
 	return endpoints.Endpoint{}, apierrors.NewNotFound(corev1.Resource("secrets"), first)
 }

@@ -12,6 +12,7 @@ import (
 	"slices"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -36,6 +37,12 @@ func authnOwned(sec *corev1.Secret, users ...string) *corev1.Secret {
 		}
 	}
 	return sec
+}
+
+// ownCred is the credential credsecret.Select chooses for a token without
+// `act` naming user and groups: the readers' input since #1560.
+func ownCred(user string, groups ...string) credsecret.Credential {
+	return credsecret.Select(jwtutil.UserInfo{Username: user, Groups: groups})
 }
 
 // authnMeta is the ObjectMeta authn writes on username's credential Secret
