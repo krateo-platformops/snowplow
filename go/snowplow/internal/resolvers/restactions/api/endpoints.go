@@ -8,6 +8,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
@@ -21,7 +22,12 @@ type endpointReferenceMapper struct {
 	// groups are the requester's groups. With username they choose the
 	// caller's own credential Secret (credsecret.For, #994).
 	groups []string
-	rc     *rest.Config
+	// act is the validated token's `act` claim, nil on a token without one.
+	// With username and groups it is what credsecret.Select chooses the
+	// caller's own credential from (#1560): a token with `act` dials its
+	// delegated credential, exactly as the auth middleware chose it.
+	act *jwtutil.Actor
+	rc  *rest.Config
 	// provenance (#443 part 2) — under ProvenanceCallerSupplied a named
 	// endpointRef Secret is read with the caller's own credentials.
 	provenance Provenance
@@ -106,8 +112,9 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 			return endpoints.Endpoint{}, false, fmt.Errorf("an unauthenticated identity has no clientconfig credential; its stage needs the impersonating context")
 		}
 		// #994 — the caller's OWN credential, chosen exactly as the auth
-		// middleware chose it: the step-up Secret for an identity whose
-		// groups carry krateo:loa:2, else the session Secret. No fallback: a
+		// middleware chose it (credsecret.Select, #1560): the delegated
+		// Secret for a token with `act`, else the step-up Secret for an
+		// identity whose groups carry krateo:loa:2, else the session Secret. No fallback: a
 		// step-up identity whose Secret is gone fails this stage rather than
 		// dialing the session credential. #1382 — read exact-then-legacy
 		// (credsecret.For), and only a Secret the caller owns
@@ -143,9 +150,11 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 	return ep, false, nil
 }
 
-// resolveOwn resolves the caller's OWN credential (#994, #1382): the names
-// credsecret.For gives, exact first, from the Secrets informer and then, when
-// it holds no Secret the caller owns, from the apiserver
+// resolveOwn resolves the caller's OWN credential (#994, #1382, #1560): the
+// credential credsecret.Select chooses for the validated token (the delegated
+// Secret for a token with `act`; else the names credsecret.For gives, exact
+// first), from the Secrets informer and then, when it holds no Secret Held for
+// the token, from the apiserver
 // (own_credential.go). A Secret the caller does not own, under any name, is a
 // miss; when no name holds one the error is a NotFound, which fails the stage
 // as a missing credential does. The endpoint is never the ServiceAccount's
@@ -157,17 +166,17 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 // feedback_no_special_cases: it is the resolver's contextual decision, not a
 // Secret-cache concern.
 func (m *endpointReferenceMapper) resolveOwn(ctx context.Context) (endpoints.Endpoint, bool, error) {
-	names := credsecret.For(m.username, m.groups)
+	cred := credsecret.Select(jwtutil.UserInfo{Username: m.username, Groups: m.groups, Act: m.act})
 	// A malformed owned Secret in the snapshot (served=false with an error)
 	// falls through to the apiserver, as on the named path: the apiserver is
 	// authoritative and answers the same verbatim error when it is malformed.
-	ep, served, _ := FromInformerOwnSecret(ctx, m.authnNS, m.username, names)
+	ep, served, _ := FromInformerOwnSecret(ctx, m.authnNS, cred)
 	if !served {
 		var err error
 		// Ship D (0.30.141) — F-3: one fallthrough per miss, recorded before
 		// the reads, however many names they try.
 		sctx := cache.RecordApiserverFallthrough(ctx, cache.ReasonSecretGet, "")
-		ep, err = FromAPIServerOwnSecret(sctx, m.rc, m.authnNS, m.username, names)
+		ep, err = FromAPIServerOwnSecret(sctx, m.rc, m.authnNS, cred)
 		if err != nil {
 			return ep, false, err
 		}

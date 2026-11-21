@@ -1,7 +1,8 @@
 // Package redact keeps identity and data values off snowplow's log lines.
 //
 // THE RULE (#1192): no username, certificate CN, `<user>-clientconfig[-stepup]`
-// Secret name or group string reaches a log line, in clear or as a label. The
+// or delegated (#1560) Secret name or group string reaches a log line, in
+// clear or as a label. The
 // audit record is the one place that stores identity on purpose, and a log line
 // reaches it through the traceId. That join is also why a per-identity label is
 // not allowed on a line (#453 allowed one): a stable label on a request's line
@@ -122,9 +123,17 @@ func Prefixed(prefix, s string) string {
 // in the exact form Kubernetes gives a service account, so a username that only
 // starts like one stays redacted: system:serviceaccount:<namespace>:<name>,
 // where the namespace is a DNS-1123 label and the name a DNS-1123 subdomain.
+//
+// delegated matches a delegated credential Secret name (#1560, authn#167):
+// "delegated-" and the 64 hex digits of a SHA-256 of (username, actor). It
+// names no one in clear, but usernames come from a small known set, so the
+// digest is guessable and counts as identity. The shape is fixed, so it is
+// matched quoted or not. This leaf cannot import plumbing's
+// endpoints.DelegatedSecretName; credsecret's tests pin the two together.
 var (
 	apiserverSubject = regexp.MustCompile(`\b(User|user|users|groups) (\\?")([^"\\]*)\\?"`)
 	clientconfig     = regexp.MustCompile(`(\\?")[^"]*-clientconfig[^"]*"`)
+	delegated        = regexp.MustCompile(`\bdelegated-[0-9a-f]{64}\b`)
 	serviceAccount   = regexp.MustCompile(`\Asystem:serviceaccount:([a-z0-9](?:[-a-z0-9]*[a-z0-9])?):([a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*)\z`)
 )
 
@@ -141,7 +150,7 @@ func isServiceAccount(name string) bool {
 }
 
 // ErrorText replaces the identity an apiserver or authn error string carries
-// (see apiserverSubject, clientconfig) with Redacted. A service account named
+// (see apiserverSubject, clientconfig, delegated) with Redacted. A service account named
 // as a user stays. It keeps the rest of the text, and it is idempotent.
 func ErrorText(s string) string {
 	s = apiserverSubject.ReplaceAllStringFunc(s, func(match string) string {
@@ -152,8 +161,13 @@ func ErrorText(s string) string {
 		}
 		return kind + " " + quote + Redacted + quote
 	})
+	s = delegated.ReplaceAllLiteralString(s, Redacted)
 	return clientconfig.ReplaceAllString(s, "${1}"+Redacted+"$1")
 }
+
+// delegatedNameMark is the fixed prefix of a delegated credential Secret
+// name: ScrubLogAttr's cheap pre-check for text with no double quote.
+const delegatedNameMark = "delegated-"
 
 // Err is ErrorText of err ("" for a nil err).
 func Err(err error) string {
@@ -167,7 +181,8 @@ func Err(err error) string {
 // handlers: ErrorText over every string and error attribute, and the message.
 // Any other value (a map, a struct, a slice, a Stringer) is left as it is (#1223).
 // A handler calls it only for a record it renders, so a disabled level costs
-// nothing, and only a string holding a double quote pays for the regexps.
+// nothing, and only a string holding a double quote, or a delegated Secret
+// name's prefix, pays for the regexps.
 func ScrubLogAttr(_ []string, a slog.Attr) slog.Attr {
 	var text string
 	switch a.Value.Kind() {
@@ -184,7 +199,7 @@ func ScrubLogAttr(_ []string, a slog.Attr) slog.Attr {
 	default:
 		return a
 	}
-	if strings.IndexByte(text, '"') < 0 {
+	if strings.IndexByte(text, '"') < 0 && !strings.Contains(text, delegatedNameMark) {
 		return a
 	}
 	if scrubbed := ErrorText(text); scrubbed != text {

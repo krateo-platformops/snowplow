@@ -16,30 +16,28 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-
-	"github.com/krateo-platformops/snowplow/internal/credsecret"
 )
 
 func benchInformer(b *testing.B, user string, secs []*corev1.Secret) {
 	b.Setenv("CACHE_ENABLED", "true")
 	oc1382Informer(b, secs)
-	names := credsecret.SessionNames(user)
+	cred := ownCred(user)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, _ = FromInformerOwnSecret(ctx, oc1382NS, user, names)
+		_, _, _ = FromInformerOwnSecret(ctx, oc1382NS, cred)
 	}
 }
 
 func benchAPIServer(b *testing.B, user string, secs []*corev1.Secret) {
 	rc, _ := oc1382APIServer(b, nil, secs...)
-	names := credsecret.SessionNames(user)
+	cred := ownCred(user)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = FromAPIServerOwnSecret(ctx, rc, oc1382NS, user, names)
+		_, _ = FromAPIServerOwnSecret(ctx, rc, oc1382NS, cred)
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/server/use"
@@ -319,6 +320,23 @@ func TestCredentialStatus1029_DocExamplesEqualTheWire(t *testing.T) {
 			su994Informer(t, stepUp)
 			su994APIServer(t, stepUp)
 			rec, _ := c1029Serve(t, su994Token(t, su994Group))
+			return rec
+		},
+		// #1560 — the doc's delegated name is alice's for the actor
+		// my-agent; the wire's is the fixture user's for d1560Actor.
+		"DelegatedCredentialMissing": func(t *testing.T) *httptest.ResponseRecorder {
+			session := su994Secret(credsecret.SessionNames(su994User)[0], su994Session)
+			su994Informer(t, session)
+			su994APIServer(t, session)
+			rec, _ := c1029Serve(t, d1560Token(t, d1560Actor, su994Group))
+			wireSub = []string{endpoints.DelegatedSecretName("alice", "my-agent"), d1560Name()}
+			return rec
+		},
+		"DelegatedCredentialMismatch": func(t *testing.T) *httptest.ResponseRecorder {
+			session := su994Secret(credsecret.SessionNames(su994User)[0], su994Session)
+			su994Informer(t, session)
+			su994APIServer(t, session, d1560Secret(t, d1560Actor, d1560Delegated, []string{d1560OtherGroup}, time.Time{}, time.Time{}))
+			rec, _ := c1029Serve(t, d1560Token(t, d1560Actor, su994Group))
 			return rec
 		},
 	}
