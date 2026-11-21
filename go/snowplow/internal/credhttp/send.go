@@ -357,6 +357,10 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 // v1.84.0 → v1.85.0 (snowplow#1481): `git diff --stat` changes only dialguard/
 // and the Makefile; http/ is byte-identical.
 //
+// v1.85.0 → v1.103.0 (authn#167's names) re-audited by `diff -r` of the two
+// module trees: http/ (util/retry.go, so RetryClient.Do, included) is
+// byte-identical.
+//
 // #1509 — since v1.85.0 the WHOLE RetryClient.Do loop is transcribed too
 // (sendRetrying, retry_loop_1509.go: transcribedBackoff is backoff(attempt, …),
 // sleepCtx is sleepWithContext), and it DEVIATES from plumbing in exactly one
@@ -373,7 +377,7 @@ func budgetedRetryWait(req *http.Request, resp *http.Response, err error, x *bud
 // is plumbing's as transcribed (retry_loop_1509_test.go pins them, over
 // HTTP/1.1 and HTTP/2). A plumbing bump re-audits the whole of RetryClient.Do
 // against sendRetrying, not only backoff and parseRetryAfter.
-const retryPolicyTranscribedFrom = "v1.85.0"
+const retryPolicyTranscribedFrom = "v1.103.0"
 
 // firstBackoff is RetryClient's backoff before its first retry (plumbing
 // v1.28.1 http/util/retry.go backoff(0, base, max)): base capped at max,

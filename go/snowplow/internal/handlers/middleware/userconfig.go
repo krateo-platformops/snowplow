@@ -190,7 +190,18 @@ import (
 // v1.84.0 → v1.85.0 (snowplow#1481): `git diff --stat` of the two tags changes
 // only dialguard/ and the Makefile; every package this file transcribes is
 // byte-identical.
-const PinnedPlumbingVersion = "v1.85.0"
+//
+// v1.85.0 → v1.103.0 (authn#167's names, bumped on their own): re-audited by
+// `diff` of every package `go list -deps -test` reaches in this module, under
+// every build tag and js/wasm. server/, jwtutil/, kubeconfig/, context/ and
+// http/ are byte-identical, so this file's upstream line numbers stand. Two
+// imported packages changed: crdgen/ (the chart guard's; see chartcrd) and
+// endpoints/, which adds delegated.go (DelegatedSecretName,
+// IsDelegatedSecretName, CheckDelegatedCredential; nothing here calls them
+// yet, #1560) and moves names.go's certificate parsing into clientCertificate,
+// which certificateCommonName now calls: OwnsSecret, SessionSecretNames and
+// FromSecret return the same answers.
+const PinnedPlumbingVersion = "v1.103.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
