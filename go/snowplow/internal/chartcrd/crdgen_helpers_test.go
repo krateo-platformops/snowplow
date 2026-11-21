@@ -90,6 +90,26 @@ const (
 	// only dialguard/ and the Makefile; crdgen/ and crdgen/schemas/ are
 	// byte-identical, so v1.85.0's crdgen is still v1.82.0's.
 	//
+	// v1.85.0 → v1.103.0 (authn#167's endpoints names, bumped on their own):
+	// crdgen/ CHANGES, in plumbing#199 (exclusive bounds), #200 (tests), #203
+	// (a `not` over allOf/anyOf/oneOf of value validations is native), #204
+	// (an integer|string union is int-or-string), #205 (a default that breaks
+	// its own subschema fails generation), #206 (CEL is validated for
+	// Kubernetes 1.36, Options.MinKubernetesVersion), #209 (an object's `not`
+	// is native; opt-in Options.Strict) and #212 (if/then/else property
+	// constraints); crdgen/schemas/ is byte-identical. The crdgen that compiles the chart moved too: core-provider
+	// 2.13.117, which installer main and 0.3.694 deploy, requires plumbing
+	// v1.100.0, and crdgen/ and crdgen/schemas/ are byte-identical between
+	// v1.100.0 and v1.103.0 (`diff -r` of the module trees). Its generateCRD
+	// options are generate()'s (2.13.105 → 2.13.117 changes only comments in
+	// generation.go). So the invariant holds by code. Measured at the bump with
+	// generate()'s options: helm/snowplow-crds' CRD is byte-identical; in
+	// helm/snowplow's, impersonateGroups' items gain the native `not` (anyOf of
+	// enum [system:masters, '*'] and pattern '^system:'), beside the CEL rule
+	// they keep, and crdgen's "not ... dropped" warning for them is gone. The
+	// rule is now a duplicate under this crdgen, kept for core-providers older
+	// than 2.13.107, whose crdgen still drops that `not`; removing it is #1504.
+	//
 	// THE TWO CORE-PROVIDER VERSIONS ARE DIFFERENT THINGS. coreProviderVersion
 	// names the status schema in testdata (statusSchemaPath), which the guard
 	// compiles beside the chart because it counts toward the CRD's CEL cost;
@@ -100,10 +120,10 @@ const (
 	// input, so it is its own change (#1488), not part of a plumbing bump.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.85.0"
+	crdgenVersion       = "v1.103.0"
 	// coreProviderCrdgenVersion is the plumbing core-provider compiles with
-	// (core-provider 2.13.105's go/core-provider/go.mod).
-	coreProviderCrdgenVersion = "v1.82.0"
+	// (core-provider 2.13.117's go/core-provider/go.mod).
+	coreProviderCrdgenVersion = "v1.100.0"
 
 	// core-provider's statics/status.schema.json at coreProviderVersion, copied
 	// verbatim. crdgen compiles it into the same CRD, so it counts toward the
@@ -120,8 +140,11 @@ var constrainedItemFields = []string{ruleOnlyField, nativeNotField}
 
 const (
 	// ruleOnlyField is the item node whose constraint exists ONLY as a CEL
-	// rule: crdgen drops this schema's `not`, so the rule is the enforcement,
-	// and the bounds are what keep its cost under the budget.
+	// rule under core-provider 2.13.106 and older: their crdgen drops this
+	// schema's `not`, so the rule is the enforcement there, and the bounds are
+	// what keep its cost under the budget. Since plumbing#203 (v1.88.0, so the
+	// crdgen pinned here) the `not` is emitted natively as well; #1504 removes
+	// the rule.
 	ruleOnlyField = "impersonateGroups"
 
 	// nativeNotField is the item node whose `not: {enum}` crdgen emits as a

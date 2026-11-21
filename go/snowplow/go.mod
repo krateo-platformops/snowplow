@@ -13,7 +13,7 @@ require (
 	github.com/itchyny/gojq v0.12.17
 	github.com/klauspost/compress v1.18.7
 	github.com/krateo-platformops/audit v0.13.0
-	github.com/krateo-platformops/plumbing v1.85.0
+	github.com/krateo-platformops/plumbing v1.103.0
 	github.com/ledongthuc/pdf v0.0.0-20261020125853-5e46805f718e
 	github.com/stretchr/testify v1.12.1
 	github.com/swaggo/http-swagger v1.3.4
@@ -100,6 +100,7 @@ require (
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
 	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/swaggo/files v0.0.0-20220610200504-28940afbdbfe // indirect
