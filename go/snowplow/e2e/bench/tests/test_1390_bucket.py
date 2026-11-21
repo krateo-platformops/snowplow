@@ -13,7 +13,7 @@ import pytest
 
 from bench import vm606
 from tests import fake_vm606
-from tests.test_vm606 import BUCKET, PROJECT, RUN, SA, _run, _up, fake  # noqa: F401  (fixture)
+from tests.test_vm606 import BUCKET, PROJECT, RUN, SA, _in, _run, _up, fake  # noqa: F401  (fixture)
 
 NAME = BUCKET[len("gs://"):]
 
@@ -73,7 +73,9 @@ def test_a_bucket_not_as_required_refuses_before_any_grant(fake, capsys, monkeyp
 
 
 def _in_use(fake):  # noqa: F811
-    fake_vm606.put_rule(fake, RUN, f"{vm606.vm_name(RUN)}-iap-ssh", expires="2026-11-20T00:00:00Z")
+    # #1557: the rule must still be live when up runs (up reaps expired rules before its in-use check), so its
+    # expiry is relative to now, never a fixed date that the calendar overtakes.
+    fake_vm606.put_rule(fake, RUN, f"{vm606.vm_name(RUN)}-iap-ssh", expires=_in(5))
 
 
 def _unconditional(fake):  # noqa: F811
