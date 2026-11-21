@@ -95,19 +95,23 @@ func failedRef(ctx context.Context, in *templatesv1.ResourceRef, err error) []te
 	cache.StageErrorSinkFromContext(ctx).Bump("resourcesRefs", "resource ref failed: "+re.class)
 
 	log := xcontext.Logger(ctx)
-	attrs := []any{
-		slog.String("id", in.ID),
-		slog.String("reason", re.class),
-		slog.String("apiVersion", in.APIVersion),
-		slog.String("resource", in.Resource),
-		slog.String("namespace", in.Namespace),
-		slog.String("err", redact.Err(re.err)),
-	}
 	if origin := cache.RefDenialOrigin(ctx); origin == cache.RefDenialOriginServe {
-		log.WarnContext(ctx, "resource ref failed; it is a failure entry in status.resourcesRefs", attrs...)
+		log.WarnContext(ctx, "resource ref failed; it is a failure entry in status.resourcesRefs",
+			slog.String("id", in.ID),
+			slog.String("reason", re.class),
+			slog.String("apiVersion", in.APIVersion),
+			slog.String("resource", in.Resource),
+			slog.String("namespace", in.Namespace),
+			slog.String("err", redact.Err(re.err)))
 	} else {
 		log.DebugContext(ctx, "resource ref failed; it is a failure entry in status.resourcesRefs",
-			append(attrs, slog.String("origin", origin))...)
+			slog.String("id", in.ID),
+			slog.String("reason", re.class),
+			slog.String("apiVersion", in.APIVersion),
+			slog.String("resource", in.Resource),
+			slog.String("namespace", in.Namespace),
+			slog.String("origin", origin),
+			slog.String("err", redact.Err(re.err)))
 	}
 
 	st := failureStatus(re)
