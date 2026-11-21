@@ -527,7 +527,7 @@ const ReasonFailedDependency = statusdetails.ReasonFailedDependency
 func typeNotInstalled(gvr schema.GroupVersionResource) *statusdetails.TypeNotInstalledError {
 	return &statusdetails.TypeNotInstalledError{
 		GVR:     gvr,
-		Message: fmt.Sprintf("The type %s (%s) is not installed on this cluster.", gvr.Resource, gvr.GroupVersion()),
+		Message: statusdetails.TypeNotInstalledMessage(gvr),
 	}
 }
 
