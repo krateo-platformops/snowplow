@@ -667,6 +667,20 @@ func (c *setupChain) handshake(ctx context.Context, conn net.Conn) (net.Conn, er
 	}
 	tc := tls.Client(conn, cfg)
 	if err := tc.HandshakeContext(ctx); err != nil {
+		if tc.ConnectionState().HandshakeComplete {
+			// #1544: the handshake COMPLETED and then the attempt's ctx ended (its chain finished, its last waiter
+			// served by another attempt: result -> finishLocked -> c.cancel). crypto/tls's HandshakeContext then
+			// returns the ctx's error for a handshake that completed, so this connection was set up, the server
+			// counted it, and nothing counted it opened. It is a raced connection like any other loser: counted
+			// opened with the chain's counting (closeLoser), then closed. (TLS 1.2 keeps a residual: there the
+			// server finishes first, so a server-complete, client-incomplete setup is still not counted;
+			// client-go to the apiserver negotiates TLS 1.3.)
+			c.mu.Lock()
+			countCtx := c.countCtx
+			c.mu.Unlock()
+			closeLoser(countCtx, tc, true)
+			return nil, err, true
+		}
 		_ = tc.Close()
 		return nil, err, true
 	}
