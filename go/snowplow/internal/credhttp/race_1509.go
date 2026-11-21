@@ -166,6 +166,55 @@ var stuckCounts sync.Map // setupKey → *atomic.Uint64
 
 func noteRaceFired(key string) { countAt(&raceCounts, key, 1) }
 
+// The same three terms per EGRESS, cumulative (Diego 2026-11-18, "no #1521 fix; add counters": a paired run attributes
+// a stage's extra setups to the race directly, next to snowplow_egress_connections). A chain serves one address for
+// every egress that dials it, so an event is charged to the egress of the chain's latest waiter (its countCtx: the
+// connection counting a request carries, connections.go), the attribution closeLoser already uses for a raced
+// connection. A TLS chain's attempts carry that counting into the address's connect chain (startAttemptLocked), so
+// both levels of an https setup are charged to its egress. Both levels are counted, as racesFiredAt and its siblings
+// count them. A chain whose waiters carry no counting (a client outside CountConnectionsOn and Harden) is charged
+// to EgressOther, the closed set's catch-all. No host, address or path is a label.
+type raceEgressCell struct {
+	racesFired, attemptsReplaced, stuckDropped atomic.Uint64
+}
+
+var egressRaces = func() map[string]*raceEgressCell {
+	m := make(map[string]*raceEgressCell, len(Egresses))
+	for _, e := range Egresses {
+		m[e] = &raceEgressCell{}
+	}
+	return m
+}()
+
+// raceCellOf is the egress cell a chain's event is charged to: its latest waiter's egress, else EgressOther.
+func raceCellOf(ctx context.Context) *raceEgressCell {
+	if ctx != nil {
+		if c, ok := ctx.Value(connectionsCountedKey{}).(connectionCounting); ok {
+			if cell, ok := egressRaces[c.egress]; ok {
+				return cell
+			}
+		}
+	}
+	return egressRaces[EgressOther]
+}
+
+// EgressRaceCount is one egress's race events, cumulative.
+type EgressRaceCount struct {
+	Egress                                     string
+	RacesFired, AttemptsReplaced, StuckDropped uint64
+}
+
+// EgressRacesSnapshot returns every egress's cell, zeros included, in Egresses order.
+func EgressRacesSnapshot() []EgressRaceCount {
+	out := make([]EgressRaceCount, 0, len(Egresses))
+	for _, e := range Egresses {
+		c := egressRaces[e]
+		out = append(out, EgressRaceCount{Egress: e, RacesFired: c.racesFired.Load(),
+			AttemptsReplaced: c.attemptsReplaced.Load(), StuckDropped: c.stuckDropped.Load()})
+	}
+	return out
+}
+
 func countAt(m *sync.Map, key string, n uint64) {
 	v, _ := m.LoadOrStore(key, new(atomic.Uint64))
 	v.(*atomic.Uint64).Add(n)
@@ -553,7 +602,17 @@ func (c *setupChain) startAttemptLocked() {
 	c.attempts[a] = struct{}{}
 	c.covering++
 	answered := c.answered
-	actx, acancel := context.WithDeadline(c.ctx, dialNow().Add(pagebudget.PageMaxGoal))
+	// the attempt runs on the chain's own ctx, without the request's httptrace; it carries only the latest waiter's
+	// connection counting VALUE, so a connect chain it joins charges its race events to the same egress
+	// (egressRaces). Counting reads it only to label (noteRacedConnectionUp counts a raced connection by its
+	// scheme: an https waiter's raw connect-level loser is not counted, as before)
+	base := c.ctx
+	if c.countCtx != nil {
+		if v := c.countCtx.Value(connectionsCountedKey{}); v != nil {
+			base = context.WithValue(base, connectionsCountedKey{}, v)
+		}
+	}
+	actx, acancel := context.WithDeadline(base, dialNow().Add(pagebudget.PageMaxGoal))
 	go func() {
 		defer acancel()
 		start := dialNow()
@@ -708,6 +767,7 @@ func (c *setupChain) beginPeriodLocked() {
 	need := func(covering int) int { return max(0, len(c.waiters)-covering) }
 	if n := need(c.covering) - need(before); n > 0 {
 		countAt(&replaceCounts, c.ringKey, uint64(n))
+		raceCellOf(c.countCtx).attemptsReplaced.Add(uint64(n))
 	}
 }
 
@@ -730,6 +790,7 @@ func (c *setupChain) onTimer() {
 			a.covers = false
 			c.covering--
 			countAt(&stuckCounts, c.ringKey, 1)
+			raceCellOf(c.countCtx).stuckDropped.Add(1)
 		}
 		a.evidence = false
 	}
@@ -747,6 +808,7 @@ func (c *setupChain) onTimer() {
 		c.wait = trigger
 	}
 	noteRaceFired(c.ringKey)
+	raceCellOf(c.countCtx).racesFired.Add(1)
 	c.startAttemptLocked()
 	c.wait *= 2
 	c.timer.Reset(c.wait)
@@ -809,6 +871,11 @@ func resetChainsForTest() {
 	raceCounts.Clear()
 	replaceCounts.Clear()
 	stuckCounts.Clear()
+	for _, c := range egressRaces {
+		c.racesFired.Store(0)
+		c.attemptsReplaced.Store(0)
+		c.stuckDropped.Store(0)
+	}
 	for _, s := range []*setupChains{connectChains, tlsChains} {
 		s.mu.Lock()
 		for _, c := range s.chains {

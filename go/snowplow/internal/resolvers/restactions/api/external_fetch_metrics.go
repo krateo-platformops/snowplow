@@ -261,6 +261,19 @@ func init() {
 		expvar.Publish("snowplow_egress_connections", expvar.Func(func() any {
 			return egressConnectionsMap(credhttp.EgressConnectionsSnapshot())
 		}))
+		// #1521's connection-setup race, per egress and cumulative (Diego 2026-11-18, "add counters"):
+		// {egress: {races_fired, attempts_replaced, stuck_dropped}} (credhttp/race_1509.go egressRaces), the
+		// three terms of a destination's setups beyond one per waiting request. Its name extends
+		// snowplow_egress_connections, so the bench's existing mem606 prefix captures it; its readers read the
+		// exact snowplow_egress_connections key, so they are unchanged.
+		expvar.Publish("snowplow_egress_connections_setup_races", expvar.Func(func() any {
+			out := map[string]map[string]uint64{}
+			for _, c := range credhttp.EgressRacesSnapshot() {
+				out[c.Egress] = map[string]uint64{"races_fired": c.RacesFired,
+					"attempts_replaced": c.AttemptsReplaced, "stuck_dropped": c.StuckDropped}
+			}
+			return out
+		}))
 		// #1115 — every budgeted (customer) exchange by what the page budget
 		// did to it, and the retry reserve it uses.
 		expvar.Publish("snowplow_page_budget", expvar.Func(func() any {
