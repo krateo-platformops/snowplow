@@ -366,6 +366,10 @@ func (r *failureRound) end() {
 // (FailureClassOf, classPerIdentityDenied). With no open round for ctx's key
 // the line keeps its own level.
 func FailureLogLevel(ctx context.Context, own slog.Level, target, class string) slog.Level {
+	// #1569 — a site that logs with no ctx (slog accepts one) has no round.
+	if ctx == nil {
+		return own
+	}
 	// #443 — an inert (dry-run) resolve neither reads nor writes the notes: it
 	// cannot spend a cell's first line. Its expected deny is DEBUG (#711).
 	if cache.Inert(ctx) {
@@ -470,7 +474,7 @@ func (c *FailureCapture) Stored() string {
 // round of ctx's cell, logging nothing (see failureRound.replayed), and in any
 // capture collecting that cell. With no round for ctx's key it does nothing.
 func ReplayFailures(ctx context.Context, stored string) {
-	if stored == "" || cache.Inert(ctx) {
+	if stored == "" || ctx == nil || cache.Inert(ctx) {
 		return
 	}
 	r, ok := ctx.Value(failureRoundCtxKey{}).(*failureRound)
