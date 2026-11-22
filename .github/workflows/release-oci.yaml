@@ -22,7 +22,12 @@ on:
 
 jobs:
   release-oci:
-    uses: krateo-platformops/.github/.github/workflows/release-oci.yaml@main
+    # Pinned to a released commit (the org pin rule): a breaking change to the shared workflow then arrives
+    # as a reviewed update here, never as a failed release. @main took release-oci 2.0.0's new required
+    # `index_channel` input on 2026-11-22 (krateo-platformops/.github 77bcf7f), which would have failed this
+    # repo's next release at startup (core-provider 2.13.125). Moving to 2.x is a deliberate later change
+    # (with `index_channel: none`: snowplow's charts are installed by the installer, never indexed).
+    uses: krateo-platformops/.github/.github/workflows/release-oci.yaml@f6185ef0a8161a4201217d6ce0953718fc736fe0 # 1.1.0
     permissions:
       contents: read
       packages: write
@@ -41,9 +46,3 @@ jobs:
     with:
       chart_version: ${{ github.event.inputs.chart_version || (github.ref_type == 'tag' && github.ref_name || '') }}
       app_version: ${{ github.event.inputs.app_version || (github.ref_type == 'tag' && github.ref_name || '') }}
-      # Required by the shared workflow since krateo-platformops/.github 77bcf7f (2026-11-22): the
-      # krateo-blueprints index channel these charts are published to. snowplow's charts (snowplow,
-      # snowplow-crds) are installed by the installer, never offered as a blueprint, page or operator,
-      # so they are deliberately not indexed. Without this input the release fails at startup and
-      # publishes nothing (core-provider 2.13.125, core-provider#624).
-      index_channel: none
