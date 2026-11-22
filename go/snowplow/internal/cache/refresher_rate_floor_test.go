@@ -82,7 +82,7 @@ func TestRefresher_RateFloorCollapsesNMarksToOne(t *testing.T) {
 	// The env knob is seconds-granular; use 1s and a sub-second burst window
 	// so the whole burst lands inside the floor, then wait just past 1s for
 	// the single deferred re-resolve at expiry.
-	t.Setenv(envRefresherRateFloorSeconds, "1")
+	t.Cleanup(SetRefresherRateFloorForTest("1"))
 	resetRefresherForTest()
 	const realFloor = 1 * time.Second
 
@@ -161,7 +161,7 @@ func TestRefresher_RateFloorZero_NMarksProduceNResolves(t *testing.T) {
 	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
-	t.Setenv(envRefresherRateFloorSeconds, "0") // kill switch — identity to pre-#321
+	t.Cleanup(SetRefresherRateFloorForTest("0")) // kill switch — identity to pre-#321
 	resetRefresherForTest()
 
 	c := ResolvedCache()
@@ -212,7 +212,7 @@ func TestRefresher_RateFloorDeferredFinalMarkResolvesAtExpiry(t *testing.T) {
 	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
-	t.Setenv(envRefresherRateFloorSeconds, "1") // 1s floor
+	t.Cleanup(SetRefresherRateFloorForTest("1")) // 1s floor
 	resetRefresherForTest()
 	const floor = 1 * time.Second
 
@@ -282,7 +282,7 @@ func TestRefresher_RateFloorDeferredFinalMarkResolvesAtExpiry(t *testing.T) {
 func TestRefresher_RateFloorDeleteBypass(t *testing.T) {
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
-	t.Setenv(envRefresherRateFloorSeconds, "5") // a large floor — would fire IF the entry were present
+	t.Cleanup(SetRefresherRateFloorForTest("5")) // a large floor — would fire IF the entry were present
 	resetRefresherForTest()
 
 	// No entry under the key (emulates "evicted before the worker picked
@@ -325,7 +325,7 @@ func TestRefresher_RateFloorDeleteListDepReResolvesWithinFloor(t *testing.T) {
 	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
-	t.Setenv(envRefresherRateFloorSeconds, "1") // 1s floor
+	t.Cleanup(SetRefresherRateFloorForTest("1")) // 1s floor
 	resetRefresherForTest()
 	const floor = 1 * time.Second
 
@@ -416,7 +416,7 @@ func TestRefresher_RateFloorConcurrentMarkerStormRaceFree(t *testing.T) {
 	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 4, 0)
 	defer cleanup()
-	t.Setenv(envRefresherRateFloorSeconds, "1") // 1s floor — many marks land inside it
+	t.Cleanup(SetRefresherRateFloorForTest("1")) // 1s floor — many marks land inside it
 	resetRefresherForTest()
 
 	c := ResolvedCache()
@@ -483,56 +483,4 @@ func TestRefresher_RateFloorConcurrentMarkerStormRaceFree(t *testing.T) {
 	}
 	t.Logf("GREEN (-race): %d keys all re-resolved under an %d-goroutine storm; floored_total=%d, completed_total=%d",
 		K, G, refresherSingleton().flooredTotal.Load(), refresherSingleton().completedTotal.Load())
-}
-
-// --- A2 (architect review) — the UNWIRED default actually fires ------------
-
-// TestRefresher_RateFloorDefaultIsTwoSecondsAndFloors closes the
-// harness-masking gap: every shared test harness pins floor=0 to preserve
-// pre-#321 semantics, so nothing else proves the env-unset DEFAULT (2s,
-// the PM-gate ruling) is wired end-to-end. Asserts rateFloor() == 2s with
-// the env empty (int64FromEnv treats "" as unset), and that a freshly-Put
-// entry is FLOORED (deferred, not resolved) under that default, then
-// resolves losslessly at expiry.
-func TestRefresher_RateFloorDefaultIsTwoSecondsAndFloors(t *testing.T) {
-	// #1233: this test writes the store under a complete snapshot.
-	CompleteRBACSnapshotForTest(t)
-	cleanup := withCleanRefresher(t, 1, 0)
-	defer cleanup()
-	t.Setenv(envRefresherRateFloorSeconds, "")
-	resetRefresherForTest()
-
-	if got, want := refresherSingleton().rateFloor(), 2*time.Second; got != want {
-		t.Fatalf("rateFloor() with env unset = %s, want %s (defaultRefresherRateFloorSeconds)", got, want)
-	}
-
-	c := ResolvedCache()
-	in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "default-floor"}
-	key := ComputeKey(in)
-	// FRESH entry (Put stamps CreatedAt=now) → younger than the 2s default
-	// → the first mark must FLOOR, not resolve.
-	c.put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
-
-	var calls atomic.Int32
-	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
-		c.put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used})
-		calls.Add(1)
-		return nil
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	StartRefresher(ctx)
-
-	flBefore := refresherSingleton().flooredTotal.Load()
-	enqueueRefreshForTest(key)
-	waitFor(t, 2*time.Second, "default-floor gate fires", func() bool {
-		return refresherSingleton().flooredTotal.Load() > flBefore
-	})
-	if got := calls.Load(); got != 0 {
-		t.Fatalf("resolve fired despite the 2s default floor: calls=%d want 0 (deferred)", got)
-	}
-	// Lossless under the default too: the deferred mark resolves at expiry.
-	waitFor(t, 4*time.Second, "deferred resolve at default-floor expiry",
-		func() bool { return calls.Load() == 1 })
 }

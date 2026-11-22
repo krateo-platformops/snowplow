@@ -24,7 +24,7 @@ func TestIssue386_M1_ExcludesSkipNoHandlerAndFloor(t *testing.T) {
 	cleanup := withCleanRefresher(t, 1, 1)
 	defer cleanup()
 	// A positive floor so the FLOOR arm below actually defers a fresh entry.
-	t.Setenv(envRefresherRateFloorSeconds, "3600")
+	t.Cleanup(SetRefresherRateFloorForTest("3600"))
 
 	c := ResolvedCache()
 	r := refresherSingleton()
@@ -104,7 +104,7 @@ func TestIssue386_M1_ExcludesPark(t *testing.T) {
 	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 1, 1)
 	defer cleanup()
-	t.Setenv(envRefresherRateFloorSeconds, "0") // no floor — we want the resolve to run
+	t.Cleanup(SetRefresherRateFloorForTest("0")) // no floor — we want the resolve to run
 
 	c := ResolvedCache()
 	r := refresherSingleton()

@@ -40,6 +40,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,55 +60,11 @@ const (
 	envRefresherBaseDelayMS = "RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS"
 	envRefresherMaxDelayMS  = "RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS"
 
-	// Task #321 (#318-R1a) — per-key re-resolve RATE-FLOOR. The minimum
-	// interval, in seconds, between SUCCESSFUL re-resolves of any one L1
-	// key on the refresher dequeue path. When an entry is younger than
-	// this floor (store.Now() − entry.CreatedAt < floor — CreatedAt is the
-	// store-clock instant of the last successful Put, #930), the
-	// dequeued key is NOT re-resolved now: it is Forgotten (reset backoff,
-	// we are NOT failing) and re-scheduled via AddAfter(remaining) onto the
-	// SAME tier queue it was drawn from, then the worker returns. The
-	// deferred re-resolve fires at >= floor expiry against LATEST cluster
-	// state. This collapses the install-churn storm's repeated within-wave
-	// re-marks of the same cluster-LIST cell (R1 trace: 141,381 redundant
-	// completed re-resolves driven by ~28 configmap events fanning into the
-	// cluster-wide bucket) into one re-resolve per floor window.
-	//
-	// LOSSLESS (the invariant): the floored branch never drops a dirty
-	// mark — AddAfter always eventually calls the idempotent base Add
-	// (client-go@v0.33.0 delaying_queue.go:305), and the workqueue's Done
-	// re-pushes any mark that arrived during processing (queue.go:303-306),
-	// so the FINAL state change inside the floor still re-resolves at
-	// expiry (last-write-wins convergence ≤ floor). NOT in the 6-revert
-	// stale-clean class.
-	//
-	// floor=0 (RATE_FLOOR_SECONDS unset / 0 / negative) short-circuits the
-	// entire gate — byte-identical to pre-#321 behaviour. This is the
-	// kill-switch (project_caching_is_provisional). It is a TUNING var
-	// UNDER the cache, not a feature flag: the gate runs only on the
-	// refresher dequeue path, which never executes under cache-off
-	// (StartRefresher early-returns, refresher.go:309). Read via
-	// int64FromEnv per the SLICEABILITY_REVERIFY_RATE_FLOOR_SECONDS
-	// prior-art pattern (ra_full_list_slice.go:419-425).
-	envRefresherRateFloorSeconds = "RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS"
-
 	defaultRefresherParallelism = 4
 	// Exponential-failure backoff: first retry after baseDelay, doubling
 	// each requeue, capped at maxDelay. 500ms -> 1s -> 2s -> ... -> 60s.
 	defaultRefresherBaseDelayMS = 500
 	defaultRefresherMaxDelayMS  = 60_000
-
-	// defaultRefresherRateFloorSeconds — the #318-R1a rate-floor default,
-	// 2s per the PM gate ruling (docs/ship-318-r1a-pm-gate-2026-06-11.md
-	// §3): 2s keeps the pathological worst-case refresher convergence AT
-	// the documented 10s SLA (yield 5s + resolve ≤3s + floor 2s = 10s),
-	// not over it, so the existing hard SLA stands with NO re-documentation;
-	// and it already coalesces a whole sub-second within-wave configmap
-	// burst into one re-resolve (the incremental collapse of 3s over 2s is
-	// small — inter-wave gaps already exceed 3s). 3s remains a valid
-	// env-knob tune-up (RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS) if
-	// Phase-6 shows 2s under-collapses; the conservative default ships.
-	defaultRefresherRateFloorSeconds int64 = 2
 
 	// Ship #98 / 0.30.215 — customer-priority cooperative yield. The
 	// refresher worker parks while a customer /call is in flight, mirroring
@@ -508,15 +465,76 @@ func refresherSingleton() *refresher {
 	return refresherInstance.Load()
 }
 
-// rateFloor returns the active #318-R1a per-key re-resolve rate-floor as a
-// time.Duration. Read on every dequeue from the env so deployers can
-// re-tune at pod start without a code change (matches the prior-art
-// sliceabilityReverifyRateFloorSeconds pattern, ra_full_list_slice.go:419-425).
-// A value <= 0 disables the floor (byte-identical to pre-#321); the caller's
-// `floor > 0` guard short-circuits the gate. int64FromEnv returns the default
-// for unset/empty/unparseable (resolved.go:1332-1342).
-func (r *refresher) rateFloor() time.Duration {
-	return time.Duration(int64FromEnv(envRefresherRateFloorSeconds, defaultRefresherRateFloorSeconds)) * time.Second
+// rateFloor is the per-key re-resolve RATE-FLOOR of the cell entry: how long
+// after its last successful Put the cell may be re-resolved again. A floor <= 0
+// disables the gate (the caller's `floor > 0` guard).
+//
+// #1570 — THE FLOOR IS THE CELL'S OWN LAST RECOMPUTE TIME (entry.RefreshCost,
+// stamped by the refresher terminal Put: from the worker's start of that
+// refresh to its accepted Put). Task #321 (#318-R1a) introduced the floor to
+// collapse the install-churn storm's repeated within-wave re-marks of an
+// EXPENSIVE cluster-LIST cell (R1 trace: 141,381 redundant re-resolves driven by
+// ~28 configmap events) into one re-resolve per window, and did it with one
+// fixed 2 s for every cell. Bench run 30 measured what that costs a cheap cell a
+// viewer watches: the probe list cell recomputes in 4–21 ms, and a change that
+// landed within 2 s of its previous refresh waited out the rest of the 2 s
+// (median 0.9–1.8 s for the exposed samples; the p95 rank of list_dep@10).
+//
+// With the floor equal to the last refresh's own cost, a cell is re-resolved at
+// most once per twice its cost: one cell keeps at most HALF of one worker busy,
+// whatever it costs. An expensive cell (0.9–3 s) keeps the #321 collapse at its
+// own scale; a 15 ms cell is floored for about 15 ms. No constant and no env
+// knob: the bound is each cell's measured work.
+//
+// A CELL WITH NO RECORDED TIME (RefreshCost 0: filled by a customer read, the
+// boot seed, a direct D2 refill or any other write that is not a timed refresh)
+// has no floor, so its first refresh runs at once. That first refresh is
+// bounded by what already bounds every key: the workqueue runs ONE re-resolve of
+// a key at a time and folds every mark that lands meanwhile into one re-run
+// (client-go queue.go: the dirty set, re-pushed at Done). It records its cost,
+// and that floors the next one. No number is invented for the unknown case,
+// because the first refresh IS the measurement.
+//
+// LOSSLESS, unchanged from #321: the floored branch never drops a dirty mark.
+// AddAfter always eventually calls the idempotent base Add (client-go
+// delaying_queue.go), and the workqueue's Done re-pushes any mark that arrived
+// during processing (queue.go), so the FINAL state change inside the floor
+// still re-resolves at expiry, against the latest cluster state.
+//
+// The only other source is the TEST-ONLY fixed override
+// (SetRefresherRateFloorForTest), for arms that need a deterministic deferral
+// or none. Nothing in production sets it.
+func (r *refresher) rateFloor(entry *ResolvedEntry) time.Duration {
+	if d := refresherFloorOverride.Load(); d != nil {
+		return *d
+	}
+	if entry == nil {
+		return 0
+	}
+	return entry.RefreshCost
+}
+
+// refresherFloorOverride is the TEST-ONLY fixed floor (SetRefresherRateFloorForTest).
+// nil (always, in production) means the cell's own cost (rateFloor).
+var refresherFloorOverride atomic.Pointer[time.Duration]
+
+// SetRefresherRateFloorForTest pins the refresher's per-key floor to a fixed
+// number of seconds: "0" (or a negative or unparseable value) disables it, ""
+// restores the production rule (the cell's own cost). It returns the restore;
+// t.Cleanup it. TEST-ONLY: nothing in production calls it.
+func SetRefresherRateFloorForTest(seconds string) (restore func()) {
+	prev := refresherFloorOverride.Load()
+	if seconds == "" {
+		refresherFloorOverride.Store(nil)
+	} else {
+		n, err := strconv.ParseInt(seconds, 10, 64)
+		if err != nil || n < 0 {
+			n = 0
+		}
+		d := time.Duration(n) * time.Second
+		refresherFloorOverride.Store(&d)
+	}
+	return func() { refresherFloorOverride.Store(prev) }
 }
 
 // RegisterRefreshFunc wires a refresh handler for handlerKind ("restactions",
@@ -1165,7 +1183,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		}
 		return true
 	}
-	if floor := r.rateFloor(); floor > 0 && ok && entry != nil {
+	if floor := r.rateFloor(entry); floor > 0 && ok && entry != nil {
 		// #930 — the entry's age on the STORE clock, the one that stamped CreatedAt.
 		if elapsed := c.now().Sub(entry.CreatedAt); elapsed < floor {
 			// Floored: the entry's content is younger than the floor, so a
@@ -1179,7 +1197,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			// re-marks collapse to ONE pending deferred add. At expiry the
 			// re-dequeue finds elapsed >= floor → NOT floored → re-resolves
 			// against LATEST cluster state. LOSSLESS: see the rate-floor
-			// invariant comment at envRefresherRateFloorSeconds.
+			// invariant comment at rateFloor.
 			// FAIL-OPEN on declines: CreatedAt is stamped ONLY by a
 			// successful Put (resolved.go:767-768); a refresh that DECLINES
 			// to cache (never-cache-partials sink skip) leaves CreatedAt

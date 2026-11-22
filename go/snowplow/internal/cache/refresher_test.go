@@ -43,7 +43,7 @@ func withCleanRefresher(t *testing.T, parallelism, _ int) func() {
 	// (project_caching_is_provisional). Tests that exercise the floor
 	// (refresher_rate_floor_test.go) set RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS
 	// explicitly, overriding this default.
-	t.Setenv(envRefresherRateFloorSeconds, "0")
+	t.Cleanup(SetRefresherRateFloorForTest("0"))
 	resetResolvedCacheForTest()
 	resetDepsForTest()
 	resetRefresherForTest()
