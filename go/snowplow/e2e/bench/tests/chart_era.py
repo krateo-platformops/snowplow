@@ -53,3 +53,4 @@ def patch(monkeypatch, *, chart_check: bool = False) -> None:
     monkeypatch.setattr(installer_values, "document", lambda *a, **k: for_archives(real(*a, **k)))
     if chart_check:
         monkeypatch.setattr(installer_features, "check_chart", lambda *a, **k: [])
+        monkeypatch.setattr(installer_features, "check_kit_version", lambda *a, **k: [])

@@ -303,9 +303,60 @@ def test_vm606s_chart_check_refuses_a_chart_that_cannot_express_057s_features(tm
             (root / p.name).write_bytes(p.read_bytes())
         return {"ok": True}
     monkeypatch.setattr(installer_src, "oci_preflight", preflight)
-    env = {"INSTALLER_VERSION": "0.3.641", "RUNS": "N1", "SNOWPLOW_TAG_N1": "1.12.75"}
-    with pytest.raises(vm606.Refused, match=r"installer 0\.3\.641: installer 0\.3\.641 cannot express 1 feature\(s\)"):
+    env = {"INSTALLER_VERSION": "0.3.697", "RUNS": "N1", "SNOWPLOW_TAG_N1": "1.12.75"}
+    with pytest.raises(vm606.Refused, match=r"installer 0\.3\.697: installer 0\.3\.697 cannot express 1 feature\(s\)"):
         REAL_CHART_CHECK(env, ["N1"])
+
+
+def test_falsifier_vm606s_chart_check_refuses_a_kit_on_another_installer_than_the_records(tmp_path, monkeypatch):
+    """The owner's ruling (2026-11-22): the kit's INSTALLER_VERSION is 057's live installer, read at the
+    kit's build; a kit on another version than the one 057's features were recorded on is refused."""
+    from bench import installer_src, vm606
+    from tests.test_1395_private_render import REAL_CHART_CHECK
+
+    def preflight(*a, **k):
+        raise AssertionError("the version is checked before any pull")
+    monkeypatch.setattr(installer_src, "oci_preflight", preflight)
+    env = {"INSTALLER_VERSION": "0.3.641", "RUNS": "N1", "SNOWPLOW_TAG_N1": "1.12.75"}
+    with pytest.raises(vm606.Refused, match=r"the kit installs installer 0\.3\.641, but 057's features were "
+                                            r"recorded on 0\.3\.697 \(read 2026-11-22\)"):
+        REAL_CHART_CHECK(env, ["N1"])
+    assert installer_features.check_kit_version("0.3.697") == [
+        "installer 0.3.697: the version 057's features were recorded on (2026-11-22)"]
+
+
+# ─── the live installer version: read from 057, never typed ────────────────
+
+def _cd(url="oci://ghcr.io/krateo-platformops/charts/installer", version="0.3.697"):
+    return {"apiVersion": "core.krateo.io/v1alpha1", "kind": "CompositionDefinition",
+            "metadata": {"name": "installer", "namespace": "krateo-system"},
+            "spec": {"chart": {"url": url, "version": version, "credentials": {"username": SECRETISH}}}}
+
+
+def test_the_live_installer_version_is_the_installer_compositiondefinitions_chart_version():
+    assert installer_features.live_installer_version(_cd()) == "0.3.697"
+    for bad in (_cd(url="oci://ghcr.io/krateo-agentiko/charts/installer-agent"), _cd(version="0.3.697-rc1"),
+                _cd(version=""), {"kind": "Installer"}, None):
+        with pytest.raises(installer_features.Refused):
+            installer_features.live_installer_version(bad)
+
+
+def test_the_installer_version_cli_prints_it_and_records_nothing_else(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "installer-version.json"
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(_cd())))
+    assert installer_features.main(["installer-version", "--out", str(out), "--date", "2026-11-22"]) == 0
+    assert capsys.readouterr().out == "0.3.697\n"
+    rec = json.loads(out.read_text())
+    assert rec["installer_version"] == "0.3.697" and SECRETISH not in out.read_text()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(_cd(version="latest"))))
+    assert installer_features.main(["installer-version"]) == 2
+
+
+def test_the_deviations_are_the_owners_rulings_and_name_their_fidelity_gap():
+    assert set(installer_features.DEVIATIONS) == {"configConnector", "serviceDesk"}
+    for f, (value, why, ruling) in installer_features.DEVIATIONS.items():
+        assert value is False and ruling == "the owner (Diego), 2026-11-22: OFF" and "Fidelity gap:" in why
+    assert "~274 cnrm.cloud.google.com CRDs" in installer_features.DEVIATIONS["configConnector"][1]
 
 
 # ─── end to end: run606.sh against the harness's fakes ─────────────────────

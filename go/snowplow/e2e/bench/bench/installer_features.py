@@ -62,21 +62,21 @@ _CR_VERSION = re.compile(r"^v(\d+)-(\d+)-(\d+)$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 #: The features the bench runs differently from 057, by name: {feature: (the bench's value, why, ruling)}.
-#: Each needs a credential or an endpoint outside the bench's reach; the owner rules on each.
+#: Each needs a credential or an endpoint outside the bench's reach; the owner rules on each, and
+#: every check says each one, with the fidelity gap it leaves.
 DEVIATIONS: dict[str, tuple[bool, str, str]] = {
     "configConnector": (
         False,
-        "GCP Config Connector: the installer's gcp-configconnector chart runs in cluster mode with a GCP "
-        "service-account key in a Secret (configConnector.credentialSecretName); 057 has one, the bench has "
-        "none and must not hold a key with rights on a real project. Without it the controller "
-        "manager cannot start. 057 serves 274 cnrm.cloud.google.com CRDs from it.",
-        "pending: put to the owner 2026-11-22"),
+        "GCP Config Connector needs a GCP service-account key Secret (the installer's gcp-configconnector "
+        "chart, cluster mode, configConnector.credentialSecretName) that the bench must not hold. "
+        "Fidelity gap: ~274 cnrm.cloud.google.com CRDs 057 serves (of its 590) are not served on the bench",
+        "the owner (Diego), 2026-11-22: OFF"),
     "serviceDesk": (
         False,
-        "Zendesk: the service-desk page reads Zendesk through zendesk-kog, which needs Krateo's Zendesk "
-        "API token (a Secret the chart reads) and its Zendesk endpoint. The bench has neither; "
-        "on, the page's calls fail, a bench-only failure tail of the kind this record removes.",
-        "pending: put to the owner 2026-11-22"),
+        "the service desk needs Krateo's Zendesk token and endpoint (zendesk-kog); without them the page "
+        "would add a bench-only failure tail. Fidelity gap: the service-desk page and its Zendesk "
+        "components are not installed on the bench",
+        "the owner (Diego), 2026-11-22: OFF"),
 }
 
 
@@ -169,6 +169,50 @@ def drift(rec: dict, listed) -> list[str]:
         if a != b:
             out.append(f"{f}: {'absent' if a is None else a} in the record, {'absent' if b is None else b} on 057 now")
     return out
+
+
+# ─── the installer version 057 runs (the owner's ruling, 2026-11-22) ───────
+#
+# A kit's INSTALLER_VERSION is the installer tag live on 057 when the kit is built, read from the
+# cluster and recorded, never typed. The helm release record is a Secret, which the bench never
+# reads; the version is read from what the release renders: the installer's own
+# CompositionDefinition (krateo-system/installer), spec.chart.url .../installer at spec.chart.version
+# (the chart 057's platform is rendered from; its spec, not the Installer's status):
+#
+#     kubectl --context <057> get compositiondefinitions.core.krateo.io -n krateo-system installer -o json \
+#       | python3 -m bench.installer_features installer-version --out <kit>/installer-version.json
+#
+# prints the version for the kit's env file. A launch installs exactly the version the feature
+# record was read on (check_kit_version): a kit built after 057 rolled is refused until 057's
+# features are recorded again at that version.
+
+_SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def live_installer_version(cd) -> str:
+    """The installer chart version of 057's installer CompositionDefinition (its spec.chart)."""
+    if not isinstance(cd, dict) or cd.get("kind") != "CompositionDefinition":
+        raise Refused("the reading is not one CompositionDefinition (kubectl get compositiondefinitions"
+                      ".core.krateo.io -n krateo-system installer -o json)")
+    chart = (cd.get("spec") or {}).get("chart") or {}
+    url, version = str(chart.get("url") or ""), str(chart.get("version") or "")
+    if not url.rstrip("/").endswith("/installer"):
+        raise Refused(f"the CompositionDefinition's chart {url!r} is not the installer's")
+    if not _SEMVER.fullmatch(version):
+        raise Refused(f"the installer CompositionDefinition's chart version {version!r} is not a release tag")
+    return version
+
+
+def check_kit_version(version: str, rec: dict | None = None) -> list[str]:
+    """The lines to say, or Refused: the kit's INSTALLER_VERSION must be the version 057's features
+    were recorded on."""
+    rec = load() if rec is None else validate(rec)
+    want = rec["read"]["installer_version"]
+    if version != want:
+        raise Refused(f"the kit installs installer {version}, but 057's features were recorded on {want} "
+                      f"(read {rec['read']['date']}): read 057's live installer version and record its features "
+                      f"again at it (python3 -m bench.installer_features installer-version / record)")
+    return [f"installer {version}: the version 057's features were recorded on ({rec['read']['date']})"]
 
 
 # ─── the installer chart ───────────────────────────────────────────────────
@@ -285,6 +329,10 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--date", required=True)
     r.add_argument("--out", required=True)
     sub.add_parser("drift", help="057's Installer CR list on stdin: what moved since the record")
+    v = sub.add_parser("installer-version",
+                       help="057's installer CompositionDefinition on stdin -> the version a kit installs")
+    v.add_argument("--out", help="the kit's record of the reading (JSON)")
+    v.add_argument("--date", default="", help="YYYY-MM-DD of the reading, for the record")
     sub.add_parser("show", help="the features a bench install writes")
     a = ap.parse_args(argv)
     try:
@@ -304,6 +352,17 @@ def main(argv: list[str] | None = None) -> int:
             os.replace(tmp, a.out)
             print(f"recorded {len(rec['features'])} features of installer {rec['read']['installer_version']} "
                   f"({len(rec['cr_features'])} from the CR, {len(rec['chart_defaults'])} chart defaults)")
+        elif a.cmd == "installer-version":
+            version = live_installer_version(_read_stdin())
+            if a.out:
+                tmp = a.out + ".part"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump({"kind": "installer_version_057", "installer_version": version, "date": a.date,
+                               "source": "compositiondefinitions.core.krateo.io krateo-system/installer "
+                                         "spec.chart.version"}, fh, indent=1)
+                    fh.write("\n")
+                os.replace(tmp, a.out)
+            print(version)
         elif a.cmd == "drift":
             moved = drift(load(), _read_stdin())
             print("\n".join(moved) if moved else "057's features are the record's")
