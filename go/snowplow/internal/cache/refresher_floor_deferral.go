@@ -97,7 +97,7 @@ func (d *floorDeferral) add(key string, q workqueue.TypedRateLimitingInterface[s
 	d.keys[key] = floorDeferred{q: q, createdAt: createdAt, cost: cost}
 	d.n.Store(int64(len(d.keys)))
 	d.mu.Unlock()
-	d.evaluate(true)
+	d.evaluate(true, false)
 }
 
 // backlogFell is the end of a key's work on this side: K may now be below the
@@ -106,14 +106,15 @@ func (d *floorDeferral) backlogFell() {
 	if d == nil || d.n.Load() == 0 {
 		return
 	}
-	d.evaluate(false)
+	d.evaluate(false, false)
 }
 
 // evaluate releases every key whose due time, at the side's current K, has
 // passed, and arms the timer at the soonest remaining one. force scans whatever
 // K is (a new key, the timer); otherwise only a K below kScan can make a key
-// due before the armed timer.
-func (d *floorDeferral) evaluate(force bool) {
+// due before the armed timer. fromTimer marks the timer's own evaluation: one
+// that releases nothing while keys remain is counted (floorDeferralHeld).
+func (d *floorDeferral) evaluate(force, fromTimer bool) {
 	k, s := d.r.backlogShare(d.tier) // priorityGetMu, never taken under d.mu
 	c := ResolvedCache()
 	d.mu.Lock()
@@ -142,12 +143,15 @@ func (d *floorDeferral) evaluate(force bool) {
 	}
 	d.kScan = k
 	d.n.Store(int64(len(d.keys)))
+	if fromTimer && len(release) == 0 && len(d.keys) > 0 {
+		floorDeferralHeld.Add(1)
+	}
 	if len(d.keys) == 0 {
 		if d.timer != nil {
 			d.timer.Stop()
 		}
 	} else if wait := soonest.Sub(now); d.timer == nil {
-		d.timer = time.AfterFunc(wait, func() { d.evaluate(true) })
+		d.timer = time.AfterFunc(wait, func() { d.evaluate(true, true) })
 	} else {
 		d.timer.Reset(wait)
 	}
@@ -169,6 +173,17 @@ func (d *floorDeferral) stop() {
 	d.n.Store(0)
 	d.mu.Unlock()
 }
+
+// floorDeferralHeld counts the timer's evaluations that released no key while
+// floored keys remained: the timer fired at a due time the current K (or the
+// store clock) had since moved later. TEST-ONLY readout
+// (FloorDeferralHeldForTest); no series is published from it.
+var floorDeferralHeld atomic.Uint64
+
+// FloorDeferralHeldForTest reads floorDeferralHeld. TEST-ONLY: a cross-package
+// arm uses it as the event "the floor's timer fired and the cell stayed
+// floored" (dispatchers F6c). Production code MUST NOT call it.
+func FloorDeferralHeldForTest() uint64 { return floorDeferralHeld.Load() }
 
 // floorDeferralFor is the set of the side that serves tier.
 func (r *refresher) floorDeferralFor(tier refreshTier) *floorDeferral {
