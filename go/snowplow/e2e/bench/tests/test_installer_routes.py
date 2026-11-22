@@ -5,46 +5,49 @@ The first paid rehearsal on installer 0.3.641 failed 26 minutes into a cluster: 
 named authn at /authn, as that chart routes it (0.3.639 moved it from /auth, whose prefix swallowed the
 frontend's OIDC callback), the bench expected /auth, waited out its window and blamed the installer.
 
-The fixtures are the PUBLISHED charts (0.3.616: authn at /auth; 0.3.641: /authn), rendered with real helm.
+The fixture is the PUBLISHED chart of the installer krateo-057's record was read on (tests/installer_archives.py:
+authn at /authn), rendered with real helm with a run's values, and the same chart with authn's pin moved back to
+/auth, where 0.3.616 routed it: the two route tables the rehearsal's failure was between. The older archives
+themselves cannot express 057's recorded features and are refused before any render (#1572,
+tests/test_installer_features.py), so no run renders them with its values.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import subprocess
 import sys
-import tarfile
 
 import pytest
 import yaml
 
 from bench import installer_routes, installer_values, load606, origin_gate
-from tests import chart_era  # #1572: values for the pre-0.3.697 archives
+from tests import installer_archives as ia
 from tests.test_run606_real_sequence import BENCH_DIR, harness  # noqa: F401  (fixture)
 
 BENCH = BENCH_DIR
-CHARTS = BENCH / "tests" / "fixtures" / "installer_charts"
-SHA256 = {"0.3.545": "ff89684302ec33852f390279f2cbd9d069fc65b39ce1ad566b5bf6907653efc1",
-          "0.3.616": "614280d447301d7df1a7779e8618eeb079ccb99e7d28ef4bc3e8d466d0c9f285",
-          "0.3.641": "d6692a9f3910d29b7b2ea7bf4fafa1d7499bab5686281259ce31fa25ecbc309b"}
-AUTHN = {"0.3.616": "/auth", "0.3.641": "/authn"}
+RECORDED = ia.RECORDED
+#: the recorded chart with authn's pin at /auth: the route 0.3.616 had, before 0.3.639 moved it to /authn
+AUTH_AT_AUTH = f"{RECORDED}+authn@/auth"
+AUTHN = {AUTH_AT_AUTH: "/auth", RECORDED: "/authn"}
 pytestmark = pytest.mark.skipif(shutil.which("helm") is None, reason="renders with the real helm")
 
 
-def _pull(tmp, version):
-    src = CHARTS / f"installer-{version}.tgz"
-    assert hashlib.sha256(src.read_bytes()).hexdigest() == SHA256[version]
-    d = tmp / f"pulled-{version}"
-    with tarfile.open(src) as tf:
-        tf.extractall(d, filter="data")
-    return d
+def _authn_at(chart, path):
+    f = chart / "installer" / "files" / "component-pins.min.yaml"
+    doc = yaml.safe_load(f.read_text())
+    next(c for c in doc["components"] if c["name"] == "authn")["gatewayPath"] = path
+    f.write_text(yaml.safe_dump(doc))
 
 
 @pytest.fixture(scope="module")
 def pulled(tmp_path_factory):
-    return {v: _pull(tmp_path_factory.mktemp("charts"), v) for v in SHA256}
+    out = {RECORDED: ia.pull(tmp_path_factory.mktemp("charts") / RECORDED, RECORDED)}
+    out[AUTH_AT_AUTH] = tmp_path_factory.mktemp("charts") / "auth"
+    shutil.copytree(out[RECORDED], out[AUTH_AT_AUTH])
+    _authn_at(out[AUTH_AT_AUTH], "/auth")
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -52,10 +55,10 @@ def tables(pulled, tmp_path_factory):
     """{version: the table, through the CLI run606's portal-routes step runs}."""
     d = tmp_path_factory.mktemp("tables")
     vals = d / "installer-values.yaml"
-    vals.write_text(chart_era.for_archives(installer_values.document("1.12.70")))
+    vals.write_text(installer_values.document("1.12.70"))
     out = {}
-    for v in AUTHN:
-        f = d / f"portal-routes-{v}.json"
+    for i, v in enumerate(AUTHN):
+        f = d / f"portal-routes-{i}.json"
         p = subprocess.run([sys.executable, "-m", "bench.installer_routes", "table", "--installer-pulled",
                             str(pulled[v]), "--values", str(vals), "--out", str(f)],
                            cwd=BENCH, capture_output=True, text=True, timeout=300)
@@ -65,7 +68,7 @@ def tables(pulled, tmp_path_factory):
 
 
 def _values(tmp_path, **exposure):
-    v = yaml.safe_load(chart_era.for_archives(installer_values.document("1.12.70")))
+    v = yaml.safe_load(installer_values.document("1.12.70"))
     v["exposure"].update(exposure)
     f = tmp_path / "v.yaml"
     f.write_text(yaml.safe_dump(v))
@@ -84,21 +87,21 @@ def test_the_table_is_what_the_published_chart_routes(tables, version):
         ("authn", AUTHN[version], True, "authn", 8082), ("snowplow", "/content", True, "snowplow", 8081),
         ("frontend", "/", False, "frontend", 8080), ("krateo-sse-proxy", "/events", True, "sse-proxy", 8080)]
     assert f"portal routes, from the installer chart: {AUTHN[version]} -> authn (authn:8082, AUTHN_API_BASE_URL)" in said
-    # 0.3.639 on carries its own route-table define, rendered too and equal; before it the routes are inline
-    assert ("equal to its own inst.platformRoutes" in t["source"]) == (version == "0.3.641")
-    assert ("has no inst.platformRoutes define" in t["source"]) == (version == "0.3.616")
-    assert {"0.3.616": "files/component-pins.yaml", "0.3.641": "files/component-pins.min.yaml"}[version] in t["source"]
+    # 0.3.639 on carries its own route-table define, rendered too and equal (it routes by the pins' gatewayPath)
+    assert "equal to its own inst.platformRoutes" in t["source"] and "files/component-pins.min.yaml" in t["source"]
+    assert "its own inst.compEnabled" in t["source"]
 
 
-def test_the_only_route_that_moved_between_the_two_charts_is_authns(tables):
-    a, b = ({r["component"]: r for r in tables[v][0]["routes"]} for v in ("0.3.616", "0.3.641"))
+def test_the_route_the_pin_moves_is_the_only_route_that_moves(tables):
+    """Each route is read from its own pin: authn's moved, and nothing else of any route differs."""
+    a, b = ({r["component"]: r for r in tables[v][0]["routes"]} for v in (AUTH_AT_AUTH, RECORDED))
     assert set(a) == set(b)
     assert {n: (a[n]["path"], b[n]["path"]) for n in a if a[n] != b[n]} == {"authn": ("/auth", "/authn")}
     for n in a:                                   # nothing else of a route differs: backend, port, rewrite, keys
         assert {k: v for k, v in a[n].items() if k != "path"} == {k: v for k, v in b[n].items() if k != "path"}
 
 
-def _copy(pulled, tmp_path, version="0.3.641"):
+def _copy(pulled, tmp_path, version=RECORDED):
     d = tmp_path / "chart"
     shutil.copytree(pulled[version], d)
     return d
@@ -119,8 +122,8 @@ def _refused(chart, values) -> str:
 def test_a_table_the_chart_does_not_give_is_refused(pulled, tmp_path):
     # not path mode: the portal is not one origin with a path per component
     assert "the run's values are not path mode (exposure.type='Gateway', gatewayMode='host')" in _refused(
-        pulled["0.3.641"], _values(tmp_path, gatewayMode="host"))
-    assert "not path mode (exposure.type='LoadBalancer'" in _refused(pulled["0.3.641"], _values(tmp_path, type="LoadBalancer"))
+        pulled[RECORDED], _values(tmp_path, gatewayMode="host"))
+    assert "not path mode (exposure.type='LoadBalancer'" in _refused(pulled[RECORDED], _values(tmp_path, type="LoadBalancer"))
     vals = _values(tmp_path)
     # a chart that cannot say which components are on
     bare = _copy(pulled, tmp_path)
@@ -130,22 +133,25 @@ def test_a_table_the_chart_does_not_give_is_refused(pulled, tmp_path):
     assert "has neither an inst.compEnabled nor an inst.featureEnabled define" in _refused(bare, vals)
     assert "no pulled installer chart at" in _refused(tmp_path / "nowhere", vals)
     # the portal's feature off: no route to hold a config against
-    off = yaml.safe_load(chart_era.for_archives(installer_values.document("1.12.70")))
+    off = yaml.safe_load(installer_values.document("1.12.70"))
     off.setdefault("features", {})["portal"] = False
     (tmp_path / "off.yaml").write_text(yaml.safe_dump(off))
-    assert "renders no portal route with a frontend key" in _refused(pulled["0.3.641"], str(tmp_path / "off.yaml"))
+    assert "renders no portal route with a frontend key" in _refused(pulled[RECORDED], str(tmp_path / "off.yaml"))
 
 
-def test_a_chart_from_before_comp_enabled_is_asked_by_its_own_feature_rule(pulled, tmp_path):
-    """0.3.545 (like 0.3.422, which several dry-pass tests pull from the real registry) has no
-    inst.compEnabled: its route table gates on inst.featureEnabled of the pin's feature."""
-    t = installer_routes.table(str(pulled["0.3.545"]), _values(tmp_path))
-    assert t["paths"]["AUTHN_API_BASE_URL"] == "/auth" and "its own inst.featureEnabled" in t["source"]
-    assert [r["component"] for r in t["routes"]] == ["authn", "snowplow", "frontend", "krateo-sse-proxy"]
-    off = yaml.safe_load(chart_era.for_archives(installer_values.document("1.12.70")))
-    off.setdefault("features", {})["portal"] = False
-    (tmp_path / "off.yaml").write_text(yaml.safe_dump(off))
-    assert "renders no portal route with a frontend key" in _refused(pulled["0.3.545"], str(tmp_path / "off.yaml"))
+def test_a_chart_from_before_comp_enabled_is_refused_before_its_routes_are_read(tmp_path):
+    """0.3.545 (like 0.3.422) has no inst.compEnabled, and cannot express 057's recorded features: the
+    source step's chart check refuses it, with its message, before the portal-routes step renders anything
+    (run606.sh s_source; #1572). No run reads its routes with its values."""
+    from bench import installer_features
+    with pytest.raises(installer_features.Refused, match=r"installer 0\.3\.545 cannot express \d+ feature\(s\) 057"):
+        installer_features.check_chart(str(ia.pull(tmp_path / "p", "0.3.545")))
+    src = (BENCH / "run606.sh").read_text()
+    body = src[src.index("s_source() {"):]
+    assert "  installer_features_check || return 1" in body[:body.index("\n}\n")]
+    # the values are written (s_registry) and the routes read (s_portal_routes) only after the source step
+    assert src.index("\nstep source    s_source\n") < src.index("\nstep registry  s_registry\n") \
+        < src.index("\nstep portal-routes s_portal_routes\n")
 
 
 def test_a_chart_with_comp_enabled_is_asked_by_it_not_by_the_feature_alone(pulled, tmp_path):
@@ -189,7 +195,7 @@ def test_a_table_with_no_snowplow_route_is_refused(pulled, tmp_path, change):
 
 def test_a_chart_whose_own_route_table_and_pins_disagree_is_refused_naming_both(pulled, tmp_path):
     chart = _copy(pulled, tmp_path)
-    _edit(chart / "installer" / "templates" / "_helpers.tpl", '"pathPrefix" $d.gatewayPath', '"pathPrefix" "/auth"')
+    _edit(chart / "installer" / "templates" / "_helpers.tpl", '"pathPrefix" $p', '"pathPrefix" "/auth"')
     why = _refused(chart, _values(tmp_path))
     assert "the installer chart's own route table (inst.platformRoutes) and its pins " \
            "(files/component-pins.min.yaml: gatewayPath) disagree" in why
@@ -235,13 +241,14 @@ def _cli(config, routes_file):
 
 
 def test_the_rehearsals_real_config_passes_against_its_own_charts_table(tables):
-    p = _cli(LIVE_641, tables["0.3.641"][1])
+    """The rehearsal's live config (installer 0.3.641) against the recorded chart, which routes as 0.3.641 did."""
+    p = _cli(LIVE_641, tables[RECORDED][1])
     assert p.returncode == 0, p.stderr
     assert "export PORTAL_ORIGIN=http://34.7.89.19:80" in p.stdout
     assert "export PORTAL_SNOWPLOW_URL=http://34.7.89.19:80/content" in p.stdout
 
 
-@pytest.mark.parametrize("version, live", [("0.3.616", "/authn"), ("0.3.641", "/auth")])
+@pytest.mark.parametrize("version, live", [(AUTH_AT_AUTH, "/authn"), (RECORDED, "/auth")])
 def test_a_config_whose_path_is_not_the_charts_says_which_two_disagree(tables, version, live):
     cfg = {"api": dict(LIVE_641["api"], AUTHN_API_BASE_URL=f"http://34.7.89.19:80{live}")}
     p = _cli(cfg, tables[version][1])
@@ -276,8 +283,9 @@ def _gate_files(tmp_path, cfg):
 
 
 def test_the_gates_reading_and_verdict_name_the_charts_paths(tables, tmp_path):
-    """Through the gate's CLI, as run606 calls it: the 0.3.641 cluster's config against 0.3.616's table (what
-    the bench did with its fixed paths) is `wrong_paths`, and the verdict says which two things disagree."""
+    """Through the gate's CLI, as run606 calls it: the 0.3.641 cluster's config against a table that routes
+    authn at /auth (what the bench did with its fixed paths) is `wrong_paths`, and the verdict says which two
+    things disagree."""
     svc, fe, dep = _gate_files(tmp_path, LIVE_641["api"])
     out = {}
     for v in AUTHN:
@@ -287,11 +295,11 @@ def test_the_gates_reading_and_verdict_name_the_charts_paths(tables, tmp_path):
                            cwd=BENCH, capture_output=True, text=True, timeout=60)
         assert p.returncode == 0, p.stderr
         out[v] = json.loads(p.stdout)
-    assert out["0.3.641"]["rendered"] == "same_origin" and out["0.3.616"]["rendered"] == "wrong_paths"
-    (tmp_path / "wait.jsonl").write_text(json.dumps(out["0.3.616"]) + "\n")
+    assert out[RECORDED]["rendered"] == "same_origin" and out[AUTH_AT_AUTH]["rendered"] == "wrong_paths"
+    (tmp_path / "wait.jsonl").write_text(json.dumps(out[AUTH_AT_AUTH]) + "\n")
     (tmp_path / "resync.json").write_text(json.dumps({"seconds": 60, "source": "x"}))
     p = subprocess.run([sys.executable, "-m", "bench.origin_gate", "verdict", "--readings", str(tmp_path / "wait.jsonl"),
-                        "--resync", str(tmp_path / "resync.json"), "--why", "w", "--routes", str(tables["0.3.616"][1])],
+                        "--resync", str(tmp_path / "resync.json"), "--why", "w", "--routes", str(tables[AUTH_AT_AUTH][1])],
                        cwd=BENCH, capture_output=True, text=True, timeout=60)
     v = json.loads(p.stdout)
     assert v["kind"] == "installer_defect"
@@ -299,8 +307,8 @@ def test_the_gates_reading_and_verdict_name_the_charts_paths(tables, tmp_path):
     assert "path '/authn', and the installer chart routes it at '/auth'" in v["message"]
     assert "The gateway routes AUTHN_API_BASE_URL at /auth, EVENTS_API_BASE_URL at /events" in v["message"]
     # a config that is simply not rendered yet names the chart's paths too, and no path of the bench's own
-    k, m = origin_gate.verdict([dict(out["0.3.641"], rendered="not_same_origin", rendered_why="3 origins")],
-                               {"seconds": 60, "source": "x"}, "w", tables["0.3.641"][0])
+    k, m = origin_gate.verdict([dict(out[RECORDED], rendered="not_same_origin", rendered_why="3 origins")],
+                               {"seconds": 60, "source": "x"}, "w", tables[RECORDED][0])
     assert k == "installer_defect" and "not one origin with AUTHN_API_BASE_URL at /authn," in m and "/auth," not in m
     # the gate refuses to run without the table
     p = subprocess.run([sys.executable, "-m", "bench.origin_gate", "verdict", "--readings", str(tmp_path / "wait.jsonl"),

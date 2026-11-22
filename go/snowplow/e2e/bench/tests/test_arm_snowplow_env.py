@@ -3,8 +3,9 @@ the same image at the Go default.
 
   - declared: SNOWPLOW_ENV="GOGC=100", explicit values only, Go runtime keys only;
   - applied through the installer's values and nothing else, and rendered by the pulled chart before
-    anything is created (real helm, the published installer 0.3.641 archive: the 50 -> 100 override, and
-    that no declaration renders the installer's own 50);
+    anything is created (real helm, the published archive of the installer krateo-057's record was read
+    on, tests/installer_archives.py: the 50 -> 100 override, and that no declaration renders the
+    installer's own 50);
   - proven from the running pod before any load (the run's own reading of the container's env and the
     ConfigMaps it reads): a mismatch fails the arm;
   - agreed between the arms of a launch: the same declared keys or the launch is refused; a key no arm
@@ -16,28 +17,21 @@ Every report is read through the CLI the run uses.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
-import tarfile
 
 import pytest
 
 from bench import installer_values, snowplow_env
-from tests import chart_era
 from bench import tracing as tr
 from tests.test_run15_customer_latency import _launch, pairbed  # noqa: F401  (fixture)
 from tests.test_run22_three_runs import ROOM_FOR_THREE, _launch_env
 from tests.test_run606_real_sequence import BENCH_DIR, RUN_NAME, harness  # noqa: F401  (fixture)
 
 BENCH = BENCH_DIR
-CHARTS = BENCH / "tests" / "fixtures" / "installer_charts"
-# the published chart, as `helm pull oci://ghcr.io/krateo-platformops/charts/installer --version 0.3.641`
-# gave it on 2026-11-14 (the registry's manifest digest: sha256:eb3799df...160ff; the archive's own sha256 below)
-INSTALLER = "0.3.641"
 needs_helm = pytest.mark.skipif(shutil.which("helm") is None, reason="renders with the real helm")
 DIG = "sha256:" + "ab" * 32
 DIG2 = "sha256:" + "cd" * 32
@@ -86,17 +80,14 @@ def test_the_values_carry_the_declaration_and_nothing_changes_without_one():
     assert v == without                                           # the declaration adds its keys, only
 
 
-# ─── rendered: the published installer 0.3.641, real helm ───────────────────
+# ─── rendered: the published installer 057's record was read on, real helm ──
 
 @pytest.fixture(scope="module")
 def pulled(tmp_path_factory):
-    src = CHARTS / f"installer-{INSTALLER}.tgz"
-    assert hashlib.sha256(src.read_bytes()).hexdigest() == \
-        "d6692a9f3910d29b7b2ea7bf4fafa1d7499bab5686281259ce31fa25ecbc309b"
-    d = tmp_path_factory.mktemp("pulled")
-    with tarfile.open(src) as tf:
-        tf.extractall(d, filter="data")
-    return d
+    """#1572: a run's values render only against the installer krateo-057's record was read on (an older one
+    cannot express the record's features and is refused before any render); tests/installer_archives.py."""
+    from tests import installer_archives as ia
+    return ia.pull(tmp_path_factory.mktemp("pulled"), ia.RECORDED)
 
 
 def _render(pulled, tmp, declared, in_values=None):
@@ -106,7 +97,6 @@ def _render(pulled, tmp, declared, in_values=None):
                         "--snowplow-env", declared if in_values is None else in_values, "--out", str(vals)],
                        cwd=BENCH, capture_output=True, text=True, timeout=60)
     assert p.returncode == 0, p.stderr
-    vals.write_text(chart_era.for_archives(vals.read_text()))   # #1572: 0.3.641 predates 057's features
     out = tmp / "snowplow-env-render.json"
     p = _cli("render-check", "--installer-pulled", str(pulled), "--values", str(vals), "--declared", declared,
              "--out", str(out))
@@ -114,7 +104,7 @@ def _render(pulled, tmp, declared, in_values=None):
 
 
 @needs_helm
-def test_installer_0_3_641_renders_the_override_and_its_own_50_without_one(pulled, tmp_path):
+def test_the_recorded_installer_renders_the_override_and_its_own_50_without_one(pulled, tmp_path):
     p, rec = _render(pulled, tmp_path, "GOGC=100")
     assert p.returncode == 0 and rec["ok"] is True and rec["rendered"] == {"GOGC": "100"}, p.stdout + p.stderr
     assert 'rendered: componentValues.snowplow.env of the Installer CR the chart applies: {"GOGC": "100"}' in p.stdout

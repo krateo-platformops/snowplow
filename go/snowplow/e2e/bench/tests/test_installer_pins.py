@@ -23,7 +23,6 @@ import pytest
 import yaml
 
 from bench import crd_schema, ghcr_pull, installer_pins, installer_src, installer_values, lb_need, login_contract
-from tests import chart_era
 from tests.test_run15_customer_latency import _launch, pairbed  # noqa: F401  (fixture)
 from tests.test_run22_three_runs import ROOM_FOR_THREE, _launch_env
 from tests.test_run606_real_sequence import BENCH_DIR, harness  # noqa: F401  (fixture)
@@ -53,7 +52,7 @@ def pulled(tmp_path_factory):
 
 def _values(tmp_path, tag="1.12.70"):
     f = tmp_path / "installer-values.yaml"
-    f.write_text(chart_era.for_archives(installer_values.document(tag)))   # #1572: tests/chart_era.py
+    f.write_text(installer_values.document(tag))
     return f
 
 
@@ -115,12 +114,17 @@ def test_the_load_balancer_plan_reads_the_pins(pulled, tmp_path, version):
 
 
 @needs_helm
-@pytest.mark.parametrize("version", list(SHA256))
-def test_the_chart_renders_its_private_image_list_with_real_helm(pulled, tmp_path, version):
-    """What the chart renders comes from the same file: helm loads it through the chart's own helper."""
+def test_the_chart_renders_its_private_image_list_with_real_helm(tmp_path):
+    """What the chart renders comes from the same file: helm loads it through the chart's own helper. Rendered
+    with a run's values, so on the published installer 057's record was read on (#1572: the two archives
+    above cannot express the record's features and are refused before any render,
+    tests/test_installer_features.py); it ships the min form."""
+    from tests import installer_archives as ia
+    pulled = ia.pull(tmp_path / "pulled", ia.RECORDED)
+    assert installer_pins.shipped(str(pulled / "installer")) == ["component-pins.min.yaml"]
     values = yaml.safe_load(_values(tmp_path).read_text())
-    paths = ghcr_pull.private_image_paths(str(pulled[version]), values)
-    names = {c["name"] for c in installer_pins.components(str(pulled[version] / "installer"))}
+    paths = ghcr_pull.private_image_paths(str(pulled), values)
+    names = {c["name"] for c in installer_pins.components(str(pulled / "installer"))}
     assert paths and set(paths) <= names
 
 
