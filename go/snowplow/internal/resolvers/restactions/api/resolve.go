@@ -1788,7 +1788,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 
 		asMap, mapErr := response.AsMap(res)
 		if mapErr != nil {
-			r.log.WarnContext(fctx, "unable to encode status as dict", slog.Any("err", mapErr))
+			r.log.Log(fctx, FailureLevelOf(r.ctx, slog.LevelWarn, "stage.status\x00"+id+"\x00"+call.Path, mapErr),
+				"unable to encode status as dict", slog.Any("err", mapErr))
 		}
 
 		// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
@@ -2440,14 +2441,16 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		log.ErrorContext(ctx, "unable to fetch user info from context", slog.Any("err", err))
+		log.Log(ctx, FailureLevelOf(ctx, slog.LevelError, "resolve.userInfo", err),
+			"unable to fetch user info from context", slog.Any("err", err))
 		return abortedResolve(ctx, opts.Items)
 	}
 
 	// Sort API by Depends
 	names, err := topologicalSort(opts.Items)
 	if err != nil {
-		log.ErrorContext(ctx, "unable to sorted api by deps", slog.Any("error", err))
+		log.Log(ctx, FailureLevelOf(ctx, slog.LevelError, "resolve.dependsOn", err),
+			"unable to sorted api by deps", slog.Any("error", err))
 		return abortedResolve(ctx, opts.Items)
 	}
 	log.Debug("sorted api by deps", slog.Any("names", names))

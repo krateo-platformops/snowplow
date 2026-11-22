@@ -51,6 +51,14 @@ type PutGateEffects struct {
 	// this package cannot import. Carried here so a memo hit is
 	// indistinguishable from the resolve it replaces in what the cell stores.
 	StageOutcomes string
+	// Failures (#1569) is the producing resolve's failures as its cell's
+	// failure-log round noted them (api.FailureCapture.Stored: target digests
+	// and closed class labels, "" = none). Like StageOutcomes it is no Put-gate
+	// sink and Replay does not touch it: apiref.Resolve records it on a
+	// producing resolve and notes it in the hitter's round
+	// (api.ReplayFailures), so a memo-served cell keeps its failures noted and
+	// its next real resolve logs an unchanged one at DEBUG.
+	Failures string
 }
 
 // PutGateCapture holds the child sinks a producing resolve runs under.

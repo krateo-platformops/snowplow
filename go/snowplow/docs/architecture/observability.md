@@ -1647,16 +1647,33 @@ The operator-notable events:
 | `dispatcher.call.complete` | Info | `dispatchers/per_call_log.go` | per-dispatch structured timing (the per-call diagnostic) |
 | `cache.secrets.informer.assertion_violation` | Error | `internal/cache/secrets_informer.go` | secrets-informer invariant breach |
 
-### Failure lines: logged again only when they change (#711, #1476)
+### Failure lines: logged again only when they change (#711, #1476, #1569)
 
 A resident cell is re-resolved on every refresh, keepwarm pass and prewarm pass, and a stage
 that failed fails the same way each time. So a failure line logs at its own level only when
 the failure is **new since the cell's previous resolve**, and at **Debug** while it repeats
-unchanged. The lines are:
+unchanged. Every failure line a cell's resolve writes follows this rule (#1569):
 
 - `api call response failure` (each dispatch branch of a stage);
 - `unable to resolve api endpoint reference` (a stage's `endpointRef`);
-- the widget's `unable to resolve api reference` (its `apiRef`).
+- the widget's `unable to resolve api reference` (its `apiRef`);
+- a RESTAction's `unable to execute iterator`, `unable to sorted api by deps`,
+  `unable to fetch user info from context` and `unable to encode status as dict`;
+- a widget's `unable to resolve widget data`, `unable to resolve widgetDataTemplate`,
+  `unable to set nested value`, `unable to set status as unstructured.NestedMap`, its
+  spec-read lines (`unable to get widgetDataTemplate`, `unable to get resources references`,
+  `unable to get resource references template`), and its resourcesRefsTemplate's
+  `unable to execute iterator`.
+
+**A resolve served by replay (#1569).** The refresher's RESTAction-resolve memo (#598) serves
+the widgets that share a RESTAction from one resolve: whichever is re-resolved first produces
+it, and the others are served its body without running anything. Such a served resolve logs
+no line, but it notes the failures its body carries in its own cell, so its cell keeps them
+noted. A failure noted that way has not been logged in that cell yet: the cell's own first
+resolve of it logs at its level, and only after that is an unchanged repeat Debug. Before
+#1569 a served resolve counted as a success that deleted the cell's notes, so with seven
+widgets sharing `dashboard-inbox` on 057 every producer had been served the burst before, and
+each re-resolve logged its unchanged denies at Warn (~0.5 lines/s on 1.12.74).
 
 The rules are in `internal/resolvers/restactions/api/failure_log.go`:
 
@@ -1726,7 +1743,9 @@ The rules are in `internal/resolvers/restactions/api/failure_log.go`:
   one a SHA-256 digest of the target plus the class label. No path, name or identity is held
   in clear.
   - Per cell, this is bounded by the cell's current failures.
-  - A resolve without a failure deletes the cell's notes.
+  - A resolve without a failure deletes the cell's notes. A resolve served by replay is not
+    one: it notes the failures it was served (each marked as not yet logged in this cell).
+  - A memo entry carries its producer's failures the same way: digests and class labels.
   - Keys that are no longer resident are swept. The sweep runs once as many keys have been
     inserted as were held after the last sweep, so its residency probes average out to at most
     two per inserted key.

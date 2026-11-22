@@ -361,6 +361,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// stored with the memo entry; outcomesCtx is the caller's ctx, whose
 	// collector a hit (or the producer, when it returns) reports into.
 	var memoOutcomes *api.StageOutcomes
+	// #1569 — the producing resolve's failures in this cell (see the hit).
+	var memoFailures *api.FailureCapture
 	outcomesCtx := ctx
 	if memo != nil {
 		username, groups := identityForMemo(ctx)
@@ -382,6 +384,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			// resolve's, so the widget cell the hitter stores (and its /call
 			// header) reads exactly what the producer's did.
 			api.ReplayStageOutcomes(ctx, effects.StageOutcomes)
+			// #1569 — and note the producer's failures in THIS cell's
+			// failure-log round (no line is logged: nothing ran), so the round
+			// does not end as a success that wipes the cell's notes and the
+			// cell's next real resolve logs an unchanged failure at DEBUG.
+			api.ReplayFailures(ctx, effects.Failures)
 			// #277 / edge-3: replay the deps captured when this body was first
 			// produced onto THIS widget's L1 key, so a memo-served widget cell
 			// carries the same backing-GVR edges a real resolve would have
@@ -435,6 +442,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		// have reported them.
 		ctx, memoOutcomes = api.WithStageOutcomes(ctx)
 		defer func() { api.ReplayStageOutcomes(outcomesCtx, api.StorableStageOutcomes(memoOutcomes)) }()
+		// #1569 — the failures the producing resolve notes in this cell, stored
+		// with the memo entry so a hit notes them in the hitter's cell.
+		ctx, memoFailures = api.WithFailureCapture(ctx)
 	}
 
 	// storeMemo stores the resolved body ENCODED (#883 F4), closes the edge-3
@@ -482,6 +492,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		memoProduce.Produced(deps, memoStamp) // measurement only: what a joiner would have taken
 		effects := memoEffects.Effects()
 		effects.StageOutcomes = api.StorableStageOutcomes(memoOutcomes) // #1319
+		effects.Failures = memoFailures.Stored()                        // #1569
 		memo.StoreLayeredWithStates(memoKey, l1Key, encoded, deps, states, memoStamp, cache.LayeredSourcesSince(ctx, layerMark),
 			effects)
 	}
