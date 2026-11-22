@@ -192,6 +192,11 @@ type refresher struct {
 	viewedQueue  workqueue.TypedRateLimitingInterface[string]
 	promotedKeys sync.Map
 	viewed       viewedTierStats
+
+	// #1570 — each side's floored keys, released at the due time their side's
+	// CURRENT backlog gives (refresher_floor_deferral.go).
+	viewedDeferral, unviewedDeferral *floorDeferral
+
 	// #799 B1 — priorityGetMu makes a priority tier's Len()>0 probe and its Get
 	// one step. B2 — inFlightKeys: the keys a worker is re-resolving now (value:
 	// a dequeue of it from another tier was deferred and must be re-added).
@@ -258,7 +263,7 @@ type refresher struct {
 
 	// Task #321 (#318-R1a) — rate-floor falsifier counter. flooredTotal
 	// ticks every time the dequeue-side floor gate DEFERS a key (entry
-	// younger than the floor): Forget + AddAfter(remaining) + return,
+	// younger than the floor): Forget + the side's floored set + return,
 	// instead of re-resolving now. THE primary falsifier readout — under
 	// the install storm completed_total collapses while flooredTotal rises.
 	//
@@ -428,6 +433,8 @@ func refresherSingleton() *refresher {
 			return &shutdownNotifyingQueue{TypedInterface: q, onShutDown: r.wakeReservedOnShutdown}
 		})
 		r.viewedQueue = newViewedQueue(vRL, r.wakeViewed, work, vStamps)
+		r.viewedDeferral = newFloorDeferral(r, tierViewed)
+		r.unviewedDeferral = newFloorDeferral(r, tierNormal)
 		refresherInstance.Store(r)
 	})
 	return refresherInstance.Load()
@@ -478,11 +485,18 @@ func refresherSingleton() *refresher {
 // and that floors the next one. No number is invented for the unknown case,
 // because the first refresh IS the measurement.
 //
+// THE WAIT FOLLOWS THE LIVE BACKLOG. K is read again for as long as the key
+// waits: the floored key is held in its side's set (refresher_floor_deferral.go)
+// and released once CreatedAt + RefreshCost × max(1, K_now/S) has passed,
+// re-evaluated at every end of a key's work on that side and at the soonest due
+// time. A cell floored at a burst's peak is released as the burst drains, not
+// after the peak's wait.
+//
 // LOSSLESS, unchanged from #321: the floored branch never drops a dirty mark.
-// AddAfter always eventually calls the idempotent base Add (client-go
-// delaying_queue.go), and the workqueue's Done re-pushes any mark that arrived
-// during processing (queue.go), so the FINAL state change inside the floor
-// still re-resolves at expiry, against the latest cluster state.
+// The set releases every key through the idempotent base Add, and the
+// workqueue's Done re-pushes any mark that arrived during processing (queue.go),
+// so the FINAL state change inside the floor still re-resolves at expiry,
+// against the latest cluster state.
 //
 // The only other source is the TEST-ONLY fixed override
 // (SetRefresherRateFloorForTest), for arms that need a deterministic deferral
@@ -495,10 +509,7 @@ func (r *refresher) rateFloor(entry *ResolvedEntry, tier refreshTier) time.Durat
 		return 0
 	}
 	k, s := r.backlogShare(tier)
-	if k <= s {
-		return entry.RefreshCost
-	}
-	return time.Duration(int64(entry.RefreshCost) * int64(k) / int64(s))
+	return floorFor(entry.RefreshCost, k, s)
 }
 
 // backlogShare is the backlog of the side of the pool that serves tier: k keys
@@ -666,6 +677,7 @@ func StartRefresher(ctx context.Context) {
 			r.queue.ShutDown()
 			r.clusterListQueue.ShutDown()
 			r.viewedQueue.ShutDown()
+			r.stopFloorDeferrals()
 		}()
 
 		slog.Info("refresher.started",
@@ -684,6 +696,7 @@ func StopRefresher() {
 		r.queue.ShutDown()
 		r.clusterListQueue.ShutDown()
 		r.viewedQueue.ShutDown()
+		r.stopFloorDeferrals()
 	})
 }
 
@@ -1065,8 +1078,8 @@ func (r *refresher) processNext(ctx context.Context) bool {
 
 	// Select the queue to mutate on success/failure (Forget /
 	// AddRateLimited / NumRequeues all read per-tier rate-limiter
-	// state). Task #321 — the floored branch's Forget/AddAfter use this
-	// SAME q, so a floored cluster_list key defers onto clusterListQueue
+	// state). Task #321 — the floored branch's Forget and its floored-set
+	// release use this SAME q, so a floored cluster_list key returns to clusterListQueue
 	// and the deferred Done (refresher.go above) is on the matching tier.
 	q := r.queue
 	switch tier {
@@ -1139,14 +1152,13 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		if elapsed := c.now().Sub(entry.CreatedAt); elapsed < floor {
 			// Floored: the entry's content is younger than the floor, so a
 			// re-resolve now is redundant. Do NOT drop the mark — defer it.
-			// Forget clears any backoff (we are NOT failing); AddAfter
-			// schedules the deferred re-resolve at floor expiry. remaining
-			// > 0 by construction (elapsed < floor), so AddAfter always
-			// takes the async delaying-queue path (delaying_queue.go:260),
-			// never the immediate Add. The delaying-heap dedup is
-			// earliest-wins (insert(), delaying_queue.go), so concurrent
-			// re-marks collapse to ONE pending deferred add. At expiry the
-			// re-dequeue finds elapsed >= floor → NOT floored → re-resolves
+			// Forget clears any backoff (we are NOT failing); the side's
+			// floored set holds the key and releases it (q.Add) once its
+			// floor at the side's CURRENT backlog has passed — re-evaluated
+			// as that backlog falls, never frozen at this dequeue's K
+			// (#1570, refresher_floor_deferral.go). The set holds a key once,
+			// so concurrent re-marks collapse to ONE pending release. The
+			// re-dequeue reads the live entry and K again and re-resolves
 			// against LATEST cluster state. LOSSLESS: see the rate-floor
 			// invariant comment at rateFloor.
 			// FAIL-OPEN on declines: CreatedAt is stamped ONLY by a
@@ -1155,7 +1167,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 			// old, so a persistently-declining key is never floored — it
 			// re-resolves on every dequeue, favoring freshness over collapse.
 			q.Forget(key)
-			q.AddAfter(key, floor-elapsed)
+			r.floorDeferralFor(tier).add(key, q, entry.CreatedAt, entry.RefreshCost)
 			r.flooredTotal.Add(1)
 			return true
 		}
@@ -1813,6 +1825,7 @@ func resetRefresherForTest() {
 		if r.viewedQueue != nil {
 			r.viewedQueue.ShutDown()
 		}
+		r.stopFloorDeferrals()
 		// Wait for workers to drain + exit. Capped at 5s as a defensive
 		// deadline that should never fire.
 		done := make(chan struct{})

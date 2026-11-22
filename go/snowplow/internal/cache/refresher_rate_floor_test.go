@@ -3,10 +3,12 @@
 //
 // The floor (refresher.processNext, dequeue side, between the
 // customer-priority yield and processOne) defers a re-resolve of a key
-// whose L1 entry is younger than RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS
+// whose L1 entry is younger than the floor (pinned here with the test-only
+// SetRefresherRateFloorForTest; production: the cell's own cost × backlog, #1570)
 // (reusing ResolvedEntry.CreatedAt — the wall-clock of the last successful
 // Put, resolved.go:767-768; "S1", no new map). The floored branch does
-// Forget(key) + AddAfter(key, remaining) onto the SAME tier queue, then
+// Forget(key) and holds the key in its side's floored set, released onto the
+// SAME tier queue at floor expiry (refresher_floor_deferral.go), then
 // returns — never dropping the dirty mark. The deferred re-resolve fires
 // at >= floor expiry against the latest cluster state (last-write-wins
 // convergence ≤ floor).

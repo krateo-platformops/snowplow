@@ -64,8 +64,8 @@
 // IDLE WAKE. Workers block in the normal tier's Get when it is empty; a key added
 // to viewedQueue then would wake nobody. The viewed tier's underlying queue
 // (wakingQueue) therefore adds viewedWakeKey to the normal queue on EVERY add —
-// a direct enqueue, a rate-floor AddAfter or a retry's AddRateLimited reaching
-// it, since the delaying queue adds through it; a worker that dequeues it goes straight
+// a direct enqueue, a rate-floor release (refresher_floor_deferral.go) or a
+// retry's AddRateLimited reaching it, since the delaying queue adds through it; a worker that dequeues it goes straight
 // back to the viewed probe (and re-adds it while more viewed keys wait, so the
 // next idle worker wakes too). With a busy normal queue the wake is a no-op:
 // every iteration probes the viewed tier first.
@@ -78,8 +78,8 @@ import (
 	"k8s.io/client-go/util/workqueue"
 )
 
-// wakingQueue is the viewed tier's underlying queue: every Add (direct, or the
-// delaying queue's when an AddAfter / AddRateLimited delay expires) also wakes
+// wakingQueue is the viewed tier's underlying queue: every Add (direct, a
+// floored key's release, or the delaying queue's when an AddRateLimited delay expires) also wakes
 // an idle worker blocked on the normal tier.
 type wakingQueue struct {
 	workqueue.TypedInterface[string]
@@ -425,6 +425,7 @@ func (r *refresher) endViewed() {
 	r.priorityGetMu.Lock()
 	r.viewedActive--
 	r.priorityGetMu.Unlock()
+	r.viewedDeferral.backlogFell() // #1570: a floored viewed key may be due now
 }
 
 // leftNormalGet ends a worker's normal-tier Get (#1069); release also gives back
@@ -446,6 +447,7 @@ func (r *refresher) endUnviewed() {
 	r.priorityGetMu.Lock()
 	r.unviewedActive--
 	r.priorityGetMu.Unlock()
+	r.unviewedDeferral.backlogFell() // #1570: a floored unviewed key may be due now
 }
 
 // wakeReservedOnShutdown releases every parked reserved worker when the normal

@@ -41,8 +41,9 @@ func withCleanRefresher(t *testing.T, parallelism, _ int) func() {
 	// Put a fresh entry then expect an IMMEDIATE re-resolve) keep their
 	// exact byte-identical behaviour. floor=0 is the documented kill-switch
 	// (project_caching_is_provisional). Tests that exercise the floor
-	// (refresher_rate_floor_test.go) set RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS
-	// explicitly, overriding this default.
+	// (refresher_rate_floor_test.go) pin their own floor with
+	// SetRefresherRateFloorForTest, overriding this default ("" = the
+	// production rule, #1570).
 	t.Cleanup(SetRefresherRateFloorForTest("0"))
 	resetResolvedCacheForTest()
 	resetDepsForTest()

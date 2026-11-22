@@ -350,7 +350,7 @@ func TestIssue354_P3_F6c_PoisonPillEndsDropped(t *testing.T) {
 func TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow(t *testing.T) {
 	// #1233: this test writes the store under a complete snapshot.
 	cache.CompleteRBACSnapshotForTest(t)
-	const deferral = time.Second // = RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS
+	const deferral = time.Second // = the SetRefresherRateFloorForTest("1") pin below
 	store := p3Env(t)
 	t.Cleanup(cache.SetRefresherRateFloorForTest("1"))
 	clk := p3VirtualWindowClock(t)

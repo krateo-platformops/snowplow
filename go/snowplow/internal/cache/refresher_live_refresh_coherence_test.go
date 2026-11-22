@@ -74,7 +74,7 @@ type servedSample struct {
 // stale window (reconcile -> first fresh served via the dispatcher read), the
 // commit latency (reconcile -> handler Put), and observed/sample counts.
 //
-//   - floorSeconds: RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS ("" = prod
+//   - floorSeconds: the SetRefresherRateFloorForTest pin ("" = prod
 //     rule: the cell's own cost, #1570; "0" = no floor).
 //   - customerInflight: pin a sustained customer /call so the refresher
 //     yields (models a busy 1000-user deployment; adds the 5s yield cap).

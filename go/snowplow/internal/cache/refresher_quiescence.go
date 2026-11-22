@@ -14,9 +14,10 @@
 // (#799 B2 releaseInFlight re-adds before its own Done) is never at zero
 // between the two.
 //
-// WHAT IT DOES NOT COUNT. A deferred re-add waiting in the delaying queue — the
-// #321 rate-floor AddAfter and the error-backoff AddRateLimited — is not yet in
-// any tier; client-go gives no hook for its expiry. Those are counted where they
+// WHAT IT DOES NOT COUNT. A deferred re-add — a #321 rate-floor key held in its
+// side's floored set (refresher_floor_deferral.go) and an error-backoff
+// AddRateLimited waiting in the delaying queue — is not yet in any tier, and
+// neither gives an expiry event to count on. Those are counted where they
 // are scheduled (floored, retried). An observer that needs "nothing will run"
 // reads both: outstanding == 0 and no deferral since its baseline.
 //
