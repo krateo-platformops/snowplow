@@ -77,7 +77,8 @@ func (r *resolveRun) refuseUAFOnNonReadVerb(id string, apiCall *templates.API) b
 	// target is not resolved (marked target).
 	r.auditStageRefusal(r.ctx, stageRefusal{apiCall: apiCall,
 		outcome: audit.OutcomeDenied, reason: audit.DenialUAFOnWriteVerb})
-	r.log.WarnContext(r.ctx, "stage refused: userAccessFilter on a verb other than GET or HEAD",
+	r.log.Log(r.ctx, FailureLogLevel(r.ctx, slog.LevelWarn, "stage.uafNonRead\x00"+id, "refused:"+StageReasonUAFOnNonReadVerb),
+		"stage refused: userAccessFilter on a verb other than GET or HEAD",
 		slog.String("name", id),
 		slog.String("verb", verb),
 		slog.String("reason", StageReasonUAFOnNonReadVerb),

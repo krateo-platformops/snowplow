@@ -24,6 +24,15 @@
 //     previous round's notes are dropped first.
 // It is neither a rate limit nor a cutoff.
 //
+// A RESOLVE SERVED BY REPLAY (#1569). A memo hit serves a widget the body
+// another widget's resolve produced; nothing runs, so no line is logged. Its
+// round still notes the failures that body carries (ReplayFailures), so it
+// never ends as a success that wipes the cell's notes. A replayed failure is
+// noted as not yet LOGGED in this cell: the cell's own first resolve of it
+// logs at its level, and only a failure the cell has logged repeats at DEBUG.
+// So per cell: the first occurrence of a failure in its residency at its
+// level, every unchanged repeat at DEBUG, a changed class at its level again.
+//
 //   - target: what failed, named by the log site: the stage and the path it
 //     read, the stage's endpointRef, a widget's apiRef. Held only as a SHA-256
 //     digest, so the notes hold no path, name or identity in clear.
@@ -90,9 +99,12 @@ package api
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -113,11 +125,24 @@ const (
 	classUncoded = "error"
 )
 
+// ClassPerIdentityDenied is the class of an expected per-identity deny, for a
+// site outside this package that decides the deny itself (#1569: objects.Get's
+// re-gate).
+const ClassPerIdentityDenied = classPerIdentityDenied
+
 // failureTarget is the digest a failure's target is noted under.
 type failureTarget [sha256.Size]byte
 
-// failureNotes is one cell's previous-round failures: target -> class.
-type failureNotes map[failureTarget]string
+// noteVal is one noted failure: its class, and whether the cell itself logged
+// it (#1569): a failure the cell's round only took over from a replayed resolve
+// (ReplayFailures) has not had its line in this cell yet.
+type noteVal struct {
+	class  string
+	logged bool
+}
+
+// failureNotes is one cell's previous-round failures: target -> noted failure.
+type failureNotes map[failureTarget]noteVal
 
 // noteEntry is one write of a key's notes. Every write stores a new entry, so
 // its pointer is the key's version: a round that loaded entry e knows the
@@ -161,6 +186,9 @@ type failureRound struct {
 	cur    failureNotes
 	// debugged are the targets this round logged at DEBUG, on prev's word.
 	debugged map[failureTarget]struct{}
+	// inherited are the replayed targets this round noted as logged, on prev's
+	// word (#1569).
+	inherited map[failureTarget]struct{}
 }
 
 type failureRoundCtxKey struct{}
@@ -206,7 +234,9 @@ func (r *failureRound) load() {
 	}
 }
 
-// level notes (target, class) in the round and returns its line's level.
+// level notes (target, class) in the round and returns its line's level: DEBUG
+// only when the cell's previous round failed on target with the same class AND
+// the cell had logged that failure.
 func (r *failureRound) level(own slog.Level, target, class string) slog.Level {
 	r.once.Do(r.load)
 	if r.off {
@@ -214,12 +244,12 @@ func (r *failureRound) level(own slog.Level, target, class string) slog.Level {
 	}
 	t := failureTarget(sha256.Sum256([]byte(target)))
 	prev, seen := r.prev[t]
-	debug := seen && prev == class
+	debug := seen && prev.class == class && prev.logged
 	r.mu.Lock()
 	if r.cur == nil {
 		r.cur = failureNotes{}
 	}
-	r.cur[t] = class
+	r.cur[t] = noteVal{class: class, logged: true}
 	if debug {
 		if r.debugged == nil {
 			r.debugged = map[failureTarget]struct{}{}
@@ -231,6 +261,36 @@ func (r *failureRound) level(own slog.Level, target, class string) slog.Level {
 		return slog.LevelDebug
 	}
 	return own
+}
+
+// replayed notes a failure the round's body carries without the round having
+// run what failed (#1569: a memo hit). Nothing is logged. It is the cell's
+// failure now, so it is noted and survives the round, and it counts as logged
+// in this cell only if the cell's previous round had logged it with the same
+// class: the cell's own first resolve of it still logs at its level. A failure
+// the round logged itself is kept as it is.
+func (r *failureRound) replayed(t failureTarget, class string) {
+	r.once.Do(r.load)
+	if r.off {
+		return
+	}
+	prev, seen := r.prev[t]
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cur == nil {
+		r.cur = failureNotes{}
+	}
+	if c, own := r.cur[t]; own && c.logged {
+		return
+	}
+	logged := seen && prev.class == class && prev.logged
+	r.cur[t] = noteVal{class: class, logged: logged}
+	if logged {
+		if r.inherited == nil {
+			r.inherited = map[failureTarget]struct{}{}
+		}
+		r.inherited[t] = struct{}{}
+	}
 }
 
 // end replaces the cell's notes with this round's failures: none (a round
@@ -246,7 +306,7 @@ func (r *failureRound) level(own slog.Level, target, class string) slog.Level {
 // entry, so no other round's end can slip between them.
 func (r *failureRound) end() {
 	r.mu.Lock()
-	cur, debugged := r.cur, r.debugged
+	cur, debugged, inherited := r.cur, r.debugged, r.inherited
 	r.mu.Unlock()
 	if r.off {
 		cur = nil
@@ -258,12 +318,19 @@ func (r *failureRound) end() {
 			now = v.(*noteEntry)
 		}
 		next := cur
-		if now != r.loaded && len(debugged) > 0 {
+		if now != r.loaded && (len(debugged) > 0 || len(inherited) > 0) {
+			// #1569 — and a replayed failure noted as logged on the old notes'
+			// word is written as not logged: the cell's next resolve of it logs
+			// at its level.
 			next = make(failureNotes, len(cur))
 			for t, c := range cur {
-				if _, d := debugged[t]; !d {
-					next[t] = c
+				if _, d := debugged[t]; d {
+					continue
 				}
+				if _, i := inherited[t]; i {
+					c.logged = false
+				}
+				next[t] = c
 			}
 		}
 		if len(next) == 0 {
@@ -299,6 +366,10 @@ func (r *failureRound) end() {
 // (FailureClassOf, classPerIdentityDenied). With no open round for ctx's key
 // the line keeps its own level.
 func FailureLogLevel(ctx context.Context, own slog.Level, target, class string) slog.Level {
+	// #1569 — a site that logs with no ctx (slog accepts one) has no round.
+	if ctx == nil {
+		return own
+	}
 	// #443 — an inert (dry-run) resolve neither reads nor writes the notes: it
 	// cannot spend a cell's first line. Its expected deny is DEBUG (#711).
 	if cache.Inert(ctx) {
@@ -311,7 +382,127 @@ func FailureLogLevel(ctx context.Context, own slog.Level, target, class string) 
 	if !ok || r.key != cache.L1KeyFromContext(ctx) {
 		return own
 	}
+	t := failureTarget(sha256.Sum256([]byte(target)))
+	captureFailure(ctx, r.key, t, class)
 	return r.level(own, target, class)
+}
+
+// ── a resolve served by replay (#1569) ───────────────────────────────────────
+//
+// A resolve can be served without running what it replaces: a SeedResolveMemo
+// hit returns the body another widget's resolve produced (#130 F4, on the
+// refresher since #598). Its round then logs no failure, and a round without a
+// failure deletes the cell's notes, so the cell's next real resolve logged its
+// unchanged failures at their level again. On 057 seven widgets share
+// dashboard-inbox: each dirty-mark burst, whichever widget is dequeued first
+// resolves it and the others hit the memo, and every producer had been a
+// hitter the burst before (~0.5 lines/s, #1569).
+//
+// So the producing resolve's failures travel with what it produced, as its
+// stage outcomes and Put-gate effects do (#1319, #912): WithFailureCapture
+// collects the (target, class) pairs noted in the producer's cell, the memo
+// stores them (Stored), and the hit notes them in the hitter's round
+// (ReplayFailures), logging nothing. The hitter's notes are then its body's
+// real failures: an unchanged one stays DEBUG at its next real resolve, a
+// recovery the producer saw clears it (a recurrence logs again), and a changed
+// class logs at its level.
+
+type failureCaptureCtxKey struct{}
+
+// FailureCapture collects the failures noted in one cell (its key) by the
+// resolves under the ctx that carries it.
+type FailureCapture struct {
+	key    string
+	parent *FailureCapture
+	mu     sync.Mutex
+	seen   map[failureTarget]string
+}
+
+// WithFailureCapture returns a ctx whose resolves' failures, noted in the round
+// of ctx's cell (its L1 key), are also collected by the returned capture. A
+// failure noted in another cell's round (a nested resolve under its own key) is
+// that cell's, and is not collected. With no L1 key, or on an inert ctx, it
+// collects nothing.
+func WithFailureCapture(ctx context.Context) (context.Context, *FailureCapture) {
+	c := &FailureCapture{key: cache.L1KeyFromContext(ctx)}
+	if ctx == nil || c.key == "" || cache.Inert(ctx) {
+		return ctx, c
+	}
+	c.parent, _ = ctx.Value(failureCaptureCtxKey{}).(*FailureCapture)
+	return context.WithValue(ctx, failureCaptureCtxKey{}, c), c
+}
+
+// captureFailure records (t, class), noted in the round of cell key, in every
+// capture on ctx collecting that cell.
+func captureFailure(ctx context.Context, key string, t failureTarget, class string) {
+	c, _ := ctx.Value(failureCaptureCtxKey{}).(*FailureCapture)
+	for ; c != nil; c = c.parent {
+		if c.key != key {
+			continue
+		}
+		c.mu.Lock()
+		if c.seen == nil {
+			c.seen = map[failureTarget]string{}
+		}
+		c.seen[t] = class
+		c.mu.Unlock()
+	}
+}
+
+// Stored is the captured failures as one string, for a memo entry to carry:
+// "<target digest hex>=<class>" pairs, sorted, newline-separated; "" for none.
+// It holds digests and closed class labels only, never a target in clear.
+// nil-receiver-safe.
+func (c *FailureCapture) Stored() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.seen) == 0 {
+		return ""
+	}
+	pairs := make([]string, 0, len(c.seen))
+	for t, class := range c.seen {
+		pairs = append(pairs, hex.EncodeToString(t[:])+"="+class)
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, "\n")
+}
+
+// ReplayFailures notes the failures a replayed resolve produced (Stored) in the
+// round of ctx's cell, logging nothing (see failureRound.replayed), and in any
+// capture collecting that cell. With no round for ctx's key it does nothing.
+func ReplayFailures(ctx context.Context, stored string) {
+	if stored == "" || ctx == nil || cache.Inert(ctx) {
+		return
+	}
+	r, ok := ctx.Value(failureRoundCtxKey{}).(*failureRound)
+	if !ok || r.key != cache.L1KeyFromContext(ctx) {
+		return
+	}
+	for _, pair := range strings.Split(stored, "\n") {
+		h, class, ok := strings.Cut(pair, "=")
+		if !ok || class == "" {
+			continue
+		}
+		var t failureTarget
+		if b, err := hex.DecodeString(h); err != nil || len(b) != len(t) {
+			continue
+		} else {
+			copy(t[:], b)
+		}
+		captureFailure(ctx, r.key, t, class)
+		r.replayed(t, class)
+	}
+}
+
+// FailureLevelOf is FailureLogLevel for a failure line about err: its class is
+// FailureClassOf(err). Every failure line a cell's resolve logs goes through
+// FailureLogLevel, so an unchanged failure of a resident cell is DEBUG at every
+// site (#1569).
+func FailureLevelOf(ctx context.Context, own slog.Level, target string, err error) slog.Level {
+	return FailureLogLevel(ctx, own, target, FailureClassOf(err))
 }
 
 // expectedDenyLevel is the level of an expected per-identity deny's failure
@@ -325,6 +516,26 @@ func expectedDenyLevel(ctx context.Context, target string) slog.Level {
 // path it read (one stage reads many paths under an iterator).
 func stageFailureTarget(id, path string) string {
 	return "stage\x00" + id + "\x00" + path
+}
+
+// stageIteratorTarget names a stage's iterator as a failure target (#1569):
+// the stage plan's and the stage loop's lines of one iterator failure share it.
+func stageIteratorTarget(in *templates.API) string {
+	if in == nil {
+		return "iterator"
+	}
+	it := ""
+	if in.DependsOn != nil && in.DependsOn.Iterator != nil {
+		it = *in.DependsOn.Iterator
+	}
+	return "iterator\x00" + in.Name + "\x00" + it
+}
+
+// stageSiteTarget names a stage read as a failure target of one log site
+// (#1569): the site's kind, the stage and the path it read. Two sites failing
+// on one read are two targets, so a line of one never repeats as the other's.
+func stageSiteTarget(site, id, path string) string {
+	return site + "\x00" + id + "\x00" + path
 }
 
 // endpointRefTarget names a stage's endpointRef as a failure target.

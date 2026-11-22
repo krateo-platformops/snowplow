@@ -439,7 +439,8 @@ func populateClusterListCellSync(
 	if !shapeOK {
 		cache.RecordApiserverFallthrough(ctx,
 			cache.ReasonClusterListShapeFallback, gvr.String())
-		log.WarnContext(ctx, "cluster_list.shape_fallback",
+		log.Log(ctx, FailureLogLevel(ctx, slog.LevelWarn, "stage.clusterListShape\x00"+apiCall.Name+"\x00"+gvr.String(), "shape:"+shapeReason),
+			"cluster_list.shape_fallback",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
@@ -455,7 +456,8 @@ func populateClusterListCellSync(
 	if decodeErr != "" {
 		cache.RecordApiserverFallthrough(ctx,
 			cache.ReasonClusterListShapeFallback, gvr.String())
-		log.WarnContext(ctx, "cluster_list.shape_fallback",
+		log.Log(ctx, FailureLogLevel(ctx, slog.LevelWarn, "stage.clusterListShape\x00"+apiCall.Name+"\x00"+gvr.String(), "decode"),
+			"cluster_list.shape_fallback",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),

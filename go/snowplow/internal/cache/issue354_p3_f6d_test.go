@@ -58,6 +58,7 @@ func TestIssue354_P3_F6d_WindowMapNeverOutlivesItsKeys(t *testing.T) {
 		t.Fatalf("F6d LEAK: %d windows outlive their DELETE-evicted keys (the map must never outgrow the resident set)", got)
 	}
 	hold.Store(false)
+	NoteCustomerDemandChanged()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) && refresherQueueDepth(refresherPeek()) > 0 {
 		time.Sleep(10 * time.Millisecond)
@@ -88,7 +89,7 @@ func TestIssue354_P3_F6d_RefilledKeyIsNotDirty(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	StartRefresher(ctx)
-	defer hold.Store(false)
+	defer func() { hold.Store(false); NoteCustomerDemandChanged() }()
 
 	in := ResolvedKeyInputs{CacheEntryClass: "restactions", Group: gvr.Group, Version: gvr.Version,
 		Resource: gvr.Resource, Namespace: "p3", Name: "refill", BindingUID: "uid"}

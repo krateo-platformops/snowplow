@@ -533,8 +533,8 @@ guard. So it stays expvar-only; see its row below.
 | `snowplow_refresher_enqueue_total`, `snowplow_refresher_completed_total`, `snowplow_refresher_failed_total`, `snowplow_refresher_retried_total`, `snowplow_refresher_dropped_total` | task lifecycle counters. **#547:** `dropped` is terminal for the background loop — a key dropped after its requeue budget stays resident and KNOWN-STALE (served, counted on `snowplow_resolved_cache_known_stale_served_total{reason=dropped|not_servable}`, revalidated on the next read) or, for a confirmed 404, is evicted via `evict_self_gone_total` | completed tracks enqueue under steady state; failed/retried/dropped low |
 | `snowplow_refresher_skipped_no_entry_total`, `snowplow_refresher_skipped_no_handler_total`, `snowplow_refresher_skipped_stage_error_total` | skip reasons | informational |
 | `snowplow_refresher_queue_depth` | live workqueue `Len()` (gauge) | near 0; climbing depth with stagnant `completed_total` = workers stuck (back-pressure) |
-| `snowplow_refresher_yielded_total` | worker yield-parked for a customer `/call` | >0 under customer burst (if 0, hook broken) |
-| `snowplow_refresher_capped_total` | yield max-parked cap fired (proceeded anyway) | **near 0**; steady climb = inflight counter leaking or sustained pressure |
+| `snowplow_refresher_yielded_total` | a dequeued refresh waited for a core (**#1571**: admitted when customer `/call`s in flight + refreshes running < GOMAXPROCS; woken by a customer request's end or a refresh's release, never polled; a viewed refresh first). Once per wait; the wait's wall time is `parked_ms_total`. Running refreshes count against the cores too, so with GOMAXPROCS below the refresher's 4 workers refresh concurrency is capped at GOMAXPROCS even with no customer in flight (the chart's CPU limit of 4 gives GOMAXPROCS 4: no cap) | >0 when customers hold every core (a burst), or when GOMAXPROCS < 4 caps the pool; 0 while customers leave a core free |
+| `snowplow_refresher_capped_total` | the 5 s leak guard fired: a refresh waited `refresherYieldMaxParked` for a core and proceeded anyway | **near 0**; a climb = a customer-inflight counter leaking, or customers holding every core for 5 s |
 | `snowplow_refresher_floored_total` | dequeue rate-floor deferred a key: its entry is younger than its floor (**#1570**: `RefreshCost × max(1, K/S)` — `ResolvedEntry.RefreshCost` is the cell's own last refresh, worker start to accepted Put; S the workers its side of the pool may hold, parallelism−1; K the keys that side is serving now. No fixed floor and no env knob; a cell with no recorded cost is never floored) | >0 under a re-mark storm or a backlog = expensive cells backing off in proportion to the cells waiting behind them; cheap cells' floors stay at their own few ms |
 | `snowplow_refresher_viewed_enqueue_total`, `snowplow_refresher_viewed_promoted_total`, `snowplow_refresher_viewed_dequeued_total`, `snowplow_refresher_viewed_queue_depth` (gauge) | **#765 viewed tier.** A dirty-marked key with an armed `/refreshes` subscription (a cell open on a page) is queued on a third tier drained before the cluster_list and normal tiers. `viewed_enqueue` counts keys routed there at the mark or promoted; `viewed_promoted` the keys a tab armed while they already waited dirty in another tier; `viewed_dequeued` the viewed-tier dequeues; `viewed_queue_depth` the live tier depth. The rate floor and the customer yield apply to it unchanged | depth bounded by the cells on open pages, near 0 at rest; `viewed_enqueue` > 0 whenever a viewed cell's data changes |
 | `snowplow_refresher_deferred_in_flight_total` | **#799 B2.** dequeues NOT run because a worker on another tier was re-resolving the same key at that moment (one re-resolve per key at a time, across tiers). The dequeue keeps its trigger set and the finishing worker re-adds the key (viewed tier if still armed) | low; it moves only when a key sits in two tiers (a promoted key, or a mark that routed viewed while the key ran on another tier) |
@@ -1647,16 +1647,37 @@ The operator-notable events:
 | `dispatcher.call.complete` | Info | `dispatchers/per_call_log.go` | per-dispatch structured timing (the per-call diagnostic) |
 | `cache.secrets.informer.assertion_violation` | Error | `internal/cache/secrets_informer.go` | secrets-informer invariant breach |
 
-### Failure lines: logged again only when they change (#711, #1476)
+### Failure lines: logged again only when they change (#711, #1476, #1569)
 
 A resident cell is re-resolved on every refresh, keepwarm pass and prewarm pass, and a stage
 that failed fails the same way each time. So a failure line logs at its own level only when
 the failure is **new since the cell's previous resolve**, and at **Debug** while it repeats
-unchanged. The lines are:
+unchanged. Every Warn- or Error-level line a cell's resolve writes follows this rule (#1569):
+every package under `internal/resolvers` and `internal/objects` logs a failure through
+`FailureLevelOf` / `FailureLogLevel`, never at a fixed level. That covers, among others,
+`api call response failure` (each dispatch branch of a stage), `unable to resolve api endpoint
+reference` (a stage's `endpointRef`), the widget's `unable to resolve api reference` (its
+`apiRef`), the stage iterator, filter, in-process resolve and response-handler lines, the
+userAccessFilter lines, the informer dispatch's RBAC and marshal lines, the widget's data and
+template lines, and `objects.Get`'s read and re-gate lines.
 
-- `api call response failure` (each dispatch branch of a stage);
-- `unable to resolve api endpoint reference` (a stage's `endpointRef`);
-- the widget's `unable to resolve api reference` (its `apiRef`).
+The guard `TestIssue1569_EveryFailureLineOnTheResolvePathGoesThroughTheRound`
+(`internal/resolvers/restactions/api`) fails on any fixed-level Warn/Error log call there. Its
+allow-list holds the lines that are not a cell's failure, each with its reason: the stale-debt
+ledger's overdue alarms, the `*.slow` latency lines, recovered panics, the cluster-list prewarm
+pass's skipped/timeout lines, the endpoint TLS-CA line, the schema validator's ServiceAccount
+discovery-client fallback, and the two resourcesRefs lines that are
+already origin-gated (#563: Warn on the serve origin, Debug for background drivers).
+
+**A resolve served by replay (#1569).** The refresher's RESTAction-resolve memo (#598) serves
+the widgets that share a RESTAction from one resolve: whichever is re-resolved first produces
+it, and the others are served its body without running anything. Such a served resolve logs
+no line, but it notes the failures its body carries in its own cell, so its cell keeps them
+noted. A failure noted that way has not been logged in that cell yet: the cell's own first
+resolve of it logs at its level, and only after that is an unchanged repeat Debug. Before
+#1569 a served resolve counted as a success that deleted the cell's notes, so with seven
+widgets sharing `dashboard-inbox` on 057 every producer had been served the burst before, and
+each re-resolve logged its unchanged denies at Warn (~0.5 lines/s on 1.12.74).
 
 The rules are in `internal/resolvers/restactions/api/failure_log.go`:
 
@@ -1726,7 +1747,9 @@ The rules are in `internal/resolvers/restactions/api/failure_log.go`:
   one a SHA-256 digest of the target plus the class label. No path, name or identity is held
   in clear.
   - Per cell, this is bounded by the cell's current failures.
-  - A resolve without a failure deletes the cell's notes.
+  - A resolve without a failure deletes the cell's notes. A resolve served by replay is not
+    one: it notes the failures it was served (each marked as not yet logged in this cell).
+  - A memo entry carries its producer's failures the same way: digests and class labels.
   - Keys that are no longer resident are swept. The sweep runs once as many keys have been
     inserted as were held after the last sweep, so its residency probes average out to at most
     two per inserted key.

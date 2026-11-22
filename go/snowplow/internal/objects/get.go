@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/http/response"
@@ -21,6 +22,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	resolveapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/statusdetails"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -67,7 +69,8 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	// read is refused here with a 400: before the informer, before any
 	// discovery, before any dial.
 	if st := checkReference(ref); st != nil {
-		xcontext.Logger(ctx).ErrorContext(ctx, "reference is not an apiserver path", slog.String("err", st.Message))
+		xcontext.Logger(ctx).Log(ctx, resolveapi.FailureLogLevel(ctx, slog.LevelError, getTarget("objects.reference", ref), strconv.Itoa(st.Code)),
+			"reference is not an apiserver path", slog.String("err", st.Message))
 		res.Err = st
 		return res
 	}
@@ -230,6 +233,12 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 // checkReference is nil for a reference whose group, version and resource are
 // each one apiserver path segment, else the 400 that refuses it. A group/version
 // that does not parse is left to the read, which answers its own 400 for it.
+// getTarget names a read of ref as a failure target of one log site (#1569):
+// the site and the reference's coordinates. Only its digest is held.
+func getTarget(site string, ref templatesv1.ObjectReference) string {
+	return site + "\x00" + ref.APIVersion + "\x00" + ref.Resource + "\x00" + ref.Namespace + "/" + ref.Name
+}
+
 func checkReference(ref templatesv1.ObjectReference) *response.Status {
 	gv, err := schema.ParseGroupVersion(ref.APIVersion)
 	if err != nil {
@@ -310,14 +319,16 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 
 	gv, err := schema.ParseGroupVersion(ref.APIVersion)
 	if err != nil {
-		log.ErrorContext(ctx, "unable to parse group version", slog.Any("reference", ref), slog.Any("err", err))
+		log.Log(ctx, resolveapi.FailureLevelOf(ctx, slog.LevelError, getTarget("objects.groupVersion", ref), err),
+			"unable to parse group version", slog.Any("reference", ref), slog.Any("err", err))
 		res.Err = response.New(http.StatusBadRequest, err)
 		return
 	}
 	res.GVR = gv.WithResource(ref.Resource)
 	ep, err := xcontext.UserConfig(ctx)
 	if err != nil {
-		log.ErrorContext(ctx, "unable to get user endpoint", slog.Any("err", err))
+		log.Log(ctx, resolveapi.FailureLevelOf(ctx, slog.LevelError, getTarget("objects.userEndpoint", ref), err),
+			"unable to get user endpoint", slog.Any("err", err))
 		res.Err = response.New(http.StatusUnauthorized, err)
 		return
 	}
@@ -333,7 +344,8 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	// (token_only_endpoint_dial_test.go).
 	rc, err := cache.ClientConfigFor(ctx, ep)
 	if err != nil {
-		log.ErrorContext(ctx, "unable to create kubernetes client config", slog.Any("err", err))
+		log.Log(ctx, resolveapi.FailureLevelOf(ctx, slog.LevelError, getTarget("objects.clientConfig", ref), err),
+			"unable to create kubernetes client config", slog.Any("err", err))
 		res.Err = response.New(http.StatusInternalServerError, err)
 		return
 	}
@@ -351,7 +363,8 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	// a GVR that is namespaced or whose scope cannot be read, and when the deny
 	// coincides with an RBAC snapshot not yet published (the RC1 guard).
 	if rbac.MustRegateSADial(ctx) && preDialGetDenied(ctx, res.GVR, ref.Namespace, ref.Name) {
-		log.WarnContext(ctx, "objects.getFromAPIServer: SA-credentialed fetch re-gated and DENIED for the ctx identity; failing closed",
+		log.Log(ctx, resolveapi.FailureLogLevel(ctx, slog.LevelWarn, getTarget("objects.regate", ref), resolveapi.ClassPerIdentityDenied),
+			"objects.getFromAPIServer: SA-credentialed fetch re-gated and DENIED for the ctx identity; failing closed",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", res.GVR.String()),
 			slog.String("namespace", ref.Namespace),
@@ -376,7 +389,8 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	// client-go's own context.TODO(), so the budget is bound to the client.
 	cli, err := dynamic.NewClient(credhttp.BindRequestBudget(ctx, rc))
 	if err != nil {
-		log.ErrorContext(ctx, "unable to create kubernetes dynamic client", slog.Any("err", err))
+		log.Log(ctx, resolveapi.FailureLevelOf(ctx, slog.LevelError, getTarget("objects.dynamicClient", ref), err),
+			"unable to create kubernetes dynamic client", slog.Any("err", err))
 		res.Err = response.New(http.StatusInternalServerError, err)
 		return
 	}
@@ -407,7 +421,8 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 		GVR:       res.GVR,
 	})
 	if err != nil {
-		log.ErrorContext(ctx, "unable to get resource",
+		log.Log(ctx, resolveapi.FailureLevelOf(ctx, slog.LevelError, getTarget("objects.get", ref), err),
+			"unable to get resource",
 			slog.String("name", ref.Name), slog.String("namespace", ref.Namespace),
 			slog.String("gvr", res.GVR.String()), slog.Any("err", err))
 
@@ -442,7 +457,8 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	if rbac.MustRegateSADial(ctx) && !filterGetByRBAC(ctx, res.GVR, uns) {
 		// #574 — attribute the refusal to its driver and cell (see
 		// rbac/sa_regate_attribution.go).
-		log.WarnContext(ctx, "objects.getFromAPIServer: SA-credentialed fetch re-gated and DENIED for the ctx identity; failing closed",
+		log.Log(ctx, resolveapi.FailureLogLevel(ctx, slog.LevelWarn, getTarget("objects.regate", ref), resolveapi.ClassPerIdentityDenied),
+			"objects.getFromAPIServer: SA-credentialed fetch re-gated and DENIED for the ctx identity; failing closed",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", res.GVR.String()),
 			slog.String("namespace", ref.Namespace),

@@ -297,6 +297,7 @@ func TestIssue354_P3_F6c_DeleteBetweenMarkAndDequeueEndsEvicted(t *testing.T) {
 		t.Fatalf("PRE: the DELETE must evict the cell")
 	}
 	hold.Store(false)
+	cache.NoteCustomerDemandChanged()
 	p3Wait(t, 5*time.Second, "the evicted outcome", func() bool { return p3Unfresh()["evicted"] > u0["evicted"] })
 	time.Sleep(100 * time.Millisecond)
 	if d := p3Unfresh()["evicted"] - u0["evicted"]; d != 1 {
@@ -456,6 +457,7 @@ func TestIssue354_P3_F6e_ParkedTimeIsAccumulated(t *testing.T) {
 			cache.Deps().OnUpdate(p3GVR, p3NS, c.name)
 			time.Sleep(tc.hold)
 			hold.Store(false)
+			cache.NoteCustomerDemandChanged()
 			p3Wait(t, 5*time.Second, "the refresh after the park", func() bool { return calls.Load() >= 1 })
 			if d := p3RefStat("parked_ms") - p0; d < tc.minMS {
 				t.Fatalf("F6e: parked_ms Δ=%d, want >= %d (the worker parked for the whole hold)", d, tc.minMS)

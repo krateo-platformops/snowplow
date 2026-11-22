@@ -90,6 +90,7 @@ func TestIssue354_P3_DOTLP_DriverSeriesReachOTLP(t *testing.T) {
 		t.Fatalf("PRE: the cell must be resident")
 	}
 	hold.Store(false)
+	cache.NoteCustomerDemandChanged()
 	close(gate)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) && done.Load() == 0 {

@@ -946,17 +946,16 @@ func main() {
 						// sweep is meaningless without the engine that processes it).
 						dispatchers.StartKeepwarmSweep(cacheCtx)
 					}
-					// Ship #98 / 0.30.215 — wire the customer-priority
-					// yield hook BEFORE StartRefresher so the worker pool
-					// sees a populated hook on its first processNext.
-					// Mirrors the prewarm engine's customer-inflight signal
-					// (prewarm_engine.go:88-105) — one atomic-int64 read per
-					// refresher yield-poll tick. Cache-off is a no-op
-					// (StartRefresher returns early). The hook is the ONE
-					// seam between cache and dispatchers; cache cannot
-					// import dispatchers (cycle), so dispatchers injects
-					// its predicate via cache.SetCustomerInflightHook.
-					cache.SetCustomerInflightHook(dispatchers.CustomerInFlight)
+					// Ship #98 / 0.30.215, #1571 — wire the customer
+					// signal BEFORE StartRefresher so the worker pool sees
+					// it on its first processNext: the count of customer
+					// requests in flight (the refresher admits work while
+					// customers + running refreshes fit within GOMAXPROCS)
+					// and the bracket's end-of-request wake. Cache-off is a
+					// no-op (StartRefresher returns early). The hooks are
+					// the ONE seam between cache and dispatchers; cache
+					// cannot import dispatchers (cycle).
+					dispatchers.InstallRefresherCustomerSignal()
 					cache.StartRefresher(cacheCtx)
 					// 1.12.6 C3 — the sampled reconcile audit: every
 					// DEPS_RECONCILE_PERIOD_SECONDS it samples

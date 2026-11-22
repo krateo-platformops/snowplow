@@ -120,6 +120,7 @@ func TestIssue386_M1_ExcludesPark(t *testing.T) {
 	// Park the worker: the hook reports a customer in flight, cleared after `park`.
 	parkUntil := time.Now().Add(park)
 	SetCustomerInflightHook(func() bool { return time.Now().Before(parkUntil) })
+	time.AfterFunc(park, NoteCustomerDemandChanged) // #1571: the park's end, announced as a customer's end is
 	defer SetCustomerInflightHook(nil)
 
 	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "parked"}

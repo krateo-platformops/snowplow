@@ -130,7 +130,8 @@ func stagePlanElements(ctx context.Context, log *slog.Logger, in *templates.API,
 		} else {
 			// err is query-derived (parse/compile) or a sanitized runtime
 			// error: no response bytes reach the log or the stage error.
-			log.ErrorContext(ctx, "unable to execute iterator", slog.String("query", it), slog.Any("err", err))
+			log.Log(ctx, FailureLevelOf(ctx, slog.LevelError, stageIteratorTarget(in), err),
+				"unable to execute iterator", slog.String("query", it), slog.Any("err", err))
 			iterErr = fmt.Errorf("iterator %q failed: %w", it, err)
 		}
 		return nil, iterErr
