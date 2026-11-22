@@ -57,7 +57,7 @@
 //   - PARALLELISM 1: nothing can be reserved; the tiers alternate, and the wake
 //     key is not a turn (viewedSlotFree).
 //
-// UNCHANGED: yieldToCustomer before every tier, the per-key rate floor (applied
+// UNCHANGED: the customer yield (admitRefresh, #1571) before every tier, the per-key rate floor (applied
 // after the dequeue, so it covers the viewed tier and defers onto it), the
 // suppression, known-stale and poison-pill paths.
 //

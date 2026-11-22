@@ -117,6 +117,7 @@ func TestFalsifier374_PartB_ResidentStillYieldsAndRefreshes(t *testing.T) {
 
 	// Release → the resident key still RE-RESOLVES (authoritative dequeue, Arm C).
 	inflight.Store(false)
+	NoteCustomerDemandChanged()
 	select {
 	case <-handlerRan:
 		// Pass — resident key refreshed after release; Part B gated the park only.

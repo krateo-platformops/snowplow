@@ -176,6 +176,7 @@ func startC1CustomerLoad(c *ResolvedCacheStore, keys []string, ratePerSec int, s
 					time.Sleep(serveHold - d) // model the rest of the /call budget; inflight stays ON
 				}
 				cl.inflight.Add(-1) // request done
+				NoteCustomerDemandChanged()
 				cl.mu.Lock()
 				cl.lat = append(cl.lat, d)
 				cl.mu.Unlock()
