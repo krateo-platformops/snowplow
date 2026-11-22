@@ -41,3 +41,9 @@ jobs:
     with:
       chart_version: ${{ github.event.inputs.chart_version || (github.ref_type == 'tag' && github.ref_name || '') }}
       app_version: ${{ github.event.inputs.app_version || (github.ref_type == 'tag' && github.ref_name || '') }}
+      # Required by the shared workflow since krateo-platformops/.github 77bcf7f (2026-11-22): the
+      # krateo-blueprints index channel these charts are published to. snowplow's charts (snowplow,
+      # snowplow-crds) are installed by the installer, never offered as a blueprint, page or operator,
+      # so they are deliberately not indexed. Without this input the release fails at startup and
+      # publishes nothing (core-provider 2.13.125, core-provider#624).
+      index_channel: none
