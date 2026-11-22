@@ -16,7 +16,7 @@ import (
 )
 
 // pickupNoopNoPark (#374 Part B) counts dequeues where the residency probe
-// skipped the yieldToCustomer park because the key was non-resident at pickup (a
+// skipped the admitRefresh park because the key was non-resident at pickup (a
 // no-op that would otherwise park a worker behind a customer burst).
 var pickupNoopNoPark atomic.Uint64
 

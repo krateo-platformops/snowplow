@@ -205,7 +205,7 @@ type refresher struct {
 	// two-tier discipline ensures cluster_list cells get fresh ahead of
 	// the long per-user tail under a CRUD storm.
 	//
-	// Customer-priority invariant PRESERVED — yieldToCustomer is called
+	// Customer-priority invariant PRESERVED — admitRefresh is called
 	// BEFORE the handler regardless of which queue the key was drawn from
 	// (see processNext below). The two-tier discipline is INSIDE
 	// processNext's source selection, ORTHOGONAL to the customer-yield
@@ -349,8 +349,8 @@ type refresher struct {
 
 	// Ship #98 / 0.30.215 — customer-priority yield falsifier counter.
 	// yieldedTotal ticks every time a worker spent at least one yield-poll
-	// parked in yieldToCustomer waiting for the customer-inflight signal
-	// to clear. cappedTotal ticks when yieldToCustomer hit
+	// parked in admitRefresh waiting for the customer-inflight signal
+	// to clear. cappedTotal ticks when admitRefresh hit
 	// refresherYieldMaxParked and proceeded anyway (the defense-in-depth
 	// bound). These two counters are the post-deploy mechanism-gate
 	// evidence: if yieldedTotal stays 0 under burst the hook is broken; if
@@ -385,7 +385,7 @@ type refresher struct {
 
 	// #386 M1 — streaming p95 of the REAL resolve latency: the registered
 	// re-resolve+Put handler fn() in processOne, timed ONLY on the ok=true path
-	// AFTER yieldToCustomer returns (so the dequeue, the customer-priority park,
+	// AFTER admitRefresh returns (so the dequeue, the customer-priority park,
 	// the skipped_no_entry/no_handler skips and the rate-floor defer never reach
 	// it). resolveLatencyMu serializes the P² estimator across the worker pool.
 	// The estimate is a DIAGNOSTIC sizing input (snowplow_resolve_latency_p95_ms,
@@ -401,7 +401,7 @@ type refresher struct {
 	dirty      sync.Map
 	dirtyStats *dirtyWindowStats
 
-	// #354 P3 (D) — wall time spent parked in yieldToCustomer, from the first
+	// #354 P3 (D) — wall time spent parked in admitRefresh, from the first
 	// park to release (a capped exit included), in nanoseconds; published as
 	// parked_ms.
 	parkedNanos atomic.Uint64
@@ -1440,7 +1440,7 @@ func (r *refresher) processOne(ctx context.Context, key string, entry *ResolvedE
 		return nil
 	}
 	// #386 M1 — time the REAL resolve (the handler fn) ONLY. We are past every
-	// skip early-return and past yieldToCustomer (called in processNext before
+	// skip early-return and past admitRefresh (called in processNext before
 	// us), so this measures resolve+Put work exclusively — never the dequeue, the
 	// customer-priority park, the skipped_no_entry/no_handler skips, or the
 	// rate-floor defer. Recorded for success AND failure: a failed re-resolve
@@ -1595,7 +1595,7 @@ func refresherQueueDepth(r *refresher) int64 {
 }
 
 // recordResolveLatency folds one REAL resolve's wall time into the p95 estimator
-// (#386 M1). Called once per fn() invocation in processOne — AFTER yieldToCustomer
+// (#386 M1). Called once per fn() invocation in processOne — AFTER admitRefresh
 // returned and ONLY on the ok=true real-resolve path, so park, dequeue, the skips
 // and the rate-floor defer never reach it. Serialized across the worker pool.
 func (r *refresher) recordResolveLatency(d time.Duration) {

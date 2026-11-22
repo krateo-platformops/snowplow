@@ -3,7 +3,7 @@ package cache
 // resolve_latency_p2.go — #386 M1: a dependency-light streaming p95 estimator
 // for the refresher's REAL resolve latency (the registered re-resolve+Put
 // handler `fn()` at refresher.go:1021), sampled ONLY on the ok=true path AFTER
-// yieldToCustomer (refresher.go:756) returns — so it excludes the dequeue, the
+// admitRefresh (refresher.go:756) returns — so it excludes the dequeue, the
 // customer-priority park, the skipped_no_entry / skipped_no_handler skips, and
 // the rate-floor defer. It yields the true resolve-work p95, not the
 // idle-inclusive dequeue-to-completion average.
