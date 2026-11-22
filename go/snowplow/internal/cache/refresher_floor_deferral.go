@@ -187,8 +187,3 @@ func (r *refresher) stopFloorDeferrals() {
 		r.unviewedDeferral.stop()
 	}
 }
-
-// floorDeferredLenForTest is the number of keys a side holds floored. TEST-ONLY.
-func (r *refresher) floorDeferredLenForTest(tier refreshTier) int {
-	return int(r.floorDeferralFor(tier).n.Load())
-}

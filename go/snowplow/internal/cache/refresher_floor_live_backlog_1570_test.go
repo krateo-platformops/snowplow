@@ -70,7 +70,8 @@ func liveBacklogArm(t *testing.T, p, fillers int, cost, slack time.Duration) {
 		gateIn     atomic.Int64
 	)
 	gateCh := make(chan struct{})
-	t.Cleanup(sync.OnceFunc(func() { close(gateCh) }))
+	openGates := sync.OnceFunc(func() { close(gateCh) })
+	t.Cleanup(openGates)
 	RegisterRefreshFunc("widgets", func(ctx context.Context, k string, used ResolvedKeyInputs) error {
 		switch {
 		case k == x:
@@ -88,7 +89,8 @@ func liveBacklogArm(t *testing.T, p, fillers int, cost, slack time.Duration) {
 		case isGate[k]:
 			gateIn.Add(1)
 			<-gateCh // holds an unviewed worker until the backlog is in place
-		default: // a filler: no Put, so it is never floored itself
+		default: // a filler: ~1 ms of work, no Put, so it is never floored itself
+			time.Sleep(time.Millisecond)
 			mu.Lock()
 			lastFillAt = time.Now()
 			mu.Unlock()
@@ -113,28 +115,32 @@ func liveBacklogArm(t *testing.T, p, fillers int, cost, slack time.Duration) {
 	for _, f := range fill {
 		enqueueRefreshForTest(f)
 	}
-	close(gateCh)
+	floored0 := r.flooredTotal.Load()
+	openGates()
 
-	// SETUP: X is floored at the top of the backlog (held in the unviewed set
-	// while most fillers still wait).
-	var kAtFloor int
+	// SETUP: X is floored at the top of the backlog, while most fillers still
+	// wait (read from the floored counter, which both the set and a frozen
+	// AddAfter tick, so the falsifier passes this SETUP too).
+	var doneAtFloor int64
 	waitFor(t, 5*time.Second, "X floored at the top of the backlog", func() bool {
-		if r.floorDeferredLenForTest(tierNormal) != 1 {
+		if r.flooredTotal.Load() == floored0 {
 			return false
 		}
-		kAtFloor, _ = r.backlogShare(tierNormal)
+		doneAtFloor = fillDone.Load()
 		return true
 	})
 	mu.Lock()
 	first := xRuns[0]
 	firstPut := xPutAt[0]
 	mu.Unlock()
-	if kAtFloor < fillers*3/4 {
-		t.Fatalf("SETUP: X was floored with only K=%d of %d fillers behind it; the arm needs the peak", kAtFloor, fillers)
+	if doneAtFloor > int64(fillers/4) {
+		t.Fatalf("SETUP: %d of %d fillers had already run when X was floored; the arm needs the peak", doneAtFloor, fillers)
 	}
+	kAtFloor := fillers - int(doneAtFloor) // at least: the fillers still queued behind X
 	frozen := time.Duration(int64(first.cost) * int64(kAtFloor) / int64(s))
 
-	waitFor(t, frozen/2+10*time.Second, "X's second refresh", func() bool { mu.Lock(); defer mu.Unlock(); return len(xRuns) == 2 })
+	waitFor(t, 15*time.Second, fmt.Sprintf("X's second refresh (a floor frozen at the peak holds it ~%v)", frozen),
+		func() bool { mu.Lock(); defer mu.Unlock(); return len(xRuns) == 2 })
 	mu.Lock()
 	second := xRuns[1]
 	drained := lastFillAt
@@ -150,9 +156,9 @@ func liveBacklogArm(t *testing.T, p, fillers int, cost, slack time.Duration) {
 	bound := first.cost + slack
 	if lag := second.start.Sub(drained); lag > bound {
 		t.Fatalf("X re-ran %v after the backlog drained: want ≤ %v (cost %v × max(1, K_now/S) + %v slack). "+
-			"Its floor was frozen at the peak (K=%d, S=%d: %v)", lag, bound, first.cost, slack, kAtFloor, s, frozen)
+			"Its floor was frozen at the peak (K≥%d, S=%d: %v)", lag, bound, first.cost, slack, kAtFloor, s, frozen)
 	}
-	t.Logf("GREEN: X (cost %v) floored at K=%d S=%d (a frozen floor would be %v) re-ran %v after the drain (%d fillers)",
+	t.Logf("GREEN: X (cost %v) floored at K≥%d S=%d (a frozen floor would be %v) re-ran %v after the drain (%d fillers)",
 		first.cost, kAtFloor, s, frozen, second.start.Sub(drained), fillers)
 }
 
