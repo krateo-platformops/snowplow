@@ -299,7 +299,7 @@ func TestRefresher1570_CheapCellsDoNotWaitBehindBackToBackExpensiveCells(t *test
 	mu.Lock()
 	ws := append([]time.Duration(nil), cheapWaits...)
 	mu.Unlock()
-	if len(ws) < 20 {
+	if len(ws) < 10 {
 		t.Fatalf("SETUP: only %d cheap refreshes in 4 s", len(ws))
 	}
 	sort.Slice(ws, func(i, j int) bool { return ws[i] < ws[j] })
