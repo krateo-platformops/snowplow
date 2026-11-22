@@ -49,10 +49,11 @@ def test_a_loaded_orchestrator_is_refused_before_any_cloud_call(harness):  # noq
 
 def _dry_env(tmp_path: Path) -> dict:
     env = {k: v for k, v in os.environ.items() if k not in ("RUN_NAME", "OUT")}
-    env.update(BENCH_606_DRY_RUN="1", RUN_NAME="snowplow-bench-1297-dry", INSTALLER_VERSION="0.3.616",
+    env.update(BENCH_606_DRY_RUN="1", RUN_NAME="snowplow-bench-1297-dry", INSTALLER_VERSION="0.3.697",
                SNOWPLOW_TAG="1.12.67", EXPECTED_IMAGE_DIGEST="sha256:" + "ab" * 32, OUT=str(tmp_path / "out"),
                PYTHONPATH=str(BENCH_DIR), HOME=str(tmp_path / "home"),
-               # the run names its frontend (installer 0.3.616 pins 1.8.41; run 26d: the login form contract):
+               # #1572: the installer krateo-057 runs (an older one cannot express its features and is refused);
+               # the run names its frontend (installer 0.3.616 pinned 1.8.41; run 26d: the login form contract):
                # the run names one that carries it, as every k6 run must
                FRONTEND_TAG="1.8.40", EXPECTED_FRONTEND_DIGEST="sha256:" + "1a" * 32)
     (tmp_path / "home").mkdir()

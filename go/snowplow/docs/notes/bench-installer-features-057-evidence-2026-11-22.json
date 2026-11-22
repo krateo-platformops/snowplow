@@ -66,5 +66,19 @@
   "the new components converge on a fresh bench install (agents without a model: vertexAI stays off; nightly-review without 057's ClickHouse secret values)",
   "with internalTls on (0.3.697), the installer's cert-manager composition over the bench's hand-installed cert-manager release (057 has the same pair, Ready)",
   "platform convergence time with ~40-47 more pods"
- ]
+ ],
+ "blocker_found_kagent_preflight": {
+  "status": "RUN in the suite's real-shaped fake registry (VM job dry697b); NOT RUN against the real registry (needs the pull-token file on the laptop)",
+  "what": "with coreAgents on, the bench's ghcr preflight (bench/ghcr_pull.py path_results, #1041) refuses kagent 0.1.24: the installer injects perUserRbac.toolImagePullSecrets (inst.privateImageComponents), the per-user tool pod is off by the chart's default (perUserRbac.enabled false), and kagent's controller/ui/tools run PUBLIC ghcr.io/kagent-dev images with no pull secret, which the rule (review N2) counts as 'not off'",
+  "real_chart_render": "RUN: helm template kagent 0.1.24 with the installer's componentValues.kagent: kagent-tools, kagent-controller, kagent-ui on ghcr.io/kagent-dev (no pull secrets), kagent-postgresql on docker.io; no per-user tool pod",
+  "057": "componentValues.kagent sets perUserRbac.enabled=true and kagentapp.kagent-tools.enabled=false (keys and booleans read only), so its per-user tool pod carries the secret",
+  "options_for_the_owner": ["write 057's componentValues.kagent switches into the bench's values (match 057 beyond features)",
+                            "teach the preflight that public ghcr.io images pulled anonymously do not make an injected path 'not off' (changes a review-won rule)"]
+ },
+ "tests": {
+  "new_tests_x3": "RUN on snowplow-build-1 at a7570a36: tests/test_installer_features.py + the PVC footprint test, 60 passed x3",
+  "mutation_probes": "RUN on snowplow-build-1 at a7570a36: 10 of 10 mutations caught",
+  "full_suite_a7570a36": "RUN on snowplow-build-1 (pytest -n 8): 4 failed, 4205 passed, 8 skipped; CI bench: 4 failed, 4209 passed. The 4 are the dry passes against the REAL installer chart (0.3.616), refused by design; moved to 0.3.697, they now stop at the kagent preflight blocker above",
+  "check_scripts": "RUN: go/snowplow/scripts/check_*.sh, 5 of 5 rc 0"
+ }
 }
