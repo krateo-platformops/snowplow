@@ -1,0 +1,132 @@
+{
+  "alloc_bytes": 15477581104,
+  "completions_s": 28.99892366628289,
+  "cpu_cores": 2.8314757393359664,
+  "cust_dep": {
+    "max_ms": 31.089,
+    "n": 1131,
+    "p50_ms": 0.091,
+    "p95_ms": 0.227,
+    "p99_ms": 0.318
+  },
+  "cust_dep_n": 2,
+  "cust_dep_rps": 37.69860076616776,
+  "cust_dep_staleness": {
+    "max_ms": 2764.331,
+    "n": 1131,
+    "p50_ms": 1347.665,
+    "p95_ms": 2422.201,
+    "p99_ms": 2546.231
+  },
+  "cust_errors": 0,
+  "cust_think_ms": 50,
+  "cust_unrel": {
+    "max_ms": 29.978,
+    "n": 2261,
+    "p50_ms": 0.087,
+    "p95_ms": 0.198,
+    "p99_ms": 0.326
+  },
+  "cust_unrel_n": 4,
+  "cust_unrel_rps": 75.36386943616738,
+  "dirty_to_fresh": {
+    "max_ms": 1100,
+    "n": 608,
+    "p50_ms": 0,
+    "p95_ms": 217,
+    "p99_ms": 344
+  },
+  "events": 1464,
+  "fills": 0,
+  "gomaxprocs": 4,
+  "hit_bench": {
+    "max_ms": 1.356,
+    "n": 2000,
+    "p50_ms": 0.031,
+    "p95_ms": 0.041,
+    "p99_ms": 0.057
+  },
+  "list_incremental": {
+    "Anchors": 2,
+    "AnchorSkipped": 0,
+    "Reads": 895,
+    "Restamps": 5,
+    "Generations": 677,
+    "AppliedKeys": 1464,
+    "Decodes": 1464,
+    "Rebinds": 0,
+    "ItemsBuilt": 249,
+    "RawJSONBuilt": 0,
+    "PendingRecorded": 1464,
+    "Passes": 1,
+    "Suspects": 0,
+    "RefreshSkipped": 611,
+    "AnchorSettling": 0,
+    "GenAllocBytesTotal": 127033984,
+    "GenAllocBytesMax": 400000,
+    "GenAllocCount": 926,
+    "Unanchors": {},
+    "Divergences": {},
+    "DivergenceTotal": 0,
+    "Live": 2
+  },
+  "n": 50000,
+  "num_gc": 27,
+  "peak_heap_inuse": 1449549824,
+  "probe": {
+    "max_ms": 0.599,
+    "n": 1133,
+    "p50_ms": 0.099,
+    "p95_ms": 0.246,
+    "p99_ms": 0.265
+  },
+  "probe_n": 2,
+  "rate": 50,
+  "refresh_capped": 0,
+  "refresh_completed": 870,
+  "refresh_duration_by_tier": {
+    "cluster_list": {
+      "n": 0
+    },
+    "direct": {
+      "n": 0
+    },
+    "normal": {
+      "mean_ms": 276.3486590038314,
+      "n": 261,
+      "share_le_100": 0,
+      "share_le_1000": 1,
+      "share_le_2000": 1,
+      "share_le_5000": 1
+    },
+    "viewed": {
+      "n": 0
+    }
+  },
+  "refresh_floored": 11205,
+  "refresh_no_put_completions": 609,
+  "refresh_parked_s": 1.19,
+  "refresh_puts": {
+    "restactions|normal|changed": 261
+  },
+  "refresh_puts_total": 261,
+  "refresh_wait_by_tier": {
+    "cluster_list": {
+      "n": 0
+    },
+    "normal": {
+      "mean_ms": 55.899198167239405,
+      "n": 873,
+      "share_le_100": 0.8281786941580757,
+      "share_le_1000": 0.993127147766323,
+      "share_le_2000": 1,
+      "share_le_5000": 1
+    },
+    "viewed": {
+      "n": 0
+    }
+  },
+  "refresh_yielded": 40,
+  "seconds": 30,
+  "wall_s": 30.00111349
+}

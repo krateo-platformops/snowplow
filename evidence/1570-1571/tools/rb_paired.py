@@ -12,6 +12,8 @@ import json, os, subprocess, sys, time
 spec = json.load(open(sys.argv[1]))
 out, test, rounds = sys.argv[2], sys.argv[3], int(sys.argv[4])
 extra = dict(a.split("=", 1) for a in sys.argv[5:])
+# Per-run wall bound: 5x the run's normal length (865 ~65 s, freshness ~220 s).
+RUN_TIMEOUT_S = 330 if test.startswith("TestPaired865") else 1100
 here = os.path.dirname(os.path.abspath(__file__))
 rbuild = os.path.join(here, "rbuild.sh")
 os.makedirs(out, exist_ok=True)
@@ -40,7 +42,24 @@ for r in range(rounds):
         rec = {"test": test, "arm": a, "round": r + 1, "sha": arm["sha"], "overlay": bool(arm.get("overlay")),
                "env": extra, "start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         t0 = time.time()
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        # A hung ssh link (2026-11-22, round 3: 7221 s) must not hold the window:
+        # past RUN_TIMEOUT_S the run is ended with TERM, which rbuild.sh turns into
+        # a remote kill of exactly this job (bin/rjob-kill), and recorded TIMEOUT.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            out_s, err_s = proc.communicate(timeout=RUN_TIMEOUT_S)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                out_s, err_s = proc.communicate(timeout=120)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out_s, err_s = proc.communicate()
+            timed_out = True
+            print(json.dumps({"arm": a, "round": r + 1, "status": "TIMEOUT", "after_s": RUN_TIMEOUT_S}), flush=True)
+        p = subprocess.CompletedProcess(cmd, proc.returncode, out_s or "", err_s or "")
+        rec["timed_out"] = timed_out
         txt = p.stdout
         rec["seconds"] = round(time.time() - t0, 1)
         rec["rc"] = p.returncode

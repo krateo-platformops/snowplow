@@ -73,6 +73,52 @@ The new arms passed ×3 under `-race` on both branches (RUN, recorded in the PR 
 - **Normal-tier wait** goes from main mean 55–67 ms (99% ≤ 1 s) to B mean 1.71–1.82 s (4% ≤ 1 s).
 - **CPU:** 2.8 → 3.4 cores. **Dependents' staleness p95:** 2.43 → 2.04–2.09 s.
 
+## #1570 v2 (floor = RefreshCost × max(1, K/S)) — RUN on the build VM, alone
+
+**Trees:**
+
+| Arm | Tree |
+|---|---|
+| floor-v2 | `refresher/1570-floor-own-cost` @ `547127539317275df72ed3eb0ecb49e36946579e` |
+| combined-v2 | this branch @ `839054d81f33eeef51c2d0d8d9d45c1497b04e3e` (A @ 18335423 + B v2) |
+| main | `1c788e28` + overlay |
+
+All 42 runs ran alone, with no timeouts and no excluded rounds. The runner bounds each run (330 s for #865, 1100 s for freshness) and kills a hung job by its token.
+
+**#865 with the split overlay**, at 10 and 50 events/s, main / mainB / floor-v2 / combined-v2 × 3 (`v2-865-r10/`, `v2-865-r50/`):
+- The floor fires: 1.3–1.7K floored per run.
+- Completions/s are 0.95× at 10 events/s and 0.51× at 50.
+- Refresher CPU is 3.36–3.40 cores, against 2.7–2.8.
+- **Completions per core: FAIL.** 4.0–4.2, against main's 5.1–5.6 at 10 events/s and 8.7–10.5 at 50.
+- **Normal-tier wait: FAIL.** Mean 219–286 ms, against main's 114–150 ms at 10 events/s and 51–87 ms at 50. Share ≤ 1 s is 97–98%, against main's 98–100%.
+- **Customers: within or better.** dep p50 0.71–0.88, unrel p50 0.56–0.79, p95 0.87–0.98. req/s 0.97–0.98.
+
+**Freshness ×6**, main / floor-v2 / combined-v2 (`v2-fresh/`, 120 samples per arm and rate):
+
+| Arm | Probe push p95 at 1 / 10 / 50 events/s |
+|---|---|
+| main | 1155 / 229 / 1305 ms |
+| floor-v2 | 241 / 180 / 229 ms |
+| combined-v2 | 14 / 3.7 / 3.7 ms |
+
+- Viewed waits ≤ 100 ms: 100% for combined-v2.
+- Customers 0.88–1.04 of main, rps 1.00.
+
+**Bars (design on #1570):**
+
+| Bar | Result |
+|---|---|
+| 1. viewed push p95 | PASS |
+| 2. normal-tier wait ≤ main | FAIL |
+| 3. completions per core | FAIL |
+| 4. customers | PASS on latency; req/s a hair under the spread |
+
+## A (#1571) gates — RUN
+
+- Full unit suite (`-race -tags=unit -p 8 ./...`) at 18335423: 52 packages ok.
+- `scripts/check_*.sh` (11) at 18335423: all rc 0.
+- PR #1579 CI green at 9cc3d968, which adds only comments and docs over 18335423.
+
 ## NOT RUN (at this commit)
 
-- the full package suite, `scripts/check_*.sh`, `gh pr checks`.
+- B's PR: B v2 misses bars 2 and 3 and is held for the owner's ruling.

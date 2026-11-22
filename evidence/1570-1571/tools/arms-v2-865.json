@@ -1,0 +1,26 @@
+{
+ "order": [
+  "main",
+  "floor2",
+  "mainB",
+  "combined2"
+ ],
+ "arms": {
+  "main": {
+   "sha": "1c788e2844407c624494e50d77976dfa80ab755d",
+   "overlay": "$SCRATCH/overlays/split-main"
+  },
+  "mainB": {
+   "sha": "1c788e2844407c624494e50d77976dfa80ab755d",
+   "overlay": "$SCRATCH/overlays/split-main"
+  },
+  "floor2": {
+   "sha": "547127539317275df72ed3eb0ecb49e36946579e",
+   "overlay": "$SCRATCH/overlays/split-branch"
+  },
+  "combined2": {
+   "sha": "839054d81f33eeef51c2d0d8d9d45c1497b04e3e",
+   "overlay": "$SCRATCH/overlays/split-branch"
+  }
+ }
+}

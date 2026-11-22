@@ -1,0 +1,600 @@
+{
+ "status_by_arm": {
+  "main": "3/3 RUN",
+  "floor2": "3/3 RUN",
+  "mainB": "3/3 RUN",
+  "combined2": "3/3 RUN"
+ },
+ "rates": {
+  "10": {
+   "combined2": {
+    "dep_p50": {
+     "median_ratio": 0.723,
+     "ratios": [
+      0.723,
+      0.62,
+      0.792
+     ],
+     "main_main_spread": [
+      0.924,
+      1.208
+     ],
+     "verdict": "PASS"
+    },
+    "dep_p95": {
+     "median_ratio": 0.979,
+     "ratios": [
+      0.883,
+      0.979,
+      0.991
+     ],
+     "main_main_spread": [
+      0.963,
+      1.017
+     ],
+     "verdict": "PASS"
+    },
+    "unrel_p50": {
+     "median_ratio": 0.771,
+     "ratios": [
+      0.803,
+      0.526,
+      0.771
+     ],
+     "main_main_spread": [
+      0.759,
+      1.086
+     ],
+     "verdict": "PASS"
+    },
+    "unrel_p95": {
+     "median_ratio": 0.869,
+     "ratios": [
+      0.869,
+      0.87,
+      0.852
+     ],
+     "main_main_spread": [
+      0.972,
+      1.047
+     ],
+     "verdict": "PASS"
+    },
+    "probe_p50": {
+     "median_ratio": 0.958,
+     "ratios": [
+      0.958,
+      0.939,
+      0.978
+     ],
+     "main_main_spread": [
+      1.011,
+      1.098
+     ],
+     "verdict": "PASS"
+    },
+    "probe_p95": {
+     "median_ratio": 0.992,
+     "ratios": [
+      0.996,
+      0.992,
+      0.976
+     ],
+     "main_main_spread": [
+      1.0,
+      1.004
+     ],
+     "verdict": "PASS"
+    },
+    "hit_p50": {
+     "median_ratio": 1.0,
+     "ratios": [
+      0.969,
+      1.688,
+      1.0
+     ],
+     "main_main_spread": [
+      0.968,
+      0.969
+     ],
+     "verdict": "FAIL"
+    },
+    "dep_rps": {
+     "median_ratio": 0.983,
+     "ratios": [
+      0.981,
+      0.983,
+      0.983
+     ],
+     "main_main_spread": [
+      0.996,
+      1.016
+     ],
+     "verdict": "FAIL"
+    },
+    "unrel_rps": {
+     "median_ratio": 0.979,
+     "ratios": [
+      0.979,
+      0.973,
+      0.981
+     ],
+     "main_main_spread": [
+      0.991,
+      1.014
+     ],
+     "verdict": "FAIL"
+    },
+    "completions_s": {
+     "median_ratio": 0.952,
+     "ratios": [
+      0.964,
+      0.952,
+      0.943
+     ],
+     "main_main_spread": [
+      0.939,
+      1.032
+     ],
+     "verdict": "PASS"
+    },
+    "staleness_p95": [
+     2165.353,
+     2241.137,
+     2262.428
+    ],
+    "yielded": [
+     0,
+     7,
+     2
+    ],
+    "capped": [
+     0,
+     0,
+     0
+    ],
+    "parked_s": [
+     0,
+     0,
+     0
+    ],
+    "floored": [
+     1576,
+     1423,
+     1306
+    ],
+    "cpu_cores": [
+     3.366284972395418,
+     3.3691418043837724,
+     3.369306298014135
+    ],
+    "errors": [
+     0,
+     0,
+     0
+    ]
+   },
+   "floor2": {
+    "dep_p50": {
+     "median_ratio": 0.706,
+     "ratios": [
+      0.706,
+      0.599,
+      0.821
+     ],
+     "main_main_spread": [
+      0.924,
+      1.208
+     ],
+     "verdict": "PASS"
+    },
+    "dep_p95": {
+     "median_ratio": 0.916,
+     "ratios": [
+      0.871,
+      0.916,
+      0.944
+     ],
+     "main_main_spread": [
+      0.963,
+      1.017
+     ],
+     "verdict": "PASS"
+    },
+    "unrel_p50": {
+     "median_ratio": 0.789,
+     "ratios": [
+      0.789,
+      0.534,
+      0.871
+     ],
+     "main_main_spread": [
+      0.759,
+      1.086
+     ],
+     "verdict": "PASS"
+    },
+    "unrel_p95": {
+     "median_ratio": 0.875,
+     "ratios": [
+      0.901,
+      0.875,
+      0.857
+     ],
+     "main_main_spread": [
+      0.972,
+      1.047
+     ],
+     "verdict": "PASS"
+    },
+    "probe_p50": {
+     "median_ratio": 0.958,
+     "ratios": [
+      0.958,
+      0.919,
+      1.011
+     ],
+     "main_main_spread": [
+      1.011,
+      1.098
+     ],
+     "verdict": "PASS"
+    },
+    "probe_p95": {
+     "median_ratio": 0.992,
+     "ratios": [
+      0.992,
+      0.992,
+      0.988
+     ],
+     "main_main_spread": [
+      1.0,
+      1.004
+     ],
+     "verdict": "PASS"
+    },
+    "hit_p50": {
+     "median_ratio": 0.969,
+     "ratios": [
+      0.938,
+      0.969,
+      1.0
+     ],
+     "main_main_spread": [
+      0.968,
+      0.969
+     ],
+     "verdict": "PASS"
+    },
+    "dep_rps": {
+     "median_ratio": 0.972,
+     "ratios": [
+      0.972,
+      0.943,
+      0.976
+     ],
+     "main_main_spread": [
+      0.996,
+      1.016
+     ],
+     "verdict": "FAIL"
+    },
+    "unrel_rps": {
+     "median_ratio": 0.964,
+     "ratios": [
+      0.975,
+      0.933,
+      0.964
+     ],
+     "main_main_spread": [
+      0.991,
+      1.014
+     ],
+     "verdict": "FAIL"
+    },
+    "completions_s": {
+     "median_ratio": 0.955,
+     "ratios": [
+      0.957,
+      0.955,
+      0.919
+     ],
+     "main_main_spread": [
+      0.939,
+      1.032
+     ],
+     "verdict": "PASS"
+    },
+    "staleness_p95": [
+     2134.766,
+     2286.83,
+     2250.086
+    ],
+    "yielded": [
+     14,
+     13,
+     10
+    ],
+    "capped": [
+     0,
+     0,
+     0
+    ],
+    "parked_s": [
+     0.408,
+     0.371,
+     0.267
+    ],
+    "floored": [
+     1467,
+     1440,
+     1268
+    ],
+    "cpu_cores": [
+     3.356348163688898,
+     3.350892331540957,
+     3.3570314126176055
+    ],
+    "errors": [
+     0,
+     0,
+     0
+    ]
+   },
+   "mainB": {
+    "dep_p50": {
+     "median_ratio": 0.958,
+     "ratios": [
+      0.924,
+      0.958,
+      1.208
+     ],
+     "main_main_spread": [
+      0.924,
+      1.208
+     ],
+     "verdict": "spread"
+    },
+    "dep_p95": {
+     "median_ratio": 0.979,
+     "ratios": [
+      0.963,
+      0.979,
+      1.017
+     ],
+     "main_main_spread": [
+      0.963,
+      1.017
+     ],
+     "verdict": "spread"
+    },
+    "unrel_p50": {
+     "median_ratio": 0.829,
+     "ratios": [
+      0.829,
+      0.759,
+      1.086
+     ],
+     "main_main_spread": [
+      0.759,
+      1.086
+     ],
+     "verdict": "spread"
+    },
+    "unrel_p95": {
+     "median_ratio": 1.013,
+     "ratios": [
+      1.047,
+      0.972,
+      1.013
+     ],
+     "main_main_spread": [
+      0.972,
+      1.047
+     ],
+     "verdict": "spread"
+    },
+    "probe_p50": {
+     "median_ratio": 1.02,
+     "ratios": [
+      1.011,
+      1.02,
+      1.098
+     ],
+     "main_main_spread": [
+      1.011,
+      1.098
+     ],
+     "verdict": "spread"
+    },
+    "probe_p95": {
+     "median_ratio": 1.0,
+     "ratios": [
+      1.0,
+      1.004,
+      1.0
+     ],
+     "main_main_spread": [
+      1.0,
+      1.004
+     ],
+     "verdict": "spread"
+    },
+    "hit_p50": {
+     "median_ratio": 0.969,
+     "ratios": [
+      0.969,
+      0.969,
+      0.968
+     ],
+     "main_main_spread": [
+      0.968,
+      0.969
+     ],
+     "verdict": "spread"
+    },
+    "dep_rps": {
+     "median_ratio": 1.004,
+     "ratios": [
+      1.004,
+      0.996,
+      1.016
+     ],
+     "main_main_spread": [
+      0.996,
+      1.016
+     ],
+     "verdict": "spread"
+    },
+    "unrel_rps": {
+     "median_ratio": 1.004,
+     "ratios": [
+      1.004,
+      0.991,
+      1.014
+     ],
+     "main_main_spread": [
+      0.991,
+      1.014
+     ],
+     "verdict": "spread"
+    },
+    "completions_s": {
+     "median_ratio": 0.986,
+     "ratios": [
+      0.986,
+      0.939,
+      1.032
+     ],
+     "main_main_spread": [
+      0.939,
+      1.032
+     ],
+     "verdict": "spread"
+    },
+    "staleness_p95": [
+     2394.964,
+     2403.499,
+     2397.331
+    ],
+    "yielded": [
+     20,
+     43,
+     15
+    ],
+    "capped": [
+     0,
+     0,
+     0
+    ],
+    "parked_s": [
+     0.543,
+     1.202,
+     0.429
+    ],
+    "floored": [
+     3285,
+     2845,
+     3469
+    ],
+    "cpu_cores": [
+     2.729075482142377,
+     2.7173407770263025,
+     2.6592936304619594
+    ],
+    "errors": [
+     0,
+     0,
+     0
+    ]
+   },
+   "main": {
+    "dep_p50": [
+     0.119,
+     0.142,
+     0.106
+    ],
+    "dep_p95": [
+     0.24,
+     0.238,
+     0.231
+    ],
+    "unrel_p50": [
+     0.076,
+     0.116,
+     0.07
+    ],
+    "unrel_p95": [
+     0.213,
+     0.216,
+     0.223
+    ],
+    "probe_p50": [
+     0.095,
+     0.099,
+     0.092
+    ],
+    "probe_p95": [
+     0.244,
+     0.245,
+     0.246
+    ],
+    "hit_p50": [
+     0.032,
+     0.032,
+     0.031
+    ],
+    "dep_rps": [
+     37.69895508549558,
+     37.69990555922325,
+     37.35949125333858
+    ],
+    "unrel_rps": [
+     75.43124258043899,
+     75.66647711709706,
+     74.88561716882408
+    ],
+    "completions_s": [
+     14.79958979483646,
+     14.666629925780926,
+     14.4972156067817
+    ],
+    "staleness_p95": [
+     2406.99,
+     2403.412,
+     2402.146
+    ],
+    "yielded": [
+     23,
+     54,
+     22
+    ],
+    "capped": [
+     0,
+     0,
+     0
+    ],
+    "parked_s": [
+     0.621,
+     1.623,
+     0.566
+    ],
+    "floored": [
+     3325,
+     3299,
+     3219
+    ],
+    "cpu_cores": [
+     2.715947987830972,
+     2.7837981597333568,
+     2.785804014004521
+    ],
+    "errors": [
+     0,
+     0,
+     0
+    ]
+   }
+  }
+ }
+}
