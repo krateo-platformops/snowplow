@@ -480,11 +480,26 @@ func refresherSingleton() *refresher {
 // landed within 2 s of its previous refresh waited out the rest of the 2 s
 // (median 0.9–1.8 s for the exposed samples; the p95 rank of list_dep@10).
 //
-// With the floor equal to the last refresh's own cost, a cell is re-resolved at
-// most once per twice its cost: one cell keeps at most HALF of one worker busy,
-// whatever it costs. An expensive cell (0.9–3 s) keeps the #321 collapse at its
-// own scale; a 15 ms cell is floored for about 15 ms. No constant and no env
-// knob: the bound is each cell's measured work.
+// THE BACKLOG IT WAITS BEHIND (#1570 v2, the split test on the build VM). With
+// the floor equal to the cost alone, an expensive cell under backlog was never
+// floored (its queue wait already exceeded its cost): the workers re-resolved
+// the expensive cells back to back while cheap cells waited behind them (normal
+// tier wait 55–67 ms → 1.7–1.8 s; cheap no-Put refreshes 21/s → 0.6/s). So the
+// cost is charged against the backlog of the side of the pool that serves the
+// cell:
+//
+//	floor = RefreshCost × max(1, K/S)
+//
+// S is the workers that side may hold (the #1069 reservation: viewed work and
+// unviewed work each at most parallelism−1, 1 with one worker); K is the keys
+// that side is serving now (its tiers' queued keys plus the keys in its
+// workers' hands), read at this dequeue (backlogShare). K keys share S workers,
+// so a cell that runs at most once per RefreshCost×K/S takes no more than its
+// equal share of worker time. With no backlog (K ≤ S) the floor is the cell's
+// own cost: one cell keeps at most HALF of one worker busy. A cheap cell's floor
+// scales with its tiny cost, so cheap cells are never held; an expensive one
+// backs off in proportion to the cells waiting behind it. No constant and no env
+// knob: the bound is each cell's measured work and the live backlog.
 //
 // A CELL WITH NO RECORDED TIME (RefreshCost 0: filled by a customer read, the
 // boot seed, a direct D2 refill or any other write that is not a timed refresh)
@@ -504,14 +519,40 @@ func refresherSingleton() *refresher {
 // The only other source is the TEST-ONLY fixed override
 // (SetRefresherRateFloorForTest), for arms that need a deterministic deferral
 // or none. Nothing in production sets it.
-func (r *refresher) rateFloor(entry *ResolvedEntry) time.Duration {
+func (r *refresher) rateFloor(entry *ResolvedEntry, tier refreshTier) time.Duration {
 	if d := refresherFloorOverride.Load(); d != nil {
 		return *d
 	}
-	if entry == nil {
+	if entry == nil || entry.RefreshCost <= 0 {
 		return 0
 	}
-	return entry.RefreshCost
+	k, s := r.backlogShare(tier)
+	if k <= s {
+		return entry.RefreshCost
+	}
+	return time.Duration(int64(entry.RefreshCost) * int64(k) / int64(s))
+}
+
+// backlogShare is the backlog of the side of the pool that serves tier: k keys
+// it is serving now (queued on its tiers plus held by its workers in a job) and
+// s workers it may hold. Read under priorityGetMu, where both are kept.
+func (r *refresher) backlogShare(tier refreshTier) (k, s int) {
+	r.priorityGetMu.Lock()
+	defer r.priorityGetMu.Unlock()
+	s = max(r.parallelism-1, 1)
+	if tier == tierViewed {
+		if r.viewedQueue != nil {
+			k = r.viewedQueue.Len()
+		}
+		return k + r.viewedActive, s
+	}
+	k = r.queue.Len()
+	if r.clusterListQueue != nil {
+		k += r.clusterListQueue.Len()
+	}
+	// unviewedActive counts the workers blocked in the normal Get too; those
+	// hold a slot but no key.
+	return k + r.unviewedActive - r.normalGetBlocked, s
 }
 
 // refresherFloorOverride is the TEST-ONLY fixed floor (SetRefresherRateFloorForTest).
@@ -1183,7 +1224,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		}
 		return true
 	}
-	if floor := r.rateFloor(entry); floor > 0 && ok && entry != nil {
+	if floor := r.rateFloor(entry, tier); floor > 0 && ok && entry != nil {
 		// #930 — the entry's age on the STORE clock, the one that stamped CreatedAt.
 		if elapsed := c.now().Sub(entry.CreatedAt); elapsed < floor {
 			// Floored: the entry's content is younger than the floor, so a
