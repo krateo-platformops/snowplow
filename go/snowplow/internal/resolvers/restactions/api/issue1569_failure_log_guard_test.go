@@ -8,11 +8,15 @@ package api
 // THE GUARD. It parses every non-test Go file of the resolve path — every
 // package under internal/resolvers, and internal/objects (a widget's apiRef
 // read and a `resolve: true` stage run through objects.Get) — and fails on a
-// log call at a FIXED Warn or Error level: logger.Warn/Error/WarnContext/
-// ErrorContext, slog.Warn/Error/WarnContext/ErrorContext, and Log/LogAttrs
-// whose level argument is slog.LevelWarn or slog.LevelError written out. A
-// call whose level is computed (FailureLevelOf, FailureLogLevel,
-// expectedDenyLevel, a level variable) is not a fixed-level call.
+// log call at a Warn or Error level the round does not compute:
+// logger.Warn/Error/WarnContext/ErrorContext and slog.Warn/Error/WarnContext/
+// ErrorContext, whatever their message (a literal, a concatenation, a
+// variable); and Log/LogAttrs unless the level is a call of FailureLevelOf /
+// FailureLogLevel / expectedDenyLevel / apiRefFailureLevel, slog.LevelDebug /
+// slog.LevelInfo, or a local variable every assignment of which (in the
+// enclosing function) is one of those. A level the guard cannot see the value
+// of — a parameter, a field, another function's result — is flagged: route it,
+// or allow-list the line.
 //
 // THE ALLOW-LIST is the lines that are not a cell's failure, each with its
 // reason. A new fixed-level line on the resolve path either goes through the
@@ -59,15 +63,76 @@ var fixedLevelMethods = map[string]int{ // method -> index of the message argume
 	"Warn": 0, "Error": 0, "WarnContext": 1, "ErrorContext": 1,
 }
 
-// isFixedFailureLevel reports whether e is slog.LevelWarn or slog.LevelError
-// written out.
-func isFixedFailureLevel(e ast.Expr) bool {
-	sel, ok := e.(*ast.SelectorExpr)
-	if !ok {
+// roundLevelFuncs are the functions that compute a failure line's level through
+// the cell's round (failure_log.go; widgets.apiRefFailureLevel wraps it).
+var roundLevelFuncs = map[string]bool{
+	"FailureLogLevel": true, "FailureLevelOf": true, "expectedDenyLevel": true, "apiRefFailureLevel": true,
+}
+
+// levelThroughRound reports whether e, the level argument of a Log/LogAttrs
+// call in fn, is computed by the round or is below Warn: a call of a
+// roundLevelFuncs function, slog.LevelDebug / slog.LevelInfo, or a local
+// variable EVERY assignment of which in fn is one of those. Anything else — a
+// fixed slog.LevelWarn / slog.LevelError, a variable holding one, a parameter
+// or field the guard cannot see the value of — is not, and the call is flagged
+// (#1569 review G3: a fixed level passed through a variable).
+func levelThroughRound(e ast.Expr, fn *ast.FuncDecl, depth int) bool {
+	if depth > 8 {
 		return false
 	}
-	id, ok := sel.X.(*ast.Ident)
-	return ok && id.Name == "slog" && (sel.Sel.Name == "LevelWarn" || sel.Sel.Name == "LevelError")
+	switch v := e.(type) {
+	case *ast.ParenExpr:
+		return levelThroughRound(v.X, fn, depth+1)
+	case *ast.CallExpr:
+		switch f := v.Fun.(type) {
+		case *ast.Ident:
+			return roundLevelFuncs[f.Name]
+		case *ast.SelectorExpr:
+			return roundLevelFuncs[f.Sel.Name]
+		}
+		return false
+	case *ast.SelectorExpr:
+		id, ok := v.X.(*ast.Ident)
+		return ok && id.Name == "slog" && (v.Sel.Name == "LevelDebug" || v.Sel.Name == "LevelInfo")
+	case *ast.Ident:
+		if fn == nil || fn.Body == nil {
+			return false
+		}
+		var rhs []ast.Expr
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			switch s := n.(type) {
+			case *ast.AssignStmt:
+				for i, l := range s.Lhs {
+					if id, ok := l.(*ast.Ident); ok && id.Name == v.Name && i < len(s.Rhs) {
+						rhs = append(rhs, s.Rhs[i])
+					}
+				}
+			case *ast.ValueSpec:
+				for i, id := range s.Names {
+					if id.Name == v.Name {
+						if i < len(s.Values) {
+							rhs = append(rhs, s.Values[i])
+						} else {
+							// declared without a value: slog.Level's zero value is
+							// LevelInfo, below Warn
+							rhs = append(rhs, &ast.SelectorExpr{X: ast.NewIdent("slog"), Sel: ast.NewIdent("LevelInfo")})
+						}
+					}
+				}
+			}
+			return true
+		})
+		if len(rhs) == 0 {
+			return false // a parameter, a field, a package variable: unseen
+		}
+		for _, r := range rhs {
+			if r == nil || !levelThroughRound(r, fn, depth+1) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // literalMessage is the message a call writes when it is a string literal, or a
@@ -98,35 +163,45 @@ func literalString(e ast.Expr) (string, bool) {
 	return "", false
 }
 
-// scanFixedLevelLogCalls returns the fixed-level log calls in file.
+// scanFixedLevelLogCalls returns the log calls in file whose level is Warn or
+// Error and not computed by the cell's round: Warn/Error/WarnContext/
+// ErrorContext with any message (a literal, a concatenation, a variable), and
+// Log/LogAttrs whose level is not levelThroughRound.
 func scanFixedLevelLogCalls(fset *token.FileSet, file *ast.File, rel string) []failureLogFinding {
 	var out []failureLogFinding
-	ast.Inspect(file, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		msgAt := -1
-		if i, ok := fixedLevelMethods[sel.Sel.Name]; ok {
-			// a logger call carries its message; err.Error() carries none
-			if len(call.Args) > i {
-				if _, isLit := call.Args[i].(*ast.BasicLit); isLit || i == 1 {
+	visit := func(fn *ast.FuncDecl, root ast.Node) {
+		ast.Inspect(root, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			msgAt := -1
+			if i, ok := fixedLevelMethods[sel.Sel.Name]; ok {
+				// a logger call carries its message; err.Error() carries none
+				if len(call.Args) > i {
 					msgAt = i
 				}
+			} else if (sel.Sel.Name == "Log" || sel.Sel.Name == "LogAttrs") && len(call.Args) >= 3 && !levelThroughRound(call.Args[1], fn, 0) {
+				msgAt = 2
 			}
-		} else if (sel.Sel.Name == "Log" || sel.Sel.Name == "LogAttrs") && len(call.Args) >= 3 && isFixedFailureLevel(call.Args[1]) {
-			msgAt = 2
-		}
-		if msgAt < 0 {
+			if msgAt < 0 {
+				return true
+			}
+			out = append(out, failureLogFinding{file: rel, line: fset.Position(call.Pos()).Line, msg: literalMessage(call.Args[msgAt])})
 			return true
+		})
+	}
+	for _, d := range file.Decls {
+		if fn, ok := d.(*ast.FuncDecl); ok {
+			visit(fn, fn)
+		} else {
+			visit(nil, d)
 		}
-		out = append(out, failureLogFinding{file: rel, line: fset.Position(call.Pos()).Line, msg: literalMessage(call.Args[msgAt])})
-		return true
-	})
+	}
 	return out
 }
 
@@ -206,7 +281,29 @@ func f(ctx context.Context, log *slog.Logger, err error) {
 	log.LogAttrs(ctx, slog.LevelWarn, "raw-6")
 	slog.WarnContext(ctx, "raw-"+
 		"7")
+	x := "y"
+	log.Warn("raw-8 "+x)
+	msg := "raw-9"
+	slog.Error(msg)
+	lvl := slog.LevelError
+	log.Log(ctx, lvl, "raw-10")
+	var mixed slog.Level
+	if err != nil {
+		mixed = slog.LevelWarn
+	} else {
+		mixed = FailureLevelOf(ctx, slog.LevelError, "t", err)
+	}
+	log.Log(ctx, mixed, "raw-11")
+	log.Log(ctx, f2(), "raw-12")
 	log.Log(ctx, FailureLevelOf(ctx, slog.LevelError, "t", err), "routed")
+	routedLvl := FailureLogLevel(ctx, slog.LevelWarn, "t", "c")
+	log.Log(ctx, routedLvl, "routed-2")
+	var zero slog.Level
+	if err != nil {
+		zero = expectedDenyLevel(ctx, "t")
+	}
+	log.Log(ctx, zero, "routed-3")
+	log.Log(ctx, slog.LevelInfo, "info")
 	log.Debug("debug")
 	_ = err.Error()
 }`
@@ -216,17 +313,32 @@ func f(ctx context.Context, log *slog.Logger, err error) {
 		t.Fatal(err)
 	}
 	got := map[string]bool{}
-	for _, fd := range scanFixedLevelLogCalls(fset, f, "x.go") {
+	findings := scanFixedLevelLogCalls(fset, f, "x.go")
+	for _, fd := range findings {
 		got[fd.msg] = true
 	}
-	for _, want := range []string{"raw-1", "raw-2", "raw-3", "raw-4", "raw-5", "raw-6", "raw-7"} {
+	for _, want := range []string{"raw-1", "raw-2", "raw-3", "raw-4", "raw-5", "raw-6", "raw-7", "raw-10", "raw-11", "raw-12"} {
 		if !got[want] {
 			t.Errorf("#1569 guard RED: the raw line %q was not found (found %v)", want, got)
 		}
 	}
-	for _, not := range []string{"routed", "debug"} {
+	// a non-literal message is reported as <non-literal>: raw-8 and raw-9 both
+	if n := countMsg(findings, "<non-literal>"); n != 2 {
+		t.Errorf("#1569 guard RED (B2): %d non-literal-message raw lines found, want 2 (raw-8 \"raw-8 \"+x, raw-9 slog.Error(msg)): %v", n, got)
+	}
+	for _, not := range []string{"routed", "routed-2", "routed-3", "info", "debug"} {
 		if got[not] {
 			t.Errorf("#1569 guard: %q is not a fixed-level line but was reported", not)
 		}
 	}
+}
+
+func countMsg(fs []failureLogFinding, msg string) int {
+	n := 0
+	for _, f := range fs {
+		if f.msg == msg {
+			n++
+		}
+	}
+	return n
 }
