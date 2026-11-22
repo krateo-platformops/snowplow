@@ -352,7 +352,7 @@ func TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow(t *testing.T) {
 	cache.CompleteRBACSnapshotForTest(t)
 	const deferral = time.Second // = RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS
 	store := p3Env(t)
-	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "1")
+	t.Cleanup(cache.SetRefresherRateFloorForTest("1"))
 	clk := p3VirtualWindowClock(t)
 	t.Cleanup(store.SetClockForTest(clk.now))
 	advanced := make(chan struct{})

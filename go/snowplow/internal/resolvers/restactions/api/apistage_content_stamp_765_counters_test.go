@@ -128,7 +128,7 @@ func TestContentStamp765_C2_RefreshCoalescedCounted(t *testing.T) {
 func TestContentStamp765_N1_DequeueStampsNeedAtOrAfterTheTrigger(t *testing.T) {
 	t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
-	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
+	t.Cleanup(cache.SetRefresherRateFloorForTest("0"))
 	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
 	dyn := newFill710Watcher(t, 3)
 	store := cache.ResolvedCache()

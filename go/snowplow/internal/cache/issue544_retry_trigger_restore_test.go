@@ -236,7 +236,7 @@ func TestIssue544_FloorDeferredKeyConsumesTriggerAtEventualDispatch(t *testing.T
 	cleanup := withCleanRefresher(t, 1, 0)
 	defer cleanup()
 	// Floor ON (seconds granularity, so 1s is the shortest real deferral).
-	t.Setenv(envRefresherRateFloorSeconds, "1")
+	t.Cleanup(SetRefresherRateFloorForTest("1"))
 	resetRefresherForTest()
 
 	c := ResolvedCache()

@@ -229,6 +229,15 @@ type ResolvedEntry struct {
 	RawJSON   []byte    // pre-encoded resolver output, ready to write
 	CreatedAt time.Time // for TTL eviction (reset by every Put, refresh re-Puts included)
 
+	// RefreshCost — #1570: how long the refresh that wrote this entry took, from
+	// the refresher worker's start of it (after the customer yield and the rate
+	// floor: the #1070 refresh-cycle start) to its accepted terminal Put
+	// (replaceIfGenRefresh). It is the cell's own rate floor (refresher.rateFloor):
+	// the cell is not re-resolved again until this long after CreatedAt. Zero for
+	// every entry no timed refresh wrote (a customer read, the seed, a direct
+	// refill): no floor, so that cell's first refresh runs at once and measures it.
+	RefreshCost time.Duration
+
 	// BornAt — 1.12.6 C5 (design §7): when the FIRST entry under this key
 	// was Put. Put inherits it from the entry it replaces, so unlike
 	// CreatedAt it is NOT reset by a refresh re-Put; Get evicts an entry
@@ -2039,6 +2048,12 @@ func (c *ResolvedCacheStore) replaceIfGenRefresh(ctx context.Context, key string
 	// #443 (a) / #1233 — the store's admission (admitWrite).
 	if !admitWrite(ctx, entry) {
 		return PutRefused
+	}
+	// #1570 — the refresh's own cost, its worker start to this Put, on the
+	// refresh-cycle clock that timed its start: the cell's next rate floor. A Put
+	// whose ctx carries no refresher timing (a direct refill) records none.
+	if rc := refreshCycleFor(ctx, key); rc != nil {
+		entry.RefreshCost = max(windowNow().Sub(rc.startedAt), 0)
 	}
 	bytes, extrasHash := c.putPreamble(ctx, entry)
 	// #1070 — ONE byte compare of the refresh Put against the resident prior,

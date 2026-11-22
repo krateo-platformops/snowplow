@@ -35,7 +35,7 @@ func p3CacheEnv(t *testing.T) *ResolvedCacheStore {
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
-	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
+	t.Cleanup(SetRefresherRateFloorForTest("0"))
 	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
 	resetRefresherForTest()
 	resetResolvedCacheForTest()
