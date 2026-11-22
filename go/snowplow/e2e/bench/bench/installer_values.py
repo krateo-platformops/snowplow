@@ -32,6 +32,9 @@ from bench import installer_features, rbac_model
 PORTAL_COMPONENT = "portal"
 #: the group granted the shell: the one every bench user is in (ONE definition, bench/rbac_model.py)
 READER_GROUP = rbac_model.BASE_GROUP
+#: the toleration of the bench's snowplow pool's taint (bench/gke.py: dedicated=snowplow:NoSchedule): snowplow's,
+#: and the node-local OTLP agent's where the installer can express it (#1575)
+SNOWPLOW_POOL_TOLERATION = {"key": "dedicated", "operator": "Equal", "value": "snowplow", "effect": "NoSchedule"}
 
 TEMPLATE = """\
 bootstrap:
@@ -101,14 +104,22 @@ def document(snowplow_tag: str, frontend_tag: str = "", snowplow_env: dict[str, 
     from bench import installer_component_values as icv
     own: dict = {"snowplow": {"image": {"tag": snowplow_tag},
                               "nodeSelector": {"bench.krateo.io/pool": "snowplow"},
-                              "tolerations": [{"key": "dedicated", "operator": "Equal", "value": "snowplow",
-                                               "effect": "NoSchedule"}]},
+                              "tolerations": [dict(SNOWPLOW_POOL_TOLERATION)]},
                  PORTAL_COMPONENT: {"readerGroups": [READER_GROUP]}}
     if snowplow_env:
         own["snowplow"]["env"] = {k: str(v) for k, v in sorted(snowplow_env.items())}
     if frontend_tag:
         own["frontend"] = {"image": {"tag": frontend_tag}}
-    cv = icv.merge(icv.nest(icv.bench_paths()), own)
+    rec = icv.load()
+    if icv.receiver_on_snowplow_node(rec):
+        # #1575: the node-local OTLP agent tolerates the bench's snowplow pool, as the bench's own topology
+        # (only where the installer can express it; else a deviation, bench/installer_component_values.py)
+        comp, *rest = icv.RECEIVER_TOLERATION.split(".")
+        node = own.setdefault(comp, {})
+        for seg in rest[:-1]:
+            node = node.setdefault(seg, {})
+        node[rest[-1]] = [dict(SNOWPLOW_POOL_TOLERATION)]
+    cv = icv.merge(icv.nest(icv.bench_paths(rec)), own)
     return TEMPLATE.format(features=installer_features.values_block(installer_features.bench_features()),
                            component_values=yaml.safe_dump({"componentValues": cv}, sort_keys=True,
                                                            default_flow_style=False, width=1000))

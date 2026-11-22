@@ -1594,6 +1594,28 @@ s_env() {
   apf_preflight || return 1
   start_netns_sampler
   flowcontrol_attribution || return 1
+  otlp_receiver_gate || return 1
+}
+# otlp_receiver_gate (#1575): where the run's values give the node-local OTLP agent the snowplow pool's
+# toleration (bench/installer_component_values.py: only where the installer can express it, and then
+# snowplow's OTLP switches are 057's), an agent must be Running and Ready on snowplow's node before any
+# load, or the env step fails: snowplow would export into a closed port. Where the values carry no such
+# toleration the bench's recorded deviation says so, and nothing is read. $OUT/otlp-receiver.json.
+otlp_receiver_gate() {
+  local line rc=0
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.tracing receiver-gate --values $OUT/installer-values.yaml --out $OUT/otlp-receiver.json -- ${K[*]} (an OTLP agent on snowplow's node, required where the run's values give it the snowplow pool's toleration)"
+    return 0
+  fi
+  line="$(bounded "$COLLECT_TIMEOUT_S" python3 -m bench.tracing receiver-gate --values "$OUT/installer-values.yaml" \
+            --out "$OUT/otlp-receiver.json" --selector "$SNOWPLOW_POD_SELECTOR" --timeout-s "$COLLECT_TIMEOUT_S" \
+            -- "${K[@]}" 2>"$KERR")" || rc=$?
+  if (( rc == 0 )); then
+    log "$line"
+    return 0
+  fi
+  record_failure "env FAILED: ${line:-the OTLP receiver on snowplow's node could not be read: $(kerr_line)}"
+  return 1
 }
 # start_netns_sampler (#1089): the TCP path under snowplow, from here (the boot
 # included) to collect — every TOP_POLL_S, ONE pod on the snowplow node

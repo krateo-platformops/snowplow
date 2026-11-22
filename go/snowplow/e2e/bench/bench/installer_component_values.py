@@ -132,6 +132,42 @@ REVIEWED_COPIED: dict[str, str] = {
 }
 
 
+#: THE OTLP RECEIVER ON SNOWPLOW'S NODE (#1575; the owner (Diego), 2026-11-22). Snowplow exports to the
+#: node-local agent (otel-collector-daemonset, http://$(HOST_IP):4318). The bench taints its snowplow pool
+#: (bench/gke.py: dedicated=snowplow:NoSchedule) and the agent tolerates no taint, so on the bench nothing
+#: receives on snowplow's node; on 057 (untainted nodes, read 2026-11-22) an agent does. The bench gives the
+#: agent its pool's toleration at RECEIVER_TOLERATION, as its own topology beside snowplow's nodeSelector and
+#: tolerations (bench/installer_values.py), only where the installer's values schema declares that path,
+#: read from the schema the record was taken against (installer_schema; the chart check holds the run's
+#: chart to it). Where it does not, the bench has no receiver there: a deviation said by every check, and
+#: snowplow's own OTLP switches that would export into that closed port (SNOWPLOW_NODE_EXPORTS) are not
+#: copied. Where it does, they are copied, and run606's env step requires the agent on snowplow's node
+#: (bench/tracing.py receiver-gate).
+RECEIVER_TOLERATION = "otel-collector-daemonset.opentelemetry-collector.tolerations"
+SNOWPLOW_NODE_EXPORTS = ("snowplow.env.OTEL_LOGS_ENABLED",)
+RULING_RECEIVER = "the owner (Diego), 2026-11-22: not copied while the bench has no receiver there"
+#: the facts of the installer's values schema the record keeps beside 057's values: {path: declared}
+SCHEMA_FACTS = (RECEIVER_TOLERATION,)
+
+
+def receiver_settable(schema: dict) -> bool:
+    """The installer's values schema declares componentValues.<RECEIVER_TOLERATION>."""
+    return schema_node(schema, RECEIVER_TOLERATION.split(".")) is not None
+
+
+def receiver_on_snowplow_node(rec: dict | None = None) -> bool:
+    """The bench writes the agent's toleration, so an OTLP agent receives on snowplow's node (the record's
+    installer can express it)."""
+    rec = load() if rec is None else validate(rec)
+    return rec["installer_schema"][RECEIVER_TOLERATION]
+
+
+def no_receiver_why(rec: dict) -> str:
+    return (f"no OTLP receiver on the bench's snowplow node: installer {rec['read']['installer_version']} cannot "
+            f"express the daemonset toleration (componentValues.{RECEIVER_TOLERATION} is not in its values schema; "
+            f"057 has a receiver there)")
+
+
 def is_off(value) -> bool:
     """A switch's off value: false, or the string "false" (an enum switch, bench/installer_component_values)."""
     return value is False or value == "false"
@@ -291,6 +327,10 @@ def validate(rec) -> dict:
             raise Refused(f"not_recorded {path}: no reason")
     if set(recorded) & set(not_recorded):
         raise Refused("a path is both recorded and not recorded")
+    facts = rec.get("installer_schema")
+    if not isinstance(facts, dict) or set(facts) != set(SCHEMA_FACTS) or \
+            not all(isinstance(v, bool) for v in facts.values()):
+        raise Refused(f"the record keeps no installer_schema facts ({', '.join(SCHEMA_FACTS)}: declared or not)")
     return rec
 
 
@@ -313,11 +353,16 @@ def _classified(classified: dict | None) -> dict:
 
 
 def deviations(rec: dict | None = None, classified: dict | None = None) -> dict:
-    """{path: (what it does, ruling)}: the identity or outside-service switches ON in the record, which the
-    bench does not copy (the owner's ruling, 2026-11-22)."""
+    """{path: (why, ruling)}: the switches ON in the record which the bench does not copy: the identity or
+    outside-service ones, and, while the bench has no OTLP receiver on snowplow's node, snowplow's own exports
+    into it (the owner's rulings, 2026-11-22)."""
     rec = load() if rec is None else validate(rec)
-    return {p: (why, RULING_ON) for p, why in sorted(_classified(classified).items())
-            if p in rec["recorded"] and not is_off(rec["recorded"][p])}
+    out = {p: (why, RULING_ON) for p, why in sorted(_classified(classified).items())
+           if p in rec["recorded"] and not is_off(rec["recorded"][p])}
+    if not receiver_on_snowplow_node(rec):
+        out.update({p: (no_receiver_why(rec), RULING_RECEIVER) for p in SNOWPLOW_NODE_EXPORTS
+                    if p in rec["recorded"] and not is_off(rec["recorded"][p])})
+    return dict(sorted(out.items()))
 
 
 def copied_off(rec: dict | None = None, classified: dict | None = None) -> dict:
@@ -387,6 +432,12 @@ def lines(rec: dict | None = None) -> list[str]:
     out += [f"the bench copies componentValues.{p} as 057 has it ({rec['recorded'][p]}): {why}"
             for p, why in sorted(REVIEWED_COPIED.items()) if p in written]
     out += [f"the bench writes componentValues.{p} itself: {why}" for p, why in sorted(BENCH_OWN.items())]
+    if receiver_on_snowplow_node(rec):
+        out.append(f"the bench writes componentValues.{RECEIVER_TOLERATION} itself: its snowplow pool's toleration, "
+                   f"so the node-local OTLP agent receives on snowplow's node, as on 057 (run606's env step "
+                   f"requires it there)")
+    else:
+        out.append(f"the bench differs from 057 ({RULING_RECEIVER}): {no_receiver_why(rec)}")
     out += [f"fidelity gap, componentValues.{p}: {why}" for p, why in sorted(gaps.items())]
     return out
 
@@ -405,6 +456,7 @@ def record(listed, schema: dict, date: str, version: str) -> dict:
                          "path and reason only, never its value"},
         "recorded": recorded,
         "not_recorded": not_recorded,
+        "installer_schema": {RECEIVER_TOLERATION: receiver_settable(schema)},
     })
 
 
@@ -419,13 +471,24 @@ def drift(rec: dict, listed, schema: dict) -> list[str]:
             out.append(f"componentValues.{p}: {a} in the record, {b} on 057 now")
     for p in sorted(set(not_recorded) ^ set(rec["not_recorded"])):
         out.append(f"componentValues.{p}: {'no longer' if p in rec['not_recorded'] else 'now'} a not-recorded path")
+    if receiver_settable(schema) != rec["installer_schema"][RECEIVER_TOLERATION]:
+        out.append(f"installer schema: componentValues.{RECEIVER_TOLERATION} "
+                   f"{'declared' if receiver_settable(schema) else 'not declared'} by this chart, "
+                   f"{'declared' if rec['installer_schema'][RECEIVER_TOLERATION] else 'not declared'} in the record")
     return out
 
 
 def check_chart(schema: dict, version: str, rec: dict | None = None) -> None:
-    """Refused unless the chart's schema declares every path the bench writes from the record."""
+    """Refused unless the chart's schema declares every path the bench writes from the record, and agrees
+    with the record's installer_schema facts (what decides the bench's own receiver toleration)."""
     rec = load() if rec is None else validate(rec)
     missing = sorted(p for p in bench_paths(rec) if not declared(schema, p))
     if missing:
         raise Refused(f"installer {version} cannot express {len(missing)} of 057's recorded component value(s): "
                       f"{', '.join(missing[:8])}{' ...' if len(missing) > 8 else ''}")
+    has, kept = receiver_settable(schema), rec["installer_schema"][RECEIVER_TOLERATION]
+    if has != kept:
+        raise Refused(f"installer {version}'s values schema {'declares' if has else 'does not declare'} "
+                      f"componentValues.{RECEIVER_TOLERATION}, and the record (installer "
+                      f"{rec['read']['installer_version']}) says it {'does' if kept else 'does not'}: record 057 "
+                      f"again at this installer (python3 -m bench.installer_features record)")

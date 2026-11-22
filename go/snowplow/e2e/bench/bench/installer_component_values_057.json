@@ -201,5 +201,8 @@
   "zendesk-kog.zendesk.baseUrl": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
   "zendesk-organisations.organisations": "a list (neither a switch nor a size)",
   "zendesk-organisations.zendesk.baseUrl": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)"
+ },
+ "installer_schema": {
+  "otel-collector-daemonset.opentelemetry-collector.tolerations": false
  }
 }

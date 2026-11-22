@@ -634,6 +634,35 @@ def read_live(phase: str, kubectl: list[str], namespace: str, selector: str, tim
                    preinstall=preinstall)
 
 
+# ─── #1575: the OTLP receiver on snowplow's node, a precondition where the bench gives the agent its pool ──
+#
+# The bench gives the node-local OTLP agent (otel-collector-daemonset) its snowplow pool's toleration only where
+# the installer can express it (bench/installer_component_values.py RECEIVER_TOLERATION); there, snowplow's own
+# OTLP switches are copied from 057, and an agent MUST receive on snowplow's node before any load, or snowplow
+# exports into a closed port. Where the run's values carry no such toleration, the bench's deviation says so and
+# nothing is required here. Decided from the run's own values document, never from a version.
+
+def receiver_required(values: dict | None) -> bool:
+    """The run's values give the node-local OTLP agent at least one toleration (its snowplow pool's)."""
+    from bench import installer_component_values as icv
+    node = (values or {}).get("componentValues") or {}
+    for seg in icv.RECEIVER_TOLERATION.split("."):
+        node = node.get(seg) if isinstance(node, dict) else None
+    return isinstance(node, list) and bool(node)
+
+
+def receiver_gate(values: dict | None, reading_: dict | None) -> tuple[bool, str]:
+    """(passes, the line): an agent Running and Ready on snowplow's node when the values require one."""
+    if not receiver_required(values):
+        return True, ("OTLP receiver on snowplow's node: not required (the run's values give the node-local agent no "
+                      "toleration of the snowplow pool: the bench's recorded deviation, bench/installer_component_values.py)")
+    rc = (reading_ or {}).get("receiver") or {"state": UNKNOWN, "why": "no reading"}
+    if rc.get("state") == PRESENT:
+        return True, f"OTLP receiver on snowplow's node: PRESENT (port {rc.get('port')}), as the run's values require"
+    return False, (f"no OTLP receiver on snowplow's node although the run's values give the node-local agent the snowplow "
+                   f"pool's toleration: {rc.get('state')} ({rc.get('why')}); snowplow would export into a closed port")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     kubectl = []
@@ -651,10 +680,32 @@ def main(argv: list[str] | None = None) -> int:
     rd.add_argument("--timeout-s", type=float, default=300.0, help="the reading's ONE bound: its kubectl reads together")
     rp = sub.add_parser("report", help="evaluate's report-only section, as JSON")
     rp.add_argument("file")
+    rg = sub.add_parser("receiver-gate", help="#1575: an OTLP agent on snowplow's node, where the run's values give it "
+                                              "the snowplow pool's toleration (-- kubectl ..., read only then)")
+    rg.add_argument("--values", required=True, help="the run's installer-values.yaml")
+    rg.add_argument("--out", required=True)
+    rg.add_argument("--namespace", default="krateo-system")
+    rg.add_argument("--selector", default="app.kubernetes.io/name=snowplow")
+    rg.add_argument("--timeout-s", type=float, default=300.0)
     a = ap.parse_args(argv)
     if a.cmd == "report":
         print(json.dumps(report(a.file), indent=1, default=str))
         return 0
+    if a.cmd == "receiver-gate":
+        import yaml
+        with open(a.values, encoding="utf-8") as fh:
+            values = yaml.safe_load(fh) or {}
+        required = receiver_required(values)
+        if required and not kubectl:
+            ap.error("receiver-gate: the run's values require a receiver: the kubectl command goes after --")
+        r = read_live("before", kubectl, a.namespace, a.selector, a.timeout_s) if required else None
+        ok, line = receiver_gate(values, r)
+        with open(a.out + ".part", "w", encoding="utf-8") as fh:
+            json.dump({"kind": "otlp_receiver", "required": required, "ok": ok, "line": line,
+                       "receiver": (r or {}).get("receiver")}, fh, indent=1, default=str)
+        os.replace(a.out + ".part", a.out)
+        print(line)
+        return 0 if ok else 1
     if not kubectl:
         ap.error("read: the kubectl command goes after --")
     if a.phase == "preinstall":

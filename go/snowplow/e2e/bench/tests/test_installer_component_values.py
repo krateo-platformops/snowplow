@@ -33,8 +33,9 @@ def _sha(path) -> str:
 
 # sha256 of bench/installer_component_values_057.json as re-taken 2026-11-22 14:05 Rome on installer 0.3.698
 # (#1575 review: the first reading was on 0.3.697; no recorded switch or size moved, one not-recorded path
-# came: zendesk-organisations.zendesk.baseUrl)
-PINNED = "dfae107f8d1381c0c2f7f12a3adde7f0123825f670cc3c30815049ceeb4a49f6"
+# came: zendesk-organisations.zendesk.baseUrl), re-taken at 15:29 Rome to keep installer_schema (the agent's
+# toleration: not declared by 0.3.698)
+PINNED = "37904656cc3e7cd58833b6fdabed8e97dadc4a073f1f254d44f340484c83d0fd"
 
 
 def test_the_committed_record_is_the_reading_of_2026_11_22():
@@ -207,7 +208,8 @@ def test_falsifier_the_pre_review_resource_rule_records_the_probe(monkeypatch):
 
 def test_a_record_holding_a_resource_key_that_is_no_resource_name_is_refused_without_naming_it():
     rec = {"kind": icv.RECORD_KIND, "read": {"date": "2026-11-22", "installer_version": "0.3.698"},
-           "recorded": {"comp.resources.limits.alice": "1"}, "not_recorded": {}}
+           "recorded": {"comp.resources.limits.alice": "1"}, "not_recorded": {},
+           "installer_schema": {icv.RECEIVER_TOLERATION: False}}
     with pytest.raises(icv.Refused, match=r"recorded comp\.resources\.limits: a key that is no Kubernetes resource "
                                           r"name") as e:
         icv.validate(rec)
@@ -252,7 +254,8 @@ def test_the_values_carry_every_recorded_switch_and_size_but_the_deviations():
     assert {p: _get(cv, p) for p in KAGENT_SWITCHES} == KAGENT_SWITCHES
     # the bench's own, under it: its group, its snowplow, its declared env beside 057's audit-log switch
     assert cv["portal"]["readerGroups"] == [installer_values.READER_GROUP]
-    assert cv["snowplow"]["env"] == {"GOGC": "100", "OTEL_LOGS_ENABLED": "true"}
+    # 057's OTEL_LOGS_ENABLED is not copied: the bench has no OTLP receiver on snowplow's node (#1575)
+    assert cv["snowplow"]["env"] == {"GOGC": "100"}
     assert cv["snowplow"]["image"]["tag"] == "1.12.75" and cv["frontend"]["image"]["tag"] == "1.8.61"
     assert "enableCyberjokerUser" not in cv["portal"] and "stt" not in cv["agentgateway-policies"]
 
@@ -277,7 +280,7 @@ def test_an_identity_or_outside_switch_is_copied_off_and_never_copied_on():
     """The owner's ruling (2026-11-22): OFF on 057, written off; ON on 057, a deviation. Read from the record."""
     rec = icv.load()
     off = icv.copied_off(rec)
-    on = icv.deviations(rec)
+    on = {p: d for p, d in icv.deviations(rec).items() if p in icv.IDENTITY_OR_OUTSIDE}
     assert set(off) | set(on) == set(icv.IDENTITY_OR_OUTSIDE) & set(rec["recorded"]) and not set(off) & set(on)
     assert all(icv.is_off(rec["recorded"][p]) for p in off) and not any(icv.is_off(rec["recorded"][p]) for p in on)
     assert sorted(off) == [
@@ -348,7 +351,8 @@ def test_every_deviation_says_why_and_the_owners_ruling_and_every_check_says_the
     lines = icv.lines()
     rec = icv.load()
     for p, (why, ruling) in icv.deviations(rec).items():
-        assert why and ruling == "the owner (Diego), 2026-11-22: ON on 057, not copied"
+        want = icv.RULING_RECEIVER if p in icv.SNOWPLOW_NODE_EXPORTS else "the owner (Diego), 2026-11-22: ON on 057, not copied"
+        assert why and ruling == want
         assert sum(f"does not copy componentValues.{p} ({ruling}): {why}" in ln for ln in lines) == 1, p
     for p, why in icv.copied_off(rec).items():
         assert sum(f"writes componentValues.{p} off, as 057 has it (the owner (Diego), 2026-11-22: OFF on 057, "
@@ -381,3 +385,151 @@ def test_drift_names_what_moved():
         "properties": {"enabled": {"type": "boolean"}}}}}}}}}
     moved = icv.drift(rec, listed, schema)
     assert "componentValues.kagent.perUserRbac.enabled: True in the record, False on 057 now" in moved
+
+
+# ─── #1575: the OTLP receiver on snowplow's node, decided by the installer's schema ─
+
+def _rec_with_receiver(settable: bool) -> dict:
+    rec = copy.deepcopy(icv.load())
+    rec["installer_schema"] = {icv.RECEIVER_TOLERATION: settable}
+    return rec
+
+
+def _schema_with(paths, receiver: bool) -> dict:
+    full = {"properties": {"componentValues": {"properties": {}}}}
+    for p in list(paths) + ([icv.RECEIVER_TOLERATION] if receiver else []):
+        node = full["properties"]["componentValues"]
+        for seg in p.split("."):
+            node = node.setdefault("properties", {}).setdefault(seg, {})
+    return full
+
+
+def test_the_record_keeps_that_the_recorded_installer_cannot_express_the_agents_toleration(tmp_path):
+    """Read from installer 0.3.698's own values schema (the archive the record was taken against)."""
+    from bench import installer_features
+    from tests import installer_archives as ia
+    rec = icv.load()
+    assert rec["installer_schema"] == {icv.RECEIVER_TOLERATION: False}
+    schema = installer_features.chart_schema(str(ia.pull(tmp_path / "p", ia.RECORDED)))[1]
+    assert icv.receiver_settable(schema) is False and not icv.receiver_on_snowplow_node(rec)
+    assert icv.receiver_settable(_schema_with([], True)) is True
+    assert icv.receiver_settable(_schema_with([], False)) is False
+
+
+def test_without_the_toleration_in_the_schema_the_deviation_is_said_and_otel_logs_is_not_copied():
+    """The branch in force (installer 0.3.698): no toleration written, OTEL_LOGS_ENABLED a deviation with the reason."""
+    rec = icv.load()
+    why, ruling = icv.deviations(rec)["snowplow.env.OTEL_LOGS_ENABLED"]
+    assert why == ("no OTLP receiver on the bench's snowplow node: installer 0.3.698 cannot express the daemonset "
+                   "toleration (componentValues.otel-collector-daemonset.opentelemetry-collector.tolerations is not in "
+                   "its values schema; 057 has a receiver there)") and ruling == icv.RULING_RECEIVER
+    cv = _cv_of(installer_values.document("1.12.75"))
+    assert "otel-collector-daemonset" not in cv and "OTEL_LOGS_ENABLED" not in cv["snowplow"].get("env", {})
+    lines = icv.lines(rec)
+    assert sum(ln == f"the bench differs from 057 ({icv.RULING_RECEIVER}): {why}" for ln in lines) == 1
+    assert any(ln.startswith("the bench does not copy componentValues.snowplow.env.OTEL_LOGS_ENABLED ") for ln in lines)
+    # the other OTLP switches export from nodes the agent covers: copied, as 057 has them
+    for p in ("alert-provider.otel.enabled", "krateo-sse-proxy.otel.enabled", "oasgen-provider.rdc.otel.nodeLocalEndpoint"):
+        assert icv.bench_paths(rec)[p] is True, p
+
+
+def test_falsifier_with_the_toleration_in_the_schema_the_bench_writes_it_and_copies_otel_logs(monkeypatch):
+    """The branch an installer that declares the path takes: the bench's own toleration, 057's OTEL_LOGS_ENABLED."""
+    rec = _rec_with_receiver(True)
+    monkeypatch.setattr(icv, "load", lambda path=icv.RECORD_PATH: rec)
+    assert "snowplow.env.OTEL_LOGS_ENABLED" not in icv.deviations()
+    cv = _cv_of(installer_values.document("1.12.75", "", {"GOGC": "100"}))
+    assert cv["otel-collector-daemonset"] == {"opentelemetry-collector": {"tolerations": [
+        {"key": "dedicated", "operator": "Equal", "value": "snowplow", "effect": "NoSchedule"}]}}
+    assert cv["snowplow"]["env"] == {"GOGC": "100", "OTEL_LOGS_ENABLED": "true"}
+    assert cv["snowplow"]["tolerations"] == cv["otel-collector-daemonset"]["opentelemetry-collector"]["tolerations"]
+    lines = icv.lines()
+    assert any(ln.startswith(f"the bench writes componentValues.{icv.RECEIVER_TOLERATION} itself: its snowplow pool's "
+                             "toleration") for ln in lines)
+    assert not any("no OTLP receiver" in ln for ln in lines)
+
+
+def test_the_toleration_is_the_bench_pools_taint():
+    from bench import gke
+    snow = next(np for np in gke.default_spec("snowplow-bench-x", now=0).extra_pools if np.name == "snowplow")
+    t = installer_values.SNOWPLOW_POOL_TOLERATION
+    assert snow.taint == (t["key"], t["value"], t["effect"]) and t["operator"] == "Equal"
+
+
+@pytest.mark.parametrize("schema_has,record_has", [(True, False), (False, True)])
+def test_falsifier_a_chart_whose_schema_disagrees_with_the_records_fact_is_refused(schema_has, record_has):
+    rec = _rec_with_receiver(record_has)
+    with pytest.raises(icv.Refused, match=rf"installer 9\.9\.9's values schema {'declares' if schema_has else 'does not declare'} "
+                                          rf"componentValues\.otel-collector-daemonset\.opentelemetry-collector\.tolerations, "
+                                          rf"and the record .* says it {'does' if record_has else 'does not'}: record 057 again"):
+        icv.check_chart(_schema_with(icv.bench_paths(rec), schema_has), "9.9.9", rec)
+    icv.check_chart(_schema_with(icv.bench_paths(rec), record_has), "9.9.9", rec)       # agreeing: passes
+
+
+def test_drift_names_a_schema_fact_that_moved():
+    rec = icv.load()
+    listed = {"items": [{"spec": {"componentValues": {}}}]}
+    moved = icv.drift(rec, listed, _schema_with([], True))
+    assert f"installer schema: componentValues.{icv.RECEIVER_TOLERATION} declared by this chart, not declared in the " \
+           f"record" in moved
+
+
+def test_a_record_without_the_schema_facts_is_refused():
+    rec = copy.deepcopy(icv.load())
+    del rec["installer_schema"]
+    with pytest.raises(icv.Refused, match="the record keeps no installer_schema facts"):
+        icv.validate(rec)
+    rec["installer_schema"] = {icv.RECEIVER_TOLERATION: "no"}
+    with pytest.raises(icv.Refused, match="the record keeps no installer_schema facts"):
+        icv.validate(rec)
+
+
+# the receiver gate (bench/tracing.py receiver-gate, run606's env step)
+
+TOLERATED = {"componentValues": {"otel-collector-daemonset": {"opentelemetry-collector": {"tolerations": [
+    {"key": "dedicated", "operator": "Equal", "value": "snowplow", "effect": "NoSchedule"}]}}}}
+
+
+@pytest.mark.parametrize("values,reading,ok,said", [
+    ({"componentValues": {}}, None, True, "not required"),
+    (TOLERATED, {"receiver": {"state": "PRESENT", "port": 4318}}, True, "PRESENT (port 4318)"),
+    (TOLERATED, {"receiver": {"state": "ABSENT", "why": "no pod on node n listens on hostPort 4318"}}, False,
+     "no OTLP receiver on snowplow's node although the run's values give the node-local agent the snowplow pool's "
+     "toleration: ABSENT (no pod on node n listens on hostPort 4318)"),
+    (TOLERATED, {"receiver": {"state": "NOT_READY", "why": "x"}}, False, "NOT_READY"),
+    (TOLERATED, {"receiver": {"state": "UNKNOWN", "why": "y"}}, False, "UNKNOWN"),
+    (TOLERATED, None, False, "UNKNOWN (no reading)"),
+])
+def test_the_receiver_gate_requires_an_agent_only_where_the_values_give_it_the_pool(values, reading, ok, said):
+    from bench import tracing
+    got_ok, line = tracing.receiver_gate(values, reading)
+    assert got_ok is ok and said in line, line
+
+
+def test_the_receiver_gate_cli_reads_nothing_when_not_required(tmp_path):
+    """The branch in force: the run's own values (no agent toleration), no kubectl command, a record, rc 0."""
+    import subprocess
+    import sys
+    v, out = tmp_path / "installer-values.yaml", tmp_path / "otlp-receiver.json"
+    v.write_text(installer_values.document("1.12.75"))
+    p = subprocess.run([sys.executable, "-m", "bench.tracing", "receiver-gate", "--values", str(v), "--out", str(out)],
+                       cwd=Path(icv.__file__).resolve().parent.parent, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0 and "not required" in p.stdout, p.stderr
+    assert json.loads(out.read_text()) == {"kind": "otlp_receiver", "required": False, "ok": True,
+                                           "line": p.stdout.strip(), "receiver": None}
+    v.write_text(yaml.safe_dump(TOLERATED))
+    p = subprocess.run([sys.executable, "-m", "bench.tracing", "receiver-gate", "--values", str(v), "--out", str(out)],
+                       cwd=Path(icv.__file__).resolve().parent.parent, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 2 and "the run's values require a receiver" in p.stderr
+
+
+def test_run606s_env_step_holds_the_receiver_gate_before_any_load():
+    src = (Path(icv.__file__).resolve().parent.parent / "run606.sh").read_text()
+    body = src[src.index("s_env() {"):]
+    body = body[:body.index("\n}\n")]
+    assert body.rstrip().endswith("otlp_receiver_gate || return 1")
+    fn = src[src.index("otlp_receiver_gate() {"):]
+    fn = fn[:fn.index("\n}\n")]
+    assert 'python3 -m bench.tracing receiver-gate --values "$OUT/installer-values.yaml"' in fn
+    assert 'record_failure "env FAILED: ' in fn
+    assert src.index("\nstep env       s_env\n") < src.index("\nstep measure   s_measure\n")
