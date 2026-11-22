@@ -1,0 +1,19 @@
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+rjob: v3-falsifier on snowplow-build-1 slot 2/12 at fc72c786c14b274eb262ba53ca3ad3a20299920d in go/snowplow
+1
+--- FAIL: TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains (5.12s)
+    --- FAIL: TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains/behind_40 (5.12s)
+panic: close of closed channel [recovered, repanicked]
+panic({0x4e430a8?, 0x2a6fb90?})
+	/usr/local/go/src/runtime/panic.go:859 +0x125
+panic({0x4e430a8?, 0x2a6fb90?})
+	/usr/local/go/src/runtime/panic.go:859 +0x125
+	/usr/local/go/src/runtime/panic.go:694 +0x54
+FAIL	github.com/krateo-platformops/snowplow/internal/cache	5.138s
+FAIL

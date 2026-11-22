@@ -1,0 +1,18 @@
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rjob: f6c-mutant on snowplow-build-1 slot 1/12 at 1c21573bbcbfa63411a4576b7190d53f433703ae in go/snowplow
+1
+1
+=== RUN   TestIssue354_P3_F6c_StageErrorDeclineEndsUnfresh
+--- PASS: TestIssue354_P3_F6c_StageErrorDeclineEndsUnfresh (0.06s)
+=== RUN   TestIssue354_P3_F6c_DeleteBetweenMarkAndDequeueEndsEvicted
+--- PASS: TestIssue354_P3_F6c_DeleteBetweenMarkAndDequeueEndsEvicted (0.20s)
+=== RUN   TestIssue354_P3_F6c_PoisonPillEndsDropped
+--- PASS: TestIssue354_P3_F6c_PoisonPillEndsDropped (0.12s)
+=== RUN   TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow
+    issue354_p3_dirty_window_test.go:385: F6c RED: a dequeue resolved while the cell was 0 s old on the store clock (calls=1 floored Δ=1) — the rate floor reads the entry's age on a clock other than the one that stamped CreatedAt
+--- FAIL: TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow (6.01s)
+=== RUN   TestIssue354_P3_F6c_StageErrorDeclineEndsUnfresh

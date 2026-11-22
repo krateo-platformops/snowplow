@@ -1,0 +1,8 @@
+{
+ "order": ["main", "v3", "mainB"],
+ "arms": {
+  "main": {"sha": "3cc6444d3aa11f871d18f18b265c4cbc75f89919", "overlay": "$SCRATCH/overlays/split-branch"},
+  "mainB": {"sha": "3cc6444d3aa11f871d18f18b265c4cbc75f89919", "overlay": "$SCRATCH/overlays/split-branch"},
+  "v3": {"sha": "1c21573bbcbfa63411a4576b7190d53f433703ae", "overlay": "$SCRATCH/overlays/split-branch"}
+ }
+}

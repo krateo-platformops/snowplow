@@ -1,0 +1,7 @@
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rjob: checks-final on snowplow-build-1 slot 2/24 at 1c21573bbcbfa63411a4576b7190d53f433703ae in go/snowplow
+checks: 11 run, 0 failed

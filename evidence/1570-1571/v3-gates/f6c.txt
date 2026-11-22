@@ -1,0 +1,16 @@
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rjob: f6c-v3b on snowplow-build-1 slot 2/12 at 1c21573bbcbfa63411a4576b7190d53f433703ae in go/snowplow
+=== RUN   TestIssue354_P3_F6c_StageErrorDeclineEndsUnfresh
+--- PASS: TestIssue354_P3_F6c_StageErrorDeclineEndsUnfresh (0.07s)
+=== RUN   TestIssue354_P3_F6c_DeleteBetweenMarkAndDequeueEndsEvicted
+--- PASS: TestIssue354_P3_F6c_DeleteBetweenMarkAndDequeueEndsEvicted (0.20s)
+=== RUN   TestIssue354_P3_F6c_PoisonPillEndsDropped
+--- PASS: TestIssue354_P3_F6c_PoisonPillEndsDropped (0.13s)
+=== RUN   TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow
+--- PASS: TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow (2.01s)
+=== RUN   TestIssue354_P3_F6c_StageErrorDeclineEndsUnfresh
+--- PASS: TestIssue354_P3_F6c_StageErrorDeclineEndsUnfresh (0.07s)

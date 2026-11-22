@@ -1,0 +1,15 @@
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rjob: f6c-only-mut on snowplow-build-1 slot 1/24 at 1c21573bbcbfa63411a4576b7190d53f433703ae in go/snowplow
+    issue354_p3_dirty_window_test.go:385: F6c RED: a dequeue resolved while the cell was 0 s old on the store clock (calls=1 floored Δ=1) — the rate floor reads the entry's age on a clock other tha
+--- FAIL: TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow (6.01s)
+    issue354_p3_dirty_window_test.go:385: F6c RED: a dequeue resolved while the cell was 0 s old on the store clock (calls=1 floored Δ=1) — the rate floor reads the entry's age on a clock other tha
+--- FAIL: TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow (6.01s)
+    issue354_p3_dirty_window_test.go:385: F6c RED: a dequeue resolved while the cell was 0 s old on the store clock (calls=1 floored Δ=1) — the rate floor reads the entry's age on a clock other tha
+--- FAIL: TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow (6.01s)
+FAIL
+FAIL	github.com/krateo-platformops/snowplow/internal/handlers/dispatchers	18.048s
+FAIL

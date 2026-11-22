@@ -1,0 +1,16 @@
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rjob: arms-final on snowplow-build-1 slot 1/12 at 1c21573bbcbfa63411a4576b7190d53f433703ae in go/snowplow
+    refresher_floor_live_backlog_1570_test.go:170: GREEN: X (cost 101.029277ms) floored at K≥31 S=1 (a frozen floor would be 3.131907587s) re-ran 43.172137ms after the drain (40 fillers)
+    refresher_floor_live_backlog_1570_test.go:170: GREEN: X (cost 100.953126ms) floored at K≥112 S=1 (a frozen floor would be 11.306750112s) re-ran 78.866µs after the drain (120 fillers)
+    refresher_floor_live_backlog_1570_test.go:178: GREEN: X (cost 275.326229ms) floored at K≥1573 S=3 (a frozen floor would be 2m24.362719405s) re-ran -1.046584ms after the drain (1600 fillers)
+    refresher_floor_live_backlog_1570_test.go:170: GREEN: X (cost 100.84179ms) floored at K≥31 S=1 (a frozen floor would be 3.12609549s) re-ran 44.127025ms after the drain (40 fillers)
+    refresher_floor_live_backlog_1570_test.go:170: GREEN: X (cost 100.677413ms) floored at K≥111 S=1 (a frozen floor would be 11.175192843s) re-ran 49.626µs after the drain (120 fillers)
+    refresher_floor_live_backlog_1570_test.go:178: GREEN: X (cost 275.577018ms) floored at K≥1574 S=3 (a frozen floor would be 2m24.586075444s) re-ran -1.112058ms after the drain (1600 fillers)
+    refresher_floor_live_backlog_1570_test.go:170: GREEN: X (cost 100.85605ms) floored at K≥32 S=1 (a frozen floor would be 3.2273936s) re-ran 42.147276ms after the drain (40 fillers)
+    refresher_floor_live_backlog_1570_test.go:170: GREEN: X (cost 100.773047ms) floored at K≥112 S=1 (a frozen floor would be 11.286581264s) re-ran 40.151µs after the drain (120 fillers)
+    refresher_floor_live_backlog_1570_test.go:178: GREEN: X (cost 275.190644ms) floored at K≥1575 S=3 (a frozen floor would be 2m24.4750881s) re-ran 59.764µs after the drain (1600 fillers)
+ok  	github.com/krateo-platformops/snowplow/internal/cache	31.826s

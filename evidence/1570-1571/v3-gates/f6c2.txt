@@ -1,0 +1,10 @@
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rjob: f6c-only on snowplow-build-1 slot 2/24 at 1c21573bbcbfa63411a4576b7190d53f433703ae in go/snowplow
+--- PASS: TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow (2.01s)
+--- PASS: TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow (2.01s)
+--- PASS: TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow (2.00s)
+ok  	github.com/krateo-platformops/snowplow/internal/handlers/dispatchers	7.128s

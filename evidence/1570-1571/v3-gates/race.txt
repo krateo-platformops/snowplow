@@ -1,0 +1,7 @@
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+rjob: race-v3 on snowplow-build-1 slot 3/12 at 98f53da6711c346a3d3a149a87afa696aafa7e86 in go/snowplow
+ok  	github.com/krateo-platformops/snowplow/internal/cache	113.465s
