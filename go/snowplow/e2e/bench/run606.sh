@@ -1614,7 +1614,7 @@ otlp_receiver_gate() {
     log "$line"
     return 0
   fi
-  record_failure "env FAILED: ${line:-the OTLP receiver on snowplow's node could not be read: $(kerr_line)}"
+  record_failure "env FAILED: ${line:-the OTLP receiver on the snowplow node could not be read: $(kerr_line)}"
   return 1
 }
 # start_netns_sampler (#1089): the TCP path under snowplow, from here (the boot

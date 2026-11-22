@@ -523,6 +523,15 @@ def test_the_receiver_gate_cli_reads_nothing_when_not_required(tmp_path):
     assert p.returncode == 2 and "the run's values require a receiver" in p.stderr
 
 
+def test_run606_parses():
+    """f0105d9a: an apostrophe inside "${line:-...}" opened a quote and the whole script stopped parsing
+    (CI: 301 failed). bash -n on the script catches that class before any harness run."""
+    import subprocess
+    p = subprocess.run(["bash", "-n", str(Path(icv.__file__).resolve().parent.parent / "run606.sh")],
+                       capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, p.stderr
+
+
 def test_run606s_env_step_holds_the_receiver_gate_before_any_load():
     src = (Path(icv.__file__).resolve().parent.parent / "run606.sh").read_text()
     body = src[src.index("s_env() {"):]
