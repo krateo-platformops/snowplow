@@ -19,6 +19,10 @@ on:
       app_version:
         description: "App image version (APP_VERSION). Default: the tag this runs on (run from a branch: the latest tag of the app repo)."
         required: false
+      dry_run:
+        description: "Package and run every check, upload the packages as an artifact, push nothing. A manual run defaults to a dry run; a tag push always publishes."
+        type: boolean
+        default: true
 
 jobs:
   release-oci:
@@ -46,3 +50,5 @@ jobs:
     with:
       chart_version: ${{ github.event.inputs.chart_version || (github.ref_type == 'tag' && github.ref_name || '') }}
       app_version: ${{ github.event.inputs.app_version || (github.ref_type == 'tag' && github.ref_name || '') }}
+      # A tag push has no inputs, so it publishes; a manual run is a dry run unless dry_run is set false.
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
