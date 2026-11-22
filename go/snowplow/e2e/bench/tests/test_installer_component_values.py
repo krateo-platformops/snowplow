@@ -23,7 +23,7 @@ import yaml
 from bench import installer_component_values as icv
 from bench import installer_features, installer_values
 
-# the reading of 2026-11-22 (installer 0.3.697): the record's bytes, and what the owner's ruling turns on
+# the reading of 2026-11-22 (installer 0.3.698): the record's bytes, and what the owner's ruling turns on
 KAGENT_SWITCHES = {"kagent.perUserRbac.enabled": True, "kagent.kagentapp.kagent-tools.enabled": False}
 
 
@@ -31,13 +31,16 @@ def _sha(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-PINNED = "ab03da9e626a938b761ac87193f12848e0945938d862744fb15267481d789255"   # sha256 of bench/installer_component_values_057.json as recorded 2026-11-22
+# sha256 of bench/installer_component_values_057.json as re-taken 2026-11-22 14:05 Rome on installer 0.3.698
+# (#1575 review: the first reading was on 0.3.697; no recorded switch or size moved, one not-recorded path
+# came: zendesk-organisations.zendesk.baseUrl)
+PINNED = "dfae107f8d1381c0c2f7f12a3adde7f0123825f670cc3c30815049ceeb4a49f6"
 
 
 def test_the_committed_record_is_the_reading_of_2026_11_22():
     rec = icv.load()
-    assert rec["read"]["date"] == "2026-11-22" and rec["read"]["installer_version"] == "0.3.697"
-    assert len(rec["recorded"]) == 57 and len(rec["not_recorded"]) == 134
+    assert rec["read"]["date"] == "2026-11-22" and rec["read"]["installer_version"] == "0.3.698"
+    assert len(rec["recorded"]) == 57 and len(rec["not_recorded"]) == 135
     assert {p: rec["recorded"][p] for p in KAGENT_SWITCHES} == KAGENT_SWITCHES
     assert rec["recorded"]["kagent.kagentapp.database.postgres.bundled.storage"] == "8Gi"
     assert rec["recorded"]["snowplow.env.OTEL_LOGS_ENABLED"] == "true"
@@ -156,6 +159,68 @@ def test_falsifier_a_schema_that_declares_a_free_form_key_would_store_it():
     assert icv.component_reading(cv, schema)[0] == {f"comp.users.{USER}.on": True}
 
 
+# ─── a ResourceList's keys: Kubernetes resource names only (#1575 review B2) ─
+
+#: the reviewer's probe: an open resources.limits map holding a name-shaped bare key
+B2_PROBE = {"comp": {"resources": {"limits": {"alice": "1"}}}}
+B2_SCHEMA = {"properties": {"componentValues": {"properties": {"comp": {"type": "object", "properties": {
+    "resources": {"type": "object", "properties": {
+        "limits": {"type": "object", "additionalProperties": {"type": "string"}},
+        "requests": {"type": "object", "additionalProperties": {"type": "string"}}}}}}}}}}
+
+
+def test_privacy_a_bare_resource_key_that_is_no_kubernetes_resource_is_never_recorded():
+    """The reviewer's probe: c.resources.limits = {"alice": "1"} was recorded as c.resources.limits.alice."""
+    rec, nr = icv.component_reading(B2_PROBE, B2_SCHEMA)
+    assert rec == {} and nr == {"comp.resources.limits": icv.FREE_FORM.format(n=1)}
+    assert "alice" not in json.dumps(icv.record({"items": [{"spec": {"componentValues": B2_PROBE}}]}, B2_SCHEMA,
+                                                "2026-11-22", "0.3.698"))
+    assert not icv.declared(B2_SCHEMA, "comp.resources.limits.alice")
+
+
+@pytest.mark.parametrize("key,name,recorded", [
+    ("cpu", True, True), ("memory", True, True), ("ephemeral-storage", True, True), ("hugepages-2Mi", True, True),
+    ("hugepages-1Gi", True, True), ("vendor/foo", True, True),
+    # a resource name the dot-joined record cannot hold (nest() would split it): a named gap, never recorded
+    ("nvidia.com/gpu", True, False), ("example.com/foo", True, False),
+    ("alice", False, False), ("gpu", False, False), ("storage", False, False), ("pods", False, False),
+    ("hugepages-", False, False), ("hugepages-big", False, False), ("Alice", False, False), ("/gpu", False, False),
+    ("example.com/", False, False), ("a b", False, False)])
+def test_a_resource_key_is_admitted_only_as_kubernetes_names_one(key, name, recorded):
+    """Bare: the standard set and hugepages-<size>; every other resource must carry its domain and a '/'."""
+    assert icv.resource_name(key) is name and icv.recordable_resource(key) is recorded
+    cv = {"comp": {"resources": {"requests": {key: "1"}}}}
+    rec, nr = icv.component_reading(cv, B2_SCHEMA)
+    assert rec == ({f"comp.resources.requests.{key}": "1"} if recorded else {})
+    assert nr == ({} if recorded else {"comp.resources.requests": icv.FREE_FORM.format(n=1)})
+    assert icv.declared(B2_SCHEMA, f"comp.resources.requests.{key}") is recorded
+
+
+def test_falsifier_the_pre_review_resource_rule_records_the_probe(monkeypatch):
+    """Put back the rule the review found (any bare lowercase word) and the probe's key enters the record:
+    the privacy test above is what catches it."""
+    import re
+    old = re.compile(r"^([a-z0-9.-]+/)?[a-z][a-z0-9-]*$")
+    monkeypatch.setattr(icv, "resource_name", lambda k: bool(old.fullmatch(k)))
+    assert icv.component_reading(B2_PROBE, B2_SCHEMA)[0] == {"comp.resources.limits.alice": "1"}
+
+
+def test_a_record_holding_a_resource_key_that_is_no_resource_name_is_refused_without_naming_it():
+    rec = {"kind": icv.RECORD_KIND, "read": {"date": "2026-11-22", "installer_version": "0.3.698"},
+           "recorded": {"comp.resources.limits.alice": "1"}, "not_recorded": {}}
+    with pytest.raises(icv.Refused, match=r"recorded comp\.resources\.limits: a key that is no Kubernetes resource "
+                                          r"name") as e:
+        icv.validate(rec)
+    assert "alice" not in str(e.value)
+    # a dotted extended resource reads, split, as two keys under the ResourceList: refused too
+    rec["recorded"] = {"comp.resources.requests.nvidia.com/gpu": "1"}
+    with pytest.raises(icv.Refused, match=r"recorded comp\.resources\.requests: a key that is no Kubernetes"):
+        icv.validate(rec)
+    rec["recorded"] = {"comp.resources.limits.memory": "1Gi", "comp.resources.requests.vendor/gpu": "1",
+                       "comp.resources.limits.hugepages-2Mi": "2Mi"}
+    icv.validate(rec)
+
+
 # ─── the values ────────────────────────────────────────────────────────────
 
 def _cv_of(doc: str) -> dict:
@@ -173,11 +238,16 @@ def _get(d, path):
 def test_the_values_carry_every_recorded_switch_and_size_but_the_deviations():
     cv = _cv_of(installer_values.document("1.12.75", "1.8.61", {"GOGC": "100"}))
     rec = icv.load()
+    devs = icv.deviations()
     for p, v in rec["recorded"].items():
-        if p in icv.DEVIATIONS:
+        if p in devs:
             assert _get(cv, p) is KeyError, p
         else:
             assert _get(cv, p) == v, p
+    # the identity / outside-service switches OFF on 057 are written off (the owner's ruling, 2026-11-22)
+    assert cv["agentgateway-policies"]["cors"] == {"enabled": False, "allowCredentials": False}
+    assert cv["frontend"]["ingress"] == {"enabled": False}
+    assert cv["krateo-observability"]["hyperdxLoadBalancer"] == {"enabled": False}
     # the run-30 blocker: kagent's per-user tool server on, its upstream tools server off, as on 057
     assert {p: _get(cv, p) for p in KAGENT_SWITCHES} == KAGENT_SWITCHES
     # the bench's own, under it: its group, its snowplow, its declared env beside 057's audit-log switch
@@ -197,8 +267,46 @@ def test_falsifier_the_values_follow_the_record(monkeypatch):
 
 
 def test_falsifier_a_deviation_keeps_a_switch_out(monkeypatch):
-    monkeypatch.setattr(icv, "DEVIATIONS", {**icv.DEVIATIONS, "kagent.perUserRbac.enabled": ("why", "ruling")})
+    """Name a switch that is ON on 057 an identity / outside-service switch, and it is no longer written."""
+    monkeypatch.setattr(icv, "IDENTITY_OR_OUTSIDE", {**icv.IDENTITY_OR_OUTSIDE, "kagent.perUserRbac.enabled": "why"})
     assert "perUserRbac" not in _cv_of(installer_values.document("1.12.75"))["kagent"]
+
+
+def test_an_identity_or_outside_switch_is_copied_off_and_never_copied_on():
+    """The owner's ruling (2026-11-22): OFF on 057, written off; ON on 057, a deviation. Read from the record."""
+    rec = icv.load()
+    off = icv.copied_off(rec)
+    on = icv.deviations(rec)
+    assert set(off) | set(on) == set(icv.IDENTITY_OR_OUTSIDE) & set(rec["recorded"]) and not set(off) & set(on)
+    assert all(icv.is_off(rec["recorded"][p]) for p in off) and not any(icv.is_off(rec["recorded"][p]) for p in on)
+    assert sorted(off) == [
+        "agentgateway-policies.cors.allowCredentials", "agentgateway-policies.cors.enabled",
+        "agentgateway-policies.uiTokenHop.impersonation.enabled", "cert-manager-issuers.acmeDns01.enabled",
+        "frontend.ingress.enabled", "krateo-observability.hyperdxLoadBalancer.enabled",
+        "zendesk-kog.plugin.webhookReceiver.enabled", "zendesk-kog.restDefinitions.ticket.enabled",
+        "zendesk-kog.restDefinitions.webhook.enabled", "zendesk-kog.snowplow.restActions.enabled"]
+    assert sorted(on) == [
+        "agentgateway-policies.mcpEntry.enabled", "agentgateway-policies.stt.enabled",
+        "agentgateway-policies.tts.enabled", "frontend.serviceAccount.automount", "frontend.serviceAccount.create",
+        "gcp-configconnector.configConnector.enabled", "keycloak-config-kog.auth.bootstrap.enabled",
+        "portal.enableAdminUser", "portal.enableCyberjokerUser", "portal.enableIncidentResponse",
+        "zendesk-kog.restDefinitions.request.enabled"]
+    written = icv.bench_paths(rec)
+    assert {p: written[p] for p in off} == {p: False for p in off} and not set(on) & set(written)
+
+
+def test_falsifier_057_turning_an_identity_switch_on_makes_it_a_deviation_not_a_copy(monkeypatch):
+    """If 057 later turns cors on, the bench must not follow: the rule reads the record, it is no list of
+    'off' switches."""
+    rec = copy.deepcopy(icv.load())
+    rec["recorded"]["agentgateway-policies.cors.enabled"] = True
+    monkeypatch.setattr(icv, "load", lambda path=icv.RECORD_PATH: rec)
+    assert "agentgateway-policies.cors.enabled" in icv.deviations()
+    assert _cv_of(installer_values.document("1.12.75"))["agentgateway-policies"]["cors"] == {"allowCredentials": False}
+    # and an identity switch with no reason is refused, not silently copied
+    monkeypatch.setattr(icv, "IDENTITY_OR_OUTSIDE", {**icv.IDENTITY_OR_OUTSIDE, "portal.enableAdminUser": ""})
+    with pytest.raises(icv.Refused, match=r"portal\.enableAdminUser: an identity or outside-service switch"):
+        icv.bench_paths()
 
 
 def test_a_path_both_the_bench_and_the_record_set_is_refused_unless_named():
@@ -220,17 +328,19 @@ def test_the_declared_snowplow_env_cannot_collide_with_057s_audit_log_switch():
 def test_every_deviation_says_why_and_the_owners_ruling_and_every_check_says_them():
     lines = icv.lines()
     rec = icv.load()
-    for p, (why, ruling) in icv.DEVIATIONS.items():
-        assert why and ruling == "the owner (Diego), 2026-11-22: not copied"
-        if p in rec["recorded"]:
-            assert any(f"does not copy componentValues.{p} " in ln for ln in lines), p
+    for p, (why, ruling) in icv.deviations(rec).items():
+        assert why and ruling == "the owner (Diego), 2026-11-22: ON on 057, not copied"
+        assert sum(f"does not copy componentValues.{p} ({ruling}): {why}" in ln for ln in lines) == 1, p
+    for p, why in icv.copied_off(rec).items():
+        assert sum(f"writes componentValues.{p} off, as 057 has it (the owner (Diego), 2026-11-22: OFF on 057, "
+                   f"copied off): {why}" in ln for ln in lines) == 1, p
     assert any("writes componentValues.portal.readerGroups itself" in ln for ln in lines)
     gaps = [ln for ln in lines if ln.startswith("fidelity gap, componentValues.")]
     assert len(gaps) == sum(1 for w in rec["not_recorded"].values()
                             if w.startswith(("not settable", "a free-form map"))) == 8
     # the switches that create an identity or reach outside, as the owner named them
     for p in ("portal.enableCyberjokerUser", "agentgateway-policies.stt.enabled", "agentgateway-policies.tts.enabled"):
-        assert p in icv.DEVIATIONS
+        assert p in icv.deviations(rec)
 
 
 def test_falsifier_the_chart_check_refuses_an_installer_that_cannot_express_a_recorded_path():
@@ -242,7 +352,7 @@ def test_falsifier_the_chart_check_refuses_an_installer_that_cannot_express_a_re
         node = full["properties"]["componentValues"]
         for s in p.split("."):
             node = node.setdefault("properties", {}).setdefault(s, {})
-    icv.check_chart(full, "0.3.697")
+    icv.check_chart(full, "0.3.698")
 
 
 def test_drift_names_what_moved():

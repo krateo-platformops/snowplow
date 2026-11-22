@@ -25,11 +25,13 @@ a key the schema does not name nothing is descended into: the record names the d
 how many keys it holds, so a free-form key (a user's name, say) can never enter it. Both are named as
 fidelity gaps by every check.
 
-THE DEVIATIONS (DEVIATIONS below): recorded switches the bench does not copy, each with why and the
-owner's ruling, said by every check: a switch that creates an identity, grants a named identity
-rights, or opens or reaches an outside service. The bench writes no value for them (the chart's or
-the installer's default stands, as before #1572). portal.readerGroups is written by the bench itself
-(bench/installer_values.py: its base group), never 057's.
+THE IDENTITY AND OUTSIDE-SERVICE SWITCHES (IDENTITY_OR_OUTSIDE below): a recorded switch that creates
+an identity, grants a named identity rights, or opens or reaches an outside service. The owner's
+rulings (2026-11-22): OFF on 057, the bench writes the off value (copied_off); ON on 057, the bench
+does not copy it (deviations: no value is written, the chart's or the installer's default stands, as
+before #1572). Which is which is read from the record, never listed by hand, and every check says
+each one. portal.readerGroups is written by the bench itself (bench/installer_values.py: its base
+group), never 057's.
 
 Imports nothing from bench but installer_features' Refused; stdlib + PyYAML.
 """
@@ -45,8 +47,32 @@ SIZE_KEYS = frozenset({"replicaCount", "replicas", "minReplicas", "maxReplicas",
                        "storage", "instances"})
 _QTY = re.compile(r"^[0-9]+(\.[0-9]+)?(m|k|Ki|Mi|Gi|Ti|Pi|M|G|T|P)?$")
 SWITCH_STRINGS = frozenset({"true", "false"})
-#: a Kubernetes resource name (cpu, memory, ephemeral-storage, nvidia.com/gpu)
-_RESOURCE_NAME = re.compile(r"^([a-z0-9.-]+/)?[a-z][a-z0-9-]*$")
+#: The keys a container's ResourceList (resources.limits / resources.requests) may carry, as Kubernetes
+#: names them (#1575 review B2): a BARE name only from the standard set, cpu, memory, ephemeral-storage
+#: and hugepages-<size>; every other resource is an extended one and Kubernetes requires it to be
+#: domain-prefixed (vendor.example/foo). A bare word that is none of these (a user's name, say) is no
+#: resource name and is never recorded.
+STANDARD_RESOURCES = frozenset({"cpu", "memory", "ephemeral-storage"})
+_HUGEPAGES = re.compile(r"^hugepages-[0-9]+(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$")
+_EXTENDED_RESOURCE = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?/[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$")
+
+
+def resource_name(key: str) -> bool:
+    """`key` is a Kubernetes container resource name: a standard one, hugepages-<size>, or an extended
+    one (its domain prefix and a '/')."""
+    return key in STANDARD_RESOURCES or bool(_HUGEPAGES.fullmatch(key)) or bool(_EXTENDED_RESOURCE.fullmatch(key))
+
+
+def recordable_resource(key: str) -> bool:
+    """A ResourceList key the record can hold: a resource name (resource_name) without a '.', since a
+    record path is dot-joined and nest() would split such a key into two (an extended resource with a
+    dotted domain, nvidia.com/gpu, stays a named gap: 057 sets none)."""
+    return resource_name(key) and "." not in key
+
+
+def _resource_list(segments: list[str]) -> bool:
+    """`segments` is a ResourceList: <...>.resources.limits or <...>.resources.requests."""
+    return len(segments) >= 2 and segments[-2] == "resources" and segments[-1] in ("limits", "requests")
 
 NOT_A_SWITCH_OR_SIZE = "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)"
 A_LIST = "a list (neither a switch nor a size)"
@@ -55,36 +81,45 @@ NOT_SETTABLE = "not settable through the installer: its values schema rejects {n
 FREE_FORM = ("a free-form map: {n} key(s) the schema does not name, not recorded (a free-form key may name an "
              "identity; a fidelity gap)")
 
-_RULING = "the owner (Diego), 2026-11-22: not copied"
-#: recorded switches the bench does not copy: {path: (why, ruling)}
-DEVIATIONS: dict[str, tuple[str, str]] = {
-    "portal.enableCyberjokerUser": ("creates the cyberjoker demo user (basic auth)", _RULING),
-    "portal.enableAdminUser": ("creates the admin user (basic auth, cluster-admin)", _RULING),
-    "portal.enableIncidentResponse": ("grants the sre-incident-responder identity cluster rights (ClusterRoleBinding)",
-                                      _RULING),
-    "agentgateway-policies.stt.enabled": ("a speech-to-text route to an outside model provider (Vertex); needs the "
-                                          "TLS platform listener the bench has not", _RULING),
-    "agentgateway-policies.tts.enabled": ("a text-to-speech route to an outside service (Google Cloud TTS); needs the "
-                                          "TLS platform listener the bench has not", _RULING),
-    "agentgateway-policies.mcpEntry.enabled": ("opens an internet-facing /mcp route (needs a TLS listener)", _RULING),
-    "agentgateway-policies.cors.enabled": ("admits outside browser origins", _RULING),
-    "agentgateway-policies.cors.allowCredentials": ("admits outside browser origins with credentials", _RULING),
-    "agentgateway-policies.uiTokenHop.impersonation.enabled": ("impersonates a named identity", _RULING),
-    "cert-manager-issuers.acmeDns01.enabled": ("an ACME issuer through Let's Encrypt and a DNS provider (outside)",
-                                               _RULING),
-    "krateo-observability.hyperdxLoadBalancer.enabled": ("an outside LoadBalancer for HyperDX", _RULING),
-    "frontend.ingress.enabled": ("an outside Ingress", _RULING),
-    "frontend.serviceAccount.create": ("creates a ServiceAccount identity", _RULING),
-    "frontend.serviceAccount.automount": ("mounts that identity's token", _RULING),
-    "gcp-configconnector.configConnector.enabled": ("reaches GCP with a service-account key (configConnector is a "
-                                                    "feature deviation too)", _RULING),
-    "keycloak-config-kog.auth.bootstrap.enabled": ("bootstraps Keycloak identities", _RULING),
-    "zendesk-kog.plugin.webhookReceiver.enabled": ("receives Zendesk's webhooks (outside)", _RULING),
-    "zendesk-kog.restDefinitions.request.enabled": ("calls Zendesk (outside)", _RULING),
-    "zendesk-kog.restDefinitions.ticket.enabled": ("calls Zendesk (outside)", _RULING),
-    "zendesk-kog.restDefinitions.webhook.enabled": ("registers a Zendesk webhook (outside)", _RULING),
-    "zendesk-kog.snowplow.restActions.enabled": ("snowplow RESTActions that call Zendesk (outside)", _RULING),
+#: The owner's rulings (Diego, 2026-11-22): a recorded switch that creates an identity, grants a named
+#: identity rights, or opens or reaches an outside service is copied only OFF. ON on 057 the bench does
+#: not copy it (a deviation: no value is written, the chart's or the installer's default stands); OFF on
+#: 057 the bench writes the off value, as 057 has it. Decided from the record each time (deviations,
+#: copied_off), so a switch 057 turns on later becomes a deviation, never a silent copy.
+RULING_ON = "the owner (Diego), 2026-11-22: ON on 057, not copied"
+RULING_OFF = "the owner (Diego), 2026-11-22: OFF on 057, copied off"
+#: the switches those rulings name: {path: what it does}
+IDENTITY_OR_OUTSIDE: dict[str, str] = {
+    "portal.enableCyberjokerUser": "creates the cyberjoker demo user (basic auth)",
+    "portal.enableAdminUser": "creates the admin user (basic auth, cluster-admin)",
+    "portal.enableIncidentResponse": "grants the sre-incident-responder identity cluster rights (ClusterRoleBinding)",
+    "agentgateway-policies.stt.enabled": "a speech-to-text route to an outside model provider (Vertex); needs the "
+                                         "TLS platform listener the bench has not",
+    "agentgateway-policies.tts.enabled": "a text-to-speech route to an outside service (Google Cloud TTS); needs the "
+                                         "TLS platform listener the bench has not",
+    "agentgateway-policies.mcpEntry.enabled": "opens an internet-facing /mcp route (needs a TLS listener)",
+    "agentgateway-policies.cors.enabled": "admits outside browser origins",
+    "agentgateway-policies.cors.allowCredentials": "admits outside browser origins with credentials",
+    "agentgateway-policies.uiTokenHop.impersonation.enabled": "impersonates a named identity",
+    "cert-manager-issuers.acmeDns01.enabled": "an ACME issuer through Let's Encrypt and a DNS provider (outside)",
+    "krateo-observability.hyperdxLoadBalancer.enabled": "an outside LoadBalancer for HyperDX",
+    "frontend.ingress.enabled": "an outside Ingress",
+    "frontend.serviceAccount.create": "creates a ServiceAccount identity",
+    "frontend.serviceAccount.automount": "mounts that identity's token",
+    "gcp-configconnector.configConnector.enabled": "reaches GCP with a service-account key (configConnector is a "
+                                                   "feature deviation too)",
+    "keycloak-config-kog.auth.bootstrap.enabled": "bootstraps Keycloak identities",
+    "zendesk-kog.plugin.webhookReceiver.enabled": "receives Zendesk's webhooks (outside)",
+    "zendesk-kog.restDefinitions.request.enabled": "calls Zendesk (outside)",
+    "zendesk-kog.restDefinitions.ticket.enabled": "calls Zendesk (outside)",
+    "zendesk-kog.restDefinitions.webhook.enabled": "registers a Zendesk webhook (outside)",
+    "zendesk-kog.snowplow.restActions.enabled": "snowplow RESTActions that call Zendesk (outside)",
 }
+
+
+def is_off(value) -> bool:
+    """A switch's off value: false, or the string "false" (an enum switch, bench/installer_component_values)."""
+    return value is False or value == "false"
 #: what the bench writes itself, never 057's (bench/installer_values.py), said by every check
 BENCH_OWN = {
     "portal.readerGroups": "the bench's base group (bench/rbac_model.py): its users are in it; 057's groups are "
@@ -158,14 +193,15 @@ def component_reading(component_values, schema: dict) -> tuple[dict, dict]:
                 return
             kids = _children(node)
             n = 0
-            # a Kubernetes ResourceList (resources.limits / resources.requests): its keys are resource names
-            # (cpu, memory, ...), never identities, and its values sizes
-            resource_list = len(segments) >= 2 and segments[-2] == "resources" and segments[-1] in ("limits", "requests")
+            # a Kubernetes ResourceList (resources.limits / resources.requests): a key is recorded only
+            # when it is a Kubernetes resource name (resource_name: standard, hugepages-<size>, or
+            # domain-prefixed), and its value a size
+            resource_list = _resource_list(segments)
             product_keyed = product_keyed_map(node)
             for k, v in value.items():
                 if k in kids:
                     walk(v, kids[k], segments + [k])
-                elif resource_list and _RESOURCE_NAME.fullmatch(k) and _is_size(segments + [k], v):
+                elif resource_list and recordable_resource(k) and _is_size(segments + [k], v):
                     recorded[".".join(segments + [k])] = v
                 elif product_keyed and _PRODUCT_NAME.fullmatch(k):
                     walk(v, node["additionalProperties"], segments + [k])
@@ -202,13 +238,13 @@ def schema_node(schema: dict, segments: list[str]) -> dict | None:
 
 
 def declared(schema: dict, path: str) -> bool:
-    """The installer chart's values schema declares componentValues.<path> (a resource name under a
-    declared resources.limits / resources.requests map counts: a ResourceList names its keys freely)."""
+    """The installer chart's values schema declares componentValues.<path> (a Kubernetes resource name,
+    resource_name, under a declared, open resources.limits / resources.requests map counts)."""
     segs = path.split(".")
     if schema_node(schema, segs) is not None:
         return True
     parent = schema_node(schema, segs[:-1])
-    return (parent is not None and len(segs) >= 3 and segs[-3] == "resources" and segs[-2] in ("limits", "requests")
+    return (parent is not None and _resource_list(segs[:-1]) and recordable_resource(segs[-1])
             and parent.get("additionalProperties") is not False)
 
 
@@ -229,6 +265,12 @@ def validate(rec) -> dict:
               or _is_size(segs, v))
         if not ok:
             raise Refused(f"recorded {path}: neither a switch nor a size")
+        for i in range(len(segs) - 2):
+            # under a ResourceList, exactly one key follows, and it is a recordable resource name
+            if _resource_list(segs[:i + 2]) and not (len(segs) == i + 3 and recordable_resource(segs[-1])):
+                raise Refused(f"recorded {'.'.join(segs[:i + 2])}: a key that is no Kubernetes resource name "
+                              f"(standard: {', '.join(sorted(STANDARD_RESOURCES))}, hugepages-<size>; extended: "
+                              f"domain/name, without a '.')")
     for path, why in not_recorded.items():
         if not isinstance(why, str) or not why:
             raise Refused(f"not_recorded {path}: no reason")
@@ -243,14 +285,36 @@ def load(path: str = RECORD_PATH) -> dict:
         return validate(json.load(fh))
 
 
-def bench_paths(rec: dict | None = None, deviations: dict | None = None) -> dict:
-    """{path: value} the bench writes from the record: every recorded switch and size, but the deviations."""
+def _classified(classified: dict | None) -> dict:
+    classified = IDENTITY_OR_OUTSIDE if classified is None else classified
+    for p, why in classified.items():
+        if not (isinstance(why, str) and why):
+            raise Refused(f"componentValues.{p}: an identity or outside-service switch that says not what it does")
+    return classified
+
+
+def deviations(rec: dict | None = None, classified: dict | None = None) -> dict:
+    """{path: (what it does, ruling)}: the identity or outside-service switches ON in the record, which the
+    bench does not copy (the owner's ruling, 2026-11-22)."""
     rec = load() if rec is None else validate(rec)
-    deviations = DEVIATIONS if deviations is None else deviations
-    for p, (why, ruling) in deviations.items():
-        if not (why and ruling):
-            raise Refused(f"deviation {p}: it names no reason or no ruling")
-    return {p: v for p, v in rec["recorded"].items() if p not in deviations}
+    return {p: (why, RULING_ON) for p, why in sorted(_classified(classified).items())
+            if p in rec["recorded"] and not is_off(rec["recorded"][p])}
+
+
+def copied_off(rec: dict | None = None, classified: dict | None = None) -> dict:
+    """{path: what it does}: the identity or outside-service switches OFF in the record, which the bench
+    writes off, as 057 has them (the owner's ruling, 2026-11-22)."""
+    rec = load() if rec is None else validate(rec)
+    return {p: why for p, why in sorted(_classified(classified).items())
+            if p in rec["recorded"] and is_off(rec["recorded"][p])}
+
+
+def bench_paths(rec: dict | None = None, classified: dict | None = None) -> dict:
+    """{path: value} the bench writes from the record: every recorded switch and size, but the deviations
+    (an identity or outside-service switch ON on 057)."""
+    rec = load() if rec is None else validate(rec)
+    skip = deviations(rec, classified)
+    return {p: v for p, v in rec["recorded"].items() if p not in skip}
 
 
 def nest(paths: dict) -> dict:
@@ -269,7 +333,7 @@ def nest(paths: dict) -> dict:
 
 def merge(recorded: dict, own: dict) -> dict:
     """The componentValues a run writes: the record's (nested) under the bench's own; a path both set
-    is refused (the bench wins only where a deviation or BENCH_OWN names the path)."""
+    is refused (the bench wins only where BENCH_OWN names the path; a deviation is never in `recorded`)."""
     import copy
     out = copy.deepcopy(recorded)
 
@@ -279,9 +343,9 @@ def merge(recorded: dict, own: dict) -> dict:
             if isinstance(v, dict) and isinstance(into.get(k), dict):
                 put(into[k], v, p)
             elif k in into:
-                if p not in DEVIATIONS and p not in BENCH_OWN:
+                if p not in BENCH_OWN:
                     raise Refused(f"componentValues.{p}: the bench sets it and 057's record does too "
-                                  f"(a deviation must name it)")
+                                  f"(BENCH_OWN must name it)")
                 into[k] = copy.deepcopy(v)
             else:
                 into[k] = copy.deepcopy(v)
@@ -298,7 +362,9 @@ def lines(rec: dict | None = None) -> list[str]:
            f"{rec['read']['installer_version']}, read {rec['read']['date']}) sets them; "
            f"{len(rec['not_recorded'])} path(s) not recorded (no endpoint, group, identity or credential is ever copied)"]
     out += [f"the bench does not copy componentValues.{p} ({ruling}): {why}"
-            for p, (why, ruling) in sorted(DEVIATIONS.items()) if p in rec["recorded"]]
+            for p, (why, ruling) in deviations(rec).items()]
+    out += [f"the bench writes componentValues.{p} off, as 057 has it ({RULING_OFF}): {why}"
+            for p, why in copied_off(rec).items()]
     out += [f"the bench writes componentValues.{p} itself: {why}" for p, why in sorted(BENCH_OWN.items())]
     out += [f"fidelity gap, componentValues.{p}: {why}" for p, why in sorted(gaps.items())]
     return out

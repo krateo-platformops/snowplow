@@ -37,7 +37,7 @@ from statistics import NormalDist
 
 import pytest
 
-from bench import custlat, load606
+from bench import custlat, installer_features, load606
 from tests import fake_gcs, fake_region
 from tests.manifests import old_evidence_manifest
 from tests.test_run14_list_narrow import FRESH, LN_KEY, _mem
@@ -580,10 +580,10 @@ def test_cli_evaluate_feeds_churn_records_to_the_phase_reports(tmp_path, capsys)
 # ─── run606.sh K6_SPAN ─────────────────────────────────────────────────────
 
 def _run606(env_extra):
-    env = dict(os.environ, PYTHONPATH=str(BENCH), RUN_NAME="snowplow-bench-r15lat", INSTALLER_VERSION="0.3.697",
+    env = dict(os.environ, PYTHONPATH=str(BENCH), RUN_NAME="snowplow-bench-r15lat", INSTALLER_VERSION=installer_features.load()["read"]["installer_version"],
                SNOWPLOW_TAG="1.12.46", BENCH_606_DRY_RUN="1",
                EXPECTED_IMAGE_DIGEST="sha256:" + "0" * 64,
-               # #1572: the installer krateo-057 runs (an older one cannot express its features and is refused);
+               # #1572: the installer 057 runs, as its record names it (an older one cannot express its features and is refused);
                # installer 0.3.422 pinned frontend 1.8.4 (0.3.616: 1.8.41), older than the login form contract (run 26d)
                FRONTEND_TAG="1.8.40", EXPECTED_FRONTEND_DIGEST="sha256:" + "1a" * 32, **env_extra)
     for k in [k for k, v in env.items() if v is None]:
@@ -928,10 +928,10 @@ def test_pair_dry_run_with_the_real_run606(tmp_path):
     env.update(PATH=f"{fbin}{os.pathsep}{env['PATH']}", CLOUDSDK_API_ENDPOINT_OVERRIDES_CLOUDQUOTAS=quotas_url)
     env.update(PYTHONPATH=str(repo), HOME=str(tmp_path), PAIR_OUT=str(tmp_path / "pair"),
                OUT_A=str(tmp_path / "A"), OUT_B=str(tmp_path / "B"), BENCH_606_DRY_RUN="1",
-               INSTALLER_VERSION="0.3.697", RUN_NAME_A=NA, RUN_NAME_B=NB,
+               INSTALLER_VERSION=installer_features.load()["read"]["installer_version"], RUN_NAME_A=NA, RUN_NAME_B=NB,
                SNOWPLOW_TAG_A="1.12.54", SNOWPLOW_TAG_B="1.12.55",
                EXPECTED_IMAGE_DIGEST_A=DIG_A, EXPECTED_IMAGE_DIGEST_B=DIG_B,
-               # #1572: the installer krateo-057 runs (an older one cannot express its features and is refused);
+               # #1572: the installer 057 runs, as its record names it (an older one cannot express its features and is refused);
                # installer 0.3.422 pinned frontend 1.8.4 (0.3.616: 1.8.41), older than the login form contract (run 26d)
                FRONTEND_TAG_A="1.8.40", FRONTEND_TAG_B="1.8.40",
                EXPECTED_FRONTEND_DIGEST_A="sha256:" + "1a" * 32, EXPECTED_FRONTEND_DIGEST_B="sha256:" + "1a" * 32)

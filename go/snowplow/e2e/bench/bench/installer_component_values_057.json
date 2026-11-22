@@ -2,9 +2,9 @@
  "kind": "installer_component_values_057",
  "read": {
   "date": "2026-11-22",
-  "installer_version": "0.3.697",
+  "installer_version": "0.3.698",
   "object": "installers.composition.krateo.io (the one Installer CR), spec.componentValues",
-  "rule": "switches and sizes by installer 0.3.697's values schema; every other path by path and reason only, never its value"
+  "rule": "switches and sizes by installer 0.3.698's values schema; every other path by path and reason only, never its value"
  },
  "recorded": {
   "agentgateway-policies.cors.allowCredentials": false,
@@ -199,6 +199,7 @@
   "zendesk-kog.restDefinitions.request.subjectPrefix": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
   "zendesk-kog.restDefinitions.request.ticketFormId": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
   "zendesk-kog.zendesk.baseUrl": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
-  "zendesk-organisations.organisations": "a list (neither a switch nor a size)"
+  "zendesk-organisations.organisations": "a list (neither a switch nor a size)",
+  "zendesk-organisations.zendesk.baseUrl": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)"
  }
 }
