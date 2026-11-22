@@ -20,7 +20,7 @@
 //     of the unrelated RESTAction;
 //   - the REFRESHER is cache.StartRefresher with production settings (no env
 //     override: 4 workers, the 2 s rate floor), main.go's customer hook
-//     (cache.SetCustomerInflightHook(CustomerInFlight)), so its yield is
+//     (pairedWireCustomerSignal: this tree's main.go wiring), so its yield is
 //     refresher.yieldToCustomer itself, and the production refresh closure
 //     (resolveAndPopulateL1) registered for every class RegisterRefreshHandlers
 //     registers. The one difference from RegisterRefreshHandlers: the SA
@@ -392,7 +392,7 @@ func TestPaired865Customer(t *testing.T) {
 	for _, class := range []string{"restactions", "widgets", cache.CacheEntryClassApistage, cache.CacheEntryClassWidgetContent} {
 		cache.RegisterRefreshFunc(class, refresh)
 	}
-	cache.SetCustomerInflightHook(CustomerInFlight)
+	pairedWireCustomerSignal() // main.go's customer-signal wiring in this tree (paired_wire_test.go)
 	var d2f p865Samples
 	var inWindow atomic.Bool
 	cache.SetDirtyToFreshRecorder(func(ms int64) {
