@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bench import diag606, installer_features, installer_values
+from bench import diag606, installer_component_values, installer_features, installer_values
 
 BENCH_DIR = Path(__file__).resolve().parent.parent
 
@@ -141,8 +141,17 @@ def _chart(tmp_path: Path, version: str, features: dict) -> Path:
     root = tmp_path / version / "installer"
     root.mkdir(parents=True)
     (root / "Chart.yaml").write_text(f"apiVersion: v2\nname: installer\nversion: {version}\n")
+    # #1572: the schema also declares every componentValues path the bench writes from 057's component-values
+    # record, as installer 0.3.697's schema declares them (the chart check refuses a chart that cannot express one)
+    cv: dict = {}
+    for path in sorted(installer_component_values.load()["recorded"]):
+        node, segs = cv, path.split(".")
+        for seg in segs[:-1]:
+            node = node.setdefault(seg, {"type": "object"}).setdefault("properties", {})
+        node.setdefault(segs[-1], {})
     (root / "values.schema.json").write_text(json.dumps(
-        {"properties": {"features": {"type": "object", "additionalProperties": False,
+        {"properties": {"componentValues": {"type": "object", "properties": cv},
+                        "features": {"type": "object", "additionalProperties": False,
                                      "properties": {f: {"type": "boolean"} for f in features}}}}))
     (root / "values.yaml").write_text(yaml.safe_dump({"features": {f: v for f, v in features.items() if v is not None}}))
     return root.parent
@@ -154,7 +163,10 @@ ALL = {**READ_20261122_CR, **READ_20261122_DEFAULTS}
 def test_a_chart_that_declares_exactly_057s_features_passes_and_says_the_deviations(tmp_path):
     lines = installer_features.check_chart(str(_chart(tmp_path, "0.3.697", {f: False for f in ALL})))
     assert lines[0].startswith("installer features: 27 written, as 057 (installer 0.3.697, read 2026-11-22)")
-    assert [ln for ln in lines[1:]] == installer_features.deviation_lines()
+    dev = installer_features.deviation_lines()
+    # the feature deviations, then the component values' own lines (#1572: switches and sizes, their deviations
+    # and the not-recorded paths)
+    assert lines[1:1 + len(dev)] == dev and lines[1 + len(dev):] == installer_component_values.lines()
     assert all(f"on {f}:" in "\n".join(lines) for f in installer_features.DEVIATIONS)
 
 

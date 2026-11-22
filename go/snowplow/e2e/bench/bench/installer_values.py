@@ -68,28 +68,17 @@ core-provider:
   resources:
     limits:
       memory: 4Gi
-componentValues:
-  snowplow:
-    image:
-      tag: "{snowplow_tag}"
-    nodeSelector:
-      bench.krateo.io/pool: snowplow
-    tolerations:
-    - key: dedicated
-      operator: Equal
-      value: snowplow
-      effect: NoSchedule{snowplow_env}{frontend}
-  # The bench's base group reads the portal's shell (the layout, the theme, the header, the sidebar
-  # Menu and the shared RESTActions) through the portal chart's own value for it: every bench user is
-  # in that group (bench/rbac_model.py BASE_GROUP) and nothing else grants it the shell. Up to
-  # installer 0.3.625 the grant came with the portal's demo user, on by a default of the installer's
-  # values schema; from 0.3.630 that default is gone, and run 26j's three clusters answered 403 on
-  # the boot root for every bench user. No demo user is installed. bench/portal_readers.py holds the
-  # grant against the pinned charts before any cluster exists.
-  {portal}:
-    readerGroups:
-    - {reader_group}
-registryAuth:
+# componentValues: krateo-057's recorded switches and sizes (bench/installer_component_values.py: the
+# record of 057's Installer CR, less the deviations the owner rules on, named in every check), under the
+# bench's own: snowplow's image, its node and the declared snowplow environment, the frontend's image,
+# and the portal's reader group. The bench's base group reads the portal's shell (the layout, the
+# theme, the header, the sidebar Menu and the shared RESTActions) through the portal chart's own
+# value for it: every bench user is in that group (bench/rbac_model.py BASE_GROUP) and nothing else
+# grants it the shell. Up to installer 0.3.625 the grant came with the portal's demo user, on by a
+# default of the installer's values schema; from 0.3.630 that default is gone, and run 26j's three
+# clusters answered 403 on the boot root for every bench user. No demo user is installed.
+# bench/portal_readers.py holds the grant against the pinned charts before any cluster exists.
+{component_values}registryAuth:
   enabled: true
   # username: set at install from the pull-token file, piped into helm's -f - (not kept)
   passwordRef:
@@ -108,11 +97,21 @@ def document(snowplow_tag: str, frontend_tag: str = "", snowplow_env: dict[str, 
     snowplow environment is `snowplow_env` (SNOWPLOW_ENV, bench/snowplow_env.py: Go runtime keys,
     each an explicit value, written as strings under componentValues.snowplow.env; none: the
     document is the one without it, and the installer's own values apply)."""
-    frontend = f'\n  frontend:\n    image:\n      tag: "{frontend_tag}"' if frontend_tag else ""
-    env = ("\n    env:" + "".join(f'\n      {k}: "{v}"' for k, v in sorted(snowplow_env.items()))) if snowplow_env else ""
-    return TEMPLATE.format(snowplow_tag=snowplow_tag, frontend=frontend, snowplow_env=env,
-                           portal=PORTAL_COMPONENT, reader_group=READER_GROUP,
-                           features=installer_features.values_block(installer_features.bench_features()))
+    import yaml
+    from bench import installer_component_values as icv
+    own: dict = {"snowplow": {"image": {"tag": snowplow_tag},
+                              "nodeSelector": {"bench.krateo.io/pool": "snowplow"},
+                              "tolerations": [{"key": "dedicated", "operator": "Equal", "value": "snowplow",
+                                               "effect": "NoSchedule"}]},
+                 PORTAL_COMPONENT: {"readerGroups": [READER_GROUP]}}
+    if snowplow_env:
+        own["snowplow"]["env"] = {k: str(v) for k, v in sorted(snowplow_env.items())}
+    if frontend_tag:
+        own["frontend"] = {"image": {"tag": frontend_tag}}
+    cv = icv.merge(icv.nest(icv.bench_paths()), own)
+    return TEMPLATE.format(features=installer_features.values_block(installer_features.bench_features()),
+                           component_values=yaml.safe_dump({"componentValues": cv}, sort_keys=True,
+                                                           default_flow_style=False, width=1000))
 
 
 def main(argv: list[str] | None = None) -> int:

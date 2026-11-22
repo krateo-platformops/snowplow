@@ -36,7 +36,7 @@ from pathlib import Path
 
 import pytest
 
-from bench import gke, installer_features
+from bench import gke, installer_component_values, installer_features
 from bench.load606 import SCALEUSER_PASSWORD
 from tests import _planted, fake_gke_api, fake_gke_ops, fake_region
 
@@ -1901,10 +1901,17 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
             drop = os.environ.get("FAKE_INSTALLER_FEATURES", "")
             if drop.startswith("drop:"):
                 feats.remove(drop[len("drop:"):])
+            # #1572: every componentValues path the bench writes from 057's component-values record
+            # (bench/installer_component_values_057.json), declared, as installer 0.3.697's schema declares them
+            cv = {"portal": {"type": "object", "additionalProperties": False, "properties": props}}
+            for path in sorted(json.load(open("@@CV_RECORD@@"))["recorded"]):
+                node, segs = cv, path.split(".")
+                for seg in segs[:-1]:
+                    node = node.setdefault(seg, {"type": "object"}).setdefault("properties", {})
+                node.setdefault(segs[-1], {})
             open(os.path.join(d, "values.schema.json"), "w").write(json.dumps({
                 "$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
-                "properties": {"componentValues": {"type": "object", "properties": {
-                    "portal": {"type": "object", "additionalProperties": False, "properties": props}}},
+                "properties": {"componentValues": {"type": "object", "properties": cv},
                     "features": {"type": "object", "additionalProperties": False,
                                  "properties": {f: {"type": "boolean"} for f in feats}}}}))
         sys.exit(0)
@@ -1940,7 +1947,8 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         print(json.dumps([{"name": "installer", "namespace": "krateo-system",
                            "status": "deployed", "chart": "installer-0.3.422"}]))
     sys.exit(0)
-    """).replace("@@FEATURES_RECORD@@", installer_features.RECORD_PATH)
+    """).replace("@@FEATURES_RECORD@@", installer_features.RECORD_PATH).replace(
+        "@@CV_RECORD@@", installer_component_values.RECORD_PATH)
 
 
 def _fake_server(state: Path):

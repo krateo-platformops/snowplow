@@ -246,8 +246,23 @@ def chart_features(installer_pulled: str) -> tuple[str, dict[str, bool]]:
     return version, {f: bool(defaults.get(f, False)) for f in props}
 
 
+def chart_schema(installer_pulled: str) -> tuple[str, dict]:
+    """(the chart's version, its values.schema.json) of a pulled installer chart."""
+    import yaml
+    root = _chart_root(installer_pulled)
+    try:
+        with open(os.path.join(root, "Chart.yaml"), encoding="utf-8") as fh:
+            version = str((yaml.safe_load(fh) or {}).get("version") or "")
+        with open(os.path.join(root, "values.schema.json"), encoding="utf-8") as fh:
+            return version, json.load(fh)
+    except (OSError, ValueError) as e:
+        raise Refused(f"the installer chart at {root} cannot be read: {e}") from None
+
+
 def check_chart(installer_pulled: str, rec: dict | None = None, deviations: dict | None = None) -> list[str]:
-    """The lines to say, or Refused: the chart must declare exactly the record's features."""
+    """The lines to say, or Refused: the chart must declare exactly the record's features, and every
+    componentValues path the bench writes from 057's record (bench/installer_component_values.py)."""
+    from bench import installer_component_values as icv
     rec = load() if rec is None else validate(rec)
     version, declared = chart_features(installer_pulled)
     missing = sorted(set(rec["features"]) - set(declared))
@@ -263,8 +278,13 @@ def check_chart(installer_pulled: str, rec: dict | None = None, deviations: dict
                       f"(python3 -m bench.installer_features record)")
     feats = bench_features(rec, deviations)
     on = sorted(f for f, v in feats.items() if v)
+    try:
+        icv.check_chart(chart_schema(installer_pulled)[1], version)
+        cv_lines = icv.lines()
+    except icv.Refused as e:
+        raise Refused(str(e)) from None
     return [f"installer features: {len(feats)} written, as {src} runs them, {len(on)} on: {', '.join(on)}"] \
-        + deviation_lines(rec, deviations)
+        + deviation_lines(rec, deviations) + cv_lines
 
 
 def record(listed, installer_pulled: str, date: str) -> dict:
@@ -328,7 +348,10 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--installer-pulled", required=True, help="the installer chart at 057's CR version")
     r.add_argument("--date", required=True)
     r.add_argument("--out", required=True)
-    sub.add_parser("drift", help="057's Installer CR list on stdin: what moved since the record")
+    r.add_argument("--component-values-out",
+                   help="the componentValues record (default: installer_component_values_057.json beside --out)")
+    d = sub.add_parser("drift", help="057's Installer CR list on stdin: what moved since the record")
+    d.add_argument("--installer-pulled", help="the installer chart at the record's version: its componentValues too")
     v = sub.add_parser("installer-version",
                        help="057's installer CompositionDefinition on stdin -> the version a kit installs")
     v.add_argument("--out", help="the kit's record of the reading (JSON)")
@@ -344,14 +367,25 @@ def main(argv: list[str] | None = None) -> int:
                                "deviations": sorted(DEVIATIONS), "lines": lines}, fh, indent=1, sort_keys=True)
             print("\n".join(lines))
         elif a.cmd == "record":
-            rec = record(_read_stdin(), a.installer_pulled, a.date)
-            tmp = a.out + ".part"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(rec, fh, indent=1)
-                fh.write("\n")
-            os.replace(tmp, a.out)
+            from bench import installer_component_values as icv
+            listed = _read_stdin()
+            rec = record(listed, a.installer_pulled, a.date)
+            try:
+                cvr = icv.record(listed, chart_schema(a.installer_pulled)[1], a.date, rec["read"]["installer_version"])
+            except icv.Refused as e:
+                raise Refused(str(e)) from None
+            cv_out = a.component_values_out or os.path.join(os.path.dirname(os.path.abspath(a.out)),
+                                                            os.path.basename(icv.RECORD_PATH))
+            for path, doc in ((a.out, rec), (cv_out, cvr)):
+                tmp = path + ".part"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(doc, fh, indent=1)
+                    fh.write("\n")
+                os.replace(tmp, path)
             print(f"recorded {len(rec['features'])} features of installer {rec['read']['installer_version']} "
-                  f"({len(rec['cr_features'])} from the CR, {len(rec['chart_defaults'])} chart defaults)")
+                  f"({len(rec['cr_features'])} from the CR, {len(rec['chart_defaults'])} chart defaults); "
+                  f"{len(cvr['recorded'])} componentValues switch(es) and size(s), {len(cvr['not_recorded'])} "
+                  f"path(s) not recorded")
         elif a.cmd == "installer-version":
             version = live_installer_version(_read_stdin())
             if a.out:
@@ -364,8 +398,16 @@ def main(argv: list[str] | None = None) -> int:
                 os.replace(tmp, a.out)
             print(version)
         elif a.cmd == "drift":
-            moved = drift(load(), _read_stdin())
-            print("\n".join(moved) if moved else "057's features are the record's")
+            listed = _read_stdin()
+            moved = drift(load(), listed)
+            if a.installer_pulled:
+                from bench import installer_component_values as icv
+                try:
+                    moved += icv.drift(icv.load(), listed, chart_schema(a.installer_pulled)[1])
+                except icv.Refused as e:
+                    raise Refused(str(e)) from None
+            print("\n".join(moved) if moved else "057's features" + (" and component values" if a.installer_pulled
+                                                                     else "") + " are the record's")
             return 1 if moved else 0
         else:
             print(values_block(bench_features()), end="")
