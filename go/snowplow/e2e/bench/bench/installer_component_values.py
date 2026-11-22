@@ -117,6 +117,21 @@ IDENTITY_OR_OUTSIDE: dict[str, str] = {
 }
 
 
+#: Switches read against the ruling and found OUTSIDE it, so copied as 057 has them: {path: why}. Said by
+#: every check, so a later reader sees why one is copied while a look-alike above is not.
+REVIEWED_COPIED: dict[str, str] = {
+    "kagent.perUserRbac.enabled": (
+        "the owner (Diego), 2026-11-22: copied, not an identity or rights switch. At kagent 0.1.24 "
+        "(templates/cert-replay-tools.yaml) it renders one ServiceAccount `kagent-tools` bound to NO role, the "
+        "private tool server's Deployment and Service, and the RemoteMCPServer kagent-tool-server; the tool "
+        "server then runs kubectl with each caller's own token through the cert-replay hop, so every call has "
+        "that user's rights. It creates no per-user identity and grants no rights, and it turns OFF the upstream "
+        "kagent-tools subchart, whose ServiceAccount is bound to a `<fullname>-cluster-admin-role`: less "
+        "privilege, not more. frontend.serviceAccount.create stays a deviation: it ADDS a ServiceAccount "
+        "identity with its token mounted, replacing none"),
+}
+
+
 def is_off(value) -> bool:
     """A switch's off value: false, or the string "false" (an enum switch, bench/installer_component_values)."""
     return value is False or value == "false"
@@ -290,6 +305,10 @@ def _classified(classified: dict | None) -> dict:
     for p, why in classified.items():
         if not (isinstance(why, str) and why):
             raise Refused(f"componentValues.{p}: an identity or outside-service switch that says not what it does")
+    both = sorted(set(classified) & set(REVIEWED_COPIED))
+    if both:
+        raise Refused(f"componentValues.{both[0]}: both an identity or outside-service switch and reviewed as "
+                      f"outside the ruling (REVIEWED_COPIED): it is one or the other")
     return classified
 
 
@@ -365,6 +384,8 @@ def lines(rec: dict | None = None) -> list[str]:
             for p, (why, ruling) in deviations(rec).items()]
     out += [f"the bench writes componentValues.{p} off, as 057 has it ({RULING_OFF}): {why}"
             for p, why in copied_off(rec).items()]
+    out += [f"the bench copies componentValues.{p} as 057 has it ({rec['recorded'][p]}): {why}"
+            for p, why in sorted(REVIEWED_COPIED.items()) if p in written]
     out += [f"the bench writes componentValues.{p} itself: {why}" for p, why in sorted(BENCH_OWN.items())]
     out += [f"fidelity gap, componentValues.{p}: {why}" for p, why in sorted(gaps.items())]
     return out

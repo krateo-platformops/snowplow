@@ -268,8 +268,9 @@ def test_falsifier_the_values_follow_the_record(monkeypatch):
 
 def test_falsifier_a_deviation_keeps_a_switch_out(monkeypatch):
     """Name a switch that is ON on 057 an identity / outside-service switch, and it is no longer written."""
-    monkeypatch.setattr(icv, "IDENTITY_OR_OUTSIDE", {**icv.IDENTITY_OR_OUTSIDE, "kagent.perUserRbac.enabled": "why"})
-    assert "perUserRbac" not in _cv_of(installer_values.document("1.12.75"))["kagent"]
+    assert _cv_of(installer_values.document("1.12.75"))["frontend"]["previewSandbox"] == {"enabled": True}
+    monkeypatch.setattr(icv, "IDENTITY_OR_OUTSIDE", {**icv.IDENTITY_OR_OUTSIDE, "frontend.previewSandbox.enabled": "why"})
+    assert "previewSandbox" not in _cv_of(installer_values.document("1.12.75"))["frontend"]
 
 
 def test_an_identity_or_outside_switch_is_copied_off_and_never_copied_on():
@@ -293,6 +294,24 @@ def test_an_identity_or_outside_switch_is_copied_off_and_never_copied_on():
         "zendesk-kog.restDefinitions.request.enabled"]
     written = icv.bench_paths(rec)
     assert {p: written[p] for p in off} == {p: False for p in off} and not set(on) & set(written)
+
+
+def test_kagent_per_user_rbac_is_copied_with_the_reason_it_is_outside_the_ruling_said_by_every_check():
+    """The owner (Diego), 2026-11-22: perUserRbac swaps a cluster-admin-bound ServiceAccount for a powerless one
+    and acts with each caller's token: no identity, no rights. Copied, and every check says why."""
+    rec = icv.load()
+    assert set(icv.REVIEWED_COPIED) == {"kagent.perUserRbac.enabled"}
+    assert not set(icv.REVIEWED_COPIED) & set(icv.IDENTITY_OR_OUTSIDE)
+    assert icv.bench_paths(rec)["kagent.perUserRbac.enabled"] is True
+    line = [ln for ln in icv.lines(rec) if ln.startswith("the bench copies componentValues.kagent.perUserRbac.enabled")]
+    assert len(line) == 1 and "no per-user identity and grants no rights" in line[0] \
+        and "frontend.serviceAccount.create stays a deviation" in line[0]
+
+
+def test_falsifier_a_switch_both_classified_and_reviewed_is_refused(monkeypatch):
+    monkeypatch.setattr(icv, "IDENTITY_OR_OUTSIDE", {**icv.IDENTITY_OR_OUTSIDE, "kagent.perUserRbac.enabled": "why"})
+    with pytest.raises(icv.Refused, match=r"kagent\.perUserRbac\.enabled: both an identity or outside-service switch"):
+        icv.bench_paths()
 
 
 def test_falsifier_057_turning_an_identity_switch_on_makes_it_a_deviation_not_a_copy(monkeypatch):
