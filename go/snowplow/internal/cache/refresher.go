@@ -48,7 +48,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
 
-	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 )
 
@@ -109,23 +108,13 @@ const (
 	// Phase-6 shows 2s under-collapses; the conservative default ships.
 	defaultRefresherRateFloorSeconds int64 = 2
 
-	// Ship #98 / 0.30.215 — customer-priority cooperative yield. The
-	// refresher worker parks while a customer /call is in flight, mirroring
-	// the prewarm engine's pattern at prewarm_engine.go:295-322. The poll
-	// cadence is the same constant the prewarm engine uses
-	// (defaultEngineYieldPoll = 25ms) so a customer burst clearing fast is
-	// observed promptly without busy-spinning the refresher worker.
-	refresherYieldPoll = 25 * time.Millisecond
-
-	// refresherYieldMaxParked caps how long a single yieldToCustomer() call
-	// can park before it proceeds anyway. Tightened from the architect's
-	// initial 10s to 5s per PM verdict C2: this leaves ~5s headroom under
-	// the 10s convergence SLA for the actual resolve+populate work, so a
-	// sustained customer burst can delay a CRUD-triggered refresh by at
-	// MOST refresherYieldMaxParked + one resolve = 5s + ≤3s ≈ 8s under the
-	// 10s budget. Also acts as a defense-in-depth bound against a buggy
-	// never-decrementing customer-inflight counter (the refresher proceeds
-	// regardless after the cap).
+	// refresherYieldMaxParked caps how long one refresh admission
+	// (admitRefresh, refresher_admission.go) can wait before it proceeds
+	// anyway. #1571: since admission is by cores and event-woken, a wait this
+	// long means customers held every core for 5 s, or a customer-inflight
+	// counter that never drops: it is the defense-in-depth guard against the
+	// latter (the refresher proceeds regardless, counted capped_total), no
+	// longer a wait the yield normally runs into. 5s per PM verdict C2.
 	refresherYieldMaxParked = 5 * time.Second
 
 	// maxRefreshRequeues caps how many times a single key may be
@@ -142,51 +131,30 @@ const (
 	maxRefreshRequeues = 5
 )
 
-// customerInflightHook is a process-global predicate the dispatchers
-// subsystem injects at start-up. The refresher reads it at every
-// processNext to decide whether to yield to a customer /call.
+// customerInflightHook is the BOOLEAN customer signal: true means "customers
+// hold every core". #1571 — production installs the COUNT instead
+// (SetCustomerDemandHook, refresher_admission.go), which takes precedence; the
+// boolean stays for tests that model a customer burst as on/off. A test that
+// flips it calls NoteCustomerDemandChanged, as the production bracket does on
+// every request end (admission is event-woken, never polled).
 //
-// Nil-default behaviour: when no hook is set (unit tests, cache-off
-// production) the refresher proceeds without yielding — byte-identical
-// to the pre-Ship-#98 path. The hook is the ONE seam between cache and
-// dispatchers; the cache package cannot import dispatchers (cycle), so
-// the dispatcher subsystem injects its predicate via SetCustomerInflightHook.
-//
-// Concurrency: the load + store run under customerInflightHookMu (a
-// sync.RWMutex). Reads are hot (per yield-poll); writes happen ONCE at
-// process start. The RWMutex serves the contract — never gives the
-// caller a stale pointer mid-flight.
+// Nil-default behaviour: with neither hook set (unit tests, cache-off
+// production) the refresher is never held — byte-identical to the
+// pre-Ship-#98 path. The hooks are the ONE seam between cache and dispatchers;
+// the cache package cannot import dispatchers (cycle).
 var (
 	customerInflightHookMu sync.RWMutex
 	customerInflightHook   func() bool
 )
 
-// SetCustomerInflightHook injects the customer-inflight predicate from
-// the dispatchers subsystem. Wired once during main.go's
-// dispatchers.RegisterRefreshHandlers + cache.StartRefresher pair. Safe
-// to call multiple times (the latest wins); production wires it BEFORE
-// StartRefresher so the worker pool sees a populated hook on its first
-// processNext.
-//
-// Passing nil clears the hook (the refresher reverts to never-yield).
-// Tests do this between runs to keep the singleton clean.
+// SetCustomerInflightHook injects the boolean customer signal (see
+// customerInflightHook). Safe to call multiple times (the latest wins). Passing
+// nil clears it. It wakes waiting refreshes to re-read the signal.
 func SetCustomerInflightHook(fn func() bool) {
 	customerInflightHookMu.Lock()
 	customerInflightHook = fn
 	customerInflightHookMu.Unlock()
-}
-
-// customerInFlightLocked reads the current hook under the RWMutex and
-// returns the predicate's result (false when no hook is set). Called by
-// the refresher worker at yield-poll cadence (25ms × N workers).
-func customerInFlightLocked() bool {
-	customerInflightHookMu.RLock()
-	fn := customerInflightHook
-	customerInflightHookMu.RUnlock()
-	if fn == nil {
-		return false
-	}
-	return fn()
+	NoteCustomerDemandChanged()
 }
 
 // RefreshFunc is the callback the cache package invokes on a refresh.
@@ -860,65 +828,6 @@ func EnqueueRefresh(l1Key string) {
 	refresherSingleton().enqueue(l1Key)
 }
 
-// yieldToCustomer parks the worker while any customer /call is in flight,
-// re-checking every refresherYieldPoll. Returns promptly once no customer
-// call is in flight, OR after refresherYieldMaxParked (defense-in-depth
-// cap so a buggy counter cannot stall refresh forever), OR on ctx cancel.
-//
-// Mirrors the prewarm engine's cooperative yield at
-// prewarm_engine.go:295-322 (Ship #98 prior art). The yield is BEFORE the
-// handler call; processOne / completedTotal++ / Forget(key) all happen
-// AFTER the yield releases. Cache settle-time after a CRUD informer event
-// is bounded by refresherYieldMaxParked + the actual resolve time (see
-// AC-98.12).
-//
-// Cooperative customer-priority discipline (feedback_customer_priority_over_refresher):
-// the refresher does NOT preempt customer /call work; it steps aside for
-// the duration of the burst. The customer-tax surface is one
-// atomic-int64 Load per yield tick — negligible (4 workers × 40 Hz = 160
-// reads/s steady-state; no cache-line bouncing on the read side because
-// each worker reads on its own poll cycle without serializing).
-func (r *refresher) yieldToCustomer(ctx context.Context) {
-	if !customerInFlightLocked() {
-		return
-	}
-	// #1054 — parked: the process-wide count every slow-call snapshot reports.
-	defer slowcall.BeginYield(ctx).End()
-	t := time.NewTicker(refresherYieldPoll)
-	defer t.Stop()
-	cap := time.NewTimer(refresherYieldMaxParked)
-	defer cap.Stop()
-	parked := false
-	// #354 P3 (D) — accumulate the parked wall time, first park to release,
-	// on every exit (released, capped, ctx cancelled).
-	var parkStart time.Time
-	defer func() {
-		if parked {
-			r.parkedNanos.Add(uint64(time.Since(parkStart)))
-		}
-	}()
-	for customerInFlightLocked() {
-		if !parked {
-			// First park — count it ONCE per yield call (mirrors the
-			// prewarm engine's per-call yieldTotal semantics).
-			r.yieldedTotal.Add(1)
-			parked = true
-			parkStart = time.Now()
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-cap.C:
-			// Max-parked cap fired — proceed regardless. Counts toward
-			// cappedTotal so a leaking customer-inflight counter is
-			// observable in the falsifier suite + post-deploy ledger.
-			r.cappedTotal.Add(1)
-			return
-		case <-t.C:
-		}
-	}
-}
-
 // processNext pulls one key, processes it, and reports whether the
 // worker loop should continue (false once the queue has ShutDown).
 //
@@ -1071,27 +980,28 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	ctx, endWork := workclass.Begin(ctx, workClass)
 	defer endWork()
 
-	// Customer-priority cooperative yield (Ship #98). Mirrors prewarm
-	// engine's yield-before-scope pattern (prewarm_engine.go:275). The
-	// yield reads the dispatcher-injected customer-inflight hook; with
-	// no hook (unit tests, cache-off) it is a single zero-cost read +
-	// immediate return. Applied IDENTICALLY for both tiers — Path 3.2
-	// preserves the Ship #98 customer-priority invariant: NO refresher
-	// work, cluster_list-tier or otherwise, races a customer /call.
+	// Customer-priority yield (Ship #98), #1571: ADMISSION BY CORES. The
+	// dequeued refresh starts once the customer requests in flight plus the
+	// refreshes already admitted leave a core free (customers that hold every
+	// core still park all refresher work), woken by a customer request's end or
+	// a refresh's release, never polled; a viewed refresh first
+	// (refresher_admission.go). Applied to every tier. The core is held until
+	// this dequeue returns. With no customer signal (unit tests, cache-off) it is
+	// never held.
 	//
 	// #374 Part B (pickup-cheapen): probe residency with the side-effect-free
-	// Has() BEFORE the park. A non-resident key is a no-op at processOne
+	// Has() BEFORE the admission. A non-resident key is a no-op at processOne
 	// (skipped_no_entry — no resolve, no Put, no customer-racing work), so it
-	// must never PARK a worker (up to refresherYieldMaxParked) behind a customer
-	// burst. Skip the yield for a non-resident key (+ bump the diagnostic
-	// counter); a resident key yields exactly as today. The dequeue Get below
-	// stays AUTHORITATIVE: a key that became resident between this probe and the
-	// Get is still re-resolved (freshness Arm C) — this gates the PARK only,
-	// never the refresh decision.
+	// must never WAIT (up to refresherYieldMaxParked) behind a customer burst.
+	// Skip the admission for a non-resident key (+ bump the diagnostic
+	// counter); a resident key is admitted as above. The dequeue Get below stays
+	// AUTHORITATIVE: a key that became resident between this probe and the Get
+	// is still re-resolved (freshness Arm C) — this gates the WAIT only, never
+	// the refresh decision.
 	if cc := ResolvedCache(); cc != nil && !cc.Has(key) {
 		pickupNoopNoPark.Add(1)
 	} else {
-		r.yieldToCustomer(ctx)
+		defer r.admitRefresh(ctx, tier == tierViewed)()
 	}
 
 	// Select the queue to mutate on success/failure (Forget /

@@ -324,6 +324,7 @@ func TestListCell854_F5y_AComparatorPassIsRefresherWorkThatYieldsToCustomers(t *
 		t.Fatalf("F5y RED: %d comparator pass(es) ran while a customer was in flight — the pass is not behind the refresher's customer yield", got)
 	}
 	customers.Store(false)
+	NoteCustomerDemandChanged()
 	for end := time.Now().Add(5 * time.Second); ListCellStatsSnapshot().Passes == p0; time.Sleep(5 * time.Millisecond) {
 		if time.Now().After(end) {
 			t.Fatal("F5y RED: the due pass never ran after the customers left — reads no longer schedule passes")

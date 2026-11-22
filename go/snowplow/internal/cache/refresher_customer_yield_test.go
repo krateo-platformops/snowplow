@@ -92,6 +92,7 @@ func TestRefresher_YieldEngagesAndReleases(t *testing.T) {
 	// Release. Handler must run within ~one yield-poll + handler call.
 	// Generous 2s budget covers slow CI.
 	inflight.Store(false)
+	NoteCustomerDemandChanged()
 	select {
 	case <-handlerRan:
 		// Pass.
@@ -231,6 +232,7 @@ func TestRefresher_ConvergesUnderIntermittentBurst(t *testing.T) {
 				return
 			case <-ticker.C:
 				inflight.Store(!inflight.Load())
+				NoteCustomerDemandChanged()
 			}
 		}
 	}()
@@ -325,6 +327,7 @@ func TestRefresher_RaceYieldUnderConcurrentInflightFlips(t *testing.T) {
 				counter.Add(1)
 				time.Sleep(time.Duration(2+i) * time.Millisecond)
 				counter.Add(-1)
+				NoteCustomerDemandChanged()
 				time.Sleep(time.Duration(1+i) * time.Millisecond)
 			}
 		}()
@@ -483,6 +486,7 @@ func TestRefresher_YieldUniformAcrossKinds(t *testing.T) {
 
 	// Release.
 	inflight.Store(false)
+	NoteCustomerDemandChanged()
 	// Both should complete within 2s.
 	gotW, gotR := false, false
 	for end := time.Now().Add(2 * time.Second); time.Now().Before(end) && (!gotW || !gotR); {
@@ -500,13 +504,19 @@ func TestRefresher_YieldUniformAcrossKinds(t *testing.T) {
 }
 
 // Compile-time sentinel: yield constants are sane (poll < cap, both > 0).
+// #1571: there is no poll any more (admission is event-woken); the cap is the
+// leak guard only.
 func TestRefresher_YieldConstantsSane(t *testing.T) {
-	if refresherYieldPoll <= 0 {
-		t.Fatalf("refresherYieldPoll=%v; expected >0", refresherYieldPoll)
+	if refresherYieldMaxParked <= 0 {
+		t.Fatalf("refresherYieldMaxParked=%v; expected >0 (the leaking-counter guard)", refresherYieldMaxParked)
 	}
-	if refresherYieldMaxParked <= refresherYieldPoll {
-		t.Fatalf("refresherYieldMaxParked=%v ≤ refresherYieldPoll=%v; cap must be longer than poll cadence", refresherYieldMaxParked, refresherYieldPoll)
-	}
+}
+
+// customerInFlightLocked (test helper, #1571) reports whether the installed
+// customer signal says any customer holds a core.
+func customerInFlightLocked() bool {
+	d, _ := customerSignal(1)
+	return d > 0
 }
 
 var _ = strconv.Itoa // keep strconv used if anything moves

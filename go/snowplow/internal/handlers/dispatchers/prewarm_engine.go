@@ -121,9 +121,16 @@ var customerInFlightCount atomic.Int64
 
 // markCustomerInFlight is called at the top of a customer /call dispatch.
 // Returns the matching done function (defer it). Cheap atomic — no lock.
+//
+// #1571 — the end also tells the refresher's admission that a customer's core
+// is free (cache.NoteCustomerDemandChanged: one atomic load when no refresh
+// waits), so a waiting refresh is woken by the event, never by a poll.
 func markCustomerInFlight() func() {
 	customerInFlightCount.Add(1)
-	return func() { customerInFlightCount.Add(-1) }
+	return func() {
+		customerInFlightCount.Add(-1)
+		cache.NoteCustomerDemandChanged()
+	}
 }
 
 // customerInFlight reports whether any customer /call is currently
@@ -143,6 +150,24 @@ func customerInFlight() bool {
 // contention on the read side.
 func CustomerInFlight() bool {
 	return customerInFlight()
+}
+
+// CustomerInFlightCount is the number of customer /call dispatches executing
+// now: the same bracket counter as CustomerInFlight. #1571 — the refresher
+// admits work by cores (customers in flight + refreshes running < GOMAXPROCS),
+// so it needs the count, not only whether it is zero.
+func CustomerInFlightCount() int {
+	return int(customerInFlightCount.Load())
+}
+
+// InstallRefresherCustomerSignal wires the refresher's customer-priority
+// admission to this package's bracket: the count (cache.SetCustomerDemandHook)
+// and the boolean predicate (cache.SetCustomerInflightHook, read only when no
+// count is installed). main.go calls it once, before cache.StartRefresher;
+// in-process harnesses call it to run the production wiring.
+func InstallRefresherCustomerSignal() {
+	cache.SetCustomerInflightHook(CustomerInFlight)
+	cache.SetCustomerDemandHook(CustomerInFlightCount)
 }
 
 // ─────────────────────────────────────────────────────────────────────
