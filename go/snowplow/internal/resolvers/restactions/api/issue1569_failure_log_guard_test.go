@@ -382,9 +382,16 @@ func g(ctx context.Context, log *slog.Logger, lvl slog.Level, c bool, err error,
 	for _, rng = range levels {
 	}
 	log.Log(ctx, rng, "raw-16")
+	// raw-17: a package variable, even written through the round inside g, is unseen (its other writers are
+	// outside the function body). The routed write pins that rule: without it "no write => unseen" alone
+	// would flag the call, and a mutant counting a package variable as a local would survive (#1574 B4, S4).
+	pkgLvl = FailureLevelOf(ctx, slog.LevelError, "t", err)
 	log.Log(ctx, pkgLvl, "raw-17")
 	opa := FailureLevelOf(ctx, slog.LevelWarn, "t", err)
-	opa += 4
+	// raw-18: an op-assignment makes the variable unseen even when its right side goes through the round
+	// (a literal right side would fail the round check on its own and leave the op-assign rule unpinned,
+	// #1574 B4, S5).
+	opa += FailureLevelOf(ctx, slog.LevelWarn, "t", err)
 	log.Log(ctx, opa, "raw-18")
 	shadowed := FailureLevelOf(ctx, slog.LevelError, "t", err)
 	if c {
