@@ -504,7 +504,8 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		resolved, isSA, err := r.mapper.resolveOne(r.ctx, nil)
 		if err != nil {
 			r.auditEndpointUnresolved(apiCall, nil, err)
-			r.log.ErrorContext(r.ctx, "userAccessFilter (caller-supplied): unable to resolve the caller's endpoint",
+			r.log.Log(r.ctx, FailureLevelOf(r.ctx, slog.LevelError, "stage.uaf.callerEndpoint\x00"+id, err),
+				"userAccessFilter (caller-supplied): unable to resolve the caller's endpoint",
 				slog.String("name", id), slog.Any("error", err))
 			return endpoints.Endpoint{}, false, false, stageReturn
 		}
@@ -514,7 +515,8 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 	if uafActive {
 		saEP, saErr := serviceAccountEndpointFn()
 		if saErr != nil {
-			r.log.ErrorContext(r.ctx, "userAccessFilter: cannot acquire ServiceAccount endpoint; falling through to per-user dispatch (degraded mode)",
+			r.log.Log(r.ctx, FailureLevelOf(r.ctx, slog.LevelError, "stage.uaf.saEndpoint\x00"+id, saErr),
+				"userAccessFilter: cannot acquire ServiceAccount endpoint; falling through to per-user dispatch (degraded mode)",
 				slog.String("name", id), slog.Any("err", saErr))
 			// Fail-closed-but-respond: per Revision 5 atomic
 			// ship there is no toggle to fall back to the
@@ -604,7 +606,8 @@ func (r *resolveRun) refuseStageEndpointRef(id string, apiCall *templates.API) (
 		// endpoint resolved, it names no target (marked target).
 		r.auditStageRefusal(r.ctx, stageRefusal{apiCall: apiCall,
 			outcome: audit.OutcomeDenied, reason: audit.DenialPerUserCredentialRef})
-		r.log.ErrorContext(r.ctx, "endpointRef refused: it names a per-user credential Secret",
+		r.log.Log(r.ctx, FailureLevelOf(r.ctx, slog.LevelError, endpointRefTarget(id, ref)+"\x00refused", err),
+			"endpointRef refused: it names a per-user credential Secret",
 			slog.String("name", id),
 			slog.String("provenance", provenanceLabel(r.opts.Provenance)),
 			slog.Bool("templated", templated),
@@ -688,7 +691,9 @@ func (r *resolveRun) planStage(planCtx context.Context, id string, apiCall *temp
 		// Runs on the stage-loop goroutine before any worker exists, so dict
 		// needs no lock.
 		msg := iterErr.Error()
-		r.log.ErrorContext(planCtx, "stage iterator failed; stage not dispatched",
+		// #1569 — the same failure stagePlanElements logged: the same target.
+		r.log.Log(planCtx, FailureLevelOf(r.ctx, slog.LevelError, stageIteratorTarget(apiCall), iterErr),
+			"stage iterator failed; stage not dispatched",
 			slog.String("name", id),
 			slog.String("restaction_namespace", r.opts.RESTActionNamespace),
 			slog.String("restaction_name", r.opts.RESTActionName))
@@ -1075,7 +1080,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	feedRawOrResolved := func(raw []byte, dispatch string) string {
 		substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve)
 		if rerr != nil {
-			r.log.ErrorContext(gctx, "in-process resolve failed",
+			r.log.Log(gctx, FailureLevelOf(r.ctx, slog.LevelError, stageSiteTarget("stage.inprocess", id, call.Path), rerr),
+				"in-process resolve failed",
 				slog.String("name", id),
 				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch+"-resolve"),
@@ -1093,7 +1099,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			dispatch += "-resolved"
 		}
 		if ferr := feedBytes(bytesToFeed); ferr != nil {
-			r.log.ErrorContext(gctx, "response handler failed",
+			r.log.Log(gctx, FailureLevelOf(r.ctx, slog.LevelError, stageSiteTarget("stage.handler", id, call.Path), ferr),
+				"response handler failed",
 				slog.String("name", id),
 				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
@@ -1166,7 +1173,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				// #710 PR-2a (D1) — the call's content fill was not admitted under
 				// the memory ceiling before its deadline: an honest per-item stage
 				// error, never a fall-through that would rebuild the refused list.
-				r.log.ErrorContext(fallCtx, "apistage content fill not admitted",
+				r.log.Log(fallCtx, FailureLevelOf(r.ctx, slog.LevelError, stageSiteTarget("stage.contentFill", id, call.Path), cerr),
+					"apistage content fill not admitted",
 					slog.String("name", id),
 					redact.PathAttr("path", call.Path),
 					slog.String("error", cerr.Error()))
@@ -1205,7 +1213,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 					dispatch := "apistage-content"
 					substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve)
 					if rerr != nil {
-						r.log.ErrorContext(fallCtx, "in-process resolve failed",
+						r.log.Log(fallCtx, FailureLevelOf(r.ctx, slog.LevelError, stageSiteTarget("stage.inprocess", id, call.Path), rerr),
+							"in-process resolve failed",
 							slog.String("name", id),
 							redact.PathAttr("path", call.Path),
 							slog.String("dispatch", "apistage-content-resolve"),
@@ -1229,7 +1238,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 							}
 						}
 						if ferr != nil {
-							r.log.ErrorContext(fallCtx, "apistage-content response handler failed",
+							r.log.Log(fallCtx, FailureLevelOf(r.ctx, slog.LevelError, stageSiteTarget("stage.handler", id, call.Path), ferr),
+								"apistage-content response handler failed",
 								slog.String("name", id),
 								redact.PathAttr("path", call.Path),
 								slog.String("dispatch", dispatch),
@@ -1493,7 +1503,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(derr), derr.Error(), itemErr)
 			dispatch = "discovery-error"
 		} else if ferr := feedBytes(raw); ferr != nil {
-			r.log.ErrorContext(gctx, "discovery response handler failed",
+			r.log.Log(gctx, FailureLevelOf(r.ctx, slog.LevelError, stageSiteTarget("stage.handler", id, call.Path), ferr),
+				"discovery response handler failed",
 				slog.String("name", id),
 				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
@@ -1550,7 +1561,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	if substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve); did || rerr != nil {
 		dispatch := "cache-off-inprocess-resolve"
 		if rerr != nil {
-			r.log.ErrorContext(gctx, "in-process resolve failed (cache-off path)",
+			r.log.Log(gctx, FailureLevelOf(r.ctx, slog.LevelError, stageSiteTarget("stage.inprocess", id, call.Path), rerr),
+				"in-process resolve failed (cache-off path)",
 				slog.String("name", id),
 				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
@@ -1562,7 +1574,8 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, itemErrorValue(rerr), rerr.Error(), itemErr)
 			dispatch = "cache-off-inprocess-resolve-error"
 		} else if ferr := feedBytes(substituted); ferr != nil {
-			r.log.ErrorContext(gctx, "in-process resolve response handler failed (cache-off path)",
+			r.log.Log(gctx, FailureLevelOf(r.ctx, slog.LevelError, stageSiteTarget("stage.handler", id, call.Path), ferr),
+				"in-process resolve response handler failed (cache-off path)",
 				slog.String("name", id),
 				redact.PathAttr("path", call.Path),
 				slog.String("dispatch", dispatch),
@@ -1634,7 +1647,14 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		// #574 — attribute the refusal to its driver (refresher trigger/trigger-less,
 		// cohort seed + prewarm scope, prewarm, live) and to the cell it was
 		// populating (key_hash), from stamps the ctx already carries.
-		r.log.WarnContext(gctx, "branch-E SA-endpoint dial re-gated and failed closed",
+		// #1569 — a re-gate is the ctx identity's expected deny; a refusal under
+		// impersonation is its own class.
+		branchEClass := classPerIdentityDenied
+		if branchE == branchEFailClosed {
+			branchEClass = "impersonation_refused"
+		}
+		r.log.Log(gctx, FailureLogLevel(r.ctx, slog.LevelWarn, stageSiteTarget("stage.branchE", id, call.Path), branchEClass),
+			"branch-E SA-endpoint dial re-gated and failed closed",
 			slog.String("name", id), slog.String("host", redact.URL(call.Endpoint.ServerURL)), redact.PathAttr("path", call.Path),
 			slog.String("sa_regate_origin", rbac.SARegateOrigin(gctx)),
 			slog.String("sa_regate_trigger", rbac.SARegateTrigger(gctx)),
@@ -1888,7 +1908,8 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// Get the api with this identifier
 	apiCall, ok := apiMap[id]
 	if !ok {
-		r.log.WarnContext(r.ctx, "api not found in apiMap", slog.Any("name", id))
+		r.log.Log(r.ctx, FailureLogLevel(r.ctx, slog.LevelWarn, "stage.missing\x00"+id, classUncoded),
+			"api not found in apiMap", slog.Any("name", id))
 		return false
 	}
 	if apiCall.Headers == nil {

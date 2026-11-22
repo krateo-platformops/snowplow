@@ -1652,18 +1652,21 @@ The operator-notable events:
 A resident cell is re-resolved on every refresh, keepwarm pass and prewarm pass, and a stage
 that failed fails the same way each time. So a failure line logs at its own level only when
 the failure is **new since the cell's previous resolve**, and at **Debug** while it repeats
-unchanged. Every failure line a cell's resolve writes follows this rule (#1569):
+unchanged. Every Warn- or Error-level line a cell's resolve writes follows this rule (#1569):
+every package under `internal/resolvers` and `internal/objects` logs a failure through
+`FailureLevelOf` / `FailureLogLevel`, never at a fixed level. That covers, among others,
+`api call response failure` (each dispatch branch of a stage), `unable to resolve api endpoint
+reference` (a stage's `endpointRef`), the widget's `unable to resolve api reference` (its
+`apiRef`), the stage iterator, filter, in-process resolve and response-handler lines, the
+userAccessFilter lines, the informer dispatch's RBAC and marshal lines, the widget's data and
+template lines, and `objects.Get`'s read and re-gate lines.
 
-- `api call response failure` (each dispatch branch of a stage);
-- `unable to resolve api endpoint reference` (a stage's `endpointRef`);
-- the widget's `unable to resolve api reference` (its `apiRef`);
-- a RESTAction's `unable to execute iterator`, `unable to sorted api by deps`,
-  `unable to fetch user info from context` and `unable to encode status as dict`;
-- a widget's `unable to resolve widget data`, `unable to resolve widgetDataTemplate`,
-  `unable to set nested value`, `unable to set status as unstructured.NestedMap`, its
-  spec-read lines (`unable to get widgetDataTemplate`, `unable to get resources references`,
-  `unable to get resource references template`), and its resourcesRefsTemplate's
-  `unable to execute iterator`.
+The guard `TestIssue1569_EveryFailureLineOnTheResolvePathGoesThroughTheRound`
+(`internal/resolvers/restactions/api`) fails on any fixed-level Warn/Error log call there. Its
+allow-list holds the lines that are not a cell's failure, each with its reason: the stale-debt
+ledger's overdue alarms, the `*.slow` latency lines, recovered panics, the cluster-list prewarm
+pass's skipped/timeout lines, the endpoint TLS-CA line, and the two resourcesRefs lines that are
+already origin-gated (#563: Warn on the serve origin, Debug for background drivers).
 
 **A resolve served by replay (#1569).** The refresher's RESTAction-resolve memo (#598) serves
 the widgets that share a RESTAction from one resolve: whichever is re-resolved first produces

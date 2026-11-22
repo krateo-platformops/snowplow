@@ -125,6 +125,11 @@ const (
 	classUncoded = "error"
 )
 
+// ClassPerIdentityDenied is the class of an expected per-identity deny, for a
+// site outside this package that decides the deny itself (#1569: objects.Get's
+// re-gate).
+const ClassPerIdentityDenied = classPerIdentityDenied
+
 // failureTarget is the digest a failure's target is noted under.
 type failureTarget [sha256.Size]byte
 
@@ -507,6 +512,26 @@ func expectedDenyLevel(ctx context.Context, target string) slog.Level {
 // path it read (one stage reads many paths under an iterator).
 func stageFailureTarget(id, path string) string {
 	return "stage\x00" + id + "\x00" + path
+}
+
+// stageIteratorTarget names a stage's iterator as a failure target (#1569):
+// the stage plan's and the stage loop's lines of one iterator failure share it.
+func stageIteratorTarget(in *templates.API) string {
+	if in == nil {
+		return "iterator"
+	}
+	it := ""
+	if in.DependsOn != nil && in.DependsOn.Iterator != nil {
+		it = *in.DependsOn.Iterator
+	}
+	return "iterator\x00" + in.Name + "\x00" + it
+}
+
+// stageSiteTarget names a stage read as a failure target of one log site
+// (#1569): the site's kind, the stage and the path it read. Two sites failing
+// on one read are two targets, so a line of one never repeats as the other's.
+func stageSiteTarget(site, id, path string) string {
+	return site + "\x00" + id + "\x00" + path
 }
 
 // endpointRefTarget names a stage's endpointRef as a failure target.
