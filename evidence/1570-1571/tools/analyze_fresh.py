@@ -9,6 +9,16 @@ import json, math, os, statistics, sys
 out = sys.argv[1]
 runs = [json.loads(l) for l in open(os.path.join(out, "runs.jsonl"))]
 runs = [r for r in runs if r["test"] == "TestPairedFresh1570"]
+# Rounds are complete or excluded: a round in which any arm did not RUN (alone) is
+# dropped for every arm, so each pooled arm covers the same rounds.
+arms_all = {r["arm"] for r in runs}
+bad_rounds = {r["round"] for r in runs if r["status"] != "RUN" or r.get("alone") is False}
+for rd in {r["round"] for r in runs}:
+    if {r["arm"] for r in runs if r["round"] == rd} != arms_all:
+        bad_rounds.add(rd)
+excluded = sorted(bad_rounds)
+runs = [r for r in runs if r["round"] not in bad_rounds]
+print("excluded rounds (incomplete):", excluded)
 
 def q(xs, p):
     xs = sorted(xs)
@@ -54,7 +64,7 @@ for r in runs:
         t["cold_p95"].append(p["cust_cold"].get("p95_ms"))
 
 med = lambda xs: statistics.median([x for x in xs if x is not None]) if xs else None
-summary = {"status_by_arm": status, "rows": []}
+summary = {"status_by_arm": status, "excluded_rounds": excluded, "rows": []}
 for (arm, rate), t in sorted(table.items(), key=lambda kv: (kv[0][1], kv[0][0])):
     m = table.get(("main", rate))
     row = {"arm": arm, "rate": rate, "rounds": t["rounds"], "samples": t["samples"], "unconverged": t["unconverged"],

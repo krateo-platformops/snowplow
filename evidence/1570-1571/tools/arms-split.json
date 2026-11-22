@@ -1,0 +1,9 @@
+{"order": ["main", "floor", "combined"],
+ "arms": {
+  "main":     {"sha": "1c788e2844407c624494e50d77976dfa80ab755d",
+               "overlay": "$SCRATCH/overlays/split-main"},
+  "floor":    {"sha": "9e6427ce37e1223f0810c2de68a88909049fb22e",
+               "overlay": "$SCRATCH/overlays/split-branch"},
+  "combined": {"sha": "11d45b49d475aa5bf3bba9b2dc207cb5ad47a626",
+               "overlay": "$SCRATCH/overlays/split-branch"}
+ }}

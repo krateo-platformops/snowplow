@@ -47,8 +47,32 @@ The new arms passed ×3 under `-race` on both branches (RUN, recorded in the PR 
   - `floored` 0, against main's 3–11K.
 - `vm-probe/` is the plumbing check: one main run, not evidence.
 
+## Freshness ×6 on the VM — RUN, alone
+
+- **Setup:** `vm-fresh/`, `tools/arms-fresh.json`, 6 alternated rounds, 24 runs, every one alone.
+- **Excluded round:** round 3's combined run failed after 7221 s when the ssh link to the VM dropped (`RUN-FAILED`, rc 255). Round 3 is EXCLUDED for every arm: rounds are complete or excluded.
+- **Pooled:** 5 rounds, 100 probe samples per arm and rate (`vm-fresh/summary.json`).
+
+| Arm | Probe push p95 at 1 / 10 / 50 events/s | Viewed waits ≤ 100 ms | Customer p95 vs main |
+|---|---|---|---|
+| main | 1219 / 204 / 1305 ms | 0.9 | — |
+| floor | 250 / 178 / 153 ms | 0.8 / 0.9 / 1.0 | 0.95–1.05 |
+| yield | 1006 / 4.7 / 1006 ms | 1.0 | 0.95–1.03 |
+| combined | 14 / 3.7 / 3.2 ms | 1.0 | 0.94–0.98 |
+
+- Customer rps is 1.00 for every arm.
+- The 2–3× customer p95 seen in 2 laptop rounds does NOT reproduce on the VM.
+- The freshness harness does not measure process CPU, so its CPU is reported only by the #865 runs.
+- Earlier laptop rounds (`fresh-gated/`) are a different environment and are not pooled with these.
+
+## Completions split by class (#865, 50 events/s, main / floor / combined ×3) — RUN, alone
+
+- **Harness change:** an overlay of `paired_865_test.go` (`overlays/split-main`, `overlays/split-branch`) adds the accepted Puts by class|tier|content, completions without a Put, and the wait and duration of refreshes by tier (`vm-865-split-r50/`).
+- **Expensive dependents (restactions, ~275 ms each):** accepted Puts go from main 8.6–8.7/s to 10.4–11.1/s with B. That is MORE expensive re-resolves, about one per dependent every 1.9 s instead of every 2.3 s.
+- **Completions without a Put** (the cheap refreshes: the incremental list cell's snapshot and declines) go from main ~21/s to 0.6/s. These are the "lost" completions.
+- **Normal-tier wait** goes from main mean 55–67 ms (99% ≤ 1 s) to B mean 1.71–1.82 s (4% ≤ 1 s).
+- **CPU:** 2.8 → 3.4 cores. **Dependents' staleness p95:** 2.43 → 2.04–2.09 s.
+
 ## NOT RUN (at this commit)
 
-- freshness ×6 on the VM (running at the time of this commit);
-- completions split by class;
 - the full package suite, `scripts/check_*.sh`, `gh pr checks`.
