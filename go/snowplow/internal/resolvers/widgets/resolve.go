@@ -222,15 +222,16 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	widgetData, err := resolveWidgetData(ctx, opts.In, ds)
 	phaseWidgetDataMs = time.Since(widgetDataStart).Milliseconds()
 	if err != nil {
-		log.ErrorContext(ctx, "unable to resolve widget data", slog.Any("err", err))
+		log.Log(ctx, api.FailureLevelOf(ctx, slog.LevelError, "widget.widgetData", err),
+			"unable to resolve widget data", slog.Any("err", err))
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
 		return opts.In, cache.WrapResolveStage(cache.ResolveStageWidgetData, "resolve widgetData "+stageObject(opts.In), err)
 	}
 
 	err = maps.SetNestedField(opts.In.Object, widgetData, "status", widgetDataKey)
 	if err != nil {
-		log.ErrorContext(ctx, "unable to set status as unstructured.NestedMap",
-			slog.Any("err", err))
+		log.Log(ctx, api.FailureLevelOf(ctx, slog.LevelError, "widget.status", err),
+			"unable to set status as unstructured.NestedMap", slog.Any("err", err))
 		return opts.In, err
 	}
 
@@ -469,7 +470,8 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 	// into the identity-free cell (#450 review).
 	wdt, err := GetWidgetDataTemplate(obj.Object)
 	if err != nil {
-		log.WarnContext(ctx, "unable to get widgetDataTemplate", slog.Any("err", err))
+		log.Log(ctx, api.FailureLevelOf(ctx, slog.LevelWarn, "widget.spec.widgetDataTemplate", err),
+			"unable to get widgetDataTemplate", slog.Any("err", err))
 		return src, nil
 	}
 
@@ -478,7 +480,8 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 		DataSource: ds,
 	})
 	if err != nil {
-		log.ErrorContext(ctx, "unable to resolve widgetDataTemplate", slog.Any("err", err))
+		log.Log(ctx, api.FailureLevelOf(ctx, slog.LevelError, "widget.widgetDataTemplate", err),
+			"unable to resolve widgetDataTemplate", slog.Any("err", err))
 		return src, err
 	}
 	// #487: JQ eval VALUES are resolved data (stage bodies, per-user rows,
@@ -512,7 +515,8 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 
 		err = maps.SetNestedValue(src, fields, el.Value)
 		if err != nil {
-			log.ErrorContext(ctx, "unable to set nested value",
+			log.Log(ctx, api.FailureLevelOf(ctx, slog.LevelError, "widget.widgetDataTemplate.set\x00"+el.Path, err),
+				"unable to set nested value",
 				slog.Any("fields", fields),
 				redact.ValueAttr("value", &el.Value),
 				slog.Any("err", err))
@@ -530,14 +534,16 @@ func resolveResourceRefs(ctx context.Context, obj *Widget, ds map[string]any) ([
 
 	resrefs, err := GetResourcesRefs(obj.Object)
 	if err != nil {
-		log.WarnContext(ctx, "unable to get resources references", slog.Any("err", err))
+		log.Log(ctx, api.FailureLevelOf(ctx, slog.LevelWarn, "widget.spec.resourcesRefs", err),
+			"unable to get resources references", slog.Any("err", err))
 	} else {
 		all = append(all, resrefs...)
 	}
 
 	resrefstpl, err := GetResourcesRefsTemplate(obj.Object)
 	if err != nil {
-		log.WarnContext(ctx, "unable to get resource references template", slog.Any("err", err))
+		log.Log(ctx, api.FailureLevelOf(ctx, slog.LevelWarn, "widget.spec.resourcesRefsTemplate", err),
+			"unable to get resource references template", slog.Any("err", err))
 	}
 	if len(resrefstpl) > 0 {
 		resrefsExtra, err := resourcesrefstemplate.Resolve(ctx, resrefstpl, ds)

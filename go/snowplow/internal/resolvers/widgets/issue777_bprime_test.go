@@ -307,6 +307,10 @@ var b777Consumers = map[string]string{
 	// coordinates to choose the failure line's level; it puts nothing in the
 	// body.
 	"apiRefFailureLevel": "spec.apiRef (classifies the apiRef error for its log level; extras-free, writes no body)",
+	// #1569 — reads only an error's TYPE and a fixed target label to choose a
+	// failure line's level (the cell's failure-log round); it puts nothing in
+	// the body.
+	"api.FailureLevelOf": "none: classifies an error for its log level only; extras-free, writes no body",
 }
 
 // TestB777_ExtrasConsumersAreEnumerated — B10, the Go-side structural guard. It

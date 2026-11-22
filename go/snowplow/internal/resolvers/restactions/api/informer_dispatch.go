@@ -725,7 +725,8 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			recordListQuery(query)
 			raw, err := marshalAsListRaw(apiVersion, listKindForResource(gvr.Resource), raws)
 			if err != nil {
-				log.WarnContext(ctx, "informer_dispatch.list_marshal_failed",
+				log.Log(ctx, FailureLevelOf(ctx, slog.LevelWarn, "informer.marshal\x00"+gvr.String()+"\x00"+namespace, err),
+					"informer_dispatch.list_marshal_failed",
 					slog.String("gvr", gvr.String()),
 					slog.String("ns", namespace),
 					slog.String("shape", "raw"),
@@ -817,7 +818,8 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 
 		raw, err := marshalAsList(apiVersion, listKindForResource(gvr.Resource), items)
 		if err != nil {
-			log.WarnContext(ctx, "informer_dispatch.list_marshal_failed",
+			log.Log(ctx, FailureLevelOf(ctx, slog.LevelWarn, "informer.marshal\x00"+gvr.String()+"\x00"+namespace, err),
+				"informer_dispatch.list_marshal_failed",
 				slog.String("gvr", gvr.String()),
 				slog.String("ns", namespace),
 				slog.Any("err", err),
@@ -905,7 +907,8 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 
 	raw, err := json.Marshal(obj.Object)
 	if err != nil {
-		log.WarnContext(ctx, "informer_dispatch.get_marshal_failed",
+		log.Log(ctx, FailureLevelOf(ctx, slog.LevelWarn, "informer.marshal\x00"+gvr.String()+"\x00"+namespace+"/"+name, err),
+			"informer_dispatch.get_marshal_failed",
 			slog.String("gvr", gvr.String()),
 			slog.String("ns", namespace),
 			slog.String("name", name),

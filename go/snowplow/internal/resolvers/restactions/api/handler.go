@@ -301,7 +301,8 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 			// declines), the stage outcome is Error, dict[errorKey] carries
 			// the message, ContinueOnError is honoured — and dict[key] is
 			// never written, so the raw body cannot reach the output.
-			log.ErrorContext(ctx, "stage filter failed; stage response not merged",
+			log.Log(ctx, FailureLevelOf(ctx, slog.LevelError, "stage.filter\x00"+opts.key+"\x00"+q, err),
+				"stage filter failed; stage response not merged",
 				slog.String("stage", opts.key),
 				slog.String("restaction_namespace", opts.raNamespace),
 				slog.String("restaction_name", opts.raName),

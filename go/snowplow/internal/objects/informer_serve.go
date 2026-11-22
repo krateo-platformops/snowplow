@@ -55,6 +55,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
+	resolveapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/workclass"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -320,7 +321,8 @@ func authorizeGetOf(ctx context.Context, gvr schema.GroupVersionResource, namesp
 		// FAIL-CLOSED: no identity → cannot vouch for the object. Fall
 		// through to the apiserver, whose per-user-token gate is the
 		// authoritative answer.
-		log.WarnContext(ctx, "objects.Get.rbac_get_filter.no_identity",
+		log.Log(ctx, resolveapi.FailureLevelOf(ctx, slog.LevelWarn, "objects.rbac.identity\x00"+gvr.String()+"\x00"+namespace+"/"+name, err),
+			"objects.Get.rbac_get_filter.no_identity",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", namespace),
@@ -345,7 +347,8 @@ func authorizeGetOf(ctx context.Context, gvr schema.GroupVersionResource, namesp
 	allowed, _, err := rbac.EvaluateRBAC(ctx, opts)
 	if err != nil {
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.
-		log.WarnContext(ctx, "objects.Get.rbac_get_filter.evaluate_error",
+		log.Log(ctx, resolveapi.FailureLevelOf(ctx, slog.LevelWarn, "objects.rbac.evaluate\x00"+gvr.String()+"\x00"+namespace+"/"+name, err),
+			"objects.Get.rbac_get_filter.evaluate_error",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("namespace", namespace),

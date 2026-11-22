@@ -13,6 +13,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jqutil"
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/utils/ptr"
@@ -84,7 +85,8 @@ func createResourceReferencesFromTemplate(ctx context.Context, in *templatesv1.R
 			// ERROR that would flood the WARN-floor firehose on a healthy cluster.
 			log.Debug("iterator yielded no items (nil upstream)", slog.String("iterator", it), slog.Any("err", err))
 		} else {
-			log.ErrorContext(ctx, "unable to execute iterator", slog.String("iterator", it), slog.Any("err", err))
+			log.Log(ctx, api.FailureLevelOf(ctx, slog.LevelError, "widget.resourcesRefsTemplate.iterator\x00"+it, err),
+				"unable to execute iterator", slog.String("iterator", it), slog.Any("err", err))
 		}
 	}
 
