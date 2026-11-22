@@ -36,7 +36,7 @@ from pathlib import Path
 
 import pytest
 
-from bench import gke
+from bench import gke, installer_features
 from bench.load606 import SCALEUSER_PASSWORD
 from tests import _planted, fake_gke_api, fake_gke_ops, fake_region
 
@@ -1836,7 +1836,8 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
             "components": [
                 {"name": "authn-crd", "kind": "AuthnCrds", "chart": "authn-crds", "version": "0.27.3"},
                 {"name": "snowplow-crd", "kind": "SnowplowCrds", "chart": "snowplow-crds", "version": "1.12.56"},
-                {"name": "alert-provider-crd", "feature": "portal" if good else "specialistAgents"},
+                # not good: gated on a feature the run keeps off (showback: off on krateo-057, #1572)
+                {"name": "alert-provider-crd", "feature": "portal" if good else "showback"},
                 # as at 0.3.468: on through portal, no repo of its own (the installer's ociRepo), a
                 # private-image component (#1041 review F1 / N1)
                 {"name": "alert-provider", "version": "0.2.53", "feature": "portal"},
@@ -1853,9 +1854,10 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                  "repo": "oci://ghcr.io/krateo-blueprints/charts", "feature": "portal"},
                 {"name": "github-provider-kog", "version": "0.6.0", "repo": "oci://ghcr.io/krateo-blueprints/charts"},
                 # a private pin of a feature that is off unless the chart makes it a core feature,
-                # at a version the fake registry has not published: preflighted only when on
+                # at a version the fake registry has not published: preflighted only when on (showback:
+                # off on krateo-057, so in the run's values, #1572)
                 {"name": "incident-agent", "version": "9.9.9", "repo": "oci://ghcr.io/krateo-agentiko/charts",
-                 "feature": "specialistAgents"}]
+                 "feature": "showback"}]
                 # run 26: the frontend, pinned as 0.3.545 pins it (no repo of its own) at
                 # FAKE_FRONTEND_PIN (0.3.545's own is 1.8.34); by default one that carries the login
                 # form contract (bench/login_contract.py, run 26d); "none": no frontend pin
@@ -1892,10 +1894,19 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
             props = {"agents": {"type": "object"}, "enableCyberjokerUser": {"type": "boolean"}}
             if schema != "no-reader-groups":
                 props["readerGroups"] = {"type": "array", "items": {"type": "string"}}
+            # #1572: the features krateo-057 runs (bench/installer_features_057.json), every one declared, as
+            # installer 0.3.697's schema declares them; FAKE_INSTALLER_FEATURES=drop:<f>: a chart without <f>
+            # (installer 0.3.641 has no internalTls)
+            feats = sorted(json.load(open("@@FEATURES_RECORD@@"))["features"])
+            drop = os.environ.get("FAKE_INSTALLER_FEATURES", "")
+            if drop.startswith("drop:"):
+                feats.remove(drop[len("drop:"):])
             open(os.path.join(d, "values.schema.json"), "w").write(json.dumps({
                 "$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
                 "properties": {"componentValues": {"type": "object", "properties": {
-                    "portal": {"type": "object", "additionalProperties": False, "properties": props}}}}}))
+                    "portal": {"type": "object", "additionalProperties": False, "properties": props}}},
+                    "features": {"type": "object", "additionalProperties": False,
+                                 "properties": {f: {"type": "boolean"} for f in feats}}}}))
         sys.exit(0)
     # the subcommand's own args (run606's H=(helm --kubeconfig .. --kube-context ..) comes first)
     sa = [x for i, x in enumerate(a) if x not in ("--kubeconfig", "--kube-context")
@@ -1929,7 +1940,7 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         print(json.dumps([{"name": "installer", "namespace": "krateo-system",
                            "status": "deployed", "chart": "installer-0.3.422"}]))
     sys.exit(0)
-    """)
+    """).replace("@@FEATURES_RECORD@@", installer_features.RECORD_PATH)
 
 
 def _fake_server(state: Path):

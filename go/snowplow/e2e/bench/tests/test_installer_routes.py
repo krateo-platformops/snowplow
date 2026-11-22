@@ -21,6 +21,7 @@ import pytest
 import yaml
 
 from bench import installer_routes, installer_values, load606, origin_gate
+from tests import chart_era  # #1572: values for the pre-0.3.697 archives
 from tests.test_run606_real_sequence import BENCH_DIR, harness  # noqa: F401  (fixture)
 
 BENCH = BENCH_DIR
@@ -51,7 +52,7 @@ def tables(pulled, tmp_path_factory):
     """{version: the table, through the CLI run606's portal-routes step runs}."""
     d = tmp_path_factory.mktemp("tables")
     vals = d / "installer-values.yaml"
-    vals.write_text(installer_values.document("1.12.70"))
+    vals.write_text(chart_era.for_archives(installer_values.document("1.12.70")))
     out = {}
     for v in AUTHN:
         f = d / f"portal-routes-{v}.json"
@@ -64,7 +65,7 @@ def tables(pulled, tmp_path_factory):
 
 
 def _values(tmp_path, **exposure):
-    v = yaml.safe_load(installer_values.document("1.12.70"))
+    v = yaml.safe_load(chart_era.for_archives(installer_values.document("1.12.70")))
     v["exposure"].update(exposure)
     f = tmp_path / "v.yaml"
     f.write_text(yaml.safe_dump(v))
@@ -129,7 +130,7 @@ def test_a_table_the_chart_does_not_give_is_refused(pulled, tmp_path):
     assert "has neither an inst.compEnabled nor an inst.featureEnabled define" in _refused(bare, vals)
     assert "no pulled installer chart at" in _refused(tmp_path / "nowhere", vals)
     # the portal's feature off: no route to hold a config against
-    off = yaml.safe_load(installer_values.document("1.12.70"))
+    off = yaml.safe_load(chart_era.for_archives(installer_values.document("1.12.70")))
     off.setdefault("features", {})["portal"] = False
     (tmp_path / "off.yaml").write_text(yaml.safe_dump(off))
     assert "renders no portal route with a frontend key" in _refused(pulled["0.3.641"], str(tmp_path / "off.yaml"))
@@ -141,7 +142,7 @@ def test_a_chart_from_before_comp_enabled_is_asked_by_its_own_feature_rule(pulle
     t = installer_routes.table(str(pulled["0.3.545"]), _values(tmp_path))
     assert t["paths"]["AUTHN_API_BASE_URL"] == "/auth" and "its own inst.featureEnabled" in t["source"]
     assert [r["component"] for r in t["routes"]] == ["authn", "snowplow", "frontend", "krateo-sse-proxy"]
-    off = yaml.safe_load(installer_values.document("1.12.70"))
+    off = yaml.safe_load(chart_era.for_archives(installer_values.document("1.12.70")))
     off.setdefault("features", {})["portal"] = False
     (tmp_path / "off.yaml").write_text(yaml.safe_dump(off))
     assert "renders no portal route with a frontend key" in _refused(pulled["0.3.545"], str(tmp_path / "off.yaml"))
@@ -154,7 +155,7 @@ def test_a_chart_with_comp_enabled_is_asked_by_it_not_by_the_feature_alone(pulle
     f = chart / "installer" / "files" / "component-pins.min.yaml"
     doc = yaml.safe_load(f.read_text())
     authn = next(c for c in doc["components"] if c["name"] == "authn")
-    authn["feature"], authn["alsoFeatures"] = "specialistAgents", ["portal"]      # off, and on through portal
+    authn["feature"], authn["alsoFeatures"] = "showback", ["portal"]      # off (as on 057, #1572), on through portal
     f.write_text(yaml.safe_dump(doc))
     t = installer_routes.table(str(chart), _values(tmp_path))
     assert t["paths"]["AUTHN_API_BASE_URL"] == "/authn" and "its own inst.compEnabled" in t["source"]

@@ -27,6 +27,7 @@ import tarfile
 import pytest
 
 from bench import installer_values, snowplow_env
+from tests import chart_era
 from bench import tracing as tr
 from tests.test_run15_customer_latency import _launch, pairbed  # noqa: F401  (fixture)
 from tests.test_run22_three_runs import ROOM_FOR_THREE, _launch_env
@@ -105,6 +106,7 @@ def _render(pulled, tmp, declared, in_values=None):
                         "--snowplow-env", declared if in_values is None else in_values, "--out", str(vals)],
                        cwd=BENCH, capture_output=True, text=True, timeout=60)
     assert p.returncode == 0, p.stderr
+    vals.write_text(chart_era.for_archives(vals.read_text()))   # #1572: 0.3.641 predates 057's features
     out = tmp / "snowplow-env-render.json"
     p = _cli("render-check", "--installer-pulled", str(pulled), "--values", str(vals), "--declared", declared,
              "--out", str(out))

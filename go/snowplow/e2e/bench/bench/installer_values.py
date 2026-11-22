@@ -10,8 +10,10 @@ comments say why each value is what it is.
 
     python3 -m bench.installer_values --snowplow-tag T [--frontend-tag F] --out installer-values.yaml
 
-Every run's document grants the bench's base group the portal's shell
-(componentValues.portal.readerGroups: the group is bench/rbac_model.py's BASE_GROUP, never a second
+Its `features:` are krateo-057's (bench/installer_features.py: ONE record of 057's Installer CR,
+every feature written, the owner's deviations named; never a list picked here; until run 30 the
+heredoc's three hand-picked lines). Every run's document grants the bench's base group the portal's
+shell (componentValues.portal.readerGroups: the group is bench/rbac_model.py's BASE_GROUP, never a second
 literal). `--snowplow-env` (SNOWPLOW_ENV) adds the run's declared snowplow environment under
 componentValues.snowplow.env. `--frontend-tag` (run 26: FRONTEND_TAG) appends the frontend's image override to componentValues;
 empty or absent, the document is the one without it. The tags are written as the heredoc wrote
@@ -24,7 +26,7 @@ import argparse
 import os
 import sys
 
-from bench import rbac_model
+from bench import installer_features, rbac_model
 
 #: the installer's component whose chart ships the portal's shell: the key of its componentValues
 PORTAL_COMPONENT = "portal"
@@ -55,11 +57,9 @@ exposure:
     name: krateo-agent-gateway
   internalDataPlane: true
   platformPort: 80
-features:
-  agentGateway: true
-  coreAgents: false
-  specialistAgents: false
-vertexAI:
+# The installer's features are krateo-057's, every one written (bench/installer_features.py: the
+# record of 057's Installer CR, and the deviations the owner rules on, named in every check).
+{features}vertexAI:
   enabled: false
 # Installer 0.3.422 schema: top-level additionalProperties=false and the
 # engine subchart key is core-provider (the fresh-install runbook's
@@ -111,7 +111,8 @@ def document(snowplow_tag: str, frontend_tag: str = "", snowplow_env: dict[str, 
     frontend = f'\n  frontend:\n    image:\n      tag: "{frontend_tag}"' if frontend_tag else ""
     env = ("\n    env:" + "".join(f'\n      {k}: "{v}"' for k, v in sorted(snowplow_env.items()))) if snowplow_env else ""
     return TEMPLATE.format(snowplow_tag=snowplow_tag, frontend=frontend, snowplow_env=env,
-                           portal=PORTAL_COMPONENT, reader_group=READER_GROUP)
+                           portal=PORTAL_COMPONENT, reader_group=READER_GROUP,
+                           features=installer_features.values_block(installer_features.bench_features()))
 
 
 def main(argv: list[str] | None = None) -> int:

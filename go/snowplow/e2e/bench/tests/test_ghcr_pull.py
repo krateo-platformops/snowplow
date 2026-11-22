@@ -139,7 +139,7 @@ def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, 
         "network": lambda: {"GHCR_API_URL": "https://127.0.0.1:1"},
         "http": lambda: {"GHCR_API_URL": env["GHCR_API_URL"].replace("https://", "http://")},
         "redirect": lambda: {"GHCR_PULL_ENV_FILE": token_file("redirect")},
-        "core_feature": lambda: {"FAKE_CORE_FEATURES": "specialistAgents"},
+        "core_feature": lambda: {"FAKE_CORE_FEATURES": "showback"},   # off in the run's values (#1572)
         "image_scope": lambda: {"GHCR_PULL_ENV_FILE": token_file("imgscope403")},
         "bad_digest": lambda: {"FAKE_AGW_VERSION": FAKE_CHART_BAD_DIGEST},
         "http_blob": lambda: {"FAKE_AGW_VERSION": FAKE_CHART_HTTP_BLOB},

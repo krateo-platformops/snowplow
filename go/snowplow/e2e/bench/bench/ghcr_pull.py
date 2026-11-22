@@ -286,10 +286,11 @@ def creds(path: str) -> tuple[str, str]:
 def private_pins(installer_pulled: str, values: str, include: set[str] | frozenset = frozenset()) -> list[dict]:
     """Every pinned chart this install pulls from a repo of its OWN (the
     repo-override pins: krateo-agentiko/*, krateo-blueprints/*, ...), whose
-    component the installer enables, by its own rule (inst.featureEnabled):
-    a pin with no feature is on; a feature in the chart's inst.coreFeatures is
-    always on; else the install's features (the installer's defaults,
-    overridden by the bench's values). The token must resolve each one: a
+    component the installer enables, by its own rule (inst.compEnabled,
+    bench/installer_features.py component_enabled): a pin with no feature is
+    on; a feature in the chart's inst.coreFeatures is always on; else its
+    feature or one of its alsoFeatures is on in the install's features (the
+    installer's defaults, overridden by the bench's values). The token must resolve each one: a
     public chart resolves with any valid token, a private one only with
     access.
 
@@ -311,7 +312,7 @@ def private_pins(installer_pulled: str, values: str, include: set[str] | frozens
     image pull secrets, mirrored by with_markers). The release name is the
     component's own name, as the installer's. Every file read by _load_yaml
     (NEST_MAX)."""
-    from bench import diag606
+    from bench import diag606, installer_features
     root = os.path.join(installer_pulled, "installer")
     core = set(diag606.core_features(installer_pulled))
     from bench import installer_pins
@@ -334,8 +335,7 @@ def private_pins(installer_pulled: str, values: str, include: set[str] | frozens
     for c in pins.get("components") or []:
         if not (isinstance(c, dict) and (c.get("repo") or c.get("name") in include)):
             continue
-        f = c.get("feature") or ""
-        if not f or f in core or features.get(f, False):
+        if installer_features.component_enabled(c, features, core):   # inst.compEnabled: feature or alsoFeatures
             repo = c.get("repo") or oci
             if not repo:
                 raise ValueError(f"{c['name']}: no repo of its own and the installer has no ociRepo")

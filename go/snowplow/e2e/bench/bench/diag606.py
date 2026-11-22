@@ -271,11 +271,13 @@ def core_features(chart: str) -> tuple[str, ...]:
 
 def declared_components(installer: dict, core: tuple[str, ...] = ()) -> list[dict] | None:
     """The component CRs this Installer CR WILL create: the entries of its
-    spec.components that are not registerOnly and whose feature is on
-    (no feature = on; a `core` feature = on, see core_features; otherwise
-    spec.features[<feature>] is true). This is
+    spec.components that are not registerOnly and that are on by
+    inst.compEnabled (bench/installer_features.py component_enabled: no
+    feature = on; a `core` feature = on, see core_features; otherwise
+    spec.features[<feature>] or spec.features[<one of its alsoFeatures>] is
+    true). This is
     the installer chart's own rule: templates/compositions.yaml Pass B emits a
-    component when inst.featureEnabled (templates/_helpers.tpl) holds, once
+    component when inst.compEnabled (templates/_helpers.tpl) holds, once
     its CRD is served and its deps are Ready, "re-evaluated every reconcile;
     the next layer unlocks as deps go Ready". So the CRs that EXIST at a
     moment are not the platform: a layer whose deps have only just gone
@@ -293,8 +295,8 @@ def declared_components(installer: dict, core: tuple[str, ...] = ()) -> list[dic
     for c in comps:
         if not isinstance(c, dict) or not c.get("name") or not c.get("kind") or c.get("registerOnly"):
             continue
-        f = c.get("feature")
-        if f and f not in core and not feats.get(f):
+        from bench import installer_features
+        if not installer_features.component_enabled(c, feats, core):   # inst.compEnabled: feature or alsoFeatures
             continue
         out.append({"name": c["name"], "kind": c["kind"], "deps": list(c.get("deps") or [])})
     return out

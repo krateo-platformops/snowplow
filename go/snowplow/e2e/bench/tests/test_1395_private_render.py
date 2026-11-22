@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 
 from bench import ghcr_pull, gke, installer_values, rbac_model, vm606
-from tests import fake_vm606
+from tests import chart_era, fake_vm606
 from tests.test_gke_pvc_disks import fakes as pvc_fakes  # noqa: F401
 from tests.test_run606_real_sequence import harness  # noqa: F401
 from tests.test_vm606 import ENV, RUN, _run  # noqa: F401
@@ -60,7 +60,8 @@ AT_0_3_616 = {**AT_0_3_545, "kagent": [["perUserRbac", "toolImagePullSecrets"]]}
 
 def _values(snowplow_tag="1.12.69", frontend_tag="1.8.41", **over) -> dict:
     """A run's installer values, as run606.sh writes them, with the username document s_install pipes."""
-    v = ghcr_pull._load_yaml(installer_values.document(snowplow_tag, frontend_tag)) or {}
+    # #1572: the document less the features these pre-0.3.697 archives cannot take (tests/chart_era.py)
+    v = ghcr_pull._load_yaml(chart_era.for_archives(installer_values.document(snowplow_tag, frontend_tag))) or {}
     return ghcr_pull._merge(v, {"registryAuth": {"username": "bench-user"}, **over})
 
 
@@ -216,7 +217,7 @@ def test_a_render_with_no_answer_refuses(tmp_path, monkeypatch):
 
 def _preflight_argv(tmp_path, pulled: Path) -> list[str]:
     v = tmp_path / "installer-values.yaml"
-    v.write_text(installer_values.document("1.12.69", "1.8.41"))
+    v.write_text(chart_era.for_archives(installer_values.document("1.12.69", "1.8.41")))
     env = tmp_path / "ghcr-pull.env"
     env.write_text("GHCR_PULL_USERNAME=bench-user\nGHCR_PULL_TOKEN=opaque-never-printed\n")
     env.chmod(0o600)
@@ -257,11 +258,17 @@ def test_the_preflight_renders_with_the_username_and_never_says_it(tmp_path, cap
     ("1.12.70", "1.8.41", "installer_values_heredoc_1.12.70_frontend_1.8.41.yaml")])
 def test_the_values_are_the_heredocs_byte_for_byte(tmp_path, snowplow, frontend, golden):
     """The goldens are what run606.sh's heredoc wrote (before #1395) for these tags; the document is
-    that, plus ONE block since run 26j: the portal's reader group, the last entry of componentValues."""
+    that, plus ONE block since run 26j: the portal's reader group, the last entry of componentValues,
+    and, since #1572, krateo-057's features (bench/installer_features.py) where the heredoc's three
+    hand-picked lines were."""
+    from bench import installer_features
     want = (FIXTURES / golden).read_text()
     got = installer_values.document(snowplow, frontend)
     i, j = got.index("  # The bench's base group reads the portal's shell"), got.index("registryAuth:")
-    assert got[:i] + got[j:] == want
+    k, m = got.index("# The installer's features are krateo-057's"), got.index("vertexAI:")
+    heredoc = "features:\n  agentGateway: true\n  coreAgents: false\n  specialistAgents: false\n"
+    assert got[k:m].split("\n", 2)[2] == installer_features.values_block(installer_features.bench_features())
+    assert got[:k] + heredoc + got[m:i] + got[j:] == want
     block = [ln for ln in got[i:j].splitlines() if not ln.lstrip().startswith("#")]
     assert block == ["  portal:", "    readerGroups:", "    - " + rbac_model.BASE_GROUP]
     out = tmp_path / "v.yaml"
@@ -318,6 +325,9 @@ def laptop_helm(tmp_path, monkeypatch):
     (b / "helm").chmod(0o755)
     monkeypatch.setenv("FAKE_INSTALLER_CHARTS", str(d))
     monkeypatch.setenv("PATH", f"{b}{os.pathsep}{os.environ['PATH']}")
+    # #1572: these archives predate 057's features, which chart_check refuses by design
+    # (tests/test_installer_features.py); here the private-image list is under test
+    chart_era.patch(monkeypatch, chart_check=True)
     return d
 
 
@@ -453,14 +463,19 @@ def test_the_bench_enable_rule_is_the_installers_for_run_26g(tmp_path, snowplow)
     for c in pins["components"]:
         c.pop("alsoFeatures", None)
     (stripped / "files" / "component-pins.yaml").write_text(yaml.safe_dump(pins))
-    assert registered(stripped) == stock and len(stock) == 43
+    # 43 with run 26g's three hand-picked features; 62 with krateo-057's (#1572): + the 10 components of
+    # coreAgents, the 7 of specialistAgents, krateo-audit-worm (auditWorm) and krateo-slo-rollup (sloRollup)
+    assert registered(stripped) == stock and len(stock) == 62
     feats = {**yaml.safe_load((root / "values.yaml").read_text())["features"], **_values(snowplow)["features"]}
     core = set(diag606.core_features(str(pulled)))
-    rule = {c["name"] for c in pins["components"]
-            if not c.get("feature") or c["feature"] in core or feats.get(c["feature"])}
+    # #1572: the bench's rule is the installer's inst.compEnabled (bench/installer_features.py)
+    from bench import installer_features
+    rule = {c["name"] for c in pins["components"] if installer_features.component_enabled(c, feats, core)}
     assert rule == stock
+    # with coreAgents on (#1572), its private-image components are registered too
     assert sorted(set(ghcr_pull.private_image_paths(str(pulled), _values(snowplow))) & stock) == [
-        "agentgateway-policies", "alert-provider"]
+        "agentgateway-policies", "alert-provider", "config-refs-mcp-server", "core-provider-agent", "kagent",
+        "repo-mcp-server"]
 
 
 # ─── helm's reason, in every line layout (#1395 review) ─────────────────────

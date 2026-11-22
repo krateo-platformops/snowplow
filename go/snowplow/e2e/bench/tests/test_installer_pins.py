@@ -23,6 +23,7 @@ import pytest
 import yaml
 
 from bench import crd_schema, ghcr_pull, installer_pins, installer_src, installer_values, lb_need, login_contract
+from tests import chart_era
 from tests.test_run15_customer_latency import _launch, pairbed  # noqa: F401  (fixture)
 from tests.test_run22_three_runs import ROOM_FOR_THREE, _launch_env
 from tests.test_run606_real_sequence import BENCH_DIR, harness  # noqa: F401  (fixture)
@@ -52,7 +53,7 @@ def pulled(tmp_path_factory):
 
 def _values(tmp_path, tag="1.12.70"):
     f = tmp_path / "installer-values.yaml"
-    f.write_text(installer_values.document(tag))
+    f.write_text(chart_era.for_archives(installer_values.document(tag)))   # #1572: tests/chart_era.py
     return f
 
 

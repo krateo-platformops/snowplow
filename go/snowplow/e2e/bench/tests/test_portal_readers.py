@@ -28,6 +28,7 @@ import pytest
 import yaml
 
 from bench import accept1126, data_manifests, ghcr_pull, installer_routes, installer_values, portal_readers, rbac_model, snowplow_env
+from tests import chart_era
 from tests.conftest import FAKE_PAGE_READERS, FAKE_PORTAL_DEMO, FAKE_PORTAL_SHELL_READERS
 from tests.test_installer_routes import CHARTS, SHA256
 from tests.test_run606_real_sequence import BENCH_DIR, SCALEUSER_PASSWORD, harness  # noqa: F401  (fixture)
@@ -57,7 +58,8 @@ def pulled(tmp_path_factory):
 
 def _values(tmp_path, doc=None):
     f = tmp_path / "installer-values.yaml"
-    f.write_text(doc if doc is not None else installer_values.document("1.12.70"))
+    # #1572: the document less the features these pre-0.3.697 archives cannot take (tests/chart_era.py)
+    f.write_text(doc if doc is not None else chart_era.for_archives(installer_values.document("1.12.70")))
     return str(f)
 
 
@@ -238,8 +240,9 @@ def test_the_published_installers_grant_the_group_the_shell_and_say_which_pages_
     # chart (it declares reader groups of its own) or not
     deps = {n for n, c in pins.items() if "portal" in (c.get("deps") or [])}
     looked = {x["component"] for x in rec["pages"]} | set(rec["not_pages"])
-    # (the three it leaves out are off for the bench's values: the service desk, and two of the agents')
-    assert looked == deps - {"service-desk-page", "builder-gate", "krateo-capability-roles"}
+    # (the two it leaves out are off for the bench's values: the service desk, a deviation from 057 the
+    # owner rules on, and the capability roles, off on 057; builder-gate is on with coreAgents, #1572)
+    assert looked == deps - {"service-desk-page", "krateo-capability-roles"}
     assert len([n for n in looked if n.endswith("-page")]) >= 13 and "portal-agents" in looked
     assert rec["granting"] == ["dashboard-page"] and rec["not_granting"] == ["settings-page"]
     assert f"portal readers: 1 of 2 page chart(s) grant `{GROUP}`: dashboard-page; not granting it: settings-page" \
@@ -256,7 +259,7 @@ def test_a_portal_chart_with_no_reader_groups_is_refused(pulled, tmp_path, monke
 
 @needs_helm
 def test_a_run_whose_values_do_not_reach_the_installers_cr_is_refused(pulled, tmp_path):
-    doc = yaml.safe_load(installer_values.document("1.12.70"))
+    doc = yaml.safe_load(chart_era.for_archives(installer_values.document("1.12.70")))
     del doc["componentValues"]["portal"]
     with pytest.raises(portal_readers.Refused, match=r"does not carry `devs` in componentValues.portal.readerGroups "
                                                      r"\(it renders \[\]\)"):

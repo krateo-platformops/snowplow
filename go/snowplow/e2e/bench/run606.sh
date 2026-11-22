@@ -873,7 +873,26 @@ s_source() {
     *) record_failure "source FAILED: the installer chart does not resolve or verify ($OUT/installer-preflight.json)"; return 1 ;;
   esac
   log "installer source: $INSTALLER_CHART --version $INSTALLER_VERSION (registry preflight OK$([[ "$VERIFY483" == "1" ]] && echo ', #483 pins present'))"
+  installer_features_check || return 1
   portal_readers
+}
+# installer_features_check (#1572, the owner's ruling 2026-11-22: the bench's install matches krateo-057's
+# installer features): the pulled chart must declare exactly the features of 057's record
+# (bench/installer_features.py), which the run's values write, every one; the deviations the owner
+# rules on are logged by name. BEFORE any cluster exists, in the dry pass too. $OUT/installer-features.json.
+installer_features_check() {
+  local rc=0 ln why
+  python3 -m bench.installer_features check --installer-pulled "$OUT/installer-pulled" \
+      --out "$OUT/installer-features.json" >"$OUT/.installer-features.out" 2>"$KERR" || rc=$?
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$OUT/.installer-features.out"
+  rm -f "$OUT/.installer-features.out"
+  (( rc == 0 )) && return 0
+  why="$(sed -n 's/^refusing: //p' "$KERR" | head -1)"
+  : > "$KERR"     # the refusal is the failure's own line, said once
+  record_failure "source FAILED: installer features: ${why:-bench.installer_features exited ${rc} ($OUT/installer-features.json)}"
+  return 1
 }
 # portal_readers (run 26j: three paid clusters, every bench user's boot call 403): the bench's base
 # group must be granted the portal's shell, and the pages its users are driven through must still
