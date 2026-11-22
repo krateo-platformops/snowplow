@@ -1,0 +1,10 @@
+{"order": ["main", "floor", "mainB", "yield", "combined"],
+ "arms": {
+  "main":     {"sha": "1c788e2844407c624494e50d77976dfa80ab755d",
+               "overlay": "$SCRATCH/overlays/main"},
+  "mainB":    {"sha": "1c788e2844407c624494e50d77976dfa80ab755d",
+               "overlay": "$SCRATCH/overlays/main"},
+  "floor":    {"sha": "9e6427ce37e1223f0810c2de68a88909049fb22e", "overlay": null},
+  "yield":    {"sha": "0b1d3f435de5a0fce054a92c5a4d16ad32cc9639", "overlay": null},
+  "combined": {"sha": "11d45b49d475aa5bf3bba9b2dc207cb5ad47a626", "overlay": null}
+ }}

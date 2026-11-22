@@ -1,0 +1,3 @@
+{"order": ["main"],
+ "arms": {"main": {"sha": "1c788e2844407c624494e50d77976dfa80ab755d",
+                   "overlay": "$SCRATCH/overlays/main"}}}

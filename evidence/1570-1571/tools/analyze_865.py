@@ -13,7 +13,7 @@ data = {}
 status = {}
 for r in runs:
     status.setdefault(r["arm"], []).append(r["status"])
-    if r["status"] != "RUN":
+    if r["status"] != "RUN" or r.get("alone") is False:
         continue
     d = json.load(open(r["out"]))
     rate = d["rate"]

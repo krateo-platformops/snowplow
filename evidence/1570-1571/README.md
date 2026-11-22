@@ -33,8 +33,22 @@ The new arms passed ×3 under `-race` on both branches (RUN, recorded in the PR 
 - **Excluded:** `fresh-excluded-load-over-8/` holds 2 runs started at load 29.5 and 43.6, before the gate existed. They are EXCLUDED from every summary.
 - **Stopped:** rounds 3–6 were stopped for the coordinator's quiet hold before any of them started.
 
+## #865 paired-throughput gate — RUN on the build VM, alone
+
+- **Setup:** snowplow-build-1 (32 vCPU) in a VM-exclusive window, `tools/rb_paired.py` with `tools/arms-865.json`. One rbuild job at a time: a fresh checkout of the pushed SHA (main + `overlays/main`), GOTOOLCHAIN=go1.27.3, GOMAXPROCS=4, `PAIRED865_PROBE=2`, `PAIRED865_HITBENCH=2000`.
+- **"Alone" proof:** every record lists the rjob jobs present before and after the test. All 30 runs saw only their own label.
+- **Runs:** `vm-865-r10/` and `vm-865-r50/`. Each holds 5 arms (main, mainB, floor, yield, combined) × 3 rounds, alternated, plus `summary.json` (`tools/analyze_865.py`: ratios against the same round's main, judged against the mainB/main spread).
+- **Result, A (yield):** neutral. Customer p50/p95 0.84–1.03, req/s 0.99–1.01, completions/s 1.06–1.07, CPU unchanged.
+- **Result, B (floor) and combined:**
+  - customer p50 0.68–0.89 and p95 0.86–0.92, i.e. better;
+  - dep staleness p95 −16 to −19%;
+  - closed-loop req/s 0.97–0.98: FAIL against the spread;
+  - completions/s 0.80× at 10 events/s and 0.44× at 50, with refresher CPU +22–25% (2.7 → 3.4 cores): FAIL;
+  - `floored` 0, against main's 3–11K.
+- `vm-probe/` is the plumbing check: one main run, not evidence.
+
 ## NOT RUN (at this commit)
 
-- freshness rounds 3–6;
-- the #865 paired-throughput gate at 10 and 50 events/s (main/main, floor, yield, combined, ×3);
+- freshness ×6 on the VM (running at the time of this commit);
+- completions split by class;
 - the full package suite, `scripts/check_*.sh`, `gh pr checks`.

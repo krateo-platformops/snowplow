@@ -1,0 +1,92 @@
+{
+  "alloc_bytes": 15619209400,
+  "completions_s": 28.566512550331456,
+  "cpu_cores": 2.8018816171820085,
+  "cust_dep": {
+    "max_ms": 19.982,
+    "n": 1138,
+    "p50_ms": 0.095,
+    "p95_ms": 0.225,
+    "p99_ms": 0.313
+  },
+  "cust_dep_n": 2,
+  "cust_dep_rps": 37.933128684104084,
+  "cust_dep_staleness": {
+    "max_ms": 2736.245,
+    "n": 1138,
+    "p50_ms": 1341.277,
+    "p95_ms": 2420.894,
+    "p99_ms": 2574.855
+  },
+  "cust_errors": 0,
+  "cust_think_ms": 50,
+  "cust_unrel": {
+    "max_ms": 20.178,
+    "n": 2281,
+    "p50_ms": 0.092,
+    "p95_ms": 0.2,
+    "p99_ms": 0.325
+  },
+  "cust_unrel_n": 4,
+  "cust_unrel_rps": 76.03292313571302,
+  "dirty_to_fresh": {
+    "max_ms": 1262,
+    "n": 593,
+    "p50_ms": 0,
+    "p95_ms": 226,
+    "p99_ms": 423
+  },
+  "events": 1479,
+  "fills": 0,
+  "gomaxprocs": 4,
+  "hit_bench": {
+    "max_ms": 0.675,
+    "n": 2000,
+    "p50_ms": 0.036,
+    "p95_ms": 0.059,
+    "p99_ms": 0.077
+  },
+  "list_incremental": {
+    "Anchors": 2,
+    "AnchorSkipped": 0,
+    "Reads": 881,
+    "Restamps": 20,
+    "Generations": 655,
+    "AppliedKeys": 1479,
+    "Decodes": 1479,
+    "Rebinds": 0,
+    "ItemsBuilt": 239,
+    "RawJSONBuilt": 0,
+    "PendingRecorded": 1479,
+    "Passes": 2,
+    "Suspects": 0,
+    "RefreshSkipped": 596,
+    "AnchorSettling": 0,
+    "GenAllocBytesTotal": 123263360,
+    "GenAllocBytesMax": 400000,
+    "GenAllocCount": 894,
+    "Unanchors": {},
+    "Divergences": {},
+    "DivergenceTotal": 0,
+    "Live": 2
+  },
+  "n": 50000,
+  "num_gc": 27,
+  "peak_heap_inuse": 1459552256,
+  "probe": {
+    "max_ms": 2.078,
+    "n": 1141,
+    "p50_ms": 0.094,
+    "p95_ms": 0.243,
+    "p99_ms": 0.26
+  },
+  "probe_n": 2,
+  "rate": 50,
+  "refresh_capped": 0,
+  "refresh_completed": 857,
+  "refresh_floored": 11062,
+  "refresh_parked_s": 1.113,
+  "refresh_yielded": 39,
+  "seconds": 30,
+  "wall_s": 30.00016185
+}
