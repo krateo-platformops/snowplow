@@ -16,7 +16,15 @@ package api
 // slog.LevelInfo, or a local variable every assignment of which (in the
 // enclosing function) is one of those. A level the guard cannot see the value
 // of — a parameter, a field, another function's result — is flagged: route it,
-// or allow-list the line.
+// or allow-list the line. A variable is matched by its parser-resolved object,
+// so a shadowing declaration of the same name is another variable; its address
+// taken, an increment, an op-assignment or a range assignment makes it unseen.
+//
+// THE RESIDUAL. roundLevelFuncs is matched by the called function's NAME,
+// whatever its receiver or package: a different function named, say,
+// FailureLevelOf would be trusted. The guard reads syntax, not types; the names
+// are this package's and widgets', and a look-alike would have to be written on
+// purpose.
 //
 // THE ALLOW-LIST is the lines that are not a cell's failure, each with its
 // reason. A new fixed-level line on the resolve path either goes through the
@@ -95,44 +103,93 @@ func levelThroughRound(e ast.Expr, fn *ast.FuncDecl, depth int) bool {
 		id, ok := v.X.(*ast.Ident)
 		return ok && id.Name == "slog" && (v.Sel.Name == "LevelDebug" || v.Sel.Name == "LevelInfo")
 	case *ast.Ident:
-		if fn == nil || fn.Body == nil {
-			return false
+		return localLevelThroughRound(v, fn, depth)
+	}
+	return false
+}
+
+// localLevelThroughRound is levelThroughRound for a variable (#1569 review B3).
+// The variable is matched by its OBJECT (the parser's resolution, mode 0), never
+// by its name, so a shadowing declaration of the same name is another variable.
+// It is seen only when it is a local of fn: no object, a parameter or receiver
+// (an *ast.Field declaration) or a declaration outside fn's body (a package
+// variable) is unseen. Every write of it in fn must be a plain `=` / `:=` /
+// `var` assignment whose value is through the round; any other write makes it
+// unseen: its address taken (`&v`, so a write through a pointer can follow),
+// `v++` / `v--`, an op-assignment (`v += …`), a range key or value.
+func localLevelThroughRound(v *ast.Ident, fn *ast.FuncDecl, depth int) bool {
+	if fn == nil || fn.Body == nil || v.Obj == nil || v.Obj.Kind != ast.Var {
+		return false
+	}
+	switch d := v.Obj.Decl.(type) {
+	case *ast.Field:
+		return false // a parameter or receiver
+	case ast.Node:
+		if d.Pos() < fn.Body.Pos() || d.Pos() > fn.Body.End() {
+			return false // declared outside fn: a package variable
 		}
-		var rhs []ast.Expr
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			switch s := n.(type) {
-			case *ast.AssignStmt:
-				for i, l := range s.Lhs {
-					if id, ok := l.(*ast.Ident); ok && id.Name == v.Name && i < len(s.Rhs) {
-						rhs = append(rhs, s.Rhs[i])
-					}
+	default:
+		return false
+	}
+	same := func(e ast.Expr) bool {
+		id, ok := e.(*ast.Ident)
+		return ok && id.Obj == v.Obj
+	}
+	var rhs []ast.Expr
+	unseen := false
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.AssignStmt:
+			for i, l := range s.Lhs {
+				if !same(l) {
+					continue
 				}
-			case *ast.ValueSpec:
-				for i, id := range s.Names {
-					if id.Name == v.Name {
-						if i < len(s.Values) {
-							rhs = append(rhs, s.Values[i])
-						} else {
-							// declared without a value: slog.Level's zero value is
-							// LevelInfo, below Warn
-							rhs = append(rhs, &ast.SelectorExpr{X: ast.NewIdent("slog"), Sel: ast.NewIdent("LevelInfo")})
-						}
-					}
+				if (s.Tok != token.ASSIGN && s.Tok != token.DEFINE) || len(s.Lhs) != len(s.Rhs) {
+					unseen = true // an op-assignment, or a multi-value call's result
+					continue
+				}
+				rhs = append(rhs, s.Rhs[i])
+			}
+		case *ast.ValueSpec:
+			for i, id := range s.Names {
+				if id.Obj != v.Obj {
+					continue
+				}
+				switch {
+				case len(s.Values) == 0:
+					// declared without a value: slog.Level's zero value is
+					// LevelInfo, below Warn
+					rhs = append(rhs, &ast.SelectorExpr{X: ast.NewIdent("slog"), Sel: ast.NewIdent("LevelInfo")})
+				case len(s.Values) == len(s.Names):
+					rhs = append(rhs, s.Values[i])
+				default:
+					unseen = true
 				}
 			}
-			return true
-		})
-		if len(rhs) == 0 {
-			return false // a parameter, a field, a package variable: unseen
-		}
-		for _, r := range rhs {
-			if r == nil || !levelThroughRound(r, fn, depth+1) {
-				return false
+		case *ast.IncDecStmt:
+			if same(s.X) {
+				unseen = true
+			}
+		case *ast.RangeStmt:
+			if (s.Key != nil && same(s.Key)) || (s.Value != nil && same(s.Value)) {
+				unseen = true
+			}
+		case *ast.UnaryExpr:
+			if s.Op == token.AND && same(s.X) {
+				unseen = true // its address is taken: a write through the pointer is not seen
 			}
 		}
 		return true
+	})
+	if unseen || len(rhs) == 0 {
+		return false
 	}
-	return false
+	for _, r := range rhs {
+		if !levelThroughRound(r, fn, depth+1) {
+			return false
+		}
+	}
+	return true
 }
 
 // literalMessage is the message a call writes when it is a string literal, or a
@@ -306,6 +363,35 @@ func f(ctx context.Context, log *slog.Logger, err error) {
 	log.Log(ctx, slog.LevelInfo, "info")
 	log.Debug("debug")
 	_ = err.Error()
+}
+var pkgLvl = FailureLevelOf(nil, slog.LevelError, "t", nil)
+func g(ctx context.Context, log *slog.Logger, lvl slog.Level, c bool, err error, levels []slog.Level) {
+	if c {
+		lvl := FailureLevelOf(ctx, slog.LevelError, "t", err)
+		_ = lvl
+	}
+	log.Log(ctx, lvl, "raw-13")
+	addr := FailureLevelOf(ctx, slog.LevelError, "t", err)
+	p := &addr
+	*p = slog.LevelError
+	log.Log(ctx, addr, "raw-14")
+	inc := FailureLevelOf(ctx, slog.LevelWarn, "t", err)
+	inc++
+	log.Log(ctx, inc, "raw-15")
+	rng := FailureLevelOf(ctx, slog.LevelWarn, "t", err)
+	for _, rng = range levels {
+	}
+	log.Log(ctx, rng, "raw-16")
+	log.Log(ctx, pkgLvl, "raw-17")
+	opa := FailureLevelOf(ctx, slog.LevelWarn, "t", err)
+	opa += 4
+	log.Log(ctx, opa, "raw-18")
+	shadowed := FailureLevelOf(ctx, slog.LevelError, "t", err)
+	if c {
+		shadowed := slog.LevelError
+		_ = shadowed
+	}
+	log.Log(ctx, shadowed, "routed-4")
 }`
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "x.go", src, 0)
@@ -317,7 +403,9 @@ func f(ctx context.Context, log *slog.Logger, err error) {
 	for _, fd := range findings {
 		got[fd.msg] = true
 	}
-	for _, want := range []string{"raw-1", "raw-2", "raw-3", "raw-4", "raw-5", "raw-6", "raw-7", "raw-10", "raw-11", "raw-12"} {
+	for _, want := range []string{"raw-1", "raw-2", "raw-3", "raw-4", "raw-5", "raw-6", "raw-7", "raw-10", "raw-11", "raw-12",
+		// #1569 review B3: matched by object, and every other write is unseen
+		"raw-13", "raw-14", "raw-15", "raw-16", "raw-17", "raw-18"} {
 		if !got[want] {
 			t.Errorf("#1569 guard RED: the raw line %q was not found (found %v)", want, got)
 		}
@@ -326,7 +414,7 @@ func f(ctx context.Context, log *slog.Logger, err error) {
 	if n := countMsg(findings, "<non-literal>"); n != 2 {
 		t.Errorf("#1569 guard RED (B2): %d non-literal-message raw lines found, want 2 (raw-8 \"raw-8 \"+x, raw-9 slog.Error(msg)): %v", n, got)
 	}
-	for _, not := range []string{"routed", "routed-2", "routed-3", "info", "debug"} {
+	for _, not := range []string{"routed", "routed-2", "routed-3", "routed-4", "info", "debug"} {
 		if got[not] {
 			t.Errorf("#1569 guard: %q is not a fixed-level line but was reported", not)
 		}
