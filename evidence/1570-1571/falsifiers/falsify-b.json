@@ -1,0 +1,31 @@
+{
+ "repo": "$SCRATCH/wt-floor",
+ "ref": "HEAD",
+ "tmp": "$SCRATCH",
+ "out": "$SCRATCH/falsify-b.out.json",
+ "arms": [{"run": "TestRefresher1570", "pkg": "./internal/cache/", "count": 1, "expect": "PASS"}],
+ "mutants": [
+  {"name": "floor-ignored",
+   "edits": [{"file": "go/snowplow/internal/cache/refresher.go",
+              "old": "\tif floor := r.rateFloor(entry); floor > 0 && ok && entry != nil {",
+              "new": "\tif floor := r.rateFloor(entry); false && floor > 0 && ok && entry != nil {"}],
+   "arms": [{"run": "TestRefresher1570_ExpensiveCellKeepsCoalescing$", "pkg": "./internal/cache/"}]},
+  {"name": "fixed-2s-floor",
+   "edits": [{"file": "go/snowplow/internal/cache/refresher.go",
+              "old": "\tif entry == nil {\n\t\treturn 0\n\t}\n\treturn entry.RefreshCost\n}",
+              "new": "\treturn 2 * time.Second\n}"}],
+   "arms": [{"run": "TestRefresher1570_CheapCellIsNotFlooredTwoSeconds$", "pkg": "./internal/cache/"},
+            {"run": "TestRefresher1570_UnmeasuredCellFirstRefreshRunsAtOnce$", "pkg": "./internal/cache/"}]},
+  {"name": "unknown-cost-gets-a-fixed-floor",
+   "edits": [{"file": "go/snowplow/internal/cache/refresher.go",
+              "old": "\treturn entry.RefreshCost\n}",
+              "new": "\tif entry.RefreshCost == 0 {\n\t\treturn 2 * time.Second\n\t}\n\treturn entry.RefreshCost\n}"}],
+   "arms": [{"run": "TestRefresher1570_UnmeasuredCellFirstRefreshRunsAtOnce$", "pkg": "./internal/cache/"}]},
+  {"name": "cost-not-recorded",
+   "edits": [{"file": "go/snowplow/internal/cache/resolved.go",
+              "old": "\t\tentry.RefreshCost = max(windowNow().Sub(rc.startedAt), 0)",
+              "new": "\t\t_ = rc"}],
+   "arms": [{"run": "TestRefresher1570_TerminalPutRecordsItsCost$", "pkg": "./internal/cache/"},
+            {"run": "TestRefresher1570_ExpensiveCellKeepsCoalescing$", "pkg": "./internal/cache/"}]}
+ ]
+}

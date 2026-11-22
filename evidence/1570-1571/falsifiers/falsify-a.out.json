@@ -1,0 +1,115 @@
+{
+ "ref": "1347abd64a75c7bc90919bea61e0cf0c2becf484",
+ "started": "2026-11-22T08:01:00+0100",
+ "mutants": [
+  {
+   "name": "unmutated",
+   "arm": "TestAdmission1571",
+   "rc": 0,
+   "seconds": 21.8,
+   "verdict": "PASS",
+   "tail": [
+    "ok  \tgithub.com/krateo-platformops/snowplow/internal/cache\t7.741s"
+   ]
+  },
+  {
+   "name": "any-customer-holds-every-core (broken demand classification)",
+   "arm": "TestAdmission1571_CustomersBelowCoresDoNotPark$",
+   "rc": 1,
+   "seconds": 17.5,
+   "verdict": "KILLED",
+   "tail": [
+    "--- FAIL: TestAdmission1571_CustomersBelowCoresDoNotPark (3.01s)",
+    "    refresher_admission_1571_test.go:102: timed out after 3s waiting for: the refresh starts",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t3.713s",
+    "FAIL"
+   ]
+  },
+  {
+   "name": "yield-bypassed",
+   "arm": "TestAdmission1571_EveryCoreBusyParksUntilACustomerEnds$",
+   "rc": 1,
+   "seconds": 18.3,
+   "verdict": "KILLED",
+   "tail": [
+    "--- FAIL: TestAdmission1571_EveryCoreBusyParksUntilACustomerEnds (3.00s)",
+    "    refresher_admission_1571_test.go:125: timed out after 3s waiting for: the refresh waits for a core",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t3.737s",
+    "FAIL"
+   ]
+  },
+  {
+   "name": "yield-bypassed",
+   "arm": "TestAdmission1571_ViewedRefreshIsAdmittedFirst$",
+   "rc": 1,
+   "seconds": 8.5,
+   "verdict": "KILLED",
+   "tail": [
+    "--- FAIL: TestAdmission1571_ViewedRefreshIsAdmittedFirst (3.00s)",
+    "    refresher_admission_1571_test.go:173: timed out after 3s waiting for: the viewed refresh waits for a core",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t3.671s",
+    "FAIL"
+   ]
+  },
+  {
+   "name": "wake-removed",
+   "arm": "TestAdmission1571_EveryCoreBusyParksUntilACustomerEnds$",
+   "rc": 1,
+   "seconds": 18.7,
+   "verdict": "KILLED",
+   "tail": [
+    "--- FAIL: TestAdmission1571_EveryCoreBusyParksUntilACustomerEnds (5.01s)",
+    "    refresher_admission_1571_test.go:146: a customer ended and the waiting refresh started 4.499158291s later: want within the wake (event), not a timer",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t5.703s",
+    "FAIL"
+   ]
+  },
+  {
+   "name": "poll-added-beside-the-wake",
+   "arm": "TestAdmission1571_EveryCoreBusyParksUntilACustomerEnds$",
+   "rc": 1,
+   "seconds": 13.9,
+   "verdict": "KILLED",
+   "tail": [
+    "--- FAIL: TestAdmission1571_EveryCoreBusyParksUntilACustomerEnds (0.50s)",
+    "    refresher_admission_1571_test.go:134: the waiting refresh re-read the customer signal 19 times in 500 ms with nothing changing: it polls (want event-woken)",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t1.236s",
+    "FAIL"
+   ]
+  },
+  {
+   "name": "viewed-classified-as-normal",
+   "arm": "TestAdmission1571_ViewedRefreshIsAdmittedFirst$",
+   "rc": 1,
+   "seconds": 16.5,
+   "verdict": "KILLED",
+   "tail": [
+    "--- FAIL: TestAdmission1571_ViewedRefreshIsAdmittedFirst (3.01s)",
+    "    refresher_admission_1571_test.go:183: timed out after 3s waiting for: both refreshes wait",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t3.709s",
+    "FAIL"
+   ]
+  },
+  {
+   "name": "cap-removed",
+   "arm": "TestAdmission1571_LeakingCounterReleasesAtTheCap$",
+   "rc": 1,
+   "seconds": 22.5,
+   "verdict": "KILLED",
+   "tail": [
+    "--- FAIL: TestAdmission1571_LeakingCounterReleasesAtTheCap (8.01s)",
+    "    refresher_admission_1571_test.go:218: timed out after 8s waiting for: the refresh proceeds at the cap",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t8.686s",
+    "FAIL"
+   ]
+  }
+ ],
+ "finished": "2026-11-22T08:03:23+0100"
+}

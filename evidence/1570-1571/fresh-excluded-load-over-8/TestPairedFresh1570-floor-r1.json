@@ -1,0 +1,290 @@
+{
+  "big": 50000,
+  "cold_per_s": 1,
+  "cust_errors": 0,
+  "fast_customers": 8,
+  "gap_ms": 3000,
+  "gomaxprocs": 4,
+  "ns": 50,
+  "phases": [
+    {
+      "churn_writes_per_s": 1.0142110070938517,
+      "completions_s": 2.836621410465616,
+      "cust_cold": {
+        "max_ms": 1200.992,
+        "n": 67,
+        "p50_ms": 277.503,
+        "p95_ms": 912.414,
+        "p99_ms": 1200.992
+      },
+      "cust_cold_rps": 1.0617521480513759,
+      "cust_fast": {
+        "max_ms": 53.354,
+        "n": 11865,
+        "p50_ms": 0.036,
+        "p95_ms": 0.275,
+        "p99_ms": 1.558
+      },
+      "cust_rps": 189.08696463505996,
+      "normal_wait": {
+        "mean_ms": 140.11971830985917,
+        "n": 142,
+        "share_le_100": 0.7464788732394366,
+        "share_le_1000": 0.9507042253521126,
+        "share_le_2000": 0.9929577464788732,
+        "share_le_5000": 1
+      },
+      "push": {
+        "max_ms": 1334.134,
+        "n": 20,
+        "p50_ms": 7.726,
+        "p95_ms": 457.286,
+        "p99_ms": 1334.134
+      },
+      "push_samples_ms": [
+        3.319,
+        245.966,
+        148.42,
+        1.736,
+        15.957,
+        371.413,
+        3.241,
+        3.849,
+        4.886,
+        255.118,
+        1334.134,
+        2.081,
+        7.726,
+        134.047,
+        3.123,
+        2.254,
+        33.82,
+        16.14,
+        457.286,
+        5.585
+      ],
+      "rate": 1,
+      "refetch_without_marker": 0,
+      "refresh_capped": 0,
+      "refresh_completed": 179,
+      "refresh_floored": 2,
+      "refresh_parked_s": 23.543,
+      "refresh_yielded": 56,
+      "samples": 20,
+      "unconverged": 0,
+      "viewed_completed": 37,
+      "viewed_duration": {
+        "mean_ms": 3.7567567567567566,
+        "n": 37,
+        "share_le_100": 1,
+        "share_le_1000": 1,
+        "share_le_2000": 1,
+        "share_le_5000": 1
+      },
+      "viewed_put_to_frame": {
+        "mean_ms": 11.27027027027027,
+        "n": 37,
+        "share_le_100": 0.972972972972973,
+        "share_le_1000": 1,
+        "share_le_2000": 1,
+        "share_le_5000": 1
+      },
+      "viewed_wait": {
+        "mean_ms": 140.86486486486487,
+        "n": 37,
+        "share_le_100": 0.7567567567567568,
+        "share_le_1000": 0.9459459459459459,
+        "share_le_2000": 0.972972972972973,
+        "share_le_5000": 1
+      },
+      "wall_s": 63.103239417
+    },
+    {
+      "churn_writes_per_s": 10.003808072862093,
+      "completions_s": 4.613886092843306,
+      "cust_cold": {
+        "max_ms": 2666.227,
+        "n": 60,
+        "p50_ms": 589.277,
+        "p95_ms": 2353.904,
+        "p99_ms": 2666.227
+      },
+      "cust_cold_rps": 0.8465846041914323,
+      "cust_fast": {
+        "max_ms": 87.834,
+        "n": 12512,
+        "p50_ms": 0.038,
+        "p95_ms": 0.332,
+        "p99_ms": 2.468
+      },
+      "cust_rps": 177.38769406491147,
+      "normal_wait": {
+        "mean_ms": 284.2255892255892,
+        "n": 297,
+        "share_le_100": 0.8720538720538721,
+        "share_le_1000": 0.9393939393939394,
+        "share_le_2000": 0.9393939393939394,
+        "share_le_5000": 0.9797979797979798
+      },
+      "push": {
+        "max_ms": 4567.443,
+        "n": 20,
+        "p50_ms": 9.11,
+        "p95_ms": 2610.975,
+        "p99_ms": 4567.443
+      },
+      "push_samples_ms": [
+        7.659,
+        10.671,
+        482.11,
+        3.766,
+        4567.443,
+        2610.975,
+        2284.09,
+        2.845,
+        18.564,
+        15.249,
+        7.224,
+        3.953,
+        528.854,
+        4.155,
+        9.11,
+        18.599,
+        2.491,
+        1.616,
+        5.595,
+        103.814
+      ],
+      "rate": 10,
+      "refetch_without_marker": 0,
+      "refresh_capped": 3,
+      "refresh_completed": 327,
+      "refresh_floored": 4,
+      "refresh_parked_s": 48.307,
+      "refresh_yielded": 41,
+      "samples": 20,
+      "unconverged": 0,
+      "viewed_completed": 30,
+      "viewed_duration": {
+        "mean_ms": 8.8,
+        "n": 30,
+        "share_le_100": 1,
+        "share_le_1000": 1,
+        "share_le_2000": 1,
+        "share_le_5000": 1
+      },
+      "viewed_put_to_frame": {
+        "mean_ms": 0,
+        "n": 20,
+        "share_le_100": 1,
+        "share_le_1000": 1,
+        "share_le_2000": 1,
+        "share_le_5000": 1
+      },
+      "viewed_wait": {
+        "mean_ms": 378.96666666666664,
+        "n": 30,
+        "share_le_100": 0.8,
+        "share_le_1000": 0.9,
+        "share_le_2000": 0.9,
+        "share_le_5000": 1
+      },
+      "wall_s": 70.873011041
+    },
+    {
+      "churn_writes_per_s": 50.01544921653577,
+      "completions_s": 21.455902852311,
+      "cust_cold": {
+        "max_ms": 766.128,
+        "n": 61,
+        "p50_ms": 285.929,
+        "p95_ms": 632.13,
+        "p99_ms": 766.128
+      },
+      "cust_cold_rps": 0.982590145638867,
+      "cust_fast": {
+        "max_ms": 19.134,
+        "n": 11971,
+        "p50_ms": 0.038,
+        "p95_ms": 0.175,
+        "p99_ms": 0.616
+      },
+      "cust_rps": 193.81187921847294,
+      "normal_wait": {
+        "mean_ms": 13.326416600159616,
+        "n": 1253,
+        "share_le_100": 0.9672785315243416,
+        "share_le_1000": 0.9992019154030327,
+        "share_le_2000": 1,
+        "share_le_5000": 1
+      },
+      "push": {
+        "max_ms": 1166.377,
+        "n": 20,
+        "p50_ms": 5.855,
+        "p95_ms": 338.776,
+        "p99_ms": 1166.377
+      },
+      "push_samples_ms": [
+        9.835,
+        2.475,
+        7.023,
+        338.776,
+        3.141,
+        3.864,
+        30.412,
+        27.089,
+        2.465,
+        2.33,
+        11.775,
+        7.805,
+        1166.377,
+        192.247,
+        2.184,
+        4.114,
+        5.855,
+        2.451,
+        3.922,
+        214.73
+      ],
+      "rate": 50,
+      "refetch_without_marker": 0,
+      "refresh_capped": 0,
+      "refresh_completed": 1332,
+      "refresh_floored": 36,
+      "refresh_parked_s": 12.932,
+      "refresh_yielded": 61,
+      "samples": 20,
+      "unconverged": 0,
+      "viewed_completed": 79,
+      "viewed_duration": {
+        "mean_ms": 4,
+        "n": 79,
+        "share_le_100": 1,
+        "share_le_1000": 1,
+        "share_le_2000": 1,
+        "share_le_5000": 1
+      },
+      "viewed_put_to_frame": {
+        "mean_ms": 40.285714285714285,
+        "n": 28,
+        "share_le_100": 0.8214285714285714,
+        "share_le_1000": 1,
+        "share_le_2000": 1,
+        "share_le_5000": 1
+      },
+      "viewed_wait": {
+        "mean_ms": 29.632911392405063,
+        "n": 79,
+        "share_le_100": 0.9367088607594937,
+        "share_le_1000": 0.9873417721518988,
+        "share_le_2000": 1,
+        "share_le_5000": 1
+      },
+      "wall_s": 62.080818
+    }
+  ],
+  "probe_items": 1000,
+  "seed": 1,
+  "think_ms": 40
+}
