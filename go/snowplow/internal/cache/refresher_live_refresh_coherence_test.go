@@ -417,7 +417,7 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 	// re-resolve to commit, then settle. #1570: the floor is the cell's own
 	// (the override when the arm pins one).
 	cur, _ := c.GetNoTouch(key)
-	floor := r.rateFloor(cur)
+	floor := r.rateFloor(cur, tierNormal)
 	settleDeadline := time.Now().Add(floor + 3*time.Second)
 	for time.Now().Before(settleDeadline) {
 		// Converged when the last commit is older than the floor (no pending

@@ -162,7 +162,7 @@ type refresher struct {
 	// two-tier discipline ensures cluster_list cells get fresh ahead of
 	// the long per-user tail under a CRUD storm.
 	//
-	// Customer-priority invariant PRESERVED — yieldToCustomer is called
+	// Customer-priority invariant PRESERVED — admitRefresh is called
 	// BEFORE the handler regardless of which queue the key was drawn from
 	// (see processNext below). The two-tier discipline is INSIDE
 	// processNext's source selection, ORTHOGONAL to the customer-yield
@@ -306,8 +306,8 @@ type refresher struct {
 
 	// Ship #98 / 0.30.215 — customer-priority yield falsifier counter.
 	// yieldedTotal ticks every time a worker spent at least one yield-poll
-	// parked in yieldToCustomer waiting for the customer-inflight signal
-	// to clear. cappedTotal ticks when yieldToCustomer hit
+	// parked in admitRefresh waiting for the customer-inflight signal
+	// to clear. cappedTotal ticks when admitRefresh hit
 	// refresherYieldMaxParked and proceeded anyway (the defense-in-depth
 	// bound). These two counters are the post-deploy mechanism-gate
 	// evidence: if yieldedTotal stays 0 under burst the hook is broken; if
@@ -342,7 +342,7 @@ type refresher struct {
 
 	// #386 M1 — streaming p95 of the REAL resolve latency: the registered
 	// re-resolve+Put handler fn() in processOne, timed ONLY on the ok=true path
-	// AFTER yieldToCustomer returns (so the dequeue, the customer-priority park,
+	// AFTER admitRefresh returns (so the dequeue, the customer-priority park,
 	// the skipped_no_entry/no_handler skips and the rate-floor defer never reach
 	// it). resolveLatencyMu serializes the P² estimator across the worker pool.
 	// The estimate is a DIAGNOSTIC sizing input (snowplow_resolve_latency_p95_ms,
@@ -358,7 +358,7 @@ type refresher struct {
 	dirty      sync.Map
 	dirtyStats *dirtyWindowStats
 
-	// #354 P3 (D) — wall time spent parked in yieldToCustomer, from the first
+	// #354 P3 (D) — wall time spent parked in admitRefresh, from the first
 	// park to release (a capped exit included), in nanoseconds; published as
 	// parked_ms.
 	parkedNanos atomic.Uint64
@@ -448,11 +448,26 @@ func refresherSingleton() *refresher {
 // landed within 2 s of its previous refresh waited out the rest of the 2 s
 // (median 0.9–1.8 s for the exposed samples; the p95 rank of list_dep@10).
 //
-// With the floor equal to the last refresh's own cost, a cell is re-resolved at
-// most once per twice its cost: one cell keeps at most HALF of one worker busy,
-// whatever it costs. An expensive cell (0.9–3 s) keeps the #321 collapse at its
-// own scale; a 15 ms cell is floored for about 15 ms. No constant and no env
-// knob: the bound is each cell's measured work.
+// THE BACKLOG IT WAITS BEHIND (#1570 v2, the split test on the build VM). With
+// the floor equal to the cost alone, an expensive cell under backlog was never
+// floored (its queue wait already exceeded its cost): the workers re-resolved
+// the expensive cells back to back while cheap cells waited behind them (normal
+// tier wait 55–67 ms → 1.7–1.8 s; cheap no-Put refreshes 21/s → 0.6/s). So the
+// cost is charged against the backlog of the side of the pool that serves the
+// cell:
+//
+//	floor = RefreshCost × max(1, K/S)
+//
+// S is the workers that side may hold (the #1069 reservation: viewed work and
+// unviewed work each at most parallelism−1, 1 with one worker); K is the keys
+// that side is serving now (its tiers' queued keys plus the keys in its
+// workers' hands), read at this dequeue (backlogShare). K keys share S workers,
+// so a cell that runs at most once per RefreshCost×K/S takes no more than its
+// equal share of worker time. With no backlog (K ≤ S) the floor is the cell's
+// own cost: one cell keeps at most HALF of one worker busy. A cheap cell's floor
+// scales with its tiny cost, so cheap cells are never held; an expensive one
+// backs off in proportion to the cells waiting behind it. No constant and no env
+// knob: the bound is each cell's measured work and the live backlog.
 //
 // A CELL WITH NO RECORDED TIME (RefreshCost 0: filled by a customer read, the
 // boot seed, a direct D2 refill or any other write that is not a timed refresh)
@@ -472,14 +487,40 @@ func refresherSingleton() *refresher {
 // The only other source is the TEST-ONLY fixed override
 // (SetRefresherRateFloorForTest), for arms that need a deterministic deferral
 // or none. Nothing in production sets it.
-func (r *refresher) rateFloor(entry *ResolvedEntry) time.Duration {
+func (r *refresher) rateFloor(entry *ResolvedEntry, tier refreshTier) time.Duration {
 	if d := refresherFloorOverride.Load(); d != nil {
 		return *d
 	}
-	if entry == nil {
+	if entry == nil || entry.RefreshCost <= 0 {
 		return 0
 	}
-	return entry.RefreshCost
+	k, s := r.backlogShare(tier)
+	if k <= s {
+		return entry.RefreshCost
+	}
+	return time.Duration(int64(entry.RefreshCost) * int64(k) / int64(s))
+}
+
+// backlogShare is the backlog of the side of the pool that serves tier: k keys
+// it is serving now (queued on its tiers plus held by its workers in a job) and
+// s workers it may hold. Read under priorityGetMu, where both are kept.
+func (r *refresher) backlogShare(tier refreshTier) (k, s int) {
+	r.priorityGetMu.Lock()
+	defer r.priorityGetMu.Unlock()
+	s = max(r.parallelism-1, 1)
+	if tier == tierViewed {
+		if r.viewedQueue != nil {
+			k = r.viewedQueue.Len()
+		}
+		return k + r.viewedActive, s
+	}
+	k = r.queue.Len()
+	if r.clusterListQueue != nil {
+		k += r.clusterListQueue.Len()
+	}
+	// unviewedActive counts the workers blocked in the normal Get too; those
+	// hold a slot but no key.
+	return k + r.unviewedActive - r.normalGetBlocked, s
 }
 
 // refresherFloorOverride is the TEST-ONLY fixed floor (SetRefresherRateFloorForTest).
@@ -1093,7 +1134,7 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		}
 		return true
 	}
-	if floor := r.rateFloor(entry); floor > 0 && ok && entry != nil {
+	if floor := r.rateFloor(entry, tier); floor > 0 && ok && entry != nil {
 		// #930 — the entry's age on the STORE clock, the one that stamped CreatedAt.
 		if elapsed := c.now().Sub(entry.CreatedAt); elapsed < floor {
 			// Floored: the entry's content is younger than the floor, so a
@@ -1458,7 +1499,7 @@ func (r *refresher) processOne(ctx context.Context, key string, entry *ResolvedE
 		return nil
 	}
 	// #386 M1 — time the REAL resolve (the handler fn) ONLY. We are past every
-	// skip early-return and past yieldToCustomer (called in processNext before
+	// skip early-return and past admitRefresh (called in processNext before
 	// us), so this measures resolve+Put work exclusively — never the dequeue, the
 	// customer-priority park, the skipped_no_entry/no_handler skips, or the
 	// rate-floor defer. Recorded for success AND failure: a failed re-resolve
@@ -1613,7 +1654,7 @@ func refresherQueueDepth(r *refresher) int64 {
 }
 
 // recordResolveLatency folds one REAL resolve's wall time into the p95 estimator
-// (#386 M1). Called once per fn() invocation in processOne — AFTER yieldToCustomer
+// (#386 M1). Called once per fn() invocation in processOne — AFTER admitRefresh
 // returned and ONLY on the ok=true real-resolve path, so park, dequeue, the skips
 // and the rate-floor defer never reach it. Serialized across the worker pool.
 func (r *refresher) recordResolveLatency(d time.Duration) {

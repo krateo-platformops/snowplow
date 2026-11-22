@@ -552,6 +552,7 @@ func TestReserve1069_R6_CustomerYieldParksBothTiers(t *testing.T) {
 			st["yielded"], st["viewed_dequeued"], p, p-1)
 	}
 	inflight.Store(false)
+	NoteCustomerDemandChanged() // #1571: the end is announced, as the production bracket does
 	waitFor(t, 5*time.Second, "every parked refresh ran after the customer ended", func() bool { return ran.Load() == p })
 	if viewedRan.Load() != 1 {
 		t.Fatalf("R6: the viewed key ran %d times, want 1", viewedRan.Load())

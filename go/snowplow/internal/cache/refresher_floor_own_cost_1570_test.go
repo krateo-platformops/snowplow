@@ -26,6 +26,7 @@ package cache
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -211,5 +212,155 @@ func TestRefresher1570_TerminalPutRecordsItsCost(t *testing.T) {
 	stored.Store(c.replaceIfGenRefresh(context.Background(), k2, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in2}, c.CaptureGen(k2)).Stored())
 	if e2, _ := c.GetNoTouch(k2); !stored.Load() || e2 == nil || e2.RefreshCost != 0 {
 		t.Fatalf("a terminal Put with no refresh cycle on its ctx must record no cost: stored=%v entry=%+v", stored.Load(), e2)
+	}
+}
+
+// ── #1570 v2: the floor charges the backlog of the side that serves the cell ──
+
+// TestRefresher1570_CheapCellsDoNotWaitBehindBackToBackExpensiveCells — v2 arm 1.
+// One unviewed worker (parallelism 2: one slot per side), six expensive cells
+// (100 ms each) and three cheap cells (~1 ms), all re-marked continuously. With
+// the cost-only floor the expensive cells are always due and the cheap cells
+// queue behind several of them (~0.5 s); with the backlog charged, the expensive
+// cells are parked long enough that a cheap cell waits at most about one
+// expensive refresh. The bound (2.5 × one expensive cost) comes from the arm's own
+// fake costs, never from a refresher counter.
+func TestRefresher1570_CheapCellsDoNotWaitBehindBackToBackExpensiveCells(t *testing.T) {
+	CompleteRBACSnapshotForTest(t)
+	cleanup := withCleanRefresher(t, 2, 0)
+	t.Cleanup(cleanup)
+	t.Cleanup(SetRefresherRateFloorForTest(""))
+	resetRefresherForTest()
+	c := ResolvedCache()
+	const expensiveCost = 100 * time.Millisecond
+	var exp, cheap []string
+	for i := 0; i < 6; i++ {
+		in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "exp-1570-" + string(rune('a'+i))}
+		k := ComputeKey(in)
+		putAgedEntry(c, k, &in)
+		exp = append(exp, k)
+	}
+	for i := 0; i < 3; i++ {
+		in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "cheap-1570-" + string(rune('a'+i))}
+		k := ComputeKey(in)
+		putAgedEntry(c, k, &in)
+		cheap = append(cheap, k)
+	}
+	isExp := map[string]bool{}
+	for _, k := range exp {
+		isExp[k] = true
+	}
+	// pending[k] is the earliest mark of k not yet served by a refresh start.
+	var mu sync.Mutex
+	pending := map[string]time.Time{}
+	var cheapWaits []time.Duration
+	RegisterRefreshFunc("widgets", func(ctx context.Context, k string, used ResolvedKeyInputs) error {
+		now := time.Now()
+		mu.Lock()
+		if t0, ok := pending[k]; ok {
+			if !isExp[k] {
+				cheapWaits = append(cheapWaits, now.Sub(t0))
+			}
+			delete(pending, k)
+		}
+		mu.Unlock()
+		gen := c.CaptureGen(k)
+		rctx := WithL1KeyContext(ctx, k)
+		if isExp[k] {
+			time.Sleep(expensiveCost)
+		} else {
+			time.Sleep(time.Millisecond)
+		}
+		c.replaceIfGenRefresh(rctx, k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used}, gen)
+		return nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartRefresher(ctx)
+	mark := func(k string) {
+		mu.Lock()
+		if _, ok := pending[k]; !ok {
+			pending[k] = time.Now()
+		}
+		mu.Unlock()
+		enqueueRefreshForTest(k)
+	}
+	stop := time.Now().Add(4 * time.Second)
+	for time.Now().Before(stop) {
+		for _, k := range exp {
+			mark(k)
+		}
+		for _, k := range cheap {
+			mark(k)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	mu.Lock()
+	ws := append([]time.Duration(nil), cheapWaits...)
+	mu.Unlock()
+	if len(ws) < 10 {
+		t.Fatalf("SETUP: only %d cheap refreshes in 4 s", len(ws))
+	}
+	sort.Slice(ws, func(i, j int) bool { return ws[i] < ws[j] })
+	p90 := ws[len(ws)*9/10]
+	if bound := expensiveCost * 5 / 2; p90 > bound {
+		t.Fatalf("cheap cells waited p90 %v (median %v, n=%d) behind the expensive ones: want ≤ %v "+
+			"(the expensive cells re-resolve back to back; the backlog is not charged)", p90, ws[len(ws)/2], len(ws), bound)
+	}
+	t.Logf("GREEN: cheap-cell wait p50 %v p90 %v (n=%d) beside 6 expensive cells on one worker", ws[len(ws)/2], p90, len(ws))
+}
+
+// TestRefresher1570_ViewedCellIsNotFlooredByTheUnviewedBacklog — v2 arm 2. A
+// viewed cell whose refresh costs 40 ms is re-marked 60 ms after its refresh
+// while the unviewed side carries a deep backlog: its floor is its own cost (its
+// side is not backlogged), so it re-resolves at once. Counting K over both sides
+// would floor it by 40 ms × (backlog / slots), hundreds of ms.
+func TestRefresher1570_ViewedCellIsNotFlooredByTheUnviewedBacklog(t *testing.T) {
+	CompleteRBACSnapshotForTest(t)
+	terminalEnv(t)
+	cleanup := withCleanRefresher(t, 4, 0)
+	t.Cleanup(cleanup)
+	t.Cleanup(SetRefresherRateFloorForTest(""))
+	_, keys := terminalFixtureNoReset(t, 41)
+	viewed, backlog := keys[0], keys[1:]
+	viewed765Arm(t, viewed)
+	var mu sync.Mutex
+	starts := []time.Time{}
+	release := make(chan struct{})
+	t.Cleanup(sync.OnceFunc(func() { close(release) }))
+	c := ResolvedCache()
+	RegisterRefreshFunc("widgets", func(ctx context.Context, k string, used ResolvedKeyInputs) error {
+		if k != viewed {
+			<-release // the unviewed backlog: its workers stay busy, its queue deep
+			return nil
+		}
+		mu.Lock()
+		starts = append(starts, time.Now())
+		mu.Unlock()
+		gen := c.CaptureGen(k)
+		rctx := WithL1KeyContext(ctx, k)
+		time.Sleep(40 * time.Millisecond)
+		c.replaceIfGenRefresh(rctx, k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &used}, gen)
+		return nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartRefresher(ctx)
+	terminalMark(backlog)
+	terminalMark([]string{viewed})
+	waitFor(t, 3*time.Second, "the viewed cell's first refresh", func() bool { mu.Lock(); defer mu.Unlock(); return len(starts) == 1 })
+	if k, s := refresherSingleton().backlogShare(tierNormal); k <= 3*s {
+		t.Fatalf("SETUP: the unviewed side must be deeply backlogged, got k=%d s=%d", k, s)
+	}
+	time.Sleep(100 * time.Millisecond) // the refresh (40 ms) ended ~60 ms ago
+	marked := time.Now()
+	terminalMark([]string{viewed})
+	waitFor(t, 3*time.Second, "the viewed cell's second refresh", func() bool { mu.Lock(); defer mu.Unlock(); return len(starts) == 2 })
+	mu.Lock()
+	lat := starts[1].Sub(marked)
+	mu.Unlock()
+	if lat > 100*time.Millisecond {
+		t.Fatalf("a viewed cell re-marked after its own 40 ms floor waited %v: the unviewed side's backlog floored it", lat)
 	}
 }
