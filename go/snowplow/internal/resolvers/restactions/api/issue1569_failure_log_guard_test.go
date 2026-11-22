@@ -42,6 +42,7 @@ var failureLogGuardAllowed = map[string]string{
 	"resolvers/restactions/api/cluster_list_prewarm.go|cluster_list.prewarm.timeout":                                           "a prewarm pass's operation, not a cell's resolve",
 	"resolvers/restactions/api/endpoints_tls_233.go|endpoints_tls.unparseable_ca_delegated":                                    "the endpoint's TLS-CA configuration line, logged where the transport is built, not a cell's failure",
 	"resolvers/widgets/resourcesrefs/failed.go|resource ref failed; it is a failure entry in status.resourcesRefs":             "origin-gated (#563): WARN only on the serve origin, Debug for every background driver",
+	"resolvers/crds/schema/schema_fill.go|schema: SA discovery singleton unavailable; falling back to per-call client":         "the ServiceAccount discovery client's construction falling back: a transport line, not a cell's failure (the read itself still runs, and fails through the cell's own lines)",
 	"resolvers/widgets/resourcesrefs/resolve.go|resource ref action not allowed":                                               "origin-gated (#563): WARN only on the serve origin, Debug for every background driver",
 }
 
@@ -69,13 +70,32 @@ func isFixedFailureLevel(e ast.Expr) bool {
 	return ok && id.Name == "slog" && (sel.Sel.Name == "LevelWarn" || sel.Sel.Name == "LevelError")
 }
 
+// literalMessage is the message a call writes when it is a string literal, or a
+// concatenation of literals; anything else is "<non-literal>".
 func literalMessage(e ast.Expr) string {
-	if bl, ok := e.(*ast.BasicLit); ok && bl.Kind == token.STRING {
-		if s, err := strconv.Unquote(bl.Value); err == nil {
-			return s
-		}
+	if s, ok := literalString(e); ok {
+		return s
 	}
 	return "<non-literal>"
+}
+
+func literalString(e ast.Expr) (string, bool) {
+	switch v := e.(type) {
+	case *ast.BasicLit:
+		if v.Kind == token.STRING {
+			s, err := strconv.Unquote(v.Value)
+			return s, err == nil
+		}
+	case *ast.BinaryExpr:
+		if v.Op == token.ADD {
+			l, lok := literalString(v.X)
+			r, rok := literalString(v.Y)
+			return l + r, lok && rok
+		}
+	case *ast.ParenExpr:
+		return literalString(v.X)
+	}
+	return "", false
 }
 
 // scanFixedLevelLogCalls returns the fixed-level log calls in file.
@@ -184,6 +204,8 @@ func f(ctx context.Context, log *slog.Logger, err error) {
 	log.Warn("raw-4", slog.Any("err", err))
 	log.Log(ctx, slog.LevelError, "raw-5")
 	log.LogAttrs(ctx, slog.LevelWarn, "raw-6")
+	slog.WarnContext(ctx, "raw-"+
+		"7")
 	log.Log(ctx, FailureLevelOf(ctx, slog.LevelError, "t", err), "routed")
 	log.Debug("debug")
 	_ = err.Error()
@@ -197,7 +219,7 @@ func f(ctx context.Context, log *slog.Logger, err error) {
 	for _, fd := range scanFixedLevelLogCalls(fset, f, "x.go") {
 		got[fd.msg] = true
 	}
-	for _, want := range []string{"raw-1", "raw-2", "raw-3", "raw-4", "raw-5", "raw-6"} {
+	for _, want := range []string{"raw-1", "raw-2", "raw-3", "raw-4", "raw-5", "raw-6", "raw-7"} {
 		if !got[want] {
 			t.Errorf("#1569 guard RED: the raw line %q was not found (found %v)", want, got)
 		}

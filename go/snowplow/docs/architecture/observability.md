@@ -1665,7 +1665,8 @@ The guard `TestIssue1569_EveryFailureLineOnTheResolvePathGoesThroughTheRound`
 (`internal/resolvers/restactions/api`) fails on any fixed-level Warn/Error log call there. Its
 allow-list holds the lines that are not a cell's failure, each with its reason: the stale-debt
 ledger's overdue alarms, the `*.slow` latency lines, recovered panics, the cluster-list prewarm
-pass's skipped/timeout lines, the endpoint TLS-CA line, and the two resourcesRefs lines that are
+pass's skipped/timeout lines, the endpoint TLS-CA line, the schema validator's ServiceAccount
+discovery-client fallback, and the two resourcesRefs lines that are
 already origin-gated (#563: Warn on the serve origin, Debug for background drivers).
 
 **A resolve served by replay (#1569).** The refresher's RESTAction-resolve memo (#598) serves
