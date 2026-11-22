@@ -1,0 +1,12 @@
+diff --git a/go/snowplow/internal/cache/refresher.go b/go/snowplow/internal/cache/refresher.go
+--- a/go/snowplow/internal/cache/refresher.go
++++ b/go/snowplow/internal/cache/refresher.go
+@@ -530,7 +530,7 @@
+ 	if k <= s {
+ 		return entry.RefreshCost
+ 	}
+-	return time.Duration(int64(entry.RefreshCost) * int64(k) / int64(s))
++	return entry.RefreshCost // MUTANT
+ }
+ 
+ // backlogShare is the backlog of the side of the pool that serves tier: k keys

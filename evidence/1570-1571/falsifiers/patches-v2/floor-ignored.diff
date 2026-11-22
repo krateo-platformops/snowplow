@@ -1,0 +1,12 @@
+diff --git a/go/snowplow/internal/cache/refresher.go b/go/snowplow/internal/cache/refresher.go
+--- a/go/snowplow/internal/cache/refresher.go
++++ b/go/snowplow/internal/cache/refresher.go
+@@ -1224,7 +1224,7 @@
+ 		}
+ 		return true
+ 	}
+-	if floor := r.rateFloor(entry, tier); floor > 0 && ok && entry != nil {
++	if floor := r.rateFloor(entry, tier); false && floor > 0 && ok && entry != nil { // MUTANT
+ 		// #930 — the entry's age on the STORE clock, the one that stamped CreatedAt.
+ 		if elapsed := c.now().Sub(entry.CreatedAt); elapsed < floor {
+ 			// Floored: the entry's content is younger than the floor, so a

@@ -1,0 +1,11 @@
+diff --git a/go/snowplow/internal/cache/refresher.go b/go/snowplow/internal/cache/refresher.go
+--- a/go/snowplow/internal/cache/refresher.go
++++ b/go/snowplow/internal/cache/refresher.go
+@@ -523,6 +523,7 @@
+ 	if d := refresherFloorOverride.Load(); d != nil {
+ 		return *d
+ 	}
++	return 2 * time.Second // MUTANT
+ 	if entry == nil || entry.RefreshCost <= 0 {
+ 		return 0
+ 	}

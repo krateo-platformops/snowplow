@@ -1,0 +1,106 @@
+{
+ "sha": "67b2bff0c1ef594f23da7a609d65913505f58089",
+ "started_utc": "2026-11-22T16:39:58Z",
+ "mutants": [
+  {
+   "name": "unmutated",
+   "run": "TestRefresher1570",
+   "verdict": "PASS",
+   "lines": [
+    "MUTANT_LINES=internal/cache/refresher.go:0 internal/cache/resolved.go:0",
+    "    refresher_floor_own_cost_1570_test.go:134: GREEN: 544 marks \u2192 7 refreshes of a 250ms cell; floored_total=270",
+    "--- PASS: TestRefresher1570_ExpensiveCellKeepsCoalescing (3.27s)",
+    "--- PASS: TestRefresher1570_CheapCellIsNotFlooredTwoSeconds (0.12s)",
+    "--- PASS: TestRefresher1570_UnmeasuredCellFirstRefreshRunsAtOnce (0.01s)",
+    "--- PASS: TestRefresher1570_TerminalPutRecordsItsCost (0.13s)",
+    "    refresher_floor_own_cost_1570_test.go:311: GREEN: cheap-cell wait p50 84.825767ms p90 189.187048ms (n=117) beside 6 expensive cells on one worker",
+    "--- PASS: TestRefresher1570_CheapCellsDoNotWaitBehindBackToBackExpensiveCells (4.64s)",
+    "--- PASS: TestRefresher1570_ViewedCellIsNotFlooredByTheUnviewedBacklog (0.16s)",
+    "ok  \tgithub.com/krateo-platformops/snowplow/internal/cache\t9.461s"
+   ]
+  },
+  {
+   "name": "floor-ignored",
+   "run": "TestRefresher1570_ExpensiveCellKeepsCoalescing$",
+   "verdict": "KILLED",
+   "lines": [
+    "MUTANT_LINES=internal/cache/refresher.go:1 internal/cache/resolved.go:0",
+    "    refresher_floor_own_cost_1570_test.go:125: refresh 1 started 250.936895ms after refresh 0, whose run took 250.848665ms: want \u2265 2\u00d7cost = 501.69733ms (the cell's own floor did not hold; 574 marks, 13 refreshes)",
+    "--- FAIL: TestRefresher1570_ExpensiveCellKeepsCoalescing (3.27s)",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t3.364s",
+    "FAIL"
+   ]
+  },
+  {
+   "name": "fixed-2s-floor",
+   "run": "TestRefresher1570_(CheapCellIsNotFlooredTwoSeconds|UnmeasuredCellFirstRefreshRunsAtOnce)$",
+   "verdict": "KILLED",
+   "lines": [
+    "MUTANT_LINES=internal/cache/refresher.go:1 internal/cache/resolved.go:0",
+    "    refresher_floor_own_cost_1570_test.go:158: a ~1 ms cell re-marked 100 ms after its refresh waited 1.891731494s to re-resolve: it was floored by something other than its own cost (want \u226a 1 s)",
+    "--- FAIL: TestRefresher1570_CheapCellIsNotFlooredTwoSeconds (2.01s)",
+    "    refresher_floor_own_cost_1570_test.go:183: the first refresh of a cell with no recorded cost waited 2.000931775s: want at once (no invented floor)",
+    "--- FAIL: TestRefresher1570_UnmeasuredCellFirstRefreshRunsAtOnce (2.01s)",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t4.112s",
+    "FAIL"
+   ]
+  },
+  {
+   "name": "unknown-cost-gets-a-fixed-floor",
+   "run": "TestRefresher1570_UnmeasuredCellFirstRefreshRunsAtOnce$",
+   "verdict": "KILLED",
+   "lines": [
+    "MUTANT_LINES=internal/cache/refresher.go:1 internal/cache/resolved.go:0",
+    "    refresher_floor_own_cost_1570_test.go:183: the first refresh of a cell with no recorded cost waited 2.000440761s: want at once (no invented floor)",
+    "--- FAIL: TestRefresher1570_UnmeasuredCellFirstRefreshRunsAtOnce (2.01s)",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t2.104s",
+    "FAIL"
+   ]
+  },
+  {
+   "name": "cost-not-recorded",
+   "run": "TestRefresher1570_(TerminalPutRecordsItsCost|ExpensiveCellKeepsCoalescing)$",
+   "verdict": "KILLED",
+   "lines": [
+    "MUTANT_LINES=internal/cache/refresher.go:0 internal/cache/resolved.go:1",
+    "    refresher_floor_own_cost_1570_test.go:125: refresh 1 started 250.488571ms after refresh 0, whose run took 250.397679ms: want \u2265 2\u00d7cost = 500.795358ms (the cell's own floor did not hold; 579 marks, 13 refreshes)",
+    "--- FAIL: TestRefresher1570_ExpensiveCellKeepsCoalescing (3.27s)",
+    "    refresher_floor_own_cost_1570_test.go:205: RefreshCost = 0s, want within [60ms, 110.166124ms] (the fake slept 60ms; its run took 60.166124ms)",
+    "--- FAIL: TestRefresher1570_TerminalPutRecordsItsCost (0.06s)",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t3.447s",
+    "FAIL"
+   ]
+  },
+  {
+   "name": "backlog-factor-removed",
+   "run": "TestRefresher1570_CheapCellsDoNotWaitBehindBackToBackExpensiveCells$",
+   "verdict": "KILLED",
+   "lines": [
+    "MUTANT_LINES=internal/cache/refresher.go:1 internal/cache/resolved.go:0",
+    "    refresher_floor_own_cost_1570_test.go:308: cheap cells waited p90 604.895263ms (median 598.906054ms, n=18) behind the expensive ones: want \u2264 250ms (the expensive cells re-resolve back to back; the backlog is not charged)",
+    "--- FAIL: TestRefresher1570_CheapCellsDoNotWaitBehindBackToBackExpensiveCells (4.66s)",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t4.746s",
+    "FAIL"
+   ]
+  },
+  {
+   "name": "sides-not-separated",
+   "run": "TestRefresher1570_ViewedCellIsNotFlooredByTheUnviewedBacklog$",
+   "verdict": "KILLED",
+   "lines": [
+    "MUTANT_LINES=internal/cache/refresher.go:1 internal/cache/resolved.go:0",
+    "    refresher_floor_own_cost_1570_test.go:364: a viewed cell re-marked after its own 40 ms floor waited 469.506423ms: the unviewed side's backlog floored it",
+    "--- FAIL: TestRefresher1570_ViewedCellIsNotFlooredByTheUnviewedBacklog (0.62s)",
+    "FAIL",
+    "FAIL\tgithub.com/krateo-platformops/snowplow/internal/cache\t0.714s",
+    "FAIL"
+   ]
+  }
+ ],
+ "finished_utc": "2026-11-22T16:43:57Z"
+}

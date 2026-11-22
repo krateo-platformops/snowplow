@@ -1,0 +1,12 @@
+diff --git a/go/snowplow/internal/cache/resolved.go b/go/snowplow/internal/cache/resolved.go
+--- a/go/snowplow/internal/cache/resolved.go
++++ b/go/snowplow/internal/cache/resolved.go
+@@ -2053,7 +2053,7 @@
+ 	// refresh-cycle clock that timed its start: the cell's next rate floor. A Put
+ 	// whose ctx carries no refresher timing (a direct refill) records none.
+ 	if rc := refreshCycleFor(ctx, key); rc != nil {
+-		entry.RefreshCost = max(windowNow().Sub(rc.startedAt), 0)
++		_ = rc // MUTANT
+ 	}
+ 	bytes, extrasHash := c.putPreamble(ctx, entry)
+ 	// #1070 — ONE byte compare of the refresh Put against the resident prior,

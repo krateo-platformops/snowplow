@@ -119,6 +119,11 @@ All 42 runs ran alone, with no timeouts and no excluded rounds. The runner bound
 - `scripts/check_*.sh` (11) at 18335423: all rc 0.
 - PR #1579 CI green at 9cc3d968, which adds only comments and docs over 18335423.
 
-## NOT RUN (at this commit)
+## B v2 gates at the PR head `67b2bff0c1ef594f23da7a609d65913505f58089` — RUN on the build VM
 
-- B's PR: B v2 misses bars 2 and 3 and is held for the owner's ruling.
+The head differs from the measured `54712753` by one doc row.
+
+- **Falsifiers** (`falsifiers/falsify-b-v2.out.json`, patches in `falsifiers/patches-v2/`): the unmutated arms PASS, and all 6 mutants are KILLED by assertions: floor ignored, fixed 2 s floor, unknown cost given a fixed floor, cost not recorded, backlog factor removed, sides not separated.
+- **Full unit suite** (`-race -tags=unit -p 8 ./...`): 52 packages ok. All 11 `scripts/check_*.sh`: rc 0.
+- **`TestIssue1458`:** failed under VM load on 54712753 and passes when quiet on both B and main. Filed as #1580.
+- **Owner ruling 2026-11-22: "Ship B v2 with A".** Bars 2 and 3 are waived.

@@ -1,0 +1,12 @@
+diff --git a/go/snowplow/internal/cache/refresher.go b/go/snowplow/internal/cache/refresher.go
+--- a/go/snowplow/internal/cache/refresher.go
++++ b/go/snowplow/internal/cache/refresher.go
+@@ -524,7 +524,7 @@
+ 		return *d
+ 	}
+ 	if entry == nil || entry.RefreshCost <= 0 {
+-		return 0
++		return 2 * time.Second // MUTANT
+ 	}
+ 	k, s := r.backlogShare(tier)
+ 	if k <= s {
