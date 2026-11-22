@@ -17,7 +17,11 @@
 //     customers + running < GOMAXPROCS (runtime.GOMAXPROCS(0), read at each
 //     admission; no constant). Customers that hold every core park all
 //     refresher work, as before; customers that leave cores free no longer
-//     freeze a refresh.
+//     freeze a refresh. BEHAVIOUR CHANGE: running refreshes count against the
+//     cores too, so with GOMAXPROCS below the refresher's parallelism (4
+//     workers) refresh concurrency is capped at GOMAXPROCS even with no
+//     customer in flight. The chart's CPU limit is 4 (GOMAXPROCS 4: the cap
+//     equals the pool), so it bites only on a pod given fewer than 4 CPUs.
 //   - EVENT-WOKEN. A waiting refresh re-checks only when something it depends
 //     on changed: a customer request ended (NoteCustomerDemandChanged, called by
 //     the dispatchers' bracket), an admitted refresh released its core, or a
