@@ -66,17 +66,24 @@ def test_a_declaration_the_bench_cannot_honour_is_refused(text, why):
     assert p.returncode == 2 and f"refusing: SNOWPLOW_ENV" in p.stderr and why in p.stderr
 
 
+#: krateo-057's recorded snowplow env switch (#1572, copied since installer 0.3.700 lets the bench give the
+#: node-local OTLP agent its snowplow pool, #1575): it rides beside every declaration, and no declaration names it
+OTEL = {"OTEL_LOGS_ENABLED": "true"}
+
+
 def test_the_values_carry_the_declaration_and_nothing_changes_without_one():
     plain = installer_values.document("1.12.70")
-    assert installer_values.document("1.12.70", "", {}) == plain and "env:" not in plain
-    doc = installer_values.document("1.12.70", "1.8.41", {"GOGC": "100", "GOMEMLIMIT": "7GiB"})
     import yaml
+    assert installer_values.document("1.12.70", "", {}) == plain
+    assert yaml.safe_load(plain)["componentValues"]["snowplow"]["env"] == OTEL      # 057's switch alone, no Go key
+    doc = installer_values.document("1.12.70", "1.8.41", {"GOGC": "100", "GOMEMLIMIT": "7GiB"})
     v = yaml.safe_load(doc)
-    assert v["componentValues"]["snowplow"]["env"] == {"GOGC": "100", "GOMEMLIMIT": "7GiB"}     # strings
+    assert v["componentValues"]["snowplow"]["env"] == {"GOGC": "100", "GOMEMLIMIT": "7GiB", **OTEL}     # strings
     assert v["componentValues"]["snowplow"]["image"]["tag"] == "1.12.70"
     assert v["componentValues"]["frontend"]["image"]["tag"] == "1.8.41"
     without = yaml.safe_load(installer_values.document("1.12.70", "1.8.41"))
-    del v["componentValues"]["snowplow"]["env"]
+    for k in ("GOGC", "GOMEMLIMIT"):
+        del v["componentValues"]["snowplow"]["env"][k]
     assert v == without                                           # the declaration adds its keys, only
 
 
@@ -106,14 +113,15 @@ def _render(pulled, tmp, declared, in_values=None):
 @needs_helm
 def test_the_recorded_installer_renders_the_override_and_its_own_50_without_one(pulled, tmp_path):
     p, rec = _render(pulled, tmp_path, "GOGC=100")
-    assert p.returncode == 0 and rec["ok"] is True and rec["rendered"] == {"GOGC": "100"}, p.stdout + p.stderr
-    assert 'rendered: componentValues.snowplow.env of the Installer CR the chart applies: {"GOGC": "100"}' in p.stdout
+    assert p.returncode == 0 and rec["ok"] is True and rec["rendered"] == {"GOGC": "100", **OTEL}, p.stdout + p.stderr
+    assert ('rendered: componentValues.snowplow.env of the Installer CR the chart applies: '
+            '{"GOGC": "100", "OTEL_LOGS_ENABLED": "true"}') in p.stdout
     p, rec = _render(pulled, tmp_path, "GOGC=50")
-    assert p.returncode == 0 and rec["rendered"] == {"GOGC": "50"}
+    assert p.returncode == 0 and rec["rendered"] == {"GOGC": "50", **OTEL}
     # the negative: with no declaration the installer's own default is what a fresh install gets,
     # which is why a run cannot "unset" the key and must declare 100 to get the Go default
     p, rec = _render(pulled, tmp_path, "")
-    assert p.returncode == 0 and rec["rendered"] == {"GOGC": "50"} and rec["declared"] == {}
+    assert p.returncode == 0 and rec["rendered"] == {"GOGC": "50", **OTEL} and rec["declared"] == {}
 
 
 @needs_helm
@@ -538,8 +546,8 @@ def test_run606_installs_the_declaration_and_proves_it_from_the_pod_before_load(
     assert p.returncode == 0 and "run complete" in log, log[-3000:]
     import yaml
     vals = yaml.safe_load((out / "installer-values.yaml").read_text())
-    assert vals["componentValues"]["snowplow"]["env"] == {"GOGC": "100"}
-    assert json.loads((out / "snowplow-env-render.json").read_text())["rendered"] == {"GOGC": "100"}
+    assert vals["componentValues"]["snowplow"]["env"] == {"GOGC": "100", **OTEL}
+    assert json.loads((out / "snowplow-env-render.json").read_text())["rendered"] == {"GOGC": "100", **OTEL}
     rec = json.loads((out / "snowplow-env.json").read_text())
     assert rec["verified"] is True and rec["declared"] == {"GOGC": "100"}
     assert rec["observed"]["GOGC"] == {"state": "set", "value": "100", "from": rec["observed"]["GOGC"]["from"]}
@@ -599,7 +607,7 @@ def test_the_rehearsal_installs_reads_the_pod_prints_one_block_and_tears_down_wi
                  "cluster operations: readable; control CREATE_CLUSTER operation-",
                  "CREATE_NODE_POOL on nodePool/snowplow", "UPDATE_CLUSTER ",
                  'snowplow env, rendered by the installer chart: as declared: componentValues.snowplow.env of the '
-                 'Installer CR the chart applies: {"GOGC": "100"}',
+                 'Installer CR the chart applies: {"GOGC": "100", "OTEL_LOGS_ENABLED": "true"}',
                  "the snowplow process's effective GC settings, read before any load (/debug/vars snowplow_go_runtime, "
                  "as the bench's debug reader): GOGC 100, memory limit 7.00 GiB (7516192768 bytes) (source cgroup_v2; the "
                  "container's limit 8.00 GiB (8589934592 bytes)); raw: {",

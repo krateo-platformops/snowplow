@@ -1904,7 +1904,13 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
             # #1572: every componentValues path the bench writes from 057's component-values record
             # (bench/installer_component_values_057.json), declared, as installer 0.3.697's schema declares them
             cv = {"portal": {"type": "object", "additionalProperties": False, "properties": props}}
-            for path in sorted(json.load(open("@@CV_RECORD@@"))["recorded"]):
+            # #1575: and the schema facts the record keeps, as its installer's schema has them (installer 0.3.700
+            # declares the collector agent's tolerations); FAKE_INSTALLER_SCHEMA=no-agent-tolerations: a chart
+            # without them (0.3.698 and before)
+            cvr = json.load(open("@@CV_RECORD@@"))
+            facts = [p for p, declared in sorted(cvr["installer_schema"].items())
+                     if declared and schema != "no-agent-tolerations"]
+            for path in sorted(cvr["recorded"]) + facts:
                 node, segs = cv, path.split(".")
                 for seg in segs[:-1]:
                     node = node.setdefault(seg, {"type": "object"}).setdefault("properties", {})

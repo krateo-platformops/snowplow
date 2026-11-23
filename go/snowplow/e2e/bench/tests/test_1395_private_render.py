@@ -60,9 +60,10 @@ AT_0_3_545 = {
 }
 # installer 0.3.616's: the same, plus kagent's per-user tool server (installer #829), behind a comment
 AT_0_3_616 = {**AT_0_3_545, "kagent": [["perUserRbac", "toolImagePullSecrets"]]}
-# installer 0.3.698's (the record's, #1575): the same, plus zendesk-kog's wrapper plugin (behind a comment too)
+# installer 0.3.698's: the same, plus zendesk-kog's wrapper plugin (behind a comment too); 0.3.700's (the record's, #1575): the same
 AT_0_3_698 = {**AT_0_3_616, "zendesk-kog": [["plugin", "imagePullSecrets"]]}
-AT_RECORDED = {"0.3.698": AT_0_3_698}[RECORDED]
+AT_0_3_700 = dict(AT_0_3_698)
+AT_RECORDED = {"0.3.700": AT_0_3_700}[RECORDED]
 
 
 def _values(snowplow_tag="1.12.69", frontend_tag="1.8.41", **over) -> dict:
@@ -289,6 +290,10 @@ def test_the_values_are_the_heredocs_byte_for_byte(tmp_path, snowplow, frontend,
     block = got[c:j]
     assert all(ln.startswith("#") for ln in block[:block.index("componentValues:\n")].splitlines())
     own = {**yaml.safe_load(want)["componentValues"], "portal": {"readerGroups": [rbac_model.BASE_GROUP]}}
+    if icv.receiver_on_snowplow_node():
+        # #1575: the bench's own topology, where the installer can express it: the node-local OTLP agent
+        # tolerates the snowplow pool, with the toleration the heredoc gave snowplow
+        own["otel-collector-daemonset"] = {"opentelemetry-collector": {"tolerations": own["snowplow"]["tolerations"]}}
     assert yaml.safe_load(block)["componentValues"] == icv.merge(icv.nest(icv.bench_paths()), own)
     out = tmp_path / "v.yaml"
     assert installer_values.main(["--snowplow-tag", snowplow, "--frontend-tag", frontend, "--out", str(out)]) == 0
@@ -482,7 +487,7 @@ def test_the_bench_enable_rule_is_the_installers(tmp_path, snowplow):
         return {d["metadata"]["name"] for d in _render(chart, values, "--show-only", "templates/definitions.yaml")
                 if d.get("kind") == "CompositionDefinition"}
     pins = yaml.safe_load((root / "files" / "component-pins.min.yaml").read_text())
-    # installer 0.3.698's files/component-pins.min.yaml, its entries with alsoFeatures
+    # installer 0.3.700's files/component-pins.min.yaml (as 0.3.698's), its entries with alsoFeatures
     assert [(c["name"], c["alsoFeatures"]) for c in pins["components"] if c.get("alsoFeatures")] == [
         ("cert-manager", ["internalTls"]), ("cert-manager-issuers", ["internalTls"]),
         ("cloudnative-pg", ["cloudnativePg"]), ("external-secrets", ["serviceDesk"])]

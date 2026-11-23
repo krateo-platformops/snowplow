@@ -1,10 +1,10 @@
 {
  "kind": "installer_component_values_057",
  "read": {
-  "date": "2026-11-22",
-  "installer_version": "0.3.698",
+  "date": "2026-11-23",
+  "installer_version": "0.3.700",
   "object": "installers.composition.krateo.io (the one Installer CR), spec.componentValues",
-  "rule": "switches and sizes by installer 0.3.698's values schema; every other path by path and reason only, never its value"
+  "rule": "switches and sizes by installer 0.3.700's values schema; every other path by path and reason only, never its value"
  },
  "recorded": {
   "agentgateway-policies.cors.allowCredentials": false,
@@ -84,9 +84,6 @@
   "agentgateway-policies.llm.gemini.auth.secretRef.name": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
   "agentgateway-policies.llm.limits.tokensPerMinute": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
   "agentgateway-policies.llm.provider": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
-  "agentgateway-policies.llm.retry.attempts": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
-  "agentgateway-policies.llm.retry.backoff": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
-  "agentgateway-policies.llm.retry.codes": "a list (neither a switch nor a size)",
   "agentgateway-policies.tracing.platform.filter": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
   "agentgateway-policies.uiTokenHop.impersonation.defaultUser": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
   "agentgateway.controllerName": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)",
@@ -203,6 +200,6 @@
   "zendesk-organisations.zendesk.baseUrl": "neither a switch nor a size (the owner's ruling, 2026-11-22: switches and sizes are recorded)"
  },
  "installer_schema": {
-  "otel-collector-daemonset.opentelemetry-collector.tolerations": false
+  "otel-collector-daemonset.opentelemetry-collector.tolerations": true
  }
 }

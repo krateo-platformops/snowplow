@@ -2,7 +2,7 @@
 (bench/installer_component_values.py; the owner's ruling, 2026-11-22: "Switches + sizes, recorded").
 
 Each check has its falsifier: break the derivation and the test fails.
-  - the committed record IS the reading of 2026-11-22 (its sha256 and counts): a hand edit fails;
+  - the committed record IS the reading of 2026-11-23 (its sha256 and counts): a hand edit fails;
   - what is recorded is decided by the installer's schema: a switch, a size; every other path is named
     with why, never its value, and nothing under an undeclared key (a user's name) is ever stored;
   - the values carry every recorded switch and size but the named deviations, under the bench's own;
@@ -23,7 +23,7 @@ import yaml
 from bench import installer_component_values as icv
 from bench import installer_features, installer_values
 
-# the reading of 2026-11-22 (installer 0.3.698): the record's bytes, and what the owner's ruling turns on
+# the reading of 2026-11-23 (installer 0.3.700): the record's bytes, and what the owner's ruling turns on
 KAGENT_SWITCHES = {"kagent.perUserRbac.enabled": True, "kagent.kagentapp.kagent-tools.enabled": False}
 
 
@@ -31,17 +31,17 @@ def _sha(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-# sha256 of bench/installer_component_values_057.json as re-taken 2026-11-22 14:05 Rome on installer 0.3.698
-# (#1575 review: the first reading was on 0.3.697; no recorded switch or size moved, one not-recorded path
-# came: zendesk-organisations.zendesk.baseUrl), re-taken at 15:29 Rome to keep installer_schema (the agent's
-# toleration: not declared by 0.3.698)
-PINNED = "37904656cc3e7cd58833b6fdabed8e97dadc4a073f1f254d44f340484c83d0fd"
+# sha256 of bench/installer_component_values_057.json as re-taken 2026-11-23 01:02 Rome on installer 0.3.700
+# (#1575: read first on 0.3.697, then 0.3.698; no recorded switch or size ever moved. On 0.3.700 three
+# not-recorded paths left 057's CR, agentgateway-policies.llm.retry.*, and the installer's schema now declares
+# the agent's toleration, installer #1121: installer_schema true)
+PINNED = "b12ef5b819cd762436b4867d6137106600f99628da93f149788857df90a07097"
 
 
-def test_the_committed_record_is_the_reading_of_2026_11_22():
+def test_the_committed_record_is_the_reading_of_2026_11_23():
     rec = icv.load()
-    assert rec["read"]["date"] == "2026-11-22" and rec["read"]["installer_version"] == "0.3.698"
-    assert len(rec["recorded"]) == 57 and len(rec["not_recorded"]) == 135
+    assert rec["read"]["date"] == "2026-11-23" and rec["read"]["installer_version"] == "0.3.700"
+    assert len(rec["recorded"]) == 57 and len(rec["not_recorded"]) == 132
     assert {p: rec["recorded"][p] for p in KAGENT_SWITCHES} == KAGENT_SWITCHES
     assert rec["recorded"]["kagent.kagentapp.database.postgres.bundled.storage"] == "8Gi"
     assert rec["recorded"]["snowplow.env.OTEL_LOGS_ENABLED"] == "true"
@@ -254,8 +254,8 @@ def test_the_values_carry_every_recorded_switch_and_size_but_the_deviations():
     assert {p: _get(cv, p) for p in KAGENT_SWITCHES} == KAGENT_SWITCHES
     # the bench's own, under it: its group, its snowplow, its declared env beside 057's audit-log switch
     assert cv["portal"]["readerGroups"] == [installer_values.READER_GROUP]
-    # 057's OTEL_LOGS_ENABLED is not copied: the bench has no OTLP receiver on snowplow's node (#1575)
-    assert cv["snowplow"]["env"] == {"GOGC": "100"}
+    # 057's OTEL_LOGS_ENABLED is copied: the bench gives the node-local OTLP agent its pool (#1575, installer 0.3.700)
+    assert cv["snowplow"]["env"] == {"GOGC": "100", "OTEL_LOGS_ENABLED": "true"}
     assert cv["snowplow"]["image"]["tag"] == "1.12.75" and cv["frontend"]["image"]["tag"] == "1.8.61"
     assert "enableCyberjokerUser" not in cv["portal"] and "stt" not in cv["agentgateway-policies"]
 
@@ -370,12 +370,8 @@ def test_falsifier_the_chart_check_refuses_an_installer_that_cannot_express_a_re
     schema = {"properties": {"componentValues": {"properties": {}}}}
     with pytest.raises(icv.Refused, match=r"installer 0\.3\.641 cannot express \d+ of 057's recorded component"):
         icv.check_chart(schema, "0.3.641")
-    full = {"properties": {"componentValues": {"properties": {}}}}
-    for p in icv.bench_paths():
-        node = full["properties"]["componentValues"]
-        for s in p.split("."):
-            node = node.setdefault("properties", {}).setdefault(s, {})
-    icv.check_chart(full, "0.3.698")
+    full = _schema_with(icv.bench_paths(), icv.receiver_on_snowplow_node())
+    icv.check_chart(full, "0.3.700")
 
 
 def test_drift_names_what_moved():
@@ -404,23 +400,26 @@ def _schema_with(paths, receiver: bool) -> dict:
     return full
 
 
-def test_the_record_keeps_that_the_recorded_installer_cannot_express_the_agents_toleration(tmp_path):
-    """Read from installer 0.3.698's own values schema (the archive the record was taken against)."""
+def test_the_record_keeps_that_the_recorded_installer_can_express_the_agents_toleration(tmp_path):
+    """Read from installer 0.3.700's own values schema (the archive the record was taken against; installer
+    #1121 declared the collector agent's tolerations)."""
     from bench import installer_features
     from tests import installer_archives as ia
     rec = icv.load()
-    assert rec["installer_schema"] == {icv.RECEIVER_TOLERATION: False}
+    assert rec["installer_schema"] == {icv.RECEIVER_TOLERATION: True}
     schema = installer_features.chart_schema(str(ia.pull(tmp_path / "p", ia.RECORDED)))[1]
-    assert icv.receiver_settable(schema) is False and not icv.receiver_on_snowplow_node(rec)
+    assert icv.receiver_settable(schema) is True and icv.receiver_on_snowplow_node(rec)
     assert icv.receiver_settable(_schema_with([], True)) is True
     assert icv.receiver_settable(_schema_with([], False)) is False
 
 
-def test_without_the_toleration_in_the_schema_the_deviation_is_said_and_otel_logs_is_not_copied():
-    """The branch in force (installer 0.3.698): no toleration written, OTEL_LOGS_ENABLED a deviation with the reason."""
-    rec = icv.load()
+def test_falsifier_without_the_toleration_in_the_schema_the_deviation_is_said_and_otel_logs_is_not_copied(monkeypatch):
+    """The branch an installer that cannot express the path takes (0.3.698 and before): no toleration written,
+    OTEL_LOGS_ENABLED a deviation with the reason, said by every check."""
+    rec = _rec_with_receiver(False)
+    monkeypatch.setattr(icv, "load", lambda path=icv.RECORD_PATH: rec)
     why, ruling = icv.deviations(rec)["snowplow.env.OTEL_LOGS_ENABLED"]
-    assert why == ("no OTLP receiver on the bench's snowplow node: installer 0.3.698 cannot express the daemonset "
+    assert why == ("no OTLP receiver on the bench's snowplow node: installer 0.3.700 cannot express the daemonset "
                    "toleration (componentValues.otel-collector-daemonset.opentelemetry-collector.tolerations is not in "
                    "its values schema; 057 has a receiver there)") and ruling == icv.RULING_RECEIVER
     cv = _cv_of(installer_values.document("1.12.75"))
@@ -433,10 +432,9 @@ def test_without_the_toleration_in_the_schema_the_deviation_is_said_and_otel_log
         assert icv.bench_paths(rec)[p] is True, p
 
 
-def test_falsifier_with_the_toleration_in_the_schema_the_bench_writes_it_and_copies_otel_logs(monkeypatch):
-    """The branch an installer that declares the path takes: the bench's own toleration, 057's OTEL_LOGS_ENABLED."""
-    rec = _rec_with_receiver(True)
-    monkeypatch.setattr(icv, "load", lambda path=icv.RECORD_PATH: rec)
+def test_with_the_toleration_in_the_schema_the_bench_writes_it_and_copies_otel_logs():
+    """The branch in force (installer 0.3.700 declares the path): the bench's own toleration, 057's OTEL_LOGS_ENABLED."""
+    assert icv.load()["installer_schema"][icv.RECEIVER_TOLERATION] is True
     assert "snowplow.env.OTEL_LOGS_ENABLED" not in icv.deviations()
     cv = _cv_of(installer_values.document("1.12.75", "", {"GOGC": "100"}))
     assert cv["otel-collector-daemonset"] == {"opentelemetry-collector": {"tolerations": [
@@ -469,9 +467,10 @@ def test_falsifier_a_chart_whose_schema_disagrees_with_the_records_fact_is_refus
 def test_drift_names_a_schema_fact_that_moved():
     rec = icv.load()
     listed = {"items": [{"spec": {"componentValues": {}}}]}
-    moved = icv.drift(rec, listed, _schema_with([], True))
-    assert f"installer schema: componentValues.{icv.RECEIVER_TOLERATION} declared by this chart, not declared in the " \
+    moved = icv.drift(rec, listed, _schema_with([], False))
+    assert f"installer schema: componentValues.{icv.RECEIVER_TOLERATION} not declared by this chart, declared in the " \
            f"record" in moved
+    assert not any(ln.startswith("installer schema:") for ln in icv.drift(rec, listed, _schema_with([], True)))
 
 
 def test_a_record_without_the_schema_facts_is_refused():
@@ -507,17 +506,18 @@ def test_the_receiver_gate_requires_an_agent_only_where_the_values_give_it_the_p
 
 
 def test_the_receiver_gate_cli_reads_nothing_when_not_required(tmp_path):
-    """The branch in force: the run's own values (no agent toleration), no kubectl command, a record, rc 0."""
+    """Values that give the agent no toleration (an installer that cannot express it): no kubectl command, a
+    record, rc 0; values that do, and no kubectl command: refused (the gate never passes unread)."""
     import subprocess
     import sys
     v, out = tmp_path / "installer-values.yaml", tmp_path / "otlp-receiver.json"
-    v.write_text(installer_values.document("1.12.75"))
+    v.write_text(yaml.safe_dump({"componentValues": {"snowplow": {"image": {"tag": "1.12.75"}}}}))
     p = subprocess.run([sys.executable, "-m", "bench.tracing", "receiver-gate", "--values", str(v), "--out", str(out)],
                        cwd=Path(icv.__file__).resolve().parent.parent, capture_output=True, text=True, timeout=60)
     assert p.returncode == 0 and "not required" in p.stdout, p.stderr
     assert json.loads(out.read_text()) == {"kind": "otlp_receiver", "required": False, "ok": True,
                                            "line": p.stdout.strip(), "receiver": None}
-    v.write_text(yaml.safe_dump(TOLERATED))
+    v.write_text(installer_values.document("1.12.75"))         # the run's own values, on installer 0.3.700
     p = subprocess.run([sys.executable, "-m", "bench.tracing", "receiver-gate", "--values", str(v), "--out", str(out)],
                        cwd=Path(icv.__file__).resolve().parent.parent, capture_output=True, text=True, timeout=60)
     assert p.returncode == 2 and "the run's values require a receiver" in p.stderr
@@ -542,3 +542,42 @@ def test_run606s_env_step_holds_the_receiver_gate_before_any_load():
     assert 'python3 -m bench.tracing receiver-gate --values "$OUT/installer-values.yaml"' in fn
     assert 'record_failure "env FAILED: ' in fn
     assert src.index("\nstep env       s_env\n") < src.index("\nstep measure   s_measure\n")
+
+
+# ─── the receiver gate in a run (installer 0.3.700: the agent's toleration written) ─────────────────
+
+from tests.test_run606_real_sequence import harness  # noqa: E402,F401  (fixture)
+
+
+def _run606(env, **extra):
+    import subprocess
+    return subprocess.run(["bash", str(Path(icv.__file__).resolve().parent.parent / "run606.sh")],
+                          env=dict(env, **extra), capture_output=True, text=True, timeout=600)
+
+
+def test_a_run_whose_values_give_the_agent_the_pool_requires_it_on_snowplows_node(harness):  # noqa: F811
+    """The branch in force: the run's values carry the agent's toleration, the agent runs on snowplow's node,
+    the env step says so and the run goes on."""
+    env, state, _, tmp = harness
+    p = _run606(env)
+    out = tmp / "out"
+    log = (out / "run.log").read_text()
+    assert p.returncode == 0 and "run complete" in log, log[-3000:]
+    assert yaml.safe_load((out / "installer-values.yaml").read_text())["componentValues"]["otel-collector-daemonset"] == \
+        {"opentelemetry-collector": {"tolerations": [installer_values.SNOWPLOW_POOL_TOLERATION]}}
+    rec = json.loads((out / "otlp-receiver.json").read_text())
+    assert rec["required"] is True and rec["ok"] is True and rec["receiver"]["state"] == "PRESENT"
+    assert "OTLP receiver on snowplow's node: PRESENT (port 4318), as the run's values require" in log
+    assert log.index("OTLP receiver on snowplow's node: PRESENT") < log.index("=== step measure ===")
+
+
+@pytest.mark.parametrize("agent", ["none", "not_ready"])
+def test_falsifier_no_agent_on_snowplows_node_fails_the_env_step_before_any_load(harness, agent):  # noqa: F811
+    env, state, _, tmp = harness
+    p = _run606(env, FAKE_OTEL_AGENT=agent)
+    log = (tmp / "out" / "run.log").read_text()
+    assert p.returncode != 0 and "run complete" not in log, log[-3000:]
+    assert ("env FAILED: no OTLP receiver on snowplow's node although the run's values give the node-local agent "
+            f"the snowplow pool's toleration: {'ABSENT' if agent == 'none' else 'NOT_READY'}") in log
+    assert "=== step preflight ===" not in log and "=== step measure ===" not in log
+    assert json.loads((tmp / "out" / "otlp-receiver.json").read_text())["ok"] is False

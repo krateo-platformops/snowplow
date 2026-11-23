@@ -6,8 +6,8 @@ kagent.dev agents/remotemcpservers nor review.krateo.io proposals, the dashboard
 steps answered 404, and snowplow declined to cache four dashboard widgets (a bench-only tail).
 
 What is held here, each with its falsifier (break the derivation and the test fails):
-  - the committed record IS the reading of 2026-11-22 (feature keys and booleans of 057's Installer
-    CR, installer 0.3.698, READ_VERSION): a record edited by hand, one feature flipped, fails;
+  - the committed record IS the reading of 2026-11-23 (feature keys and booleans of 057's Installer
+    CR, installer 0.3.700, READ_VERSION): a record edited by hand, one feature flipped, fails;
   - the run's values write every feature of the record, each at 057's value or at a named deviation's:
     a record that changes, changes the values (they are derived, not a second list);
   - the chart check refuses an installer that cannot express 057's features (0.3.641: no internalTls)
@@ -42,17 +42,19 @@ READ_20261122_CR = {
     "publicPages": False, "selfservice": False, "serviceDesk": True, "showback": False, "sloRollup": True,
     "specialistAgents": True, "tenantOnboarding": False,
 }
-# installer 0.3.698 (helm pull, digest sha256:e8fc4fc38887cc4a5d0c1305ec074234ba46b63530ad0649683d8aa074ec308f):
+# installer 0.3.700 (helm pull, digest sha256:d086c876b27ca2e8e10295bdf2efb8eb3a07bf8ee2d2eb77b6725847b1dcd20b):
 # the features its values.schema.json declares that the CR leaves out, at their values.yaml defaults
 READ_20261122_DEFAULTS = {"cloudnativePg": False, "repoGraph": False, "structureGraph": False}
-# the installer 057 ran at the reading (re-taken 2026-11-22 14:05 Rome on 0.3.698, #1575 review: the first
-# reading, ~07:35, was on 0.3.697; the features did not move): every test below names it through this one pin
-READ_VERSION = "0.3.698"
+# the installer 057 ran at the reading (re-taken 2026-11-23 01:02 Rome on 0.3.700, #1575: the first reading,
+# 2026-11-22 ~07:35, was on 0.3.697, the second on 0.3.698; the features never moved): every test below names it
+# and the reading's date through these pins
+READ_VERSION = "0.3.700"
+READ_DATE = "2026-11-23"
 READ_CR_VERSION = "v" + READ_VERSION.replace(".", "-")
 
 
 def _is_the_reading(rec: dict) -> bool:
-    return (rec["read"]["date"] == "2026-11-22" and rec["read"]["installer_version"] == READ_VERSION
+    return (rec["read"]["date"] == READ_DATE and rec["read"]["installer_version"] == READ_VERSION
             and rec["cr_features"] == READ_20261122_CR and rec["chart_defaults"] == READ_20261122_DEFAULTS
             and rec["features"] == {**READ_20261122_CR, **READ_20261122_DEFAULTS})
 
@@ -149,7 +151,10 @@ def _chart(tmp_path: Path, version: str, features: dict) -> Path:
     # #1572: the schema also declares every componentValues path the bench writes from 057's component-values
     # record, as installer 0.3.697's schema declares them (the chart check refuses a chart that cannot express one)
     cv: dict = {}
-    for path in sorted(installer_component_values.load()["recorded"]):
+    cvr = installer_component_values.load()
+    # #1575: and the schema facts the record keeps (installer 0.3.700 declares the collector agent's tolerations)
+    facts = [p for p, declared in sorted(cvr["installer_schema"].items()) if declared]
+    for path in sorted(cvr["recorded"]) + facts:
         node, segs = cv, path.split(".")
         for seg in segs[:-1]:
             node = node.setdefault(seg, {"type": "object"}).setdefault("properties", {})
@@ -167,7 +172,7 @@ ALL = {**READ_20261122_CR, **READ_20261122_DEFAULTS}
 
 def test_a_chart_that_declares_exactly_057s_features_passes_and_says_the_deviations(tmp_path):
     lines = installer_features.check_chart(str(_chart(tmp_path, READ_VERSION, {f: False for f in ALL})))
-    assert lines[0].startswith(f"installer features: 27 written, as 057 (installer {READ_VERSION}, read 2026-11-22)")
+    assert lines[0].startswith(f"installer features: 27 written, as 057 (installer {READ_VERSION}, read {READ_DATE})")
     dev = installer_features.deviation_lines()
     # the feature deviations, then the component values' own lines (#1572: switches and sizes, their deviations
     # and the not-recorded paths)
@@ -218,7 +223,7 @@ def test_every_published_archive_before_the_record_is_refused_by_the_chart_check
     n, named = CANNOT_EXPRESS[version]
     with pytest.raises(installer_features.Refused, match=rf"installer {re.escape(version)} cannot express {n} "
                                                          rf"feature\(s\) 057 \(installer {re.escape(READ_VERSION)}, "
-                                                         rf"read 2026-11-22\) runs: {re.escape(named)}; "
+                                                         rf"read {READ_DATE}\) runs: {re.escape(named)}; "
                                                          rf"install an installer that declares them"):
         installer_features.check_chart(str(ia.pull(tmp_path / "p", version)))
 
@@ -249,7 +254,7 @@ def _listed(features: dict, version=READ_CR_VERSION, n=1) -> dict:
 
 def test_record_keeps_the_crs_feature_booleans_and_the_charts_defaults_only(tmp_path):
     chart = _chart(tmp_path, READ_VERSION, {**{f: False for f in READ_20261122_CR}, **READ_20261122_DEFAULTS})
-    rec = installer_features.record(_listed(READ_20261122_CR), str(chart), "2026-11-22")
+    rec = installer_features.record(_listed(READ_20261122_CR), str(chart), READ_DATE)
     assert _is_the_reading(rec)
     assert SECRETISH not in json.dumps(rec)
 
@@ -257,10 +262,10 @@ def test_record_keeps_the_crs_feature_booleans_and_the_charts_defaults_only(tmp_
 def test_record_refuses_a_chart_of_another_version_or_a_feature_it_does_not_declare(tmp_path):
     chart = _chart(tmp_path, "0.3.641", {f: False for f in ALL})
     with pytest.raises(installer_features.Refused, match=f"pull {READ_VERSION}"):
-        installer_features.record(_listed(READ_20261122_CR), str(chart), "2026-11-22")
+        installer_features.record(_listed(READ_20261122_CR), str(chart), READ_DATE)
     chart = _chart(tmp_path, READ_VERSION, {f: False for f in ALL if f != "sloRollup"})
     with pytest.raises(installer_features.Refused, match="sloRollup"):
-        installer_features.record(_listed(READ_20261122_CR), str(chart), "2026-11-22")
+        installer_features.record(_listed(READ_20261122_CR), str(chart), READ_DATE)
 
 
 def test_drift_is_empty_for_the_reading_and_names_what_moved():
@@ -361,10 +366,10 @@ def test_falsifier_vm606s_chart_check_refuses_a_kit_on_another_installer_than_th
     monkeypatch.setattr(installer_src, "oci_preflight", preflight)
     env = {"INSTALLER_VERSION": "0.3.641", "RUNS": "N1", "SNOWPLOW_TAG_N1": "1.12.75"}
     with pytest.raises(vm606.Refused, match=r"the kit installs installer 0\.3\.641, but 057's features were "
-                                            rf"recorded on {re.escape(READ_VERSION)} \(read 2026-11-22\)"):
+                                            rf"recorded on {re.escape(READ_VERSION)} \(read {READ_DATE}\)"):
         REAL_CHART_CHECK(env, ["N1"])
     assert installer_features.check_kit_version(READ_VERSION) == [
-        f"installer {READ_VERSION}: the version 057's features were recorded on (2026-11-22)"]
+        f"installer {READ_VERSION}: the version 057's features were recorded on ({READ_DATE})"]
 
 
 # ─── the live installer version: read from 057, never typed ────────────────
@@ -416,7 +421,7 @@ def test_run606_writes_057s_features_and_says_the_deviations(harness):  # noqa: 
     env, state, _, tmp = harness
     p = _run606(env, BENCH_606_DRY_RUN="1")
     log = (tmp / "out" / "run.log").read_text()
-    assert f"installer features: 27 written, as 057 (installer {READ_VERSION}, read 2026-11-22) runs them" in log, \
+    assert f"installer features: 27 written, as 057 (installer {READ_VERSION}, read {READ_DATE}) runs them" in log, \
         (p.stderr + log)[-3000:]
     assert all(f"the bench differs from 057 on {f}:" in log for f in installer_features.DEVIATIONS)
     assert json.loads((tmp / "out" / "installer-features.json").read_text())["ok"] is True
@@ -429,6 +434,6 @@ def test_falsifier_run606_refuses_an_installer_that_cannot_express_057s_features
     log = (tmp / "out" / "run.log").read_text()
     assert p.returncode != 0
     assert ("source FAILED: installer features: installer 0.3.422 cannot express 1 feature(s) 057 (installer "
-            f"{READ_VERSION}, read 2026-11-22) runs: internalTls=True") in log, log[-3000:]
+            f"{READ_VERSION}, read {READ_DATE}) runs: internalTls=True") in log, log[-3000:]
     assert "=== step up ===" not in log
     assert json.loads((tmp / "out" / "installer-features.json").read_text())["ok"] is False
