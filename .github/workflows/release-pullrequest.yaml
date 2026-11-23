@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   build:
-    uses: krateo-platformops/.github/.github/workflows/component-image-build.yaml@main
+    uses: krateo-platformops/.github/.github/workflows/component-image-build.yaml@f6185ef0a8161a4201217d6ce0953718fc736fe0 # 1.1.0
     permissions:
       contents: read
       packages: write
@@ -46,9 +46,9 @@ jobs:
   # docs/ file set, frontmatter, link integrity, banned dead-org strings, examples
   # pairing. Resolves once krateo-platformops/.github#2 (the standard seed) merges.
   lint-docs:
-    uses: krateo-platformops/.github/.github/workflows/lint-docs.yaml@main
+    uses: krateo-platformops/.github/.github/workflows/lint-docs.yaml@f6185ef0a8161a4201217d6ce0953718fc736fe0 # 1.1.0
   checks:
-    uses: krateo-platformops/.github/.github/workflows/component-go-checks.yaml@main
+    uses: krateo-platformops/.github/.github/workflows/component-go-checks.yaml@f6185ef0a8161a4201217d6ce0953718fc736fe0 # 1.1.0
     with:
       module: go/snowplow
       crd_drift: true
