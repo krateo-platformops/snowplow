@@ -142,7 +142,8 @@ def test_every_deviation_names_why_and_a_ruling_and_differs_from_057():
 
 # ─── the chart check ───────────────────────────────────────────────────────
 
-def _chart(tmp_path: Path, version: str, features: dict, krateo_ns: str = "krateo-system") -> Path:
+def _chart(tmp_path: Path, version: str, features: dict, krateo_ns: str = "krateo-system",
+           cm_ns: str = "cert-manager") -> Path:
     """A pulled installer chart, as installer_src leaves it (<dir>/installer): its version, its schema's
     features and their values.yaml defaults."""
     root = tmp_path / version / "installer"
@@ -166,6 +167,12 @@ def _chart(tmp_path: Path, version: str, features: dict, krateo_ns: str = "krate
     # as every published installer chart: namespaces.krateo (the bench's KRATEO_NAMESPACE is held to it)
     (root / "values.yaml").write_text(yaml.safe_dump({"features": {f: v for f, v in features.items() if v is not None},
                                                       "namespaces": {"krateo": krateo_ns}}))
+    # the pins file, with installer 0.3.703's own cert-manager: on under features.internalTls (alsoFeatures), in the
+    # namespace the bench's cert-manager step installs into (installer_features.cm_check holds the two together)
+    (root / "files").mkdir()
+    (root / "files" / "component-pins.min.yaml").write_text(yaml.safe_dump({"components": [
+        {"name": "cert-manager", "kind": "CertManager", "version": "0.10.0", "feature": "ingress",
+         "alsoFeatures": ["internalTls"], "namespace": cm_ns}]}))
     return root.parent
 
 
@@ -317,6 +324,19 @@ def test_with_internal_tls_off_an_empty_ca_bundle_target_is_not_refused(tmp_path
         "internal TLS: features.internalTls is off, so nothing of it is written"]
 
 
+def test_falsifier_a_chart_whose_own_cert_manager_runs_elsewhere_is_refused(tmp_path):
+    """With features.internalTls on, installer 0.3.703 takes over the bench's cert-manager release; a pin in another
+    namespace would run a second cert-manager there, and the CA would be read from the wrong one."""
+    assert installer_features.bench_features()["internalTls"] is True
+    chart = _chart(tmp_path, READ_VERSION, {f: False for f in ALL}, cm_ns="cert-manager-elsewhere")
+    with pytest.raises(installer_features.Refused, match=r"pins its own cert-manager under features\.internalTls in "
+                                                         r"namespace 'cert-manager-elsewhere', and the bench's "
+                                                         r"cert-manager step installs it into 'cert-manager'"):
+        installer_features.check_chart(str(chart))
+    off = {**installer_features.DEVIATIONS, "internalTls": (False, "a test's deviation", "a test's ruling")}
+    assert installer_features.check_chart(str(chart), deviations=off)        # the feature off: nothing to agree on
+
+
 def test_falsifier_a_chart_that_installs_krateo_elsewhere_is_refused(tmp_path):
     chart = _chart(tmp_path, READ_VERSION, {f: False for f in ALL}, krateo_ns="krateo")
     with pytest.raises(installer_features.Refused, match=r"installs krateo into namespaces\.krateo='krateo' by default, "
@@ -427,11 +447,9 @@ def test_vm606s_chart_check_refuses_a_chart_that_cannot_express_057s_features(tm
     from tests.test_1395_private_render import REAL_CHART_CHECK
 
     def preflight(chart, version, workdir, requirements=(), **kw):
-        root = Path(workdir) / "installer"
-        root.mkdir(parents=True)
+        import shutil
         src = _chart(tmp_path, version, {f: False for f in ALL if f != "internalTls"}) / "installer"
-        for p in src.iterdir():
-            (root / p.name).write_bytes(p.read_bytes())
+        shutil.copytree(src, Path(workdir) / "installer")
         return {"ok": True}
     monkeypatch.setattr(installer_src, "oci_preflight", preflight)
     env = {"INSTALLER_VERSION": READ_VERSION, "RUNS": "N1", "SNOWPLOW_TAG_N1": "1.12.75"}

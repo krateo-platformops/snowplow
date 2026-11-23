@@ -301,8 +301,32 @@ def check_chart(installer_pulled: str, rec: dict | None = None, deviations: dict
         raise Refused(f"installer {version} installs krateo into namespaces.krateo={ns!r} by default, and the bench "
                       f"installs it into {installer_values.KRATEO_NAMESPACE!r} (bench/installer_values.py "
                       f"KRATEO_NAMESPACE: s_install's release namespace, the CA bundle's target): the two must agree")
+    if feats.get("internalTls"):
+        cm_check(installer_pulled, version)
     return [f"installer features: {len(feats)} written, as {src} runs them, {len(on)} on: {', '.join(on)}"] \
         + deviation_lines(rec, deviations) + cv_lines + installer_values.top_level_lines()
+
+
+def cm_check(installer_pulled: str, version: str) -> None:
+    """Refused unless cert-manager runs where the bench says it does once the installer takes it over: with
+    features.internalTls on, installer 0.3.703 pins its own cert-manager (alsoFeatures: [internalTls]) under
+    the release name of the bench's cert-manager step, and upgrades that release in place (krateo-057:
+    jetstack v1.21.1 rev 1, then cert-manager-0.10.0 rev 2). Its pinned namespace must be the bench's
+    (bench/cert_manager.py NAMESPACE, the installer's internalTls.certManagerNamespace), or the installer
+    would run a second cert-manager elsewhere and the CA would be read from the wrong namespace."""
+    from bench import cert_manager, installer_pins
+    try:
+        pins = installer_pins.components(_chart_root(installer_pulled))
+    except installer_pins.Refused as e:
+        raise Refused(f"installer {version}: {e}") from None
+    for c in pins:
+        on = [c.get("feature"), *(c.get("alsoFeatures") or [])]
+        if c.get("name") == cert_manager.RELEASE and "internalTls" in on \
+                and c.get("namespace") != cert_manager.NAMESPACE:
+            raise Refused(f"installer {version} pins its own {cert_manager.RELEASE} under features.internalTls in "
+                          f"namespace {c.get('namespace')!r}, and the bench's cert-manager step installs it into "
+                          f"{cert_manager.NAMESPACE!r} (bench/cert_manager.py NAMESPACE, the installer's "
+                          f"internalTls.certManagerNamespace): the two must agree")
 
 
 def check_values(values: dict, rec: dict | None = None, deviations: dict | None = None) -> list[str]:
