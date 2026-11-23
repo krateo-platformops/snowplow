@@ -142,7 +142,7 @@ def test_every_deviation_names_why_and_a_ruling_and_differs_from_057():
 
 # ─── the chart check ───────────────────────────────────────────────────────
 
-def _chart(tmp_path: Path, version: str, features: dict) -> Path:
+def _chart(tmp_path: Path, version: str, features: dict, krateo_ns: str = "krateo-system") -> Path:
     """A pulled installer chart, as installer_src leaves it (<dir>/installer): its version, its schema's
     features and their values.yaml defaults."""
     root = tmp_path / version / "installer"
@@ -163,7 +163,9 @@ def _chart(tmp_path: Path, version: str, features: dict) -> Path:
         {"properties": {"componentValues": {"type": "object", "properties": cv},
                         "features": {"type": "object", "additionalProperties": False,
                                      "properties": {f: {"type": "boolean"} for f in features}}}}))
-    (root / "values.yaml").write_text(yaml.safe_dump({"features": {f: v for f, v in features.items() if v is not None}}))
+    # as every published installer chart: namespaces.krateo (the bench's KRATEO_NAMESPACE is held to it)
+    (root / "values.yaml").write_text(yaml.safe_dump({"features": {f: v for f, v in features.items() if v is not None},
+                                                      "namespaces": {"krateo": krateo_ns}}))
     return root.parent
 
 
@@ -176,7 +178,8 @@ def test_a_chart_that_declares_exactly_057s_features_passes_and_says_the_deviati
     dev = installer_features.deviation_lines()
     # the feature deviations, then the component values' own lines (#1572: switches and sizes, their deviations
     # and the not-recorded paths)
-    assert lines[1:1 + len(dev)] == dev and lines[1 + len(dev):] == installer_component_values.lines()
+    assert lines[1:1 + len(dev)] == dev
+    assert lines[1 + len(dev):] == installer_component_values.lines() + installer_values.top_level_lines()
     assert all(f"on {f}:" in "\n".join(lines) for f in installer_features.DEVIATIONS)
 
 
@@ -228,15 +231,97 @@ def test_every_published_archive_before_the_record_is_refused_by_the_chart_check
         installer_features.check_chart(str(ia.pull(tmp_path / "p", version)))
 
 
+def _values_file(tmp_path: Path, mutate=None) -> Path:
+    """The values document a run installs with (bench.installer_values), parsed, mutated, written back."""
+    doc = yaml.safe_load(installer_values.document("1.12.74"))
+    if mutate:
+        mutate(doc)
+    f = tmp_path / f"values-{len(list(tmp_path.glob('values-*')))}.yaml"
+    f.write_text(yaml.safe_dump(doc))
+    return f
+
+
 def test_the_check_cli_writes_its_record_and_refuses_with_exit_2(tmp_path, capsys):
     ok, out = _chart(tmp_path, READ_VERSION, {f: False for f in ALL}), tmp_path / "ok.json"
-    assert installer_features.main(["check", "--installer-pulled", str(ok), "--out", str(out)]) == 0
+    vals = _values_file(tmp_path)
+    assert installer_features.main(["check", "--installer-pulled", str(ok), "--values", str(vals),
+                                    "--out", str(out)]) == 0
     rec = json.loads(out.read_text())
     assert rec["ok"] and rec["features"] == installer_features.bench_features()
     bad, out2 = _chart(tmp_path, "0.3.641", {f: False for f in ALL if f != "internalTls"}), tmp_path / "bad.json"
-    assert installer_features.main(["check", "--installer-pulled", str(bad), "--out", str(out2)]) == 2
+    assert installer_features.main(["check", "--installer-pulled", str(bad), "--values", str(vals),
+                                    "--out", str(out2)]) == 2
     assert "refusing: installer 0.3.641 cannot express" in capsys.readouterr().err
     assert json.loads(out2.read_text())["ok"] is False
+
+
+# ─── #1588 follow-up: what the installer refuses to render, refused before any cluster ──
+
+def test_the_run_writes_the_ca_bundle_target_from_the_namespace_it_installs_krateo_into():
+    """The value is the bench's own topology (installer_values.KRATEO_NAMESPACE), the namespace s_install
+    installs into and the chart's namespaces.krateo; the document's registry pull Secret's namespace is the
+    same definition; run606.sh's installer release namespace is it too."""
+    doc = yaml.safe_load(installer_values.document("1.12.74"))
+    assert doc["componentValues"]["internal-ca-bundle"] == {"target": {"namespaces": [installer_values.KRATEO_NAMESPACE]}}
+    assert doc["registryAuth"]["passwordRef"]["namespace"] == installer_values.KRATEO_NAMESPACE
+    src = (BENCH_DIR / "run606.sh").read_text()
+    installs = [ln for ln in src.splitlines() if "-n krateo-system --create-namespace -f \"$OUT/installer-values.yaml\"" in ln]
+    assert len(installs) == 2 and installer_values.KRATEO_NAMESPACE == "krateo-system"
+    assert "internal-ca-bundle.target.namespaces" in installer_component_values.BENCH_OWN
+    # the top-level values the bench writes off are off in the document it writes
+    for path in installer_values.TOP_LEVEL_OFF:
+        node = doc
+        for seg in path.split("."):
+            node = node[seg]
+        assert node is False, path
+
+
+def test_s_cert_manager_reads_its_namespace_from_the_one_definition():
+    """The cert-manager step installs into bench/cert_manager.py NAMESPACE, read from its preflight record: no
+    literal namespace in the step (the installer's internalTls.certManagerNamespace comes from the same one)."""
+    src = (BENCH_DIR / "run606.sh").read_text()
+    body = src[src.index("s_cert_manager() {"):]
+    body = body[:body.index("\n}\n")]
+    assert 'ns="$(cm_field namespace)"' in body and "-n cert-manager" not in body
+    assert body.count('-n "$ns"') == 5           # [[ -n "$ns" ]], then install, wait, helm list, helm get values
+
+
+@pytest.mark.parametrize("case,mutate", [
+    ("absent", lambda d: d["componentValues"].pop("internal-ca-bundle")),
+    ("empty_list", lambda d: d["componentValues"]["internal-ca-bundle"]["target"].__setitem__("namespaces", [])),
+    ("empty_name", lambda d: d["componentValues"]["internal-ca-bundle"]["target"].__setitem__("namespaces", [""])),
+])
+def test_falsifier_internal_tls_on_with_an_empty_ca_bundle_target_is_refused_before_any_cluster(tmp_path, capsys,
+                                                                                                  case, mutate):
+    """installer 0.3.703 compositions.yaml:1005: features.internalTls on and target.namespaces empty refuses the
+    whole composition render (no component installs); the check refuses the run first, by the CLI s_source runs."""
+    assert installer_features.bench_features()["internalTls"] is True
+    chart = _chart(tmp_path, READ_VERSION, {f: False for f in ALL})
+    bad = _values_file(tmp_path, mutate)
+    with pytest.raises(installer_features.Refused, match=r"features\.internalTls is on and the run's values leave "
+                                                         r"componentValues\.internal-ca-bundle\.target\.namespaces empty"):
+        installer_features.check_values(yaml.safe_load(bad.read_text()))
+    assert installer_features.main(["check", "--installer-pulled", str(chart), "--values", str(bad)]) == 2
+    assert "refusing: features.internalTls is on and the run's values leave" in capsys.readouterr().err
+    # the same document with the value passes, and says it
+    good = yaml.safe_load(_values_file(tmp_path).read_text())
+    assert installer_features.check_values(good) == [
+        f"internal TLS: componentValues.internal-ca-bundle.target.namespaces = {installer_values.KRATEO_NAMESPACE}, "
+        f"the namespace the bench installs krateo into"]
+
+
+def test_with_internal_tls_off_an_empty_ca_bundle_target_is_not_refused(tmp_path):
+    bad = yaml.safe_load(_values_file(tmp_path, lambda d: d["componentValues"].pop("internal-ca-bundle")).read_text())
+    off = {**installer_features.DEVIATIONS, "internalTls": (False, "a test's deviation", "a test's ruling")}
+    assert installer_features.check_values(bad, deviations=off) == [
+        "internal TLS: features.internalTls is off, so nothing of it is written"]
+
+
+def test_falsifier_a_chart_that_installs_krateo_elsewhere_is_refused(tmp_path):
+    chart = _chart(tmp_path, READ_VERSION, {f: False for f in ALL}, krateo_ns="krateo")
+    with pytest.raises(installer_features.Refused, match=r"installs krateo into namespaces\.krateo='krateo' by default, "
+                                                         r"and the bench installs it into 'krateo-system'"):
+        installer_features.check_chart(str(chart))
 
 
 # ─── a reading of 057: record and drift ────────────────────────────────────

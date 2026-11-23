@@ -273,7 +273,8 @@ def test_the_values_are_the_heredocs_byte_for_byte(tmp_path, snowplow, frontend,
       - features: krateo-057's (bench/installer_features.py, #1572) where the heredoc's three
         hand-picked lines were;
       - componentValues: the heredoc's own entries (snowplow's image, node and tolerations; the
-        frontend's image), plus the portal's reader group (run 26j), under krateo-057's recorded switches
+        frontend's image), plus the portal's reader group (run 26j) and the internal CA bundle's target
+        namespace (the namespace the bench installs krateo into), under krateo-057's recorded switches
         and sizes (bench/installer_component_values.py, #1572), written as one YAML map after a comment."""
     from bench import installer_component_values as icv
     from bench import installer_features
@@ -294,6 +295,8 @@ def test_the_values_are_the_heredocs_byte_for_byte(tmp_path, snowplow, frontend,
         # #1575: the bench's own topology, where the installer can express it: the node-local OTLP agent
         # tolerates the snowplow pool, with the toleration the heredoc gave snowplow
         own["otel-collector-daemonset"] = {"opentelemetry-collector": {"tolerations": own["snowplow"]["tolerations"]}}
+    # #1588 follow-up: features.internalTls's CA bundle targets the namespace the bench installs krateo into
+    own["internal-ca-bundle"] = {"target": {"namespaces": [installer_values.KRATEO_NAMESPACE]}}
     assert yaml.safe_load(block)["componentValues"] == icv.merge(icv.nest(icv.bench_paths()), own)
     out = tmp_path / "v.yaml"
     assert installer_values.main(["--snowplow-tag", snowplow, "--frontend-tag", frontend, "--out", str(out)]) == 0
@@ -381,6 +384,26 @@ def test_the_laptop_renders_every_runs_list(laptop_helm):
     lines = REAL_CHART_CHECK(_env(), ["N1", "N2"])
     assert _chart_lines(lines) == [f"installer {RECORDED}, run N1's values: {WANT_RECORDED}",
                                    f"installer {RECORDED}, run N2's values: {WANT_RECORDED}"]
+    # #1588 follow-up: every run's values are checked for what the installer refuses to render with them
+    assert [ln for ln in lines if "internal TLS" in ln] == [
+        f"run {x}: internal TLS: componentValues.internal-ca-bundle.target.namespaces = "
+        f"{installer_values.KRATEO_NAMESPACE}, the namespace the bench installs krateo into" for x in ("N1", "N2")]
+
+
+def test_falsifier_the_laptop_refuses_a_run_whose_values_leave_the_ca_bundle_target_empty(laptop_helm, monkeypatch):
+    """#1588 follow-up: installer 0.3.703 refuses its whole composition render with features.internalTls on and
+    componentValues.internal-ca-bundle.target.namespaces empty; the laptop refuses the launch first."""
+    real = installer_values.document
+
+    def without(*a, **k):
+        d = yaml.safe_load(real(*a, **k))
+        d["componentValues"].pop("internal-ca-bundle")
+        return yaml.safe_dump(d)
+    monkeypatch.setattr(installer_values, "document", without)
+    with pytest.raises(vm606.Refused) as e:
+        REAL_CHART_CHECK(_env(), ["N1", "N2"])
+    assert str(e.value).startswith(f"installer {RECORDED}, run N1's values: features.internalTls is on and the run's "
+                                   "values leave componentValues.internal-ca-bundle.target.namespaces empty"), str(e.value)
 
 
 @pytest.mark.parametrize("body,why", [

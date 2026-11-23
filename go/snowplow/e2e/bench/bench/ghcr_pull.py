@@ -227,8 +227,10 @@ MEASURED_INPUT = {"blob": "blob", "largest_file": "file", "inflated": "inflated"
                   "parsed": "parsed", "members": "members", "deepest": "deepest",
                   "render_deepest": "deepest"}
 #: preflight's exits: the registry's own answer refuses (a 401 / 403 / 404, a manifest that does not
-#: parse, ...); no answer within the step's bound is a refusal of its own, said as such (run 25)
-EXIT_REFUSED, EXIT_NO_ANSWER = 3, 4
+#: parse, ...); no answer within the step's bound is a refusal of its own, said as such (run 25); a
+#: component the install runs that does not render with the run's values is one too (#1588 follow-up:
+#: until then recorded as "OK (render failed: ...)", while on the cluster it fails the install)
+EXIT_REFUSED, EXIT_NO_ANSWER, EXIT_UNRENDERED = 3, 4, 5
 #: the registry API. GHCR_API_URL may point it elsewhere (the suite's fake
 #: registry), over https only: the token is never sent in clear text.
 API = os.environ.get("GHCR_API_URL", "https://ghcr.io")
@@ -1377,17 +1379,25 @@ def main(argv: list[str] | None = None) -> int:
             err, no_answer = ci["error"], ci["no_answer"]
             render = (None if ci["error"] else ("failed: " + ci["render_error"]) if ci["render_error"]
                       else f"ok ({len(ci['rendered'])} images)")
+            if not err and ci["render_error"]:
+                # #1588 follow-up: EVERY component the install runs must render with the values the run
+                # installs with; one that does not fails on the cluster (the installer renders it the same
+                # way), so it refuses the run here, by name, with helm's own error
+                roles = "".join(f", {w}" for w, on in (
+                    ("which the installer lists as a private-image component (inst.privateImageComponents)",
+                     p["name"] in private),
+                    (f"whose image the run overrides (tag {overrides.get(p['name'])})", p["name"] in overrides))
+                    if on)
+                if ci["render_no_answer"]:
+                    err, no_answer = (f"{ref}:{p['version']}: component {p['name']}{roles}: its render with the "
+                                      f"values the run installs with gave no answer: {ci['render_error']}"), True
+                else:
+                    err = (f"{ref}:{p['version']}: component {p['name']}{roles}: it cannot be rendered with the "
+                           f"values the run installs with: {ci['render_error']}")
             if not err and p["name"] in private:
                 # the installer injects image-pull Secrets into this one: its images MUST be known
                 missing = [r["path"] for r in ci["paths"] or [] if r["result"] == "missing"]
-                if ci["render_error"] and ci["render_no_answer"]:
-                    err, no_answer = (f"{ref}:{p['version']}: the installer lists it as a private-image "
-                                      f"component (inst.privateImageComponents) and its render gave no answer: "
-                                      f"{ci['render_error']}"), True
-                elif ci["render_error"]:
-                    err = (f"{ref}:{p['version']}: the installer lists it as a private-image component "
-                           f"(inst.privateImageComponents) and it cannot be rendered: {ci['render_error']}")
-                elif missing:
+                if missing:
                     err = (f"{ref}:{p['version']}: the installer lists it as a private-image component "
                            f"(inst.privateImageComponents), yet no rendered pod running a {REGISTRY_HOST} "
                            f"image carries the pull secret it injects at {', '.join(missing)} (the image "
@@ -1397,13 +1407,7 @@ def main(argv: list[str] | None = None) -> int:
                 want = overrides[p["name"]]
                 hits = [i for i in ci["rendered"] or []
                         if i.startswith(REGISTRY_HOST + "/") and split_image(i)[2] == want]
-                if ci["render_error"] and ci["render_no_answer"]:
-                    err, no_answer = (f"{ref}:{p['version']}: the run overrides its image (tag {want}) and its "
-                                      f"render gave no answer: {ci['render_error']}"), True
-                elif ci["render_error"]:
-                    err = (f"{ref}:{p['version']}: the run overrides its image (tag {want}) and it cannot be "
-                           f"rendered: {ci['render_error']}")
-                elif not hits:
+                if not hits:
                     err = (f"{ref}:{p['version']}: the run overrides its image (tag {want}), yet no "
                            f"{REGISTRY_HOST} image it renders carries that tag (rendered: "
                            f"{', '.join(ci['rendered'] or []) or 'none'})")
@@ -1411,6 +1415,7 @@ def main(argv: list[str] | None = None) -> int:
                  "private_image_component": p["name"] in private,
                  **({"image_override": overrides[p["name"]]} if p["name"] in overrides else {}),
                  "paths": ci["paths"] if ci else None, "measured": ci["measured"] if ci else None,
+                 "unrendered": bool(ci and not ci["error"] and ci["render_error"]),
                  "error": err, "no_answer": bool(err) and no_answer}, ci)
 
     charts, chart_tries = _phase(budget, pins, chart_s, one_chart, lambda r: r[0]["no_answer"])
@@ -1456,14 +1461,19 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
     for line in stale_notes(stale):
         print(line, file=sys.stderr)
-    refused = [r["error"] for r in res + img_res if r["error"] and not r["no_answer"]]
+    refused = [r["error"] for r in res + img_res if r["error"] and not r["no_answer"] and not r.get("unrendered")]
+    unrendered = [r["error"] for r in res if r["error"] and not r["no_answer"] and r["unrendered"]]
     unanswered = [r["error"] for r in res + img_res if r["error"] and r["no_answer"]]
+    more = f" (and NO ANSWER for {len(unanswered)} more: " + "; ".join(unanswered) + ")" if unanswered else ""
     if refused:
         print("refusing: the ghcr pull token does not resolve every chart and image this install pulls: "
-              + "; ".join(refused)
-              + (f" (and NO ANSWER for {len(unanswered)} more: " + "; ".join(unanswered) + ")" if unanswered else ""),
-              file=sys.stderr)
-        return EXIT_REFUSED
+              + "; ".join(refused) + more, file=sys.stderr)
+    if unrendered:
+        print(f"refusing: {len(unrendered)} component(s) this install runs cannot be rendered with the values the "
+              f"run installs with, so the install would fail on the cluster: " + "; ".join(unrendered)
+              + ("" if refused else more), file=sys.stderr)
+    if refused or unrendered:
+        return EXIT_REFUSED if refused else EXIT_UNRENDERED
     if unanswered:
         print(f"refusing: NO ANSWER from the registry within the step's {bound:g} s bound for "
               f"{len(unanswered)} of this install's charts and images, so whether the ghcr pull token resolves "

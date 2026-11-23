@@ -880,10 +880,13 @@ s_source() {
 # installer features): the pulled chart must declare exactly the features of 057's record
 # (bench/installer_features.py), which the run's values write, every one; the deviations the owner
 # rules on are logged by name. BEFORE any cluster exists, in the dry pass too. $OUT/installer-features.json.
+# The run's values are checked here too: what the installer refuses to render with them (features.internalTls
+# with its CA bundle's target namespaces empty refuses the whole composition, every component) is refused now.
 installer_features_check() {
   local rc=0 ln why
+  write_installer_values
   python3 -m bench.installer_features check --installer-pulled "$OUT/installer-pulled" \
-      --out "$OUT/installer-features.json" >"$OUT/.installer-features.out" 2>"$KERR" || rc=$?
+      --values "$OUT/installer-values.yaml" --out "$OUT/installer-features.json" >"$OUT/.installer-features.out" 2>"$KERR" || rc=$?
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$OUT/.installer-features.out"
@@ -1271,9 +1274,12 @@ s_registry() {
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$KERR"
   # run 25: exit 4 is NO ANSWER within the step's bound (bench/ghcr_pull.py EXIT_NO_ANSWER): whether the
-  # token resolves them is unknown, and the line says so; any other failure is the registry's own answer
+  # token resolves them is unknown, and the line says so; exit 5 is a component the install runs that does
+  # not render with the run's values (EXIT_UNRENDERED: on the cluster it fails the install); any other
+  # failure is the registry's own answer
   case "$rc" in
     0) ;;
+    5) record_failure "registry FAILED: a component this install runs cannot be rendered with the values the run installs with, so the install would fail on the cluster (above: the component and helm's error)"; return 1 ;;
     4) record_failure "registry FAILED: the registry gave NO ANSWER for some of this install's private charts and images within the step's bound (above: which call, how often): whether the ghcr pull token resolves them is unknown"; return 1 ;;
     *) record_failure "registry FAILED: the ghcr pull token does not resolve this install's private charts and images"; return 1 ;;
   esac
@@ -1313,32 +1319,34 @@ cm_field() {
 # (CERT_MANAGER_TIMEOUT_S); then the run's record, as helm reads it back,
 # compared with 057's reading ($OUT/cert-manager.jsonl, the verdict's report).
 s_cert_manager() {
-  local t0=$SECONDS left chart values d c deps=() crds=()
-  chart="$(cm_field chart_file)" && values="$(cm_field values_file)" \
+  local t0=$SECONDS left chart values ns d c deps=() crds=()
+  # the namespace is bench/cert_manager.py NAMESPACE, from the record (ONE definition: the installer's
+  # internalTls.certManagerNamespace is written from it too, bench/installer_values.py)
+  chart="$(cm_field chart_file)" && values="$(cm_field values_file)" && ns="$(cm_field namespace)" && [[ -n "$ns" ]] \
     || { record_failure "cert-manager FAILED: its preflight record is unreadable"; return 1; }
   for d in $(cm_field deployments); do deps+=("deployment/$d"); done
   for c in $(cm_field crds); do crds+=("crd/$c"); done
   (( ${#deps[@]} > 0 && ${#crds[@]} > 0 )) \
     || { record_failure "cert-manager FAILED: its preflight record names no Deployment or no CRD to wait for"; return 1; }
-  run "${H[@]}" install cert-manager "$chart" -n cert-manager --create-namespace -f "$values" \
+  run "${H[@]}" install cert-manager "$chart" -n "$ns" --create-namespace -f "$values" \
       --wait --timeout "${CERT_MANAGER_TIMEOUT_S}s" 2>"$KERR" \
     || { record_failure "cert-manager FAILED: helm install"; return 1; }
   left=$(( CERT_MANAGER_TIMEOUT_S - (SECONDS - t0) )); (( left > 0 )) || left=1
-  run "${K[@]}" -n cert-manager wait --for=condition=Available --timeout="${left}s" "${deps[@]}" >/dev/null 2>"$KERR" \
+  run "${K[@]}" -n "$ns" wait --for=condition=Available --timeout="${left}s" "${deps[@]}" >/dev/null 2>"$KERR" \
     || { record_failure "cert-manager FAILED: its Deployments not Available within ${CERT_MANAGER_TIMEOUT_S}s"; return 1; }
   left=$(( CERT_MANAGER_TIMEOUT_S - (SECONDS - t0) )); (( left > 0 )) || left=1
   run "${K[@]}" wait --for=condition=Established --timeout="${left}s" "${crds[@]}" >/dev/null 2>"$KERR" \
     || { record_failure "cert-manager FAILED: its CRDs not Established within ${CERT_MANAGER_TIMEOUT_S}s"; return 1; }
   if [[ "$DRY" == "1" ]]; then
-    log "DRY: helm list / get values -n cert-manager -> python3 -m bench.cert_manager record -> $OUT/cert-manager.jsonl"
+    log "DRY: helm list / get values -n $ns -> python3 -m bench.cert_manager record -> $OUT/cert-manager.jsonl"
     return 0
   fi
   # the readback, under what is left of the step's one bound
   left=$(( CERT_MANAGER_TIMEOUT_S - (SECONDS - t0) )); (( left > 0 )) || left=1
-  bounded "$left" "${H[@]}" list -n cert-manager -o json > "$OUT/cert-manager-helm-list.json" 2>"$KERR" \
+  bounded "$left" "${H[@]}" list -n "$ns" -o json > "$OUT/cert-manager-helm-list.json" 2>"$KERR" \
     || { record_failure "cert-manager FAILED: helm list (within ${CERT_MANAGER_TIMEOUT_S}s)"; return 1; }
   left=$(( CERT_MANAGER_TIMEOUT_S - (SECONDS - t0) )); (( left > 0 )) || left=1
-  bounded "$left" "${H[@]}" get values cert-manager -n cert-manager -o json > "$OUT/cert-manager-helm-values.json" 2>"$KERR" \
+  bounded "$left" "${H[@]}" get values cert-manager -n "$ns" -o json > "$OUT/cert-manager-helm-values.json" 2>"$KERR" \
     || { record_failure "cert-manager FAILED: helm get values (within ${CERT_MANAGER_TIMEOUT_S}s)"; return 1; }
   local rc=0 ln
   python3 -m bench.cert_manager record --preflight "$OUT/cert-manager-preflight.json" \

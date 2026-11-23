@@ -26,12 +26,20 @@ import argparse
 import os
 import sys
 
-from bench import installer_features, rbac_model
+from bench import cert_manager, installer_features, rbac_model
 
 #: the installer's component whose chart ships the portal's shell: the key of its componentValues
 PORTAL_COMPONENT = "portal"
 #: the group granted the shell: the one every bench user is in (ONE definition, bench/rbac_model.py)
 READER_GROUP = rbac_model.BASE_GROUP
+#: the namespace the bench installs krateo into: s_install's release namespace (run606.sh, `helm install installer
+#: -n`) and the installer's namespaces.krateo, which the bench leaves at the chart's default (installer_features
+#: check_chart refuses a chart whose default is another)
+KRATEO_NAMESPACE = "krateo-system"
+#: features.internalTls's CA bundle (installer 0.3.703 compositions.yaml:1005 refuses the umbrella render while its
+#: target.namespaces is empty; its own chart, internal-ca-bundle 0.16.0 bundle.yaml:12, too): the bench names the
+#: namespace it installs krateo into, its own topology, never 057's list (it happens to equal 057's)
+CA_BUNDLE_TARGET = "internal-ca-bundle.target.namespaces"
 #: the toleration of the bench's snowplow pool's taint (bench/gke.py: dedicated=snowplow:NoSchedule): snowplow's,
 #: and the node-local OTLP agent's where the installer can express it (#1575)
 SNOWPLOW_POOL_TOLERATION = {"key": "dedicated", "operator": "Equal", "value": "snowplow", "effect": "NoSchedule"}
@@ -86,7 +94,7 @@ core-provider:
   # username: set at install from the pull-token file, piped into helm's -f - (not kept)
   passwordRef:
     name: krateo-agentiko-pull
-    namespace: krateo-system
+    namespace: {krateo_namespace}
     key: token
   imagePullSecretName: bench-ghcr-image-pull
   insecureSkipVerifyTLS: false
@@ -110,6 +118,11 @@ def document(snowplow_tag: str, frontend_tag: str = "", snowplow_env: dict[str, 
         own["snowplow"]["env"] = {k: str(v) for k, v in sorted(snowplow_env.items())}
     if frontend_tag:
         own["frontend"] = {"image": {"tag": frontend_tag}}
+    comp, *rest = CA_BUNDLE_TARGET.split(".")
+    node = own.setdefault(comp, {})
+    for seg in rest[:-1]:
+        node = node.setdefault(seg, {})
+    node[rest[-1]] = [KRATEO_NAMESPACE]
     rec = icv.load()
     if icv.receiver_on_snowplow_node(rec):
         # #1575: the node-local OTLP agent tolerates the bench's snowplow pool, as the bench's own topology
@@ -122,7 +135,48 @@ def document(snowplow_tag: str, frontend_tag: str = "", snowplow_env: dict[str, 
     cv = icv.merge(icv.nest(icv.bench_paths(rec)), own)
     return TEMPLATE.format(features=installer_features.values_block(installer_features.bench_features()),
                            component_values=yaml.safe_dump({"componentValues": cv}, sort_keys=True,
-                                                           default_flow_style=False, width=1000))
+                                                           default_flow_style=False, width=1000),
+                           krateo_namespace=KRATEO_NAMESPACE)
+
+
+def internal_tls_refusal(values: dict, features: dict) -> str | None:
+    """Why a run with these values (the document, parsed) and features cannot install, before any cluster:
+    with features.internalTls on, installer 0.3.703 refuses its whole composition render (every component)
+    while componentValues.internal-ca-bundle.target.namespaces is empty (compositions.yaml:1005). None when
+    the feature is off or the value is there."""
+    if not features.get("internalTls"):
+        return None
+    node = (values or {}).get("componentValues") or {}
+    for seg in CA_BUNDLE_TARGET.split("."):
+        node = node.get(seg) if isinstance(node, dict) else None
+    if not (isinstance(node, list) and node and all(isinstance(n, str) and n for n in node)):
+        return (f"features.internalTls is on and the run's values leave componentValues.{CA_BUNDLE_TARGET} "
+                f"empty ({node!r}): the installer refuses its whole composition render without it, so no "
+                f"component would install")
+    return None
+
+
+def internal_tls_lines(values: dict, features: dict) -> list[str]:
+    """What every check says about features.internalTls's values in the run's document (refusal: above)."""
+    if not features.get("internalTls"):
+        return ["internal TLS: features.internalTls is off, so nothing of it is written"]
+    node = values["componentValues"]
+    for seg in CA_BUNDLE_TARGET.split("."):
+        node = node[seg]
+    return [f"internal TLS: componentValues.{CA_BUNDLE_TARGET} = {', '.join(node)}, the namespace the bench installs "
+            f"krateo into"]
+
+
+#: the installer's top-level values the bench writes off where 057 may set them, and why (said by every check;
+#: what 057 sets there is never read, so never copied)
+TOP_LEVEL_OFF = {
+    "vertexAI.enabled": "an outside service (Google Vertex AI) reached with a credential: no endpoint, identity or "
+                        "credential is ever copied",
+}
+
+
+def top_level_lines() -> list[str]:
+    return [f"the bench writes {k} off: {why}" for k, why in sorted(TOP_LEVEL_OFF.items())]
 
 
 def main(argv: list[str] | None = None) -> int:

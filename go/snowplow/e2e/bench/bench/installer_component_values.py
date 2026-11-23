@@ -175,6 +175,9 @@ def is_off(value) -> bool:
 BENCH_OWN = {
     "portal.readerGroups": "the bench's base group (bench/rbac_model.py): its users are in it; 057's groups are "
                            "057's identities (the owner (Diego), 2026-11-22)",
+    "internal-ca-bundle.target.namespaces": "the namespace the bench installs krateo into (bench/installer_values.py "
+                                            "KRATEO_NAMESPACE), its own topology, never 057's list: features.internalTls "
+                                            "cannot render without it (installer 0.3.703 compositions.yaml:1005)",
 }
 
 

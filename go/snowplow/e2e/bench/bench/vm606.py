@@ -1811,6 +1811,11 @@ def chart_check(env: dict[str, str], labels: list[str], helm: str = "helm") -> l
                 paths = ghcr_pull.private_image_paths(pulled, values, helm)
             except (ValueError, ghcr_pull._Refused) as e:
                 raise Refused(f"installer {version}, run {x}'s values: {e}") from None
+            try:
+                # what the installer refuses to render with these values (features.internalTls's own), refused here
+                lines += [f"run {x}: {ln}" for ln in installer_features.check_values(values)]
+            except installer_features.Refused as e:
+                raise Refused(f"installer {version}, run {x}'s values: {e}") from None
             lines.append(f"installer {version}, run {x}'s values: private-image components (rendered on the laptop, "
                          f"{sum(map(len, paths.values()))} entries): {', '.join(sorted(paths))}")
     return lines

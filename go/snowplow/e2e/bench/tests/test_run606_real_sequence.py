@@ -1787,6 +1787,7 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         crd_chart("core-provider-crds", os.path.join(d, "charts", "core-provider-crds"))
         open(os.path.join(d, "values.yaml"), "w").write(
             "ociRepo: oci://ghcr.io/krateo-platformops/charts" + chr(10)
+            + "namespaces: {krateo: krateo-system}" + chr(10)
             + "features: {portal: true, agentGateway: false, specialistAgents: false}" + chr(10)
             # as 0.3.468: the installer turns the dashboard's ui-token-hop on through componentValues
             + "componentValues: {agentgateway-policies: {uiTokenHop: {enabled: true}}}" + chr(10))

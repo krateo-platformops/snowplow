@@ -246,6 +246,18 @@ def chart_features(installer_pulled: str) -> tuple[str, dict[str, bool]]:
     return version, {f: bool(defaults.get(f, False)) for f in props}
 
 
+def chart_krateo_namespace(installer_pulled: str) -> str:
+    """The namespace a pulled installer chart installs krateo into by default (values.yaml namespaces.krateo)."""
+    import yaml
+    root = _chart_root(installer_pulled)
+    try:
+        with open(os.path.join(root, "values.yaml"), encoding="utf-8") as fh:
+            values = yaml.safe_load(fh) or {}
+    except (OSError, ValueError) as e:
+        raise Refused(f"the installer chart at {root} cannot be read: {e}") from None
+    return str(((values.get("namespaces") or {}).get("krateo")) or "")
+
+
 def chart_schema(installer_pulled: str) -> tuple[str, dict]:
     """(the chart's version, its values.schema.json) of a pulled installer chart."""
     import yaml
@@ -283,8 +295,25 @@ def check_chart(installer_pulled: str, rec: dict | None = None, deviations: dict
         cv_lines = icv.lines()
     except icv.Refused as e:
         raise Refused(str(e)) from None
+    from bench import installer_values
+    ns = chart_krateo_namespace(installer_pulled)
+    if ns != installer_values.KRATEO_NAMESPACE:
+        raise Refused(f"installer {version} installs krateo into namespaces.krateo={ns!r} by default, and the bench "
+                      f"installs it into {installer_values.KRATEO_NAMESPACE!r} (bench/installer_values.py "
+                      f"KRATEO_NAMESPACE: s_install's release namespace, the CA bundle's target): the two must agree")
     return [f"installer features: {len(feats)} written, as {src} runs them, {len(on)} on: {', '.join(on)}"] \
-        + deviation_lines(rec, deviations) + cv_lines
+        + deviation_lines(rec, deviations) + cv_lines + installer_values.top_level_lines()
+
+
+def check_values(values: dict, rec: dict | None = None, deviations: dict | None = None) -> list[str]:
+    """The lines to say about the values document a run installs with (parsed), or Refused: what the
+    installer refuses to render with them, said before any cluster (bench/installer_values.py)."""
+    from bench import installer_values
+    feats = bench_features(load() if rec is None else validate(rec), deviations)
+    why = installer_values.internal_tls_refusal(values, feats)
+    if why:
+        raise Refused(why)
+    return installer_values.internal_tls_lines(values, feats)
 
 
 def record(listed, installer_pulled: str, date: str) -> dict:
@@ -343,6 +372,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("check", help="the installer chart must declare exactly 057's recorded features")
     c.add_argument("--installer-pulled", required=True)
+    c.add_argument("--values", required=True, help="the values document the run installs with "
+                   "(bench.installer_values): what the installer refuses to render with it is refused here")
     c.add_argument("--out")
     r = sub.add_parser("record", help="057's Installer CR list on stdin -> the record")
     r.add_argument("--installer-pulled", required=True, help="the installer chart at 057's CR version")
@@ -360,7 +391,13 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     try:
         if a.cmd == "check":
-            lines = check_chart(a.installer_pulled)
+            import yaml
+            try:
+                with open(a.values, encoding="utf-8") as fh:
+                    values = yaml.safe_load(fh) or {}
+            except (OSError, ValueError) as e:
+                raise Refused(f"the run's values {a.values} cannot be read: {e}") from None
+            lines = check_chart(a.installer_pulled) + check_values(values)
             if a.out:
                 with open(a.out, "w", encoding="utf-8") as fh:
                     json.dump({"kind": "installer_features_check", "ok": True, "features": bench_features(),
