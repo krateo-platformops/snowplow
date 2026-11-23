@@ -1,0 +1,432 @@
+{
+ "status_by_arm": {
+  "main": "3/3 RUN",
+  "v3": "3/3 RUN",
+  "mainB": "3/3 RUN"
+ },
+ "rates": {
+  "50": {
+   "mainB": {
+    "dep_p50": {
+     "median_ratio": 0.938,
+     "ratios": [
+      1.264,
+      0.938,
+      0.853
+     ],
+     "main_main_spread": [
+      0.853,
+      1.264
+     ],
+     "verdict": "spread"
+    },
+    "dep_p95": {
+     "median_ratio": 1.039,
+     "ratios": [
+      1.039,
+      1.017,
+      1.044
+     ],
+     "main_main_spread": [
+      1.017,
+      1.044
+     ],
+     "verdict": "spread"
+    },
+    "unrel_p50": {
+     "median_ratio": 0.912,
+     "ratios": [
+      1.2,
+      0.795,
+      0.912
+     ],
+     "main_main_spread": [
+      0.795,
+      1.2
+     ],
+     "verdict": "spread"
+    },
+    "unrel_p95": {
+     "median_ratio": 1.006,
+     "ratios": [
+      1.006,
+      0.959,
+      1.057
+     ],
+     "main_main_spread": [
+      0.959,
+      1.057
+     ],
+     "verdict": "spread"
+    },
+    "probe_p50": {
+     "median_ratio": 0.833,
+     "ratios": [
+      0.945,
+      0.833,
+      0.691
+     ],
+     "main_main_spread": [
+      0.691,
+      0.945
+     ],
+     "verdict": "spread"
+    },
+    "probe_p95": {
+     "median_ratio": 1.008,
+     "ratios": [
+      1.016,
+      0.992,
+      1.008
+     ],
+     "main_main_spread": [
+      0.992,
+      1.016
+     ],
+     "verdict": "spread"
+    },
+    "hit_p50": {
+     "median_ratio": 1.0,
+     "ratios": [
+      0.968,
+      1.0,
+      1.0
+     ],
+     "main_main_spread": [
+      0.968,
+      1.0
+     ],
+     "verdict": "spread"
+    },
+    "dep_rps": {
+     "median_ratio": 1.005,
+     "ratios": [
+      1.005,
+      1.007,
+      0.99
+     ],
+     "main_main_spread": [
+      0.99,
+      1.007
+     ],
+     "verdict": "spread"
+    },
+    "unrel_rps": {
+     "median_ratio": 1.008,
+     "ratios": [
+      1.008,
+      1.009,
+      0.996
+     ],
+     "main_main_spread": [
+      0.996,
+      1.009
+     ],
+     "verdict": "spread"
+    },
+    "completions_s": {
+     "median_ratio": 1.065,
+     "ratios": [
+      1.065,
+      1.102,
+      1.055
+     ],
+     "main_main_spread": [
+      1.055,
+      1.102
+     ],
+     "verdict": "spread"
+    },
+    "staleness_p95": [
+     2375.975,
+     2351.828,
+     2350.993
+    ],
+    "yielded": [
+     1,
+     8,
+     2
+    ],
+    "capped": [
+     0,
+     0,
+     0
+    ],
+    "parked_s": [
+     0,
+     0.001,
+     0
+    ],
+    "floored": [
+     12675,
+     15194,
+     14700
+    ],
+    "cpu_cores": [
+     2.5048327237440033,
+     2.5084883743159856,
+     2.4629820758104892
+    ],
+    "errors": [
+     0,
+     0,
+     0
+    ]
+   },
+   "v3": {
+    "dep_p50": {
+     "median_ratio": 0.753,
+     "ratios": [
+      0.828,
+      0.753,
+      0.725
+     ],
+     "main_main_spread": [
+      0.853,
+      1.264
+     ],
+     "verdict": "PASS"
+    },
+    "dep_p95": {
+     "median_ratio": 0.904,
+     "ratios": [
+      0.904,
+      0.927,
+      0.901
+     ],
+     "main_main_spread": [
+      1.017,
+      1.044
+     ],
+     "verdict": "PASS"
+    },
+    "unrel_p50": {
+     "median_ratio": 0.626,
+     "ratios": [
+      0.857,
+      0.625,
+      0.626
+     ],
+     "main_main_spread": [
+      0.795,
+      1.2
+     ],
+     "verdict": "PASS"
+    },
+    "unrel_p95": {
+     "median_ratio": 0.865,
+     "ratios": [
+      0.865,
+      0.828,
+      0.893
+     ],
+     "main_main_spread": [
+      0.959,
+      1.057
+     ],
+     "verdict": "PASS"
+    },
+    "probe_p50": {
+     "median_ratio": 0.674,
+     "ratios": [
+      0.835,
+      0.674,
+      0.558
+     ],
+     "main_main_spread": [
+      0.691,
+      0.945
+     ],
+     "verdict": "PASS"
+    },
+    "probe_p95": {
+     "median_ratio": 0.992,
+     "ratios": [
+      0.992,
+      0.996,
+      0.988
+     ],
+     "main_main_spread": [
+      0.992,
+      1.016
+     ],
+     "verdict": "PASS"
+    },
+    "hit_p50": {
+     "median_ratio": 1.0,
+     "ratios": [
+      0.968,
+      1.033,
+      1.0
+     ],
+     "main_main_spread": [
+      0.968,
+      1.0
+     ],
+     "verdict": "PASS"
+    },
+    "dep_rps": {
+     "median_ratio": 0.964,
+     "ratios": [
+      0.982,
+      0.964,
+      0.955
+     ],
+     "main_main_spread": [
+      0.99,
+      1.007
+     ],
+     "verdict": "FAIL"
+    },
+    "unrel_rps": {
+     "median_ratio": 0.969,
+     "ratios": [
+      0.98,
+      0.969,
+      0.959
+     ],
+     "main_main_spread": [
+      0.996,
+      1.009
+     ],
+     "verdict": "FAIL"
+    },
+    "completions_s": {
+     "median_ratio": 0.623,
+     "ratios": [
+      0.65,
+      0.623,
+      0.576
+     ],
+     "main_main_spread": [
+      1.055,
+      1.102
+     ],
+     "verdict": "FAIL"
+    },
+    "staleness_p95": [
+     1998.189,
+     2062.956,
+     2084.336
+    ],
+    "yielded": [
+     2,
+     0,
+     2
+    ],
+    "capped": [
+     0,
+     0,
+     0
+    ],
+    "parked_s": [
+     0,
+     0,
+     0
+    ],
+    "floored": [
+     3750,
+     4434,
+     3681
+    ],
+    "cpu_cores": [
+     3.38026836420447,
+     3.361871114439046,
+     3.3738124060828896
+    ],
+    "errors": [
+     0,
+     0,
+     0
+    ]
+   },
+   "main": {
+    "dep_p50": [
+     0.087,
+     0.097,
+     0.102
+    ],
+    "dep_p95": [
+     0.178,
+     0.178,
+     0.182
+    ],
+    "unrel_p50": [
+     0.07,
+     0.088,
+     0.091
+    ],
+    "unrel_p95": [
+     0.163,
+     0.169,
+     0.159
+    ],
+    "probe_p50": [
+     0.109,
+     0.138,
+     0.165
+    ],
+    "probe_p95": [
+     0.249,
+     0.251,
+     0.249
+    ],
+    "hit_p50": [
+     0.031,
+     0.03,
+     0.03
+    ],
+    "dep_rps": [
+     37.66201889860184,
+     37.91855439548133,
+     37.89970952020303
+    ],
+    "unrel_rps": [
+     75.29070857693944,
+     75.4718687748941,
+     75.63275365113516
+    ],
+    "completions_s": [
+     29.263055392010987,
+     32.53956506792618,
+     32.93308091993016
+    ],
+    "staleness_p95": [
+     2406.849,
+     2365.542,
+     2377.102
+    ],
+    "yielded": [
+     1,
+     1,
+     4
+    ],
+    "capped": [
+     0,
+     0,
+     0
+    ],
+    "parked_s": [
+     0,
+     0,
+     0
+    ],
+    "floored": [
+     11595,
+     13478,
+     13611
+    ],
+    "cpu_cores": [
+     2.5439438920862596,
+     2.4571153852668846,
+     2.4939128522378717
+    ],
+    "errors": [
+     0,
+     0,
+     0
+    ]
+   }
+  }
+ }
+}

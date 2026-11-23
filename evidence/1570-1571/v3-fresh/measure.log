@@ -1,0 +1,35 @@
+START 2026-11-23T00:02:04Z
+{"arm": "main", "round": 1, "status": "RUN", "seconds": 65.2, "alone": true, "other_jobs": [], "vm_before": "0.14 1.00 1.62 1/486 88854 jobs=[bin/rjob TestPaired865Customer-main-r1,] nproc=32"}
+{"arm": "v3", "round": 1, "status": "RUN", "seconds": 64.7, "alone": true, "other_jobs": [], "vm_before": "1.45 1.25 1.67 1/483 89456 jobs=[bin/rjob TestPaired865Customer-v3-r1,] nproc=32"}
+{"arm": "mainB", "round": 1, "status": "RUN", "seconds": 64.9, "alone": true, "other_jobs": [], "vm_before": "1.94 1.46 1.72 1/479 90060 jobs=[bin/rjob TestPaired865Customer-mainB-r1,] nproc=32"}
+{"arm": "v3", "round": 2, "status": "RUN", "seconds": 64.6, "alone": true, "other_jobs": [], "vm_before": "1.71 1.53 1.72 1/476 90668 jobs=[bin/rjob TestPaired865Customer-v3-r2,] nproc=32"}
+{"arm": "mainB", "round": 2, "status": "RUN", "seconds": 65.1, "alone": true, "other_jobs": [], "vm_before": "2.02 1.69 1.77 1/474 91288 jobs=[bin/rjob TestPaired865Customer-mainB-r2,] nproc=32"}
+{"arm": "main", "round": 2, "status": "RUN", "seconds": 64.9, "alone": true, "other_jobs": [], "vm_before": "1.69 1.68 1.76 1/475 91915 jobs=[bin/rjob TestPaired865Customer-main-r2,] nproc=32"}
+{"arm": "mainB", "round": 3, "status": "RUN", "seconds": 66.6, "alone": true, "other_jobs": [], "vm_before": "1.32 1.60 1.73 1/475 92515 jobs=[bin/rjob TestPaired865Customer-mainB-r3,] nproc=32"}
+{"arm": "main", "round": 3, "status": "RUN", "seconds": 65.3, "alone": true, "other_jobs": [], "vm_before": "1.78 1.73 1.77 1/474 93120 jobs=[bin/rjob TestPaired865Customer-main-r3,] nproc=32"}
+{"arm": "v3", "round": 3, "status": "RUN", "seconds": 65.4, "alone": true, "other_jobs": [], "vm_before": "1.59 1.70 1.76 1/473 93732 jobs=[bin/rjob TestPaired865Customer-v3-r3,] nproc=32"}
+PHASE r10 done rc=0 2026-11-23T00:11:51Z
+{"arm": "main", "round": 1, "status": "RUN", "seconds": 64.8, "alone": true, "other_jobs": [], "vm_before": "2.04 1.83 1.80 1/472 94337 jobs=[bin/rjob TestPaired865Customer-main-r1,] nproc=32"}
+{"arm": "v3", "round": 1, "status": "RUN", "seconds": 143.7, "alone": true, "other_jobs": [], "vm_before": "1.51 1.74 1.77 1/469 94950 jobs=[bin/rjob TestPaired865Customer-v3-r1,] nproc=32"}
+{"arm": "mainB", "round": 1, "status": "RUN", "seconds": 71.7, "alone": true, "other_jobs": [], "vm_before": "0.50 1.37 1.64 2/472 95588 jobs=[bin/rjob TestPaired865Customer-mainB-r1,] nproc=32"}
+{"arm": "v3", "round": 2, "status": "RUN", "seconds": 64.8, "alone": true, "other_jobs": [], "vm_before": "0.93 1.33 1.60 1/475 96213 jobs=[bin/rjob TestPaired865Customer-v3-r2,] nproc=32"}
+{"arm": "mainB", "round": 2, "status": "RUN", "seconds": 64.6, "alone": true, "other_jobs": [], "vm_before": "1.67 1.46 1.63 1/474 96827 jobs=[bin/rjob TestPaired865Customer-mainB-r2,] nproc=32"}
+{"arm": "main", "round": 2, "status": "RUN", "seconds": 64.9, "alone": true, "other_jobs": [], "vm_before": "1.97 1.61 1.67 1/475 97433 jobs=[bin/rjob TestPaired865Customer-main-r2,] nproc=32"}
+{"arm": "mainB", "round": 3, "status": "RUN", "seconds": 64.4, "alone": true, "other_jobs": [], "vm_before": "1.86 1.68 1.69 1/477 98039 jobs=[bin/rjob TestPaired865Customer-mainB-r3,] nproc=32"}
+{"arm": "main", "round": 3, "status": "RUN", "seconds": 64.8, "alone": true, "other_jobs": [], "vm_before": "1.57 1.66 1.69 1/478 98649 jobs=[bin/rjob TestPaired865Customer-main-r3,] nproc=32"}
+{"arm": "v3", "round": 3, "status": "RUN", "seconds": 66.4, "alone": true, "other_jobs": [], "vm_before": "1.48 1.65 1.69 1/474 99252 jobs=[bin/rjob TestPaired865Customer-v3-r3,] nproc=32"}
+PHASE r50 done rc=0 2026-11-23T00:23:01Z
+{"arm": "main", "round": 1, "status": "RUN", "seconds": 233.2, "alone": true, "other_jobs": [], "vm_before": "1.92 1.79 1.74 1/475 99886 jobs=[bin/rjob TestPairedFresh1570-main-r1,] nproc=32"}
+{"arm": "v3", "round": 1, "status": "RUN", "seconds": 217.1, "alone": true, "other_jobs": [], "vm_before": "0.24 1.02 1.44 1/471 100600 jobs=[bin/rjob TestPairedFresh1570-v3-r1,] nproc=32"}
+{"arm": "v3", "round": 2, "status": "RUN", "seconds": 212.1, "alone": true, "other_jobs": [], "vm_before": "0.61 0.86 1.30 1/469 101242 jobs=[bin/rjob TestPairedFresh1570-v3-r2,] nproc=32"}
+{"arm": "main", "round": 2, "status": "RUN", "seconds": 225.5, "alone": true, "other_jobs": [], "vm_before": "0.33 0.73 1.17 1/466 101888 jobs=[bin/rjob TestPairedFresh1570-main-r2,] nproc=32"}
+{"arm": "main", "round": 3, "status": "RUN", "seconds": 225.1, "alone": true, "other_jobs": [], "vm_before": "0.17 0.50 0.98 1/466 102546 jobs=[bin/rjob TestPairedFresh1570-main-r3,] nproc=32"}
+{"arm": "v3", "round": 3, "status": "RUN", "seconds": 209.8, "alone": true, "other_jobs": [], "vm_before": "0.38 0.47 0.87 1/467 103195 jobs=[bin/rjob TestPairedFresh1570-v3-r3,] nproc=32"}
+{"arm": "v3", "round": 4, "status": "RUN", "seconds": 212.3, "alone": true, "other_jobs": [], "vm_before": "0.24 0.41 0.77 1/467 103843 jobs=[bin/rjob TestPairedFresh1570-v3-r4,] nproc=32"}
+{"arm": "main", "round": 4, "status": "RUN", "seconds": 225.5, "alone": true, "other_jobs": [], "vm_before": "0.39 0.41 0.70 1/468 104487 jobs=[bin/rjob TestPairedFresh1570-main-r4,] nproc=32"}
+{"arm": "main", "round": 5, "status": "RUN", "seconds": 224.9, "alone": true, "other_jobs": [], "vm_before": "0.36 0.41 0.64 1/469 105137 jobs=[bin/rjob TestPairedFresh1570-main-r5,] nproc=32"}
+{"arm": "v3", "round": 5, "status": "RUN", "seconds": 209.7, "alone": true, "other_jobs": [], "vm_before": "0.47 0.49 0.63 1/465 105785 jobs=[bin/rjob TestPairedFresh1570-v3-r5,] nproc=32"}
+{"arm": "v3", "round": 6, "status": "RUN", "seconds": 210.1, "alone": true, "other_jobs": [], "vm_before": "0.16 0.41 0.58 1/466 106430 jobs=[bin/rjob TestPairedFresh1570-v3-r6,] nproc=32"}
+{"arm": "main", "round": 6, "status": "RUN", "seconds": 225.0, "alone": true, "other_jobs": [], "vm_before": "0.30 0.39 0.54 1/467 107069 jobs=[bin/rjob TestPairedFresh1570-main-r6,] nproc=32"}
+PHASE fresh done rc=0 2026-11-23T01:06:52Z
+ALL-DONE

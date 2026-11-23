@@ -1,0 +1,35 @@
+== v3-865-r10
+  main   status=['RUN', 'RUN', 'RUN']
+     normal wait mean 84-96 ms, share<=1s 99-100%; completions/s 15.2-15.7; cpu 2.39-2.45 cores; completions/core 6.4
+     dep staleness p50 1.25-1.26 p95 2.32-2.34 max 2.57-2.72 s; d2f p95 0.25-0.31 max 0.69-1.11 s
+     cust dep p50 0.1 ms, unrel p50 0.1 ms, rps 112-113
+  mainB  status=['RUN', 'RUN', 'RUN']
+     normal wait mean 102-129 ms, share<=1s 100%; completions/s 14.9-15.6; cpu 2.40-2.43 cores; completions/core 6.2-6.5
+     dep staleness p50 1.26-1.28 p95 2.35-2.37 max 2.55-2.63 s; d2f p95 0.28-0.39 max 0.83-7.72 s
+     cust dep p50 0.1 ms, unrel p50 0.1 ms, rps 113
+  v3     status=['RUN', 'RUN', 'RUN']
+     normal wait mean 75-78 ms, share<=1s 99%; completions/s 18.4-18.6; cpu 3.34-3.35 cores; completions/core 5.5-5.6
+     dep staleness p50 0.95-0.98 p95 1.89-1.97 max 2.48-2.58 s; d2f p95 0.23-0.25 max 1.12-1.22 s
+     cust dep p50 0.1 ms, unrel p50 0.1 ms, rps 108-111
+== v3-865-r50
+  main   status=['RUN', 'RUN', 'RUN']
+     normal wait mean 45-70 ms, share<=1s 100%; completions/s 29.3-32.9; cpu 2.46-2.54 cores; completions/core 11.5-13.2
+     dep staleness p50 1.30-1.34 p95 2.37-2.41 max 2.61-2.87 s; d2f p95 0.19-0.23 max 1.08-1.18 s
+     cust dep p50 0.1 ms, unrel p50 0.1 ms, rps 113-114
+  mainB  status=['RUN', 'RUN', 'RUN']
+     normal wait mean 30-53 ms, share<=1s 99-100%; completions/s 31.2-35.9; cpu 2.46-2.51 cores; completions/core 12.4-14.3
+     dep staleness p50 1.28-1.30 p95 2.35-2.38 max 2.55-2.63 s; d2f p95 0.18-0.20 max 0.94-1.23 s
+     cust dep p50 0.1 ms, unrel p50 0.1 ms, rps 113-114
+  v3     status=['RUN', 'RUN', 'RUN']
+     normal wait mean 76-89 ms, share<=1s 99%; completions/s 19.0-20.3; cpu 3.36-3.38 cores; completions/core 5.6-6.0
+     dep staleness p50 1.01-1.04 p95 2.00-2.08 max 2.65-2.78 s; d2f p95 0.25-0.29 max 0.71-1.18 s
+     cust dep p50 0.1 ms, unrel p50 0.1 ms, rps 109-111
+== v3-fresh
+  main   status=['RUN', 'RUN', 'RUN', 'RUN', 'RUN', 'RUN']
+     @1/s: push p95 1004.4-1006.3 ms; d2f p95 1.02-1.04 max 1.03-3.02 s
+     @10/s: push p95 3.0-5.0 ms; d2f p95 0.00 max 1.91-2.00 s
+     @50/s: push p95 1003.7-1005.8 ms; d2f p95 0.00 max 2.00-2.01 s
+  v3     status=['RUN', 'RUN', 'RUN', 'RUN', 'RUN', 'RUN']
+     @1/s: push p95 4.5-11.0 ms; d2f p95 0.00 max 0.00-0.01 s
+     @10/s: push p95 2.8-3.6 ms; d2f p95 0.00 max 0.00-0.14 s
+     @50/s: push p95 2.5-3.1 ms; d2f p95 0.00 max 0.00-0.02 s

@@ -1,0 +1,37 @@
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+rjob: viewed-arm on snowplow-build-1 slot 1/12 at 1c21573bbcbfa63411a4576b7190d53f433703ae in go/snowplow
+VET-OK
+    refresher_floor_live_backlog_1570_test.go:191: GREEN: X (cost 100.130984ms) floored at K≥31 S=1 (a frozen floor would be 3.104060504s) re-ran 41.186609ms after the drain (40 fillers)
+    refresher_floor_live_backlog_1570_test.go:191: GREEN: X (cost 100.712742ms) floored at K≥112 S=1 (a frozen floor would be 11.279827104s) re-ran 50.919µs after the drain (120 fillers)
+--- PASS: TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains (0.67s)
+    --- PASS: TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains/behind_40 (0.31s)
+    --- PASS: TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains/behind_120 (0.36s)
+    refresher_floor_live_backlog_1570_test.go:199: GREEN: X (cost 275.562166ms) floored at K≥1575 S=3 (a frozen floor would be 2m24.67013715s) re-ran -1.071454ms after the drain (1600 fillers)
+--- PASS: TestRefresher1570_FlooredWaitClosesAtBurstScale (1.22s)
+    refresher_floor_live_backlog_1570_test.go:206: GREEN: X (cost 100.55432ms) floored at K≥32 S=1 (a frozen floor would be 3.21773824s) re-ran 42.001638ms after the drain (40 fillers)
+--- PASS: TestRefresher1570_FlooredWaitClosesOnTheViewedSide (0.31s)
+    refresher_floor_live_backlog_1570_test.go:191: GREEN: X (cost 100.991393ms) floored at K≥31 S=1 (a frozen floor would be 3.130733183s) re-ran 44.041606ms after the drain (40 fillers)
+    refresher_floor_live_backlog_1570_test.go:191: GREEN: X (cost 100.993771ms) floored at K≥112 S=1 (a frozen floor would be 11.311302352s) re-ran 44.493µs after the drain (120 fillers)
+--- PASS: TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains (0.67s)
+    --- PASS: TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains/behind_40 (0.31s)
+    --- PASS: TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains/behind_120 (0.36s)
+    refresher_floor_live_backlog_1570_test.go:199: GREEN: X (cost 275.972158ms) floored at K≥1575 S=3 (a frozen floor would be 2m24.88538295s) re-ran -1.068364ms after the drain (1600 fillers)
+--- PASS: TestRefresher1570_FlooredWaitClosesAtBurstScale (1.22s)
+    refresher_floor_live_backlog_1570_test.go:206: GREEN: X (cost 100.655442ms) floored at K≥32 S=1 (a frozen floor would be 3.220974144s) re-ran 41.207646ms after the drain (40 fillers)
+--- PASS: TestRefresher1570_FlooredWaitClosesOnTheViewedSide (0.31s)
+    refresher_floor_live_backlog_1570_test.go:191: GREEN: X (cost 100.854294ms) floored at K≥32 S=1 (a frozen floor would be 3.227337408s) re-ran 43.943779ms after the drain (40 fillers)
+    refresher_floor_live_backlog_1570_test.go:191: GREEN: X (cost 100.513508ms) floored at K≥111 S=1 (a frozen floor would be 11.156999388s) re-ran 47.534µs after the drain (120 fillers)
+--- PASS: TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains (0.67s)
+    --- PASS: TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains/behind_40 (0.31s)
+    --- PASS: TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains/behind_120 (0.36s)
+    refresher_floor_live_backlog_1570_test.go:199: GREEN: X (cost 275.665197ms) floored at K≥1573 S=3 (a frozen floor would be 2m24.540451627s) re-ran 16.97µs after the drain (1600 fillers)
+--- PASS: TestRefresher1570_FlooredWaitClosesAtBurstScale (1.22s)
+    refresher_floor_live_backlog_1570_test.go:206: GREEN: X (cost 100.710941ms) floored at K≥31 S=1 (a frozen floor would be 3.122039171s) re-ran 41.262995ms after the drain (40 fillers)
+--- PASS: TestRefresher1570_FlooredWaitClosesOnTheViewedSide (0.31s)
+ok  	github.com/krateo-platformops/snowplow/internal/cache	7.698s

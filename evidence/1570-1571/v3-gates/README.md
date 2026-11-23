@@ -16,3 +16,14 @@ All runs are on snowplow-build-1 (the build VM), dated 2026-11-23 (UTC). They ar
 | checks-final.txt | all 11 `scripts/check_*.sh` | 1c21573b | RUN, 0 failed |
 
 Re-measure specs: `tools/arms-v3-865.json` (main / v3 / mainB with the split-branch overlay) and `tools/arms-v3-fresh.json` (main / v3 with `overlays/fresh-d2f`, which adds dirty_to_fresh per phase). Both overlays were vetted on both SHAs (`go vet -tags paired854,pairedfresh`): RUN, clean.
+
+## Viewed-side arm (reviewer mutant M4), head eefb5072a47b29b0629c1c6bdb138a096f29db0a
+
+| File | What | Result |
+|---|---|---|
+| viewed-arm.txt | `go vet ./internal/cache`; all `TestRefresher1570_FlooredWait*` arms under `-race` ×3, including the new `FlooredWaitClosesOnTheViewedSide` (S_viewed=1, 40 viewed keys, 100 ms cell) | RUN: vet clean, PASS 3/3 (viewed X re-ran 41–42 ms after the drain) |
+| viewed-arm-m4.txt | the viewed arm ×3 with endViewed's `backlogFell()` removed (M4) | RUN: FAIL 3/3 (re-ran 4.06–4.07 s after the drain) |
+
+## VM-exclusive re-measure (window opened ~00:01Z 2026-11-23), at main 3cc6444d vs v3 1c21573b
+
+Directories `v3-865-r10/`, `v3-865-r50/`, `v3-fresh/` (runs.jsonl per run, JSON per run, summary.txt); `v3-table.txt` is `tools/v3_table.py` over all three. 30/30 runs RUN, alone (no other rjob on the VM before or after any run), no round excluded. One run, v3 round 1 at 50/s, took 143.7 s against ~65 s for the others, outside its measured window (wall_s 30.0 like every other run); the other two v3 runs at 50/s took 64.8 s and 66.4 s.

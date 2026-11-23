@@ -1,0 +1,7 @@
+== rate 10
+  mainB: dep_p50=1.077(spread) dep_p95=0.983(spread) unrel_p50=0.941(spread) unrel_p95=0.959(spread) probe_p50=1.137(spread) probe_p95=1.012(spread) hit_p50=1.0(spread) dep_rps=1.002(spread) unrel_rps=1.005(spread) completions_s=0.978(spread)
+     capped=[0, 0, 0] yielded=[6, 3, 2] parked_s=[0, 0, 0] errors=[0, 0, 0]
+  v3: dep_p50=0.78(PASS) dep_p95=0.908(PASS) unrel_p50=0.682(PASS) unrel_p95=0.853(PASS) probe_p50=0.774(PASS) probe_p95=0.988(PASS) hit_p50=1.033(FAIL) dep_rps=0.98(FAIL) unrel_rps=0.978(FAIL) completions_s=1.18(PASS)
+     capped=[0, 0, 0] yielded=[0, 1, 0] parked_s=[0, 0, 0] errors=[0, 0, 0]
+  main: capped=[0, 0, 0] yielded=[3, 3, 5] parked_s=[0, 0, 0]
+{'main': '3/3 RUN', 'v3': '3/3 RUN', 'mainB': '3/3 RUN'}

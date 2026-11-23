@@ -1,0 +1,12 @@
+excluded rounds (incomplete): []
+arm	rate	rounds	push_pooled_n	push_pooled_p50	push_pooled_p95	push_p95_median_of_runs	viewed_wait_share_le_100	capped	yielded	parked_s	floored	completions_s_median	cust_rps_median	bar_viewed_wait	bar_push_p95
+main	1	6	120	2.5	1006.2	1005.2	1.0	0	0	0.0	401	2.3	198.4	PASS	FAIL
+v3	1	6	120	2.5	11.0	5.4	1.0	0	0	0.0	1	2.9	198.5	PASS	PASS
+main	10	6	120	2.4	5.0	3.5	1.0	0	0	0.0	1263	5.1	197.7	PASS	PASS
+v3	10	6	120	2.4	3.4	3.2	1.0	0	3	0.3	3	8.7	197.8	PASS	PASS
+main	50	6	120	2.4	1005.8	1004.4	1.0	0	0	0.0	5052	16.7	196.7	PASS	FAIL
+v3	50	6	120	2.4	3.1	2.8	1.0	0	1	0.0	8	24.4	196.7	PASS	PASS
+status: {'main': '6/6 RUN', 'v3': '6/6 RUN'}
+1 {'fast_p50': 0.96, 'fast_p95': 1.0, 'cold_p50': 1.01, 'cold_p95': 1.0, 'rps': 1.0} main medians {'fast_p50': 0.04, 'fast_p95': 0.09, 'cold_p50': 214.64, 'cold_p95': 280.47, 'rps': 198.4}
+10 {'fast_p50': 0.97, 'fast_p95': 1.0, 'cold_p50': 0.99, 'cold_p95': 0.97, 'rps': 1.0} main medians {'fast_p50': 0.05, 'fast_p95': 0.09, 'cold_p50': 208.17, 'cold_p95': 275.02, 'rps': 197.71}
+50 {'fast_p50': 0.89, 'fast_p95': 0.98, 'cold_p50': 1.0, 'cold_p95': 1.02, 'rps': 1.0} main medians {'fast_p50': 0.05, 'fast_p95': 0.09, 'cold_p50': 207.35, 'cold_p95': 265.83, 'rps': 196.67}
