@@ -246,6 +246,18 @@ def chart_features(installer_pulled: str) -> tuple[str, dict[str, bool]]:
     return version, {f: bool(defaults.get(f, False)) for f in props}
 
 
+def chart_krateo_namespace(installer_pulled: str) -> str:
+    """The namespace a pulled installer chart installs krateo into by default (values.yaml namespaces.krateo)."""
+    import yaml
+    root = _chart_root(installer_pulled)
+    try:
+        with open(os.path.join(root, "values.yaml"), encoding="utf-8") as fh:
+            values = yaml.safe_load(fh) or {}
+    except (OSError, ValueError) as e:
+        raise Refused(f"the installer chart at {root} cannot be read: {e}") from None
+    return str(((values.get("namespaces") or {}).get("krateo")) or "")
+
+
 def chart_schema(installer_pulled: str) -> tuple[str, dict]:
     """(the chart's version, its values.schema.json) of a pulled installer chart."""
     import yaml
@@ -283,8 +295,45 @@ def check_chart(installer_pulled: str, rec: dict | None = None, deviations: dict
         cv_lines = icv.lines()
     except icv.Refused as e:
         raise Refused(str(e)) from None
+    from bench import installer_values
+    ns = chart_krateo_namespace(installer_pulled)
+    if ns != installer_values.KRATEO_NAMESPACE:
+        raise Refused(f"installer {version} installs krateo into namespaces.krateo={ns!r} by default, and the bench "
+                      f"installs it into {installer_values.KRATEO_NAMESPACE!r} (bench/installer_values.py "
+                      f"KRATEO_NAMESPACE: s_install's release namespace, the CA bundle's target): the two must agree")
+    if feats.get("internalTls"):
+        cm_check(installer_pulled, version)
     return [f"installer features: {len(feats)} written, as {src} runs them, {len(on)} on: {', '.join(on)}"] \
-        + deviation_lines(rec, deviations) + cv_lines
+        + deviation_lines(rec, deviations) + cr_patch_lines(feats) + cv_lines + installer_values.top_level_lines()
+
+
+def cr_patch_lines(feats: dict) -> list[str]:
+    """The features the run's values write off and its Installer CR patch turns on (bench/installer_render.py)."""
+    from bench import installer_render
+    return [f"installer features: {f} is written by the CR patch after helm install, recorded ON (the values write it "
+            f"off): {why}" for f, why in sorted(installer_render.CR_PATCH_FEATURES.items()) if feats.get(f)]
+
+
+def cm_check(installer_pulled: str, version: str) -> None:
+    """Refused unless cert-manager runs where the bench says it does once the installer takes it over: with
+    features.internalTls on, installer 0.3.703 pins its own cert-manager (alsoFeatures: [internalTls]) under
+    the release name of the bench's cert-manager step, and upgrades that release in place (krateo-057:
+    jetstack v1.21.1 rev 1, then cert-manager-0.10.0 rev 2). Its pinned namespace must be the bench's
+    (bench/cert_manager.py NAMESPACE, the installer's internalTls.certManagerNamespace), or the installer
+    would run a second cert-manager elsewhere and the CA would be read from the wrong namespace."""
+    from bench import cert_manager, installer_pins
+    try:
+        pins = installer_pins.components(_chart_root(installer_pulled))
+    except installer_pins.Refused as e:
+        raise Refused(f"installer {version}: {e}") from None
+    for c in pins:
+        on = [c.get("feature"), *(c.get("alsoFeatures") or [])]
+        if c.get("name") == cert_manager.RELEASE and "internalTls" in on \
+                and c.get("namespace") != cert_manager.NAMESPACE:
+            raise Refused(f"installer {version} pins its own {cert_manager.RELEASE} under features.internalTls in "
+                          f"namespace {c.get('namespace')!r}, and the bench's cert-manager step installs it into "
+                          f"{cert_manager.NAMESPACE!r} (bench/cert_manager.py NAMESPACE, the installer's "
+                          f"internalTls.certManagerNamespace): the two must agree")
 
 
 def record(listed, installer_pulled: str, date: str) -> dict:

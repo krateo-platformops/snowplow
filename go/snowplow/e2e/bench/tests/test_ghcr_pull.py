@@ -106,8 +106,9 @@ def _leaks():
     ("bad_digest", f"agentgateway-controller:{FAKE_CHART_BAD_DIGEST}: its images unreadable: "),
     ("http_blob", f"agentgateway-controller:{FAKE_CHART_HTTP_BLOB}: its images unreadable: "),
     # #1023 A: a private-image component (inst.privateImageComponents) must render, and render a ghcr image
-    ("private_unrendered", "agentgateway-policies:0.2.18: the installer lists it as a private-image component "
-                           "(inst.privateImageComponents) and it cannot be rendered: helm template failed: "),
+    ("private_unrendered", "agentgateway-policies:0.2.18: component agentgateway-policies, which the installer "
+                           "lists as a private-image component (inst.privateImageComponents): it cannot be rendered "
+                           "with the values the run installs with: helm template failed: "),
     ("private_no_image", "agentgateway-policies:0.2.18: the installer lists it as a private-image component "
                          "(inst.privateImageComponents), yet no rendered pod running a ghcr.io image carries the "
                          "pull secret it injects at certReplayHop.image.pullSecrets, uiTokenHop.image.pullSecrets"),
@@ -116,8 +117,9 @@ def _leaks():
                                 "(inst.privateImageComponents), yet no rendered pod running a ghcr.io image carries "
                                 "the pull secret it injects at uiTokenHop.image.pullSecrets"),
     # #1041 review F1: a private-image component with no repo of its own is checked too
-    ("private_repoless", "ghcr.io/krateo-platformops/charts/alert-provider:0.2.53: the installer lists it as a "
-                         "private-image component (inst.privateImageComponents) and it cannot be rendered"),
+    ("private_repoless", "ghcr.io/krateo-platformops/charts/alert-provider:0.2.53: component alert-provider, "
+                         "which the installer lists as a private-image component (inst.privateImageComponents): "
+                         "it cannot be rendered"),
     # #1395: the list is RENDERED from the installer chart; one that cannot be read refuses the run, by name
     # helm's cause, whatever its version's line layout (#1395 review: helm_reason)
     ("private_rule_missing", 'no template "inst.privateImageComponents" associated with template "gotpl"'),
@@ -750,14 +752,14 @@ def test_the_image_pull_failure_redacts_the_pull_account():
     assert FAKE_GHCR_USER not in f[0]["message"] and "<redacted>" in f[0]["message"]
 
 
-@pytest.mark.parametrize("env,render", [({"FAKE_HELM_TEMPLATE_FAIL": "agentgateway-controller"}, "failed: helm template failed: "),
-                                        ({"FAKE_PRIVATE_IMAGES": "commented"}, "ok"),
+@pytest.mark.parametrize("env,render", [({"FAKE_PRIVATE_IMAGES": "commented"}, "ok"),
                                         ({"FAKE_PRIVATE_IMAGES": "dynamic"}, "ok")])
 def test_what_is_not_a_private_image_component_is_recorded_not_refused(harness, env, render):  # noqa: F811
-    """A chart the installer injects no pull Secret into may fail to render:
-    recorded (its values' images still preflighted), the run goes on. #1395: the
-    installer's list is rendered, so a comment inside it (installer 0.3.616, run
-    26f) and an entry from a rule over the values read as the list they render."""
+    """A chart the installer injects no pull Secret into is preflighted too, and
+    passes. #1395: the installer's list is rendered, so a comment inside it
+    (installer 0.3.616, run 26f) and an entry from a rule over the values read as
+    the list they render. (A chart of either kind that does not RENDER refuses the
+    run: test_a_component_that_does_not_render_refuses_the_run_before_up.)"""
     env0, state, ambient, tmp = harness
     p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=dict(env0, **env), capture_output=True,
                        text=True, timeout=300)
@@ -771,6 +773,48 @@ def test_what_is_not_a_private_image_component_is_recorded_not_refused(harness, 
             "agentgateway-policies, alert-provider, core-provider-agent") in out
     ap = next(c for c in pf["charts"] if c["chart"].endswith("/alert-provider"))
     assert ap["private_image_component"] and ap["error"] is None
+
+
+@pytest.mark.parametrize("chart", ["agentgateway-controller", "agentgateway-policies"])
+def test_a_component_that_does_not_render_refuses_the_run_before_up(harness, chart):  # noqa: F811
+    """#1588 follow-up: a component the install runs that does not render with the
+    run's values refuses the run before any cluster, by name and with helm's own
+    error, whether or not it is a private-image component. Until then one that is
+    not was recorded "OK (render failed: ...)" and the run went on: the 0.3.703
+    dry passes carried internal-ca-bundle so (target.namespaces empty), which on
+    the cluster fails the installer's whole composition render."""
+    env0, state, ambient, tmp = harness
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=dict(env0, FAKE_HELM_TEMPLATE_FAIL=chart),
+                       capture_output=True, text=True, timeout=300)
+    out = p.stdout + p.stderr
+    assert p.returncode != 0, out[-3000:]
+    assert ("registry FAILED: a component this install runs cannot be rendered with the values the run installs "
+            "with") in out, out[-3000:]
+    assert (f"component {chart}" in out and "it cannot be rendered with the values the run installs with: "
+            f"helm template failed: Error: execution error at ({chart}/templates/hop.yaml:3:4): a required value "
+            "is missing") in out, out[-3000:]
+    assert "the ghcr pull token does not resolve" not in out, out[-3000:]
+    assert "=== step registry ===" in out and "=== step up ===" not in out
+    assert not any(c["tool"] == "gcloud" and c["argv"][:3] == ["container", "clusters", "create"]
+                   for c in _calls(state))
+    pf = json.loads((tmp / "out" / "ghcr-pull-preflight.json").read_text())
+    rec = next(c for c in pf["charts"] if c["chart"].endswith("/" + chart))
+    assert rec["unrendered"] and rec["render"].startswith("failed: helm template failed: ") and rec["error"]
+    assert [c["chart"].rsplit("/", 1)[-1] for c in pf["charts"] if c["unrendered"]] == [chart]
+    assert not any(c["unrendered"] for c in pf["charts"] if c["error"] is None)
+
+
+def test_every_rendered_component_passes_with_no_render_failure(harness):  # noqa: F811
+    """The falsifier's other side: the same run with every chart rendering passes the
+    registry step, and its record says no chart is unrendered."""
+    env0, state, ambient, tmp = harness
+    p = subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=env0, capture_output=True, text=True,
+                       timeout=300)
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, out[-3000:]
+    pf = json.loads((tmp / "out" / "ghcr-pull-preflight.json").read_text())
+    assert pf["charts"] and not any(c["unrendered"] for c in pf["charts"])
+    assert all(c["render"].startswith("ok") for c in pf["charts"] if c["render"]), pf["charts"]
 
 
 def test_an_init_container_that_cannot_pull_is_named_too():
@@ -1512,6 +1556,7 @@ def _s_registry(tmp_path, rc: int, lines: list[str]) -> str:
               f"log() {{ printf '%s\\n' \"$*\" >> {log}; }}\n"
               f"record_failure() {{ log \"RECORD: $1\"; return 1; }}\n"
               "write_installer_values() { :; }\n"
+              "installer_render_check() { :; }\n"        # #1590: before the preflight, tests/test_installer_render.py's
               f"python3() {{ {stub}return {rc}; }}\n"
               f"{fn}s_registry; echo \"rc=$?\" >> {log}\n")
     subprocess.run(["bash", "-c", script], check=True)
@@ -1528,6 +1573,10 @@ def test_run606_says_no_answer_for_the_preflights_exit_4_and_does_not_resolve_fo
     assert "refusing: NO ANSWER from the registry ..." in out              # the preflight's own lines, logged
     out = _s_registry(tmp_path, 3, ["refusing: the ghcr pull token does not resolve ..."])
     assert "RECORD: registry FAILED: the ghcr pull token does not resolve this install's private charts" in out
+    out = _s_registry(tmp_path, 5, ["refusing: a component does not render ..."])
+    last = out.split("a component does not render ...")[-1]
+    assert ("RECORD: registry FAILED: a component this install runs cannot be rendered with the values the run installs "
+            "with") in last and "does not resolve" not in last and last.endswith("rc=1\n")
     out = _s_registry(tmp_path, 0, ["[ghcr] all OK"])
     assert "RECORD" not in out.split("all OK")[-1] and out.endswith("rc=0\n")
 

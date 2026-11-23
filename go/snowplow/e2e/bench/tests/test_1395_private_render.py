@@ -273,7 +273,8 @@ def test_the_values_are_the_heredocs_byte_for_byte(tmp_path, snowplow, frontend,
       - features: krateo-057's (bench/installer_features.py, #1572) where the heredoc's three
         hand-picked lines were;
       - componentValues: the heredoc's own entries (snowplow's image, node and tolerations; the
-        frontend's image), plus the portal's reader group (run 26j), under krateo-057's recorded switches
+        frontend's image), plus the portal's reader group (run 26j) and the internal CA bundle's target
+        namespace (the namespace the bench installs krateo into), under krateo-057's recorded switches
         and sizes (bench/installer_component_values.py, #1572), written as one YAML map after a comment."""
     from bench import installer_component_values as icv
     from bench import installer_features
@@ -282,7 +283,8 @@ def test_the_values_are_the_heredocs_byte_for_byte(tmp_path, snowplow, frontend,
     k, m = got.index("# The installer's features are krateo-057's"), got.index("vertexAI:")
     c, j = got.index("# componentValues: krateo-057's recorded switches and sizes"), got.index("registryAuth:")
     heredoc = "features:\n  agentGateway: true\n  coreAgents: false\n  specialistAgents: false\n"
-    assert got[k:m].split("\n", 2)[2] == installer_features.values_block(installer_features.bench_features())
+    # the features the values write: 057's, the CR patch's (internalTls) off (bench/installer_render.py)
+    assert got[k:m].split("\n", 2)[2] == installer_features.values_block(installer_values.values_features())
     wc, wj = want.index("componentValues:\n"), want.index("registryAuth:")
     # every byte outside the two blocks is the heredoc's
     assert got[:k] + heredoc + got[m:c] + want[wc:wj] + got[j:] == want
@@ -294,6 +296,8 @@ def test_the_values_are_the_heredocs_byte_for_byte(tmp_path, snowplow, frontend,
         # #1575: the bench's own topology, where the installer can express it: the node-local OTLP agent
         # tolerates the snowplow pool, with the toleration the heredoc gave snowplow
         own["otel-collector-daemonset"] = {"opentelemetry-collector": {"tolerations": own["snowplow"]["tolerations"]}}
+    # #1588 follow-up: features.internalTls's CA bundle targets the namespace the bench installs krateo into
+    own["internal-ca-bundle"] = {"target": {"namespaces": [installer_values.KRATEO_NAMESPACE]}}
     assert yaml.safe_load(block)["componentValues"] == icv.merge(icv.nest(icv.bench_paths()), own)
     out = tmp_path / "v.yaml"
     assert installer_values.main(["--snowplow-tag", snowplow, "--frontend-tag", frontend, "--out", str(out)]) == 0
@@ -320,6 +324,11 @@ import os, sys, tarfile
 REAL = {real!r}
 a = sys.argv[1:]
 ver = a[a.index("--version") + 1] if "--version" in a else ""
+if a[:1] == ["pull"] and a[1:2] == ["oci://quay.io/jetstack/charts/cert-manager"]:
+    # the bench's pinned cert-manager chart, the REAL archive (bench/cert_manager.py verifies its sha256)
+    import shutil
+    shutil.copy(os.environ["FAKE_CERT_MANAGER_TGZ"], os.path.join(a[a.index("-d") + 1], "cert-manager-" + ver + ".tgz"))
+    sys.exit(0)
 src = os.path.join(os.environ["FAKE_INSTALLER_CHARTS"], "installer-" + ver + ".tgz")
 if a[:2] == ["show", "chart"] or a[:1] == ["pull"]:
     if not os.path.isfile(src):
@@ -348,6 +357,7 @@ def laptop_helm(tmp_path, monkeypatch):
     (b / "helm").write_text(FAKE_PULL_HELM.format(real=shutil.which("helm")))
     (b / "helm").chmod(0o755)
     monkeypatch.setenv("FAKE_INSTALLER_CHARTS", str(d))
+    monkeypatch.setenv("FAKE_CERT_MANAGER_TGZ", str(Path(__file__).resolve().parent / "fixtures" / "cert-manager-v1.21.1.tgz"))
     monkeypatch.setenv("PATH", f"{b}{os.pathsep}{os.environ['PATH']}")
     return d
 
@@ -381,6 +391,34 @@ def test_the_laptop_renders_every_runs_list(laptop_helm):
     lines = REAL_CHART_CHECK(_env(), ["N1", "N2"])
     assert _chart_lines(lines) == [f"installer {RECORDED}, run N1's values: {WANT_RECORDED}",
                                    f"installer {RECORDED}, run N2's values: {WANT_RECORDED}"]
+    # #1588 follow-up: every run's effective spec rendered by the installer's composition template, every enabled
+    # component, every guard passed; and the CR patch it was rendered with
+    rendered = [ln for ln in lines if "installer render: rendered " in ln]
+    assert [ln.split(":", 1)[0] for ln in rendered] == ["run N1", "run N2"], lines
+    for ln in rendered:
+        n = re.search(r"rendered (\d+) of (\d+) enabled components", ln)
+        assert n and n.group(1) == n.group(2) and int(n.group(1)) > 0, ln
+        assert "trust-manager" in ln and "internal-ca-bundle" in ln and "cert-manager-issuers" in ln, ln
+    assert sum('installer CR patch (after helm install, one merge patch): {"spec": {"features": {"internalTls": true}, '
+               '"internalTls": {"certManagerNamespace": "cert-manager"}}}' in ln for ln in lines) == 2, lines
+
+
+def test_falsifier_the_laptop_refuses_a_run_whose_values_leave_the_ca_bundle_target_empty(laptop_helm, monkeypatch):
+    """#1588 follow-up: installer 0.3.703 refuses its whole composition render with features.internalTls on and
+    componentValues.internal-ca-bundle.target.namespaces empty; the laptop refuses the launch first."""
+    real = installer_values.document
+
+    def without(*a, **k):
+        d = yaml.safe_load(real(*a, **k))
+        d["componentValues"].pop("internal-ca-bundle")
+        return yaml.safe_dump(d)
+    monkeypatch.setattr(installer_values, "document", without)
+    with pytest.raises(vm606.Refused) as e:
+        REAL_CHART_CHECK(_env(), ["N1", "N2"])
+    assert str(e.value).startswith(f"installer {RECORDED}, run N1's values: the installer refuses to render its "
+                                   "components with the run's effective spec"), str(e.value)
+    assert ("compositions.yaml:1005:4): features.internalTls is on but componentValues.internal-ca-bundle.target"
+            ".namespaces is empty") in str(e.value), str(e.value)
 
 
 @pytest.mark.parametrize("body,why", [
@@ -481,7 +519,13 @@ def test_the_bench_enable_rule_is_the_installers(tmp_path, snowplow):
     from bench import diag606
     pulled = _pulled(tmp_path, RECORDED)
     root = pulled / "installer"
-    values = ghcr_pull._merge(_values(snowplow), {"bootstrap": {"coreProvider": {"enabled": False}}})
+    # the run's EFFECTIVE values: the document writes internalTls off, the run's Installer CR patch turns it on
+    # with its certManagerNamespace (bench/installer_render.py, installer#1084)
+    from bench import cert_manager, installer_features, installer_render
+    patch = installer_render.cr_patch(installer_features.bench_features(), cert_manager.NAMESPACE)
+    assert patch["spec"]["features"] == {"internalTls": True}
+    effective = ghcr_pull._merge(_values(snowplow), patch["spec"])
+    values = ghcr_pull._merge(effective, {"bootstrap": {"coreProvider": {"enabled": False}}})
 
     def registered(chart):
         return {d["metadata"]["name"] for d in _render(chart, values, "--show-only", "templates/definitions.yaml")
@@ -500,14 +544,13 @@ def test_the_bench_enable_rule_is_the_installers(tmp_path, snowplow):
     (stripped / "files" / "component-pins.min.yaml").write_text(yaml.safe_dump(bare))
     assert stock - registered(stripped) == {"cert-manager", "cert-manager-issuers"}
     assert registered(stripped) < stock
-    feats = {**yaml.safe_load((root / "values.yaml").read_text())["features"], **_values(snowplow)["features"]}
+    feats = {**yaml.safe_load((root / "values.yaml").read_text())["features"], **effective["features"]}
     core = set(diag606.core_features(str(pulled)))
     # #1572: the bench's rule is the installer's inst.compEnabled (bench/installer_features.py)
-    from bench import installer_features
     rule = {c["name"] for c in pins["components"] if installer_features.component_enabled(c, feats, core)}
     assert rule == stock
     # with coreAgents on (#1572), its private-image components are registered too
-    assert sorted(set(ghcr_pull.private_image_paths(str(pulled), _values(snowplow))) & stock) == [
+    assert sorted(set(ghcr_pull.private_image_paths(str(pulled), effective)) & stock) == [
         "agentgateway-policies", "alert-provider", "config-refs-mcp-server", "core-provider-agent", "kagent",
         "repo-mcp-server"]
 

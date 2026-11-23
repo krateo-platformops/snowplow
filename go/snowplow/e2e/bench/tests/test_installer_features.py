@@ -99,10 +99,24 @@ def _doc_features(doc: str) -> dict:
     return yaml.safe_load(doc)["features"]
 
 
+def _effective_features(doc: str) -> dict:
+    """What the Installer CR holds once s_install is done: the document's features, the run's CR patch merged in
+    (installer#1084: the patch is the only way installer 0.3.703's CR gets CR_PATCH_FEATURES with their value)."""
+    from bench import cert_manager, installer_render
+    patch = installer_render.cr_patch(installer_features.bench_features(), cert_manager.NAMESPACE)
+    return {**_doc_features(doc), **((patch.get("spec") or {}).get("features") or {})}
+
+
 def test_the_values_write_every_feature_at_057s_value_or_a_named_deviation():
+    from bench import installer_render
     rec = installer_features.load()
-    got = _doc_features(installer_values.document("1.12.75"))
-    assert set(got) == set(rec["features"])                   # every one written: no chart default decides one
+    doc = _doc_features(installer_values.document("1.12.75"))
+    got = _effective_features(installer_values.document("1.12.75"))
+    assert set(doc) == set(rec["features"])                   # every one written: no chart default decides one
+    # the document differs from what the CR ends up with by exactly the CR-patched features: off there, on here
+    assert rec["features"]["internalTls"] is True             # 057 runs it (else the next line proves nothing)
+    assert {f for f in doc if doc[f] is not got[f]} == set(installer_render.CR_PATCH_FEATURES) == {"internalTls"}
+    assert all(doc[f] is False and got[f] is True for f in installer_render.CR_PATCH_FEATURES)
     for f, v in got.items():
         want = installer_features.DEVIATIONS[f][0] if f in installer_features.DEVIATIONS else rec["features"][f]
         assert v is want, f
@@ -124,7 +138,7 @@ def test_falsifier_the_values_follow_the_record_they_are_not_a_second_list(monke
 def test_falsifier_a_deviation_changes_only_its_feature(monkeypatch):
     rec = installer_features.load()
     monkeypatch.setattr(installer_features, "DEVIATIONS", {"auditWorm": (False, "why", "ruling")})
-    got = _doc_features(installer_values.document("1.12.75"))
+    got = _effective_features(installer_values.document("1.12.75"))
     assert got == {**rec["features"], "auditWorm": False}
 
 
@@ -142,7 +156,8 @@ def test_every_deviation_names_why_and_a_ruling_and_differs_from_057():
 
 # ─── the chart check ───────────────────────────────────────────────────────
 
-def _chart(tmp_path: Path, version: str, features: dict) -> Path:
+def _chart(tmp_path: Path, version: str, features: dict, krateo_ns: str = "krateo-system",
+           cm_ns: str = "cert-manager") -> Path:
     """A pulled installer chart, as installer_src leaves it (<dir>/installer): its version, its schema's
     features and their values.yaml defaults."""
     root = tmp_path / version / "installer"
@@ -163,7 +178,15 @@ def _chart(tmp_path: Path, version: str, features: dict) -> Path:
         {"properties": {"componentValues": {"type": "object", "properties": cv},
                         "features": {"type": "object", "additionalProperties": False,
                                      "properties": {f: {"type": "boolean"} for f in features}}}}))
-    (root / "values.yaml").write_text(yaml.safe_dump({"features": {f: v for f, v in features.items() if v is not None}}))
+    # as every published installer chart: namespaces.krateo (the bench's KRATEO_NAMESPACE is held to it)
+    (root / "values.yaml").write_text(yaml.safe_dump({"features": {f: v for f, v in features.items() if v is not None},
+                                                      "namespaces": {"krateo": krateo_ns}}))
+    # the pins file, with installer 0.3.703's own cert-manager: on under features.internalTls (alsoFeatures), in the
+    # namespace the bench's cert-manager step installs into (installer_features.cm_check holds the two together)
+    (root / "files").mkdir()
+    (root / "files" / "component-pins.min.yaml").write_text(yaml.safe_dump({"components": [
+        {"name": "cert-manager", "kind": "CertManager", "version": "0.10.0", "feature": "ingress",
+         "alsoFeatures": ["internalTls"], "namespace": cm_ns}]}))
     return root.parent
 
 
@@ -176,7 +199,12 @@ def test_a_chart_that_declares_exactly_057s_features_passes_and_says_the_deviati
     dev = installer_features.deviation_lines()
     # the feature deviations, then the component values' own lines (#1572: switches and sizes, their deviations
     # and the not-recorded paths)
-    assert lines[1:1 + len(dev)] == dev and lines[1 + len(dev):] == installer_component_values.lines()
+    assert lines[1:1 + len(dev)] == dev
+    assert lines[1 + len(dev):] == (installer_features.cr_patch_lines(installer_features.bench_features())
+                                    + installer_component_values.lines() + installer_values.top_level_lines())
+    # #1588 follow-up: internalTls is named as the CR patch's, recorded ON
+    assert any(ln.startswith("installer features: internalTls is written by the CR patch after helm install, "
+                             "recorded ON (the values write it off)") for ln in lines)
     assert all(f"on {f}:" in "\n".join(lines) for f in installer_features.DEVIATIONS)
 
 
@@ -237,6 +265,57 @@ def test_the_check_cli_writes_its_record_and_refuses_with_exit_2(tmp_path, capsy
     assert installer_features.main(["check", "--installer-pulled", str(bad), "--out", str(out2)]) == 2
     assert "refusing: installer 0.3.641 cannot express" in capsys.readouterr().err
     assert json.loads(out2.read_text())["ok"] is False
+
+
+# ─── #1588 follow-up: what the installer refuses to render, refused before any cluster ──
+
+def test_the_run_writes_the_ca_bundle_target_from_the_namespace_it_installs_krateo_into():
+    """The value is the bench's own topology (installer_values.KRATEO_NAMESPACE), the namespace s_install
+    installs into and the chart's namespaces.krateo; the document's registry pull Secret's namespace is the
+    same definition; run606.sh's installer release namespace is it too."""
+    doc = yaml.safe_load(installer_values.document("1.12.74"))
+    assert doc["componentValues"]["internal-ca-bundle"] == {"target": {"namespaces": [installer_values.KRATEO_NAMESPACE]}}
+    assert doc["registryAuth"]["passwordRef"]["namespace"] == installer_values.KRATEO_NAMESPACE
+    src = (BENCH_DIR / "run606.sh").read_text()
+    installs = [ln for ln in src.splitlines() if "-n krateo-system --create-namespace -f \"$OUT/installer-values.yaml\"" in ln]
+    assert len(installs) == 2 and installer_values.KRATEO_NAMESPACE == "krateo-system"
+    assert "internal-ca-bundle.target.namespaces" in installer_component_values.BENCH_OWN
+    # the top-level values the bench writes off are off in the document it writes
+    for path in installer_values.TOP_LEVEL_OFF:
+        node = doc
+        for seg in path.split("."):
+            node = node[seg]
+        assert node is False, path
+
+
+def test_s_cert_manager_reads_its_namespace_from_the_one_definition():
+    """The cert-manager step installs into bench/cert_manager.py NAMESPACE, read from its preflight record: no
+    literal namespace in the step (the installer's internalTls.certManagerNamespace comes from the same one)."""
+    src = (BENCH_DIR / "run606.sh").read_text()
+    body = src[src.index("s_cert_manager() {"):]
+    body = body[:body.index("\n}\n")]
+    assert 'ns="$(cm_field namespace)"' in body and "-n cert-manager" not in body
+    assert body.count('-n "$ns"') == 5           # [[ -n "$ns" ]], then install, wait, helm list, helm get values
+
+
+def test_falsifier_a_chart_whose_own_cert_manager_runs_elsewhere_is_refused(tmp_path):
+    """With features.internalTls on, installer 0.3.703 takes over the bench's cert-manager release; a pin in another
+    namespace would run a second cert-manager there, and the CA would be read from the wrong one."""
+    assert installer_features.bench_features()["internalTls"] is True
+    chart = _chart(tmp_path, READ_VERSION, {f: False for f in ALL}, cm_ns="cert-manager-elsewhere")
+    with pytest.raises(installer_features.Refused, match=r"pins its own cert-manager under features\.internalTls in "
+                                                         r"namespace 'cert-manager-elsewhere', and the bench's "
+                                                         r"cert-manager step installs it into 'cert-manager'"):
+        installer_features.check_chart(str(chart))
+    off = {**installer_features.DEVIATIONS, "internalTls": (False, "a test's deviation", "a test's ruling")}
+    assert installer_features.check_chart(str(chart), deviations=off)        # the feature off: nothing to agree on
+
+
+def test_falsifier_a_chart_that_installs_krateo_elsewhere_is_refused(tmp_path):
+    chart = _chart(tmp_path, READ_VERSION, {f: False for f in ALL}, krateo_ns="krateo")
+    with pytest.raises(installer_features.Refused, match=r"installs krateo into namespaces\.krateo='krateo' by default, "
+                                                         r"and the bench installs it into 'krateo-system'"):
+        installer_features.check_chart(str(chart))
 
 
 # ─── a reading of 057: record and drift ────────────────────────────────────
@@ -342,11 +421,9 @@ def test_vm606s_chart_check_refuses_a_chart_that_cannot_express_057s_features(tm
     from tests.test_1395_private_render import REAL_CHART_CHECK
 
     def preflight(chart, version, workdir, requirements=(), **kw):
-        root = Path(workdir) / "installer"
-        root.mkdir(parents=True)
+        import shutil
         src = _chart(tmp_path, version, {f: False for f in ALL if f != "internalTls"}) / "installer"
-        for p in src.iterdir():
-            (root / p.name).write_bytes(p.read_bytes())
+        shutil.copytree(src, Path(workdir) / "installer")
         return {"ok": True}
     monkeypatch.setattr(installer_src, "oci_preflight", preflight)
     env = {"INSTALLER_VERSION": READ_VERSION, "RUNS": "N1", "SNOWPLOW_TAG_N1": "1.12.75"}
@@ -425,7 +502,7 @@ def test_run606_writes_057s_features_and_says_the_deviations(harness):  # noqa: 
         (p.stderr + log)[-3000:]
     assert all(f"the bench differs from 057 on {f}:" in log for f in installer_features.DEVIATIONS)
     assert json.loads((tmp / "out" / "installer-features.json").read_text())["ok"] is True
-    assert _doc_features((tmp / "out" / "installer-values.yaml").read_text()) == installer_features.bench_features()
+    assert _doc_features((tmp / "out" / "installer-values.yaml").read_text()) == installer_values.values_features()
 
 
 def test_falsifier_run606_refuses_an_installer_that_cannot_express_057s_features(harness):  # noqa: F811
