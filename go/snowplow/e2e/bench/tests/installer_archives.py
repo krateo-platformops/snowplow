@@ -26,11 +26,11 @@ SHA256 = {
     "0.3.545": "ff89684302ec33852f390279f2cbd9d069fc65b39ce1ad566b5bf6907653efc1",
     "0.3.616": "614280d447301d7df1a7779e8618eeb079ccb99e7d28ef4bc3e8d466d0c9f285",
     "0.3.641": "d6692a9f3910d29b7b2ea7bf4fafa1d7499bab5686281259ce31fa25ecbc309b",
-    # pulled 2026-11-23, the registry's manifest digest sha256:cc8f73fddb82cbb7922e480a74398244e310465afec1106b309994b882e99d9d
-    "0.3.701": "29a5a409d7932a478703a2939d1739547b0ba08d283dc800d3e216961d416f6d",
+    # pulled 2026-11-23, the registry's manifest digest sha256:f37134378bb1a4a5821d117d5651e0e431c7c1f0ac30bcd6431c5e9f422554ed
+    "0.3.703": "8b0d89a8d6ae999aaf6ab7c34e0eec681dd5d0db23e0e04a73c0dfd7af55258e",
 }
 #: the archive of the installer krateo-057's record was read on: the one a run's values render against
-RECORDED = "0.3.701"
+RECORDED = "0.3.703"
 #: the archives a run's chart check refuses (they cannot express 057's recorded features)
 BEFORE_THE_RECORD = tuple(v for v in SHA256 if v != RECORDED)
 

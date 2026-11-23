@@ -62,8 +62,8 @@ AT_0_3_545 = {
 AT_0_3_616 = {**AT_0_3_545, "kagent": [["perUserRbac", "toolImagePullSecrets"]]}
 # installer 0.3.698's: the same, plus zendesk-kog's wrapper plugin (behind a comment too); 0.3.700's and 0.3.701's (the record's): the same
 AT_0_3_698 = {**AT_0_3_616, "zendesk-kog": [["plugin", "imagePullSecrets"]]}
-AT_0_3_701 = dict(AT_0_3_698)
-AT_RECORDED = {"0.3.701": AT_0_3_701}[RECORDED]
+AT_0_3_703 = dict(AT_0_3_698)
+AT_RECORDED = {"0.3.703": AT_0_3_703}[RECORDED]
 
 
 def _values(snowplow_tag="1.12.69", frontend_tag="1.8.41", **over) -> dict:

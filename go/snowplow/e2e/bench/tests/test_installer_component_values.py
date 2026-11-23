@@ -31,17 +31,17 @@ def _sha(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-# sha256 of bench/installer_component_values_057.json as re-taken 2026-11-23 08:5x Rome on installer 0.3.701
+# sha256 of bench/installer_component_values_057.json as re-taken 2026-11-23 09:45 Rome on installer 0.3.703
 # (read first on 0.3.697, then 0.3.698 and 0.3.700; no recorded switch or size ever moved. On 0.3.700 three
 # not-recorded paths left 057's CR, agentgateway-policies.llm.retry.*, and the installer's schema declared the
 # agent's toleration, installer #1121: installer_schema true. 0.3.701 moved only the version: the same
 # switches, sizes, not-recorded paths and schema fact)
-PINNED = "7162d9c37ce6df40c600294dc01ab64a27dab85bb1db7d2a3300378993da257a"
+PINNED = "7182cfb7e9bf570e749da0342bf90f203547785d2440bc8ca19f089326f27f32"
 
 
 def test_the_committed_record_is_the_reading_of_2026_11_23():
     rec = icv.load()
-    assert rec["read"]["date"] == "2026-11-23" and rec["read"]["installer_version"] == "0.3.701"
+    assert rec["read"]["date"] == "2026-11-23" and rec["read"]["installer_version"] == "0.3.703"
     assert len(rec["recorded"]) == 57 and len(rec["not_recorded"]) == 132
     assert {p: rec["recorded"][p] for p in KAGENT_SWITCHES} == KAGENT_SWITCHES
     assert rec["recorded"]["kagent.kagentapp.database.postgres.bundled.storage"] == "8Gi"
@@ -372,7 +372,7 @@ def test_falsifier_the_chart_check_refuses_an_installer_that_cannot_express_a_re
     with pytest.raises(icv.Refused, match=r"installer 0\.3\.641 cannot express \d+ of 057's recorded component"):
         icv.check_chart(schema, "0.3.641")
     full = _schema_with(icv.bench_paths(), icv.receiver_on_snowplow_node())
-    icv.check_chart(full, "0.3.701")
+    icv.check_chart(full, "0.3.703")
 
 
 def test_drift_names_what_moved():
@@ -420,7 +420,7 @@ def test_falsifier_without_the_toleration_in_the_schema_the_deviation_is_said_an
     rec = _rec_with_receiver(False)
     monkeypatch.setattr(icv, "load", lambda path=icv.RECORD_PATH: rec)
     why, ruling = icv.deviations(rec)["snowplow.env.OTEL_LOGS_ENABLED"]
-    assert why == ("no OTLP receiver on the bench's snowplow node: installer 0.3.701 cannot express the daemonset "
+    assert why == ("no OTLP receiver on the bench's snowplow node: installer 0.3.703 cannot express the daemonset "
                    "toleration (componentValues.otel-collector-daemonset.opentelemetry-collector.tolerations is not in "
                    "its values schema; 057 has a receiver there)") and ruling == icv.RULING_RECEIVER
     cv = _cv_of(installer_values.document("1.12.75"))
