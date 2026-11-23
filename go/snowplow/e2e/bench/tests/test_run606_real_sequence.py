@@ -1025,11 +1025,15 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         # (run 24: run606's pre-install tracing reading) there is no snowplow pod.
         if not os.path.exists(os.path.join(STATE, "installer-installed")):
             print(json.dumps({"items": []})); sys.exit(0)
-        cnt = os.path.join(STATE, "snowplow_pod_reads")
+        cnt = os.path.join(STATE, "snowplow_pod_reads")      # FAKE_TERMINATING_READS counts reads (below)
         n = int(open(cnt).read()) if os.path.exists(cnt) else 0
         open(cnt, "w").write(str(n + 1))
-        # read 0 = the digest gate, 1 = the before record, 2+ = after
-        restarted = os.environ.get("FAKE_RESTART_DURING_MEASURE") == "1" and n >= 2
+        # the restart happens DURING measure: once a measuring driver Job is applied (run606 driver_jobs:
+        # load606, or k6load / k6browser), never by the ordinal of a read (#1575: the env step's receiver
+        # gate reads the pod too, before the digest gate)
+        jf = os.path.join(STATE, "applied-jobs")
+        driving = os.path.exists(jf) and bool({"load606", "k6load", "k6browser"} & set(open(jf).read().split()))
+        restarted = os.environ.get("FAKE_RESTART_DURING_MEASURE") == "1" and driving
         cs = {"name": "snowplow", "ready": True, "restartCount": 1 if restarted else 0,
               "image": "ghcr.io/krateo-platformops/snowplow:1.12.50",
               "imageID": "ghcr.io/krateo-platformops/snowplow@" + os.environ["FAKE_IMAGE_DIGEST"],
