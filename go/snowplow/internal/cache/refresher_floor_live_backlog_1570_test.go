@@ -12,6 +12,10 @@
 //     12.19–12.22 s for a 44 ms / 132 ms drain — cost × (N+1)/S, frozen).
 //  2. AT BURST SCALE (S = 3, 1,600 fillers, a 275 ms cell: the refresher's
 //     recorded burst and the reviewer's example, whose frozen floor is ~147 s).
+//  3. ON THE VIEWED SIDE (S_viewed = 1, 40 viewed fillers, a 100 ms viewed
+//     cell): the viewed side's set is re-evaluated at the end of viewed work
+//     (endViewed). Falsifier: that hook removed ⇒ X waits for the timer armed
+//     at the peak's due time (~4 s) ⇒ RED.
 //
 // In both, X's next refresh must start within RefreshCost × max(1, K_now/S) of
 // the drain (K_now ≤ S once drained: one cost), plus scheduling slack — and not
@@ -33,7 +37,10 @@ import (
 
 // liveBacklogArm runs one arm: parallelism p, a cell X costing cost, fillers
 // behind it, and the drain; it asserts X's second refresh against the drain.
-func liveBacklogArm(t *testing.T, p, fillers int, cost, slack time.Duration) {
+// viewed puts every key on the viewed side: armed by a /refreshes subscription
+// and marked through the production dirty-mark hook, so X, the gates and the
+// fillers all queue on the viewed tier and K is the viewed side's backlog.
+func liveBacklogArm(t *testing.T, p, fillers int, cost, slack time.Duration, viewed bool) {
 	t.Helper()
 	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, p, 0)
@@ -41,7 +48,10 @@ func liveBacklogArm(t *testing.T, p, fillers int, cost, slack time.Duration) {
 	t.Cleanup(SetRefresherRateFloorForTest("")) // the production rule
 	resetRefresherForTest()
 	c := ResolvedCache()
-	s := max(p-1, 1) // the unviewed side's workers (#1069)
+	s := max(p-1, 1) // the workers either side may hold (#1069)
+	if viewed {
+		Deps().SetStore(c)
+	}
 
 	mk := func(name string) string {
 		in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: name}
@@ -59,6 +69,11 @@ func liveBacklogArm(t *testing.T, p, fillers int, cost, slack time.Duration) {
 	fill := make([]string, fillers)
 	for i := range fill {
 		fill[i] = mk(fmt.Sprintf("live-backlog-fill-%d", i))
+	}
+	mark := enqueueRefreshForTest
+	if viewed {
+		viewed765Arm(t, append(append([]string{x}, gates...), fill...)...)
+		mark = func(k string) { terminalMark([]string{k}) }
 	}
 
 	var (
@@ -104,16 +119,16 @@ func liveBacklogArm(t *testing.T, p, fillers int, cost, slack time.Duration) {
 	r := refresherSingleton()
 
 	// X's first refresh records its cost.
-	enqueueRefreshForTest(x)
+	mark(x)
 	waitFor(t, 5*time.Second, "X's first refresh", func() bool { mu.Lock(); defer mu.Unlock(); return len(xRuns) == 1 })
 	// Every unviewed worker held; X, then the fillers, queued behind them.
 	for _, g := range gates {
-		enqueueRefreshForTest(g)
+		mark(g)
 	}
-	waitFor(t, 5*time.Second, "every unviewed worker held by a gate", func() bool { return gateIn.Load() == int64(s) })
-	enqueueRefreshForTest(x)
+	waitFor(t, 5*time.Second, "every worker of the side held by a gate", func() bool { return gateIn.Load() == int64(s) })
+	mark(x)
 	for _, f := range fill {
-		enqueueRefreshForTest(f)
+		mark(f)
 	}
 	floored0 := r.flooredTotal.Load()
 	openGates()
@@ -145,6 +160,12 @@ func liveBacklogArm(t *testing.T, p, fillers int, cost, slack time.Duration) {
 	second := xRuns[1]
 	drained := lastFillAt
 	mu.Unlock()
+	if viewed {
+		// SETUP: the whole backlog ran on the viewed tier (X twice, every gate and filler)
+		if d := r.viewed.dequeued.Load(); d < uint64(fillers+len(gates)+2) {
+			t.Fatalf("SETUP: only %d viewed dequeues for %d keys: the backlog was not on the viewed side", d, fillers+len(gates)+2)
+		}
+	}
 	if n := fillDone.Load(); n != int64(fillers) {
 		t.Fatalf("SETUP: X re-ran before the drain (%d of %d fillers done): the backlog did not hold it", n, fillers)
 	}
@@ -167,7 +188,7 @@ func liveBacklogArm(t *testing.T, p, fillers int, cost, slack time.Duration) {
 func TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains(t *testing.T) {
 	for _, n := range []int{40, 120} {
 		t.Run(fmt.Sprintf("behind_%d", n), func(t *testing.T) {
-			liveBacklogArm(t, 2, n, 100*time.Millisecond, 50*time.Millisecond)
+			liveBacklogArm(t, 2, n, 100*time.Millisecond, 50*time.Millisecond, false)
 		})
 	}
 }
@@ -175,5 +196,12 @@ func TestRefresher1570_FlooredWaitClosesAsTheBacklogDrains(t *testing.T) {
 // TestRefresher1570_FlooredWaitClosesAtBurstScale — arm 2: K ≈ 1,600, S = 3, a
 // 275 ms cell.
 func TestRefresher1570_FlooredWaitClosesAtBurstScale(t *testing.T) {
-	liveBacklogArm(t, 4, 1600, 275*time.Millisecond, 100*time.Millisecond)
+	liveBacklogArm(t, 4, 1600, 275*time.Millisecond, 100*time.Millisecond, false)
+}
+
+// TestRefresher1570_FlooredWaitClosesOnTheViewedSide — arm 3: a viewed cell
+// floored behind a viewed backlog (K_viewed ≫ S_viewed = 1) refreshes within its
+// own cost of that backlog's drain.
+func TestRefresher1570_FlooredWaitClosesOnTheViewedSide(t *testing.T) {
+	liveBacklogArm(t, 2, 40, 100*time.Millisecond, 50*time.Millisecond, true)
 }
