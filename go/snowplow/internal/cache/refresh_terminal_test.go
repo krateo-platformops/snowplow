@@ -55,7 +55,7 @@ func terminalEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv(envRefresherBaseDelayMS, "1")
 	t.Setenv(envRefresherMaxDelayMS, "2")
-	t.Setenv(envRefresherRateFloorSeconds, "0")
+	t.Cleanup(SetRefresherRateFloorForTest("0"))
 }
 
 // terminalFixture: clean store + deps + refresher, N resident widgets entries

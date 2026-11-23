@@ -305,7 +305,7 @@ func TestC1Smoke_SubstratePlumbing(t *testing.T) {
 	t.Setenv(envResolvedCacheTTLSeconds, "20")
 	t.Setenv(envResolvedCacheMaxEntryAgeSeconds, "86400")
 	t.Setenv(envResolvedCacheSummaryEvery, "36000")
-	t.Setenv(envRefresherRateFloorSeconds, "0")
+	t.Cleanup(SetRefresherRateFloorForTest("0"))
 	resetResolvedCacheForTest()
 	t.Cleanup(resetResolvedCacheForTest)
 	resetRefresherForTest()

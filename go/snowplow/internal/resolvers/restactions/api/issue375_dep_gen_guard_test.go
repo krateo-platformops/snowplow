@@ -294,7 +294,7 @@ func TestIssue375_TwoGVRsMoved_OuterConvergesFreshForBoth(t *testing.T) {
 
 func runConvergenceArm375(t *testing.T, stages []*templates.API, churns map[schema.GroupVersionResource][2]string) {
 	dyn := newWatcher375(t)
-	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
+	t.Cleanup(cache.SetRefresherRateFloorForTest("0"))
 	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "4")
 	cache.ResetRefresherForTest()
 	store := cache.ResolvedCache()
@@ -420,7 +420,7 @@ func runConvergenceArm375(t *testing.T, stages []*templates.API, churns map[sche
 // ---------------------------------------------------------------------------
 func TestIssue375_ContentOwnDepChurn_ContentKeyRemarked_ConvergesFresh(t *testing.T) {
 	dyn := newWatcher375(t)
-	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
+	t.Cleanup(cache.SetRefresherRateFloorForTest("0"))
 	cache.ResetRefresherForTest()
 	rem := observeRemarks375(t)
 	store := cache.ResolvedCache()

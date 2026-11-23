@@ -143,7 +143,7 @@ func TestIssue316_MissedDirtyMark_WarmCellProactivelyRefreshed(t *testing.T) {
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "20")              // TTL/4 = 5s
 	t.Setenv("RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS", "86400") // off-axis (large)
 	t.Setenv("RESOLVED_CACHE_SUMMARY_EVERY_SECONDS", "36000") // drive the pass directly
-	t.Setenv(envRefresherRateFloorSeconds, "0")               // no floor delay in test
+	t.Cleanup(SetRefresherRateFloorForTest("0"))               // no floor delay in test
 	resetResolvedCacheForTest()
 	t.Cleanup(resetResolvedCacheForTest)
 	resetRefresherForTest()
@@ -209,7 +209,7 @@ func TestIssue316_StaleSource_PassCannotManufactureFreshness(t *testing.T) {
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "20")
 	t.Setenv("RESOLVED_CACHE_MAX_ENTRY_AGE_SECONDS", "86400")
 	t.Setenv("RESOLVED_CACHE_SUMMARY_EVERY_SECONDS", "36000")
-	t.Setenv(envRefresherRateFloorSeconds, "0")
+	t.Cleanup(SetRefresherRateFloorForTest("0"))
 	resetResolvedCacheForTest()
 	t.Cleanup(resetResolvedCacheForTest)
 	resetRefresherForTest()

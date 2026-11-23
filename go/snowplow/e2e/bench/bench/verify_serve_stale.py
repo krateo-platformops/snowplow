@@ -897,12 +897,12 @@ def run_verify_serve_stale(user: str = "admin",
         f"informer={informer_ack})")
 
     # ── T+10s probe (post-refresh) ──────────────────────────────────────
-    # #318-R1a PM-gate C2: was T+5s. The refresher rate-floor (default 2s,
-    # RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS) can defer the
-    # post-mutation re-resolve by up to floor + resolve time; a 5s window
-    # raced that and would spuriously FAIL a healthy floor. 10s clears
-    # floor(2s) + worst-case resolve with margin while staying far under
-    # the 30s convergence tier.
+    # #318-R1a PM-gate C2: was T+5s. The refresher rate-floor (a fixed 2s
+    # until #1570; now the cell's own refresh cost x its side's live
+    # backlog) can defer the post-mutation re-resolve by up to floor +
+    # resolve time; a 5s window raced the old 2s floor and would spuriously
+    # FAIL a healthy floor. 10s clears it plus worst-case resolve with
+    # margin while staying far under the 30s convergence tier.
     post_target = t_mutate + 10.000
     sleep_fn(max(0.0, post_target - time.monotonic()))
     actual_post_offset_ms = int((time.monotonic() - t_mutate) * 1000)

@@ -31,6 +31,7 @@ var resolvedEntryBodyFields = map[string]bool{"RawJSON": true, "Inputs": true}
 // or during putCoreLocked, under c.mu where noted) or are lazily-derived views.
 var resolvedEntryMetadataInPlace = map[string]string{
 	"CreatedAt":       "putPreamble stamps the incoming entry's write time",
+	"RefreshCost":     "#1570 replaceIfGenRefresh stamps the incoming entry's refresh cost before putPreamble (metadata: the per-key rate floor)",
 	"BornAt":          "putPreamble / ReplaceIfGenRefresh / putCoreLocked lifetime clock (incoming entry); SetBornAtForTest",
 	"resolveStart":    "#1198 putPreamble stamps where the incoming entry's resolve began (metadata: the stale-push ledger only)",
 	"hasResolveStart": "#1198 stamped with resolveStart",

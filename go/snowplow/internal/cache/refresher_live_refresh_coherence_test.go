@@ -12,7 +12,7 @@
 //      OnUpdate -> enqueue) and the refresher re-resolving + committing it
 //      (stale-while-revalidate). The proposal hedged "sub-ms–ms, usually
 //      fresh"; these tests prove the window is dominated by the #318-R1a
-//      rate-floor (default 2s; refresher.go:105) and the Ship #98 customer
+//      rate-floor (#1570: the cell's own last refresh cost; was a fixed 2s) and the Ship #98 customer
 //      yield (cap 5s; refresher.go:124), NOT the ms-scale resolve. This is
 //      the deterministic 2.0s / up-to-~5s window option B's floor-bypass
 //      must close.
@@ -74,8 +74,8 @@ type servedSample struct {
 // stale window (reconcile -> first fresh served via the dispatcher read), the
 // commit latency (reconcile -> handler Put), and observed/sample counts.
 //
-//   - floorSeconds: RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS ("" = prod
-//     default 2s; "0" = kill-switch baseline).
+//   - floorSeconds: the SetRefresherRateFloorForTest pin ("" = prod
+//     rule: the cell's own cost, #1570; "0" = no floor).
 //   - customerInflight: pin a sustained customer /call so the refresher
 //     yields (models a busy 1000-user deployment; adds the 5s yield cap).
 //   - resolveCost: models the in-process resolve+populate latency.
@@ -83,7 +83,7 @@ func runStaleWindowProbe(t *testing.T, floorSeconds string, customerInflight boo
 	t.Helper()
 	cleanup := withCleanRefresher(t, 4, 0) // 4 workers = production default parallelism
 	defer cleanup()
-	t.Setenv(envRefresherRateFloorSeconds, floorSeconds)
+	t.Cleanup(SetRefresherRateFloorForTest(floorSeconds))
 	resetRefresherForTest()
 
 	c := ResolvedCache()
@@ -175,26 +175,27 @@ func runStaleWindowProbe(t *testing.T, floorSeconds string, customerInflight boo
 
 // --- A. STALE-WINDOW falsifier ----------------------------------------------
 
-// TestLiveRefreshCoherence_StaleWindow_ProductionDefault is THE headline
-// falsifier: floor at the production default (2s, env unset), no customer
-// load, a sub-ms-modelled resolve. A fresh L1 entry (just served by the first
-// /call) is dirty-marked by a reconcile; the refetch reads stale v1 until the
-// FLOORED re-resolve commits v2. The window is ~2s (the rate-floor), NOT the
-// "sub-ms–ms" the proposal assumed.
-func TestLiveRefreshCoherence_StaleWindow_ProductionDefault(t *testing.T) {
+// TestLiveRefreshCoherence_StaleWindow_ProductionRule is the headline arm at
+// the production floor rule, no customer load, a ms-modelled resolve. A fresh
+// L1 entry (just served by the first /call) is dirty-marked by a reconcile; the
+// refetch reads stale v1 until the re-resolve commits v2.
+//
+// Under the fixed 2 s floor this window was ~2 s (the floor, not the resolve:
+// this arm used to assert ≥ 1.5 s). #1570 — the floor is now the cell's own
+// last refresh cost, and a cell the first /call just filled has none recorded,
+// so the window is the mechanism plus the resolve, as on floor=0. RED if a fixed
+// floor comes back for a young dirty-marked entry.
+func TestLiveRefreshCoherence_StaleWindow_ProductionRule(t *testing.T) {
 	// #1233: this test writes the store under a complete snapshot.
 	CompleteRBACSnapshotForTest(t)
 	win, observed, n, commit := runStaleWindowProbe(t, "", false, 5*time.Millisecond)
-	t.Logf("STALE-WINDOW[prod-default floor=2s, no customer load]: stale_window=%s observed_fresh=%v refetch_samples=%d commit_latency_from_reconcile=%s",
+	t.Logf("STALE-WINDOW[production rule: the cell's own cost, no customer load]: stale_window=%s observed_fresh=%v refetch_samples=%d commit_latency_from_reconcile=%s",
 		win.Round(time.Millisecond), observed, n, commit.Round(time.Millisecond))
 	if !observed {
 		t.Fatalf("never observed fresh within 15s — would indicate a hang, not a window")
 	}
-	// Guard the FINDING: the window must be floor-dominated (>= ~1.5s), well
-	// above the ms-scale resolve. RED if a future change makes the floor stop
-	// applying to a young dirty-marked entry (the premise would dissolve).
-	if win < 1500*time.Millisecond {
-		t.Fatalf("stale_window=%s < 1.5s — the 2s rate-floor no longer dominates the window; re-baseline the premise", win)
+	if win > 500*time.Millisecond {
+		t.Fatalf("stale_window=%s > 500ms for a cell with no recorded refresh cost — a fixed floor still applies (#1570)", win)
 	}
 }
 
@@ -244,9 +245,13 @@ func TestLiveRefreshCoherence_StaleWindow_FloorPlusCustomerYield(t *testing.T) {
 // 0..2500ms post-reconcile, each a concurrent dispatcher read, and report the
 // stale fraction. Run under -race (concurrent readers vs the refresher).
 func TestLiveRefreshCoherence_RefetchLandsInsideWindow(t *testing.T) {
+	// #1233: the refresh's write needs a complete snapshot. Without it every
+	// refresh Put was refused and retried, and the "mostly stale" this arm used
+	// to assert held for that reason too, not only the floor's.
+	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 4, 0)
 	defer cleanup()
-	t.Setenv(envRefresherRateFloorSeconds, "") // production default 2s
+	t.Cleanup(SetRefresherRateFloorForTest("")) // the production rule: the cell's own cost (#1570)
 	resetRefresherForTest()
 
 	c := ResolvedCache()
@@ -297,11 +302,14 @@ func TestLiveRefreshCoherence_RefetchLandsInsideWindow(t *testing.T) {
 	}
 	wg.Wait()
 	total := stale.Load() + fresh.Load()
-	t.Logf("REFETCH-LANDING[floor=2s]: %d refetches across 0-2500ms post-reconcile -> STALE=%d FRESH=%d (%.0f%% landed in the stale window)",
+	t.Logf("REFETCH-LANDING[production rule]: %d refetches across 0-2500ms post-reconcile -> STALE=%d FRESH=%d (%.0f%% landed in the stale window)",
 		total, stale.Load(), fresh.Load(), 100*float64(stale.Load())/float64(total))
-	// A majority of refetches in the first 2.5s must land stale — the premise.
-	if stale.Load() <= fresh.Load() {
-		t.Fatalf("stale=%d <= fresh=%d — refetches no longer predominantly land stale; the premise weakened", stale.Load(), fresh.Load())
+	// Under the fixed 2 s floor a majority of these refetches landed stale (this
+	// arm asserted it). #1570 — the young cell has no recorded refresh cost, so
+	// nothing floors its refresh: only the refetches fired before the ~5 ms
+	// resolve committed can be stale (the 0 ms offset, at most the 100 ms one).
+	if stale.Load() > 2 {
+		t.Fatalf("stale=%d of %d refetches across 2.5 s — a fixed floor still holds the young cell stale (#1570)", stale.Load(), total)
 	}
 }
 
@@ -347,7 +355,7 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 	t.Helper()
 	cleanup := withCleanRefresher(t, 4, 0)
 	defer cleanup()
-	t.Setenv(envRefresherRateFloorSeconds, floorSeconds)
+	t.Cleanup(SetRefresherRateFloorForTest(floorSeconds))
 	resetRefresherForTest()
 
 	c := ResolvedCache()
@@ -366,12 +374,15 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 
 	var resolves atomic.Int32
 	var lastCommitAt atomic.Int64
-	RegisterRefreshFunc("widgets", func(_ context.Context, k string, used ResolvedKeyInputs) error {
-		// Models a real ~50-100ms per-user widget re-resolve compacted to a
-		// small but non-zero cost so the alloc/wall figures are meaningful
-		// without making the test slow.
-		time.Sleep(2 * time.Millisecond)
-		c.put(k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used})
+	RegisterRefreshFunc("widgets", func(ctx context.Context, k string, used ResolvedKeyInputs) error {
+		// Models a per-user widget re-resolve of a modest cost. #1570: the
+		// floor is the cell's own last refresh cost, recorded by the REAL
+		// terminal Put (replaceIfGenRefresh with the refresh ctx), so the wave
+		// collapses at the cell's own scale: one refresh per 2 × 20 ms at most.
+		gen := c.CaptureGen(k)
+		rctx := WithL1KeyContext(ctx, k) // the resolve's dep-gen sink, as resolveAndPopulateL1's
+		time.Sleep(20 * time.Millisecond)
+		c.replaceIfGenRefresh(rctx, k, &ResolvedEntry{RawJSON: []byte(coherenceV2), Inputs: &used}, gen)
 		resolves.Add(1)
 		lastCommitAt.Store(time.Now().UnixNano())
 		return nil
@@ -403,8 +414,10 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 	}
 
 	// Let the wave fully converge: wait past the floor for the final deferred
-	// re-resolve to commit, then settle.
-	floor := r.rateFloor()
+	// re-resolve to commit, then settle. #1570: the floor is the cell's own
+	// (the override when the arm pins one).
+	cur, _ := c.GetNoTouch(key)
+	floor := r.rateFloor(cur, tierNormal)
 	settleDeadline := time.Now().Add(floor + 3*time.Second)
 	for time.Now().Before(settleDeadline) {
 		// Converged when the last commit is older than the floor (no pending
@@ -444,7 +457,7 @@ func runFloorOnBurstCollapse(t *testing.T, floorSeconds string, marks int, sprea
 
 // TestLiveRefreshCoherence_FloorOnAmplificationBaseline is the DENOMINATOR
 // option B's floor-bypass must NOT regress: with the floor ON (production
-// default 2s), a 200-mark churn wave on one subscribed key over ~400ms
+// rule, #1570: the cell's own cost), a 200-mark churn wave on one subscribed key over ~400ms
 // collapses into a SMALL number of re-resolves (the floor's whole purpose —
 // #318-R1a docstring: "under the install storm completed_total collapses while
 // flooredTotal rises"). Captures re-resolves-run, floored-cycles, alloc, wall.
@@ -458,7 +471,7 @@ func TestLiveRefreshCoherence_FloorOnAmplificationBaseline(t *testing.T) {
 	// #1233: this test writes the store under a complete snapshot.
 	CompleteRBACSnapshotForTest(t)
 	const marks = 200
-	const spread = 400 * time.Millisecond // whole wave inside the 2s floor
+	const spread = 400 * time.Millisecond // the wave: 200 marks, 2 ms apart
 	res := runFloorOnBurstCollapse(t, "", marks, spread)
 
 	collapseRatio := float64(res.marksFired) / float64(res.resolvesRun)
@@ -471,7 +484,7 @@ func TestLiveRefreshCoherence_FloorOnAmplificationBaseline(t *testing.T) {
 		t.Fatalf("resolves_run=%d for %d marks — the floor did not collapse the wave (expected a small handful)", res.resolvesRun, marks)
 	}
 	if res.flooredCycles == 0 {
-		t.Fatalf("floored_cycles=0 — the floor gate never fired under a 200-mark wave inside the 2s floor")
+		t.Fatalf("floored_cycles=0 — the floor gate never fired under a 200-mark wave on one 20 ms cell")
 	}
 	// Convergence is bounded by ~floor + resolve (last-write-wins at expiry).
 	if res.convergeToV2 > res.floor+2*time.Second {

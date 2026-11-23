@@ -111,7 +111,7 @@ func c1SetEnv(t *testing.T, floorSeconds string, capBytes int64) {
 	t.Setenv(envResolvedCacheTTLSeconds, fmt.Sprintf("%d", c1TTLSeconds))
 	t.Setenv(envResolvedCacheMaxEntryAgeSeconds, fmt.Sprintf("%d", c1MaxAgeSeconds))
 	t.Setenv(envResolvedCacheSummaryEvery, "36000") // inert auto-ticker; drive the pass by hand
-	t.Setenv(envRefresherRateFloorSeconds, floorSeconds)
+	t.Cleanup(SetRefresherRateFloorForTest(floorSeconds))
 }
 
 // c1AvgResolveCost is the realistic re-resolve latency at the 057 mean size —

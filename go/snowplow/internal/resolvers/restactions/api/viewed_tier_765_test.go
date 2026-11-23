@@ -26,7 +26,7 @@ func TestViewedTier765_V4b_ViewedRefreshIsAdmittedAtDebtClass(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
 			t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
-			t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
+			t.Cleanup(cache.SetRefresherRateFloorForTest("0"))
 			t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
 			dyn := newFill710Watcher(t, 3)
 			store := cache.ResolvedCache()

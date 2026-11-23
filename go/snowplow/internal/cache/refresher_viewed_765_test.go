@@ -247,7 +247,7 @@ func TestViewedTier765_V5_RateFloorStillAppliesOnTheViewedTier(t *testing.T) {
 	terminalEnv(t)
 	cleanup := withCleanRefresher(t, 1, 0)
 	t.Cleanup(cleanup)
-	t.Setenv(envRefresherRateFloorSeconds, "2") // read on every dequeue
+	t.Cleanup(SetRefresherRateFloorForTest("2")) // read on every dequeue
 	c, keys := terminalFixtureNoReset(t, 1)
 	k := keys[0]
 	e, _ := c.GetNoTouch(k)
