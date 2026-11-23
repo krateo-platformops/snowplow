@@ -43,6 +43,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -108,6 +109,52 @@ def rendered_waits(manifest: str) -> tuple[list[str], list[str]]:
     return sorted(deps), sorted(crds)
 
 
+#: the controller's flag naming the namespace cert-manager reads cluster CA Secrets from (a ClusterIssuer's): what the
+#: installer's internalTls.certManagerNamespace must name (installer 0.3.703 compositions.yaml:964, "the namespace
+#: cert-manager RUNS in -- read --cluster-resource-namespace from its deployment")
+CLUSTER_RESOURCE_FLAG = "--cluster-resource-namespace"
+_ENV_REF = re.compile(r"^\$\(([A-Za-z_][A-Za-z0-9_]*)\)$")
+
+
+class Refused(ValueError):
+    """Why a rendered chart does not say where cert-manager reads cluster CA Secrets from."""
+
+
+def cluster_resource_namespace(manifest: str) -> str:
+    """The value of CLUSTER_RESOURCE_FLAG in the rendered chart, resolved as the kubelet resolves it: a `$(VAR)`
+    reference is the container's env VAR, a literal value or a fieldRef to metadata.namespace (the pod's, the
+    Deployment's own namespace). Raises Refused unless exactly one container sets the flag and it resolves. The
+    flag is never assumed: v1.21.1's deployment.yaml:100-103 always sets it (clusterResourceNamespace, else
+    $(POD_NAMESPACE)), so a chart without it is a chart this was not read on."""
+    found = []
+    for d in yaml.safe_load_all(manifest):
+        if not isinstance(d, dict) or d.get("kind") != "Deployment":
+            continue
+        ns = (d.get("metadata") or {}).get("namespace")
+        for c in (((d.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers") or []:
+            for a in c.get("args") or []:
+                if isinstance(a, str) and a.startswith(CLUSTER_RESOURCE_FLAG + "="):
+                    found.append((d["metadata"].get("name"), ns, c, a.split("=", 1)[1]))
+    if len(found) != 1:
+        raise Refused(f"the rendered chart sets {CLUSTER_RESOURCE_FLAG} in {len(found)} container(s), not one: "
+                      f"where cert-manager reads cluster CA Secrets is not read from it")
+    name, ns, c, val = found[0]
+    m = _ENV_REF.match(val)
+    if m:
+        env = next((e for e in c.get("env") or [] if e.get("name") == m.group(1)), None)
+        path = (((env or {}).get("valueFrom") or {}).get("fieldRef") or {}).get("fieldPath")
+        if env is not None and "value" in env:
+            val = str(env["value"])
+        elif path == "metadata.namespace":
+            val = ns or ""
+        else:
+            raise Refused(f"Deployment {name}: {CLUSTER_RESOURCE_FLAG}={found[0][3]} names env {m.group(1)}, which "
+                          f"is neither a value nor the pod's namespace")
+    if not val:
+        raise Refused(f"Deployment {name}: {CLUSTER_RESOURCE_FLAG} resolves to nothing")
+    return val
+
+
 def preflight(workdir: str, run=subprocess.run, budget=None) -> dict:
     """Pull the pinned chart into `workdir`, verify it, render it with VALUES.
     The record says what was refused, if anything (`ok` False); `no_answer` when the pull got
@@ -162,6 +209,10 @@ def preflight(workdir: str, run=subprocess.run, budget=None) -> dict:
         return res
     deps, crds = rendered_waits(tpl.stdout or "")
     res["deployments"], res["crds"] = deps, crds
+    try:
+        res["cluster_resource_namespace"] = cluster_resource_namespace(tpl.stdout or "")
+    except Refused as e:
+        res["failures"].append(f"the verified chart, rendered with its values: {e}")
     if not deps:
         res["failures"].append("the verified chart, rendered with its values, has no Deployment")
     if not any(c.endswith("." + REQUIRED_GROUP) and c.count(".") == REQUIRED_GROUP.count(".") + 1

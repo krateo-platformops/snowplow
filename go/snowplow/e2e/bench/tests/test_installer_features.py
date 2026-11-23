@@ -186,7 +186,11 @@ def test_a_chart_that_declares_exactly_057s_features_passes_and_says_the_deviati
     # the feature deviations, then the component values' own lines (#1572: switches and sizes, their deviations
     # and the not-recorded paths)
     assert lines[1:1 + len(dev)] == dev
-    assert lines[1 + len(dev):] == installer_component_values.lines() + installer_values.top_level_lines()
+    assert lines[1 + len(dev):] == (installer_features.cr_patch_lines(installer_features.bench_features())
+                                    + installer_component_values.lines() + installer_values.top_level_lines())
+    # #1588 follow-up: internalTls is named as the CR patch's, recorded ON
+    assert any(ln.startswith("installer features: internalTls is written by the CR patch after helm install, "
+                             "recorded ON (the values write it off)") for ln in lines)
     assert all(f"on {f}:" in "\n".join(lines) for f in installer_features.DEVIATIONS)
 
 
@@ -238,26 +242,13 @@ def test_every_published_archive_before_the_record_is_refused_by_the_chart_check
         installer_features.check_chart(str(ia.pull(tmp_path / "p", version)))
 
 
-def _values_file(tmp_path: Path, mutate=None) -> Path:
-    """The values document a run installs with (bench.installer_values), parsed, mutated, written back."""
-    doc = yaml.safe_load(installer_values.document("1.12.74"))
-    if mutate:
-        mutate(doc)
-    f = tmp_path / f"values-{len(list(tmp_path.glob('values-*')))}.yaml"
-    f.write_text(yaml.safe_dump(doc))
-    return f
-
-
 def test_the_check_cli_writes_its_record_and_refuses_with_exit_2(tmp_path, capsys):
     ok, out = _chart(tmp_path, READ_VERSION, {f: False for f in ALL}), tmp_path / "ok.json"
-    vals = _values_file(tmp_path)
-    assert installer_features.main(["check", "--installer-pulled", str(ok), "--values", str(vals),
-                                    "--out", str(out)]) == 0
+    assert installer_features.main(["check", "--installer-pulled", str(ok), "--out", str(out)]) == 0
     rec = json.loads(out.read_text())
     assert rec["ok"] and rec["features"] == installer_features.bench_features()
     bad, out2 = _chart(tmp_path, "0.3.641", {f: False for f in ALL if f != "internalTls"}), tmp_path / "bad.json"
-    assert installer_features.main(["check", "--installer-pulled", str(bad), "--values", str(vals),
-                                    "--out", str(out2)]) == 2
+    assert installer_features.main(["check", "--installer-pulled", str(bad), "--out", str(out2)]) == 2
     assert "refusing: installer 0.3.641 cannot express" in capsys.readouterr().err
     assert json.loads(out2.read_text())["ok"] is False
 
@@ -291,37 +282,6 @@ def test_s_cert_manager_reads_its_namespace_from_the_one_definition():
     body = body[:body.index("\n}\n")]
     assert 'ns="$(cm_field namespace)"' in body and "-n cert-manager" not in body
     assert body.count('-n "$ns"') == 5           # [[ -n "$ns" ]], then install, wait, helm list, helm get values
-
-
-@pytest.mark.parametrize("case,mutate", [
-    ("absent", lambda d: d["componentValues"].pop("internal-ca-bundle")),
-    ("empty_list", lambda d: d["componentValues"]["internal-ca-bundle"]["target"].__setitem__("namespaces", [])),
-    ("empty_name", lambda d: d["componentValues"]["internal-ca-bundle"]["target"].__setitem__("namespaces", [""])),
-])
-def test_falsifier_internal_tls_on_with_an_empty_ca_bundle_target_is_refused_before_any_cluster(tmp_path, capsys,
-                                                                                                  case, mutate):
-    """installer 0.3.703 compositions.yaml:1005: features.internalTls on and target.namespaces empty refuses the
-    whole composition render (no component installs); the check refuses the run first, by the CLI s_source runs."""
-    assert installer_features.bench_features()["internalTls"] is True
-    chart = _chart(tmp_path, READ_VERSION, {f: False for f in ALL})
-    bad = _values_file(tmp_path, mutate)
-    with pytest.raises(installer_features.Refused, match=r"features\.internalTls is on and the run's values leave "
-                                                         r"componentValues\.internal-ca-bundle\.target\.namespaces empty"):
-        installer_features.check_values(yaml.safe_load(bad.read_text()))
-    assert installer_features.main(["check", "--installer-pulled", str(chart), "--values", str(bad)]) == 2
-    assert "refusing: features.internalTls is on and the run's values leave" in capsys.readouterr().err
-    # the same document with the value passes, and says it
-    good = yaml.safe_load(_values_file(tmp_path).read_text())
-    assert installer_features.check_values(good) == [
-        f"internal TLS: componentValues.internal-ca-bundle.target.namespaces = {installer_values.KRATEO_NAMESPACE}, "
-        f"the namespace the bench installs krateo into"]
-
-
-def test_with_internal_tls_off_an_empty_ca_bundle_target_is_not_refused(tmp_path):
-    bad = yaml.safe_load(_values_file(tmp_path, lambda d: d["componentValues"].pop("internal-ca-bundle")).read_text())
-    off = {**installer_features.DEVIATIONS, "internalTls": (False, "a test's deviation", "a test's ruling")}
-    assert installer_features.check_values(bad, deviations=off) == [
-        "internal TLS: features.internalTls is off, so nothing of it is written"]
 
 
 def test_falsifier_a_chart_whose_own_cert_manager_runs_elsewhere_is_refused(tmp_path):
@@ -528,7 +488,7 @@ def test_run606_writes_057s_features_and_says_the_deviations(harness):  # noqa: 
         (p.stderr + log)[-3000:]
     assert all(f"the bench differs from 057 on {f}:" in log for f in installer_features.DEVIATIONS)
     assert json.loads((tmp / "out" / "installer-features.json").read_text())["ok"] is True
-    assert _doc_features((tmp / "out" / "installer-values.yaml").read_text()) == installer_features.bench_features()
+    assert _doc_features((tmp / "out" / "installer-values.yaml").read_text()) == installer_values.values_features()
 
 
 def test_falsifier_run606_refuses_an_installer_that_cannot_express_057s_features(harness):  # noqa: F811

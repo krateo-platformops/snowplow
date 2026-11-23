@@ -283,7 +283,8 @@ def test_the_values_are_the_heredocs_byte_for_byte(tmp_path, snowplow, frontend,
     k, m = got.index("# The installer's features are krateo-057's"), got.index("vertexAI:")
     c, j = got.index("# componentValues: krateo-057's recorded switches and sizes"), got.index("registryAuth:")
     heredoc = "features:\n  agentGateway: true\n  coreAgents: false\n  specialistAgents: false\n"
-    assert got[k:m].split("\n", 2)[2] == installer_features.values_block(installer_features.bench_features())
+    # the features the values write: 057's, the CR patch's (internalTls) off (bench/installer_render.py)
+    assert got[k:m].split("\n", 2)[2] == installer_features.values_block(installer_values.values_features())
     wc, wj = want.index("componentValues:\n"), want.index("registryAuth:")
     # every byte outside the two blocks is the heredoc's
     assert got[:k] + heredoc + got[m:c] + want[wc:wj] + got[j:] == want
@@ -323,6 +324,11 @@ import os, sys, tarfile
 REAL = {real!r}
 a = sys.argv[1:]
 ver = a[a.index("--version") + 1] if "--version" in a else ""
+if a[:1] == ["pull"] and a[1:2] == ["oci://quay.io/jetstack/charts/cert-manager"]:
+    # the bench's pinned cert-manager chart, the REAL archive (bench/cert_manager.py verifies its sha256)
+    import shutil
+    shutil.copy(os.environ["FAKE_CERT_MANAGER_TGZ"], os.path.join(a[a.index("-d") + 1], "cert-manager-" + ver + ".tgz"))
+    sys.exit(0)
 src = os.path.join(os.environ["FAKE_INSTALLER_CHARTS"], "installer-" + ver + ".tgz")
 if a[:2] == ["show", "chart"] or a[:1] == ["pull"]:
     if not os.path.isfile(src):
@@ -351,6 +357,7 @@ def laptop_helm(tmp_path, monkeypatch):
     (b / "helm").write_text(FAKE_PULL_HELM.format(real=shutil.which("helm")))
     (b / "helm").chmod(0o755)
     monkeypatch.setenv("FAKE_INSTALLER_CHARTS", str(d))
+    monkeypatch.setenv("FAKE_CERT_MANAGER_TGZ", str(Path(__file__).resolve().parent / "fixtures" / "cert-manager-v1.21.1.tgz"))
     monkeypatch.setenv("PATH", f"{b}{os.pathsep}{os.environ['PATH']}")
     return d
 
@@ -384,10 +391,16 @@ def test_the_laptop_renders_every_runs_list(laptop_helm):
     lines = REAL_CHART_CHECK(_env(), ["N1", "N2"])
     assert _chart_lines(lines) == [f"installer {RECORDED}, run N1's values: {WANT_RECORDED}",
                                    f"installer {RECORDED}, run N2's values: {WANT_RECORDED}"]
-    # #1588 follow-up: every run's values are checked for what the installer refuses to render with them
-    assert [ln for ln in lines if "internal TLS" in ln] == [
-        f"run {x}: internal TLS: componentValues.internal-ca-bundle.target.namespaces = "
-        f"{installer_values.KRATEO_NAMESPACE}, the namespace the bench installs krateo into" for x in ("N1", "N2")]
+    # #1588 follow-up: every run's effective spec rendered by the installer's composition template, every enabled
+    # component, every guard passed; and the CR patch it was rendered with
+    rendered = [ln for ln in lines if "installer render: rendered " in ln]
+    assert [ln.split(":", 1)[0] for ln in rendered] == ["run N1", "run N2"], lines
+    for ln in rendered:
+        n = re.search(r"rendered (\d+) of (\d+) enabled components", ln)
+        assert n and n.group(1) == n.group(2) and int(n.group(1)) > 0, ln
+        assert "trust-manager" in ln and "internal-ca-bundle" in ln and "cert-manager-issuers" in ln, ln
+    assert sum('installer CR patch (after helm install, one merge patch): {"spec": {"features": {"internalTls": true}, '
+               '"internalTls": {"certManagerNamespace": "cert-manager"}}}' in ln for ln in lines) == 2, lines
 
 
 def test_falsifier_the_laptop_refuses_a_run_whose_values_leave_the_ca_bundle_target_empty(laptop_helm, monkeypatch):
@@ -402,8 +415,10 @@ def test_falsifier_the_laptop_refuses_a_run_whose_values_leave_the_ca_bundle_tar
     monkeypatch.setattr(installer_values, "document", without)
     with pytest.raises(vm606.Refused) as e:
         REAL_CHART_CHECK(_env(), ["N1", "N2"])
-    assert str(e.value).startswith(f"installer {RECORDED}, run N1's values: features.internalTls is on and the run's "
-                                   "values leave componentValues.internal-ca-bundle.target.namespaces empty"), str(e.value)
+    assert str(e.value).startswith(f"installer {RECORDED}, run N1's values: the installer refuses to render its "
+                                   "components with the run's effective spec"), str(e.value)
+    assert ("compositions.yaml:1005:4): features.internalTls is on but componentValues.internal-ca-bundle.target"
+            ".namespaces is empty") in str(e.value), str(e.value)
 
 
 @pytest.mark.parametrize("body,why", [

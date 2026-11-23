@@ -880,13 +880,10 @@ s_source() {
 # installer features): the pulled chart must declare exactly the features of 057's record
 # (bench/installer_features.py), which the run's values write, every one; the deviations the owner
 # rules on are logged by name. BEFORE any cluster exists, in the dry pass too. $OUT/installer-features.json.
-# The run's values are checked here too: what the installer refuses to render with them (features.internalTls
-# with its CA bundle's target namespaces empty refuses the whole composition, every component) is refused now.
 installer_features_check() {
   local rc=0 ln why
-  write_installer_values
   python3 -m bench.installer_features check --installer-pulled "$OUT/installer-pulled" \
-      --values "$OUT/installer-values.yaml" --out "$OUT/installer-features.json" >"$OUT/.installer-features.out" 2>"$KERR" || rc=$?
+      --out "$OUT/installer-features.json" >"$OUT/.installer-features.out" 2>"$KERR" || rc=$?
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
   done < "$OUT/.installer-features.out"
@@ -1259,8 +1256,13 @@ s_rehearsal() {
 # a bad or under-scoped token costs nothing (bench/ghcr_pull.py preflight;
 # $OUT/ghcr-pull-preflight.json names charts, images and versions, never the
 # token).
+# First the installer's own composition render (bench/installer_render.py): every component the run's Installer CR
+# enables, rendered with its EFFECTIVE spec (the CR a fresh install of these values writes, merged with the run's
+# CR patch), the cluster-state emission gate bypassed in that check's in-memory chart only, so every `fail` guard of
+# the installer fires here. $OUT/installer-cr-patch.json is the patch s_install applies; $OUT/installer-render.json.
 s_registry() {
   write_installer_values
+  installer_render_check || return 1
   local rc=0 ln override=()
   # run 26: the frontend image the run overrides is rendered and resolved too
   if [[ -n "$FRONTEND_TAG" ]]; then
@@ -1268,7 +1270,8 @@ s_registry() {
     log "frontend image override: componentValues.frontend.image.tag=${FRONTEND_TAG}, expected digest ${EXPECTED_FRONTEND_DIGEST} (gated before any load)"
   fi
   python3 -m bench.ghcr_pull preflight --env-file "$GHCR_PULL_ENV_FILE" --installer-pulled "$OUT/installer-pulled" \
-      --values "$OUT/installer-values.yaml" --out "$OUT/ghcr-pull-preflight.json" \
+      --values "$OUT/installer-values.yaml" --cr-patch "$OUT/installer-cr-patch.json" \
+      --out "$OUT/ghcr-pull-preflight.json" \
       --budget-file "$REGISTRY_BUDGET" ${override[@]+"${override[@]}"} 2>"$KERR" || rc=$?
   while IFS= read -r ln; do
     if [[ -n "$ln" ]]; then log "$ln"; fi
@@ -1313,6 +1316,59 @@ s_cert_manager_source() {
 cm_field() {
   python3 -c 'import json, sys; v = json.load(open(sys.argv[1]))[sys.argv[2]]; print(" ".join(v) if isinstance(v, list) else v)' \
       "$OUT/cert-manager-preflight.json" "$1"
+}
+# installer_render_check: the run's CR patch (cert-manager's --cluster-resource-namespace, read from the bench's
+# cert-manager step's verified render), then the installer's composition render of the effective spec.
+installer_render_check() {
+  local rc=0 ln why
+  python3 -m bench.installer_render patch --cert-manager-preflight "$OUT/cert-manager-preflight.json" \
+      --out "$OUT/installer-cr-patch.json" >"$OUT/.installer-render.out" 2>"$KERR" || rc=$?
+  if (( rc == 0 )); then
+    python3 -m bench.installer_render check --installer-pulled "$OUT/installer-pulled" \
+        --values "$OUT/installer-values.yaml" --patch "$OUT/installer-cr-patch.json" \
+        --out "$OUT/installer-render.json" >>"$OUT/.installer-render.out" 2>"$KERR" || rc=$?
+  fi
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$OUT/.installer-render.out"
+  rm -f "$OUT/.installer-render.out"
+  (( rc == 0 )) && return 0
+  why="$(sed -n 's/^refusing: //p' "$KERR" | head -1)"
+  : > "$KERR"
+  record_failure "registry FAILED: installer render: ${why:-bench.installer_render exited ${rc} ($OUT/installer-render.json)}"
+  return 1
+}
+# installer_cr_patch: right after helm install, the run's ONE merge patch of the Installer CR (installer#1084:
+# internalTls.certManagerNamespace is CR-only, set in the same patch as features.internalTls), logged (it holds
+# no identity); then the CR read back, refused unless it holds every field written, before s_platform's wait.
+installer_cr_patch() {
+  local api res why
+  api="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["cr_api_version"])' "$OUT/installer-render.json")" \
+    || { record_failure "install FAILED: the Installer CR's version is not in $OUT/installer-render.json"; return 1; }
+  res="installers.${api#composition.krateo.io/}.composition.krateo.io"
+  if [[ "$(cat "$OUT/installer-cr-patch.json")" == "{}" ]]; then
+    log "installer CR patch: none (no feature of the run is CR-only)"
+    return 0
+  fi
+  log "installer CR patch: kubectl -n krateo-system patch $res installer --type merge: $(cat "$OUT/installer-cr-patch.json")"
+  run "${K[@]}" -n krateo-system patch "$res" installer --type merge --patch-file "$OUT/installer-cr-patch.json" \
+      >/dev/null 2>"$KERR" || { record_failure "install FAILED: the Installer CR patch: $(kerr_line)"; return 1; }
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: kubectl -n krateo-system get $res installer -o json | python3 -m bench.installer_render readback (refused unless the CR holds the patch)"
+    return 0
+  fi
+  bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n krateo-system get "$res" installer \
+      -o json > "$OUT/installer-cr-readback.json" 2>"$KERR" \
+    || { record_failure "install FAILED: the Installer CR could not be read back: $(kerr_line)"; return 1; }
+  if ! python3 -m bench.installer_render readback --patch "$OUT/installer-cr-patch.json" \
+      < "$OUT/installer-cr-readback.json" > "$OUT/.installer-readback.out" 2>"$KERR"; then
+    why="$(sed -n 's/^refusing: //p' "$KERR" | head -1)"
+    : > "$KERR"
+    record_failure "install FAILED: ${why:-the Installer CR does not hold the patch of this run}"
+    return 1
+  fi
+  log "$(cat "$OUT/.installer-readback.out")"
+  rm -f "$OUT/.installer-readback.out"
 }
 # s_cert_manager: the verified archive installed (never a second pull), then
 # its Deployments Available and its CRDs Established, all under one bound
@@ -1397,12 +1453,14 @@ s_install() {
     run "${H[@]}" install installer "$INSTALLER_LOCAL" \
         -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" -f - \
         --wait --timeout "${INSTALL_TIMEOUT_S}s"
-    return 0
+    installer_cr_patch
+    return
   fi
   python3 -m bench.ghcr_pull username --env-file "$GHCR_PULL_ENV_FILE" \
     | run "${H[@]}" install installer "$INSTALLER_LOCAL" \
         -n krateo-system --create-namespace -f "$OUT/installer-values.yaml" -f - \
-        --wait --timeout "${INSTALL_TIMEOUT_S}s"
+        --wait --timeout "${INSTALL_TIMEOUT_S}s" || return 1
+  installer_cr_patch
 }
 s_verify483() {
   # installer#483 acceptance. Items 1-4 gate (a FAIL aborts the run with

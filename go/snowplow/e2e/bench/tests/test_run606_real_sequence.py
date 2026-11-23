@@ -283,6 +283,21 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     if os.environ.get("FAKE_VERDICT_LOST") == "1" and os.path.exists(_vj) and os.path.getsize(_vj) > 0:
         os.remove(_vj)
     port = os.environ["FAKE_PORT"]
+    # #1588 follow-up: s_install's ONE merge patch of the Installer CR, and the CR read back by name (FAKE_CR_PATCH:
+    # drops = the apiserver keeps the CR without internalTls.certManagerNamespace; fails = the patch is refused)
+    if a[:1] == ["patch"] and a[1:2] and a[1].startswith("installers.") and a[2:3] == ["installer"]:
+        if os.environ.get("FAKE_CR_PATCH") == "fails":
+            print('Error from server (Invalid): installers "installer" is invalid', file=sys.stderr); sys.exit(1)
+        open(os.path.join(STATE, "installer-cr-patch.json"), "w").write(open(a[a.index("--patch-file") + 1]).read())
+        sys.exit(0)
+    if a[:1] == ["get"] and a[1:2] and a[1].startswith("installers.") and a[2:3] == ["installer"]:
+        pf = os.path.join(STATE, "installer-cr-patch.json")
+        spec = (json.load(open(pf)).get("spec") or {}) if os.path.exists(pf) else {}
+        if os.environ.get("FAKE_CR_PATCH") == "drops":
+            spec.pop("internalTls", None)
+        print(json.dumps({"apiVersion": "composition.krateo.io/" + a[1].split(".")[1], "kind": "Installer",
+                          "metadata": {"name": "installer", "namespace": ns}, "spec": spec}))
+        sys.exit(0)
     if a[:2] == ["auth", "can-i"]:
         # #1307 L7: GKE's IAM authorizer's answer to the orchestrator's SelfSubjectAccessReview;
         # FAKE_K8S_AUTHZ=no: the conditional container.admin is not honoured (kubectl: "no", rc 1)
@@ -1819,7 +1834,40 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
               else ".Values.componentValues")
         open(os.path.join(d, "templates", "self-bootstrap.yaml"), "w").write(chr(10).join([
             "apiVersion: v1", "kind: ConfigMap", "metadata:", "  name: installer-bootstrap", "data:",
-            '  components-patch.json: {{ dict "spec" (dict "componentValues" ' + cv + ') | toJson | quote }}', ""]))
+            '  components-patch.json: {{ dict "spec" (dict "componentValues" ' + cv + ') | toJson | quote }}',
+            # #1588 follow-up: the CR a fresh install writes (installer 0.3.703's installer-self-cr ConfigMap): the
+            # values' picked keys (internalTls is NOT among them, installer#1084), the composition pass's bootstrap off
+            "---", "apiVersion: v1", "kind: ConfigMap", "metadata:", "  name: installer-self-cr", "data:",
+            "  installer.yaml: |",
+            '    {{- $spec := pick .Values "namespaces" "features" "componentValues" "registryAuth" }}',
+            '    {{- $_ := set $spec "bootstrap" (dict "coreProvider" (dict "enabled" false)) }}',
+            '    {{- dict "apiVersion" (printf "composition.krateo.io/v%s" (.Chart.Version | replace "." "-")) "kind" '
+            '"Installer" "metadata" (dict "name" "installer") "spec" $spec | toJson | nindent 4 }}', ""]))
+        # the composition pass, as installer 0.3.703's compositions.yaml has it: only with bootstrap off, its
+        # internalTls guards (L964/L1005), each pinned component emitted only where inst.emitDecision says so
+        # (offline: never, no CRD is served), at composition.krateo.io/<the tag it returns>. FAKE_INSTALLER_GUARD=
+        # new: an installer whose guard also requires a value the bench does not write (the class the bench's
+        # composition render exists for: a guard nobody has listed yet)
+        newguard = ("{{- if not (index (.Values.componentValues | default dict) \"internal-ca-bundle\" | default dict)"
+                    ".required }}{{- fail \"features.internalTls is on but componentValues.internal-ca-bundle.required "
+                    "is empty\" }}{{- end }}") if os.environ.get("FAKE_INSTALLER_GUARD") == "new" else ""
+        open(os.path.join(d, "templates", "compositions.yaml"), "w").write(chr(10).join([
+            "{{- if not ((.Values.bootstrap | default dict).coreProvider | default dict).enabled }}",
+            "{{- $top := . }}",
+            "{{- if (.Values.features | default dict).internalTls }}",
+            "{{- if not ((.Values.internalTls | default dict).certManagerNamespace) }}"
+            '{{- fail "features.internalTls is on but internalTls.certManagerNamespace is empty" }}{{- end }}',
+            '{{- $icb := index (.Values.componentValues | default dict) "internal-ca-bundle" | default dict }}',
+            "{{- if not (($icb.target | default dict).namespaces) }}"
+            '{{- fail "features.internalTls is on but componentValues.internal-ca-bundle.target.namespaces is empty" }}'
+            "{{- end }}", newguard,
+            "{{- end }}",
+            '{{- range $c := (include "inst.componentsYaml" $ | fromYaml).components }}',
+            '{{- $emit := include "inst.emitDecision" (list $top $c) }}',
+            "{{- if $emit }}",
+            "---", "apiVersion: composition.krateo.io/{{ $emit }}", 'kind: {{ $c.kind | default "Component" }}',
+            "metadata:", "  name: {{ $c.name }}", "spec: {}",
+            "{{- end }}", "{{- end }}", "{{- end }}", ""]))
         # the pins file, as the published chart ships and loads it: component-pins.yaml up to installer
         # 0.3.639; FAKE_INSTALLER_PINS=min: 0.3.640's form, only the generated component-pins.min.yaml,
         # which its inst.componentsYaml loads
@@ -1831,7 +1879,9 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
             # which components are on: the installer's own rule (a pin's feature, in the values)
             + '{{- define "inst.compEnabled" -}}{{- $top := index . 0 -}}{{- $c := index . 1 -}}'
             + '{{- if or (not $c.feature) (index $top.Values.features $c.feature) -}}true{{- end -}}{{- end -}}'
-            + chr(10))
+            + chr(10)
+            # the emission gate: a served CRD and Ready deps, `lookup`s that `helm template` answers empty
+            + '{{- define "inst.emitDecision" -}}{{- end -}}' + chr(10))
         open(os.path.join(d, "Chart.yaml"), "w").write(json.dumps({
             "apiVersion": "v2", "name": "installer", "version": ver,
             "dependencies": [{"name": "core-provider", "version": "2.13.24"},

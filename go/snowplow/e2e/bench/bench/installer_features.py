@@ -304,7 +304,14 @@ def check_chart(installer_pulled: str, rec: dict | None = None, deviations: dict
     if feats.get("internalTls"):
         cm_check(installer_pulled, version)
     return [f"installer features: {len(feats)} written, as {src} runs them, {len(on)} on: {', '.join(on)}"] \
-        + deviation_lines(rec, deviations) + cv_lines + installer_values.top_level_lines()
+        + deviation_lines(rec, deviations) + cr_patch_lines(feats) + cv_lines + installer_values.top_level_lines()
+
+
+def cr_patch_lines(feats: dict) -> list[str]:
+    """The features the run's values write off and its Installer CR patch turns on (bench/installer_render.py)."""
+    from bench import installer_render
+    return [f"installer features: {f} is written by the CR patch after helm install, recorded ON (the values write it "
+            f"off): {why}" for f, why in sorted(installer_render.CR_PATCH_FEATURES.items()) if feats.get(f)]
 
 
 def cm_check(installer_pulled: str, version: str) -> None:
@@ -327,17 +334,6 @@ def cm_check(installer_pulled: str, version: str) -> None:
                           f"namespace {c.get('namespace')!r}, and the bench's cert-manager step installs it into "
                           f"{cert_manager.NAMESPACE!r} (bench/cert_manager.py NAMESPACE, the installer's "
                           f"internalTls.certManagerNamespace): the two must agree")
-
-
-def check_values(values: dict, rec: dict | None = None, deviations: dict | None = None) -> list[str]:
-    """The lines to say about the values document a run installs with (parsed), or Refused: what the
-    installer refuses to render with them, said before any cluster (bench/installer_values.py)."""
-    from bench import installer_values
-    feats = bench_features(load() if rec is None else validate(rec), deviations)
-    why = installer_values.internal_tls_refusal(values, feats)
-    if why:
-        raise Refused(why)
-    return installer_values.internal_tls_lines(values, feats)
 
 
 def record(listed, installer_pulled: str, date: str) -> dict:
@@ -396,8 +392,6 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("check", help="the installer chart must declare exactly 057's recorded features")
     c.add_argument("--installer-pulled", required=True)
-    c.add_argument("--values", required=True, help="the values document the run installs with "
-                   "(bench.installer_values): what the installer refuses to render with it is refused here")
     c.add_argument("--out")
     r = sub.add_parser("record", help="057's Installer CR list on stdin -> the record")
     r.add_argument("--installer-pulled", required=True, help="the installer chart at 057's CR version")
@@ -415,13 +409,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     try:
         if a.cmd == "check":
-            import yaml
-            try:
-                with open(a.values, encoding="utf-8") as fh:
-                    values = yaml.safe_load(fh) or {}
-            except (OSError, ValueError) as e:
-                raise Refused(f"the run's values {a.values} cannot be read: {e}") from None
-            lines = check_chart(a.installer_pulled) + check_values(values)
+            lines = check_chart(a.installer_pulled)
             if a.out:
                 with open(a.out, "w", encoding="utf-8") as fh:
                     json.dump({"kind": "installer_features_check", "ok": True, "features": bench_features(),

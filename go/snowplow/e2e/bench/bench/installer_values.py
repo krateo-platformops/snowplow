@@ -133,38 +133,19 @@ def document(snowplow_tag: str, frontend_tag: str = "", snowplow_env: dict[str, 
             node = node.setdefault(seg, {})
         node[rest[-1]] = [dict(SNOWPLOW_POOL_TOLERATION)]
     cv = icv.merge(icv.nest(icv.bench_paths(rec)), own)
-    return TEMPLATE.format(features=installer_features.values_block(installer_features.bench_features()),
+    return TEMPLATE.format(features=installer_features.values_block(values_features()),
                            component_values=yaml.safe_dump({"componentValues": cv}, sort_keys=True,
                                                            default_flow_style=False, width=1000),
                            krateo_namespace=KRATEO_NAMESPACE)
 
 
-def internal_tls_refusal(values: dict, features: dict) -> str | None:
-    """Why a run with these values (the document, parsed) and features cannot install, before any cluster:
-    with features.internalTls on, installer 0.3.703 refuses its whole composition render (every component)
-    while componentValues.internal-ca-bundle.target.namespaces is empty (compositions.yaml:1005). None when
-    the feature is off or the value is there."""
-    if not features.get("internalTls"):
-        return None
-    node = (values or {}).get("componentValues") or {}
-    for seg in CA_BUNDLE_TARGET.split("."):
-        node = node.get(seg) if isinstance(node, dict) else None
-    if not (isinstance(node, list) and node and all(isinstance(n, str) and n for n in node)):
-        return (f"features.internalTls is on and the run's values leave componentValues.{CA_BUNDLE_TARGET} "
-                f"empty ({node!r}): the installer refuses its whole composition render without it, so no "
-                f"component would install")
-    return None
-
-
-def internal_tls_lines(values: dict, features: dict) -> list[str]:
-    """What every check says about features.internalTls's values in the run's document (refusal: above)."""
-    if not features.get("internalTls"):
-        return ["internal TLS: features.internalTls is off, so nothing of it is written"]
-    node = values["componentValues"]
-    for seg in CA_BUNDLE_TARGET.split("."):
-        node = node[seg]
-    return [f"internal TLS: componentValues.{CA_BUNDLE_TARGET} = {', '.join(node)}, the namespace the bench installs "
-            f"krateo into"]
+def values_features() -> dict[str, bool]:
+    """The features the values document writes: 057's (bench/installer_features.py), with each feature the run's
+    Installer CR patch turns on written off here (bench/installer_render.py CR_PATCH_FEATURES: the installer reads
+    internalTls's own value only from its CR, so the feature goes on in the same patch)."""
+    from bench import installer_render
+    feats = installer_features.bench_features()
+    return {f: (False if f in installer_render.CR_PATCH_FEATURES else v) for f, v in feats.items()}
 
 
 #: the installer's top-level values the bench writes off where 057 may set them, and why (said by every check;
