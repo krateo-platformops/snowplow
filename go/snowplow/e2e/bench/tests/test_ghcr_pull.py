@@ -395,6 +395,17 @@ def test_the_images_are_what_the_chart_values_name():
         "ghcr.io", "krateo-agentiko/ui-token-hop", "0.2.18")
 
 
+def test_a_reference_with_a_tag_and_a_digest_is_pulled_by_its_digest_from_its_own_repository():
+    """#1575: the real dry pass on installer 0.3.700 refused ghcr.io/clickhouse/mcp-clickhouse:0.5.0@sha256:...
+    (clickhouse-mcp-server 0.1.15) with HTTP 404: the tag stayed in the repository name. Anonymously the
+    registry answers 200 for that repository by the digest (2026-11-23)."""
+    d = "sha256:37564a952d1428984b2fc189cc3ef1e77453c7e1cb65dde286938dac282f9ab0"
+    assert ghcr_pull.split_image(f"ghcr.io/clickhouse/mcp-clickhouse:0.5.0@{d}") == (
+        "ghcr.io", "clickhouse/mcp-clickhouse", d)
+    assert ghcr_pull.split_image(f"ghcr.io/x/pinned@{d}") == ("ghcr.io", "x/pinned", d)
+    assert ghcr_pull.split_image("ghcr.io/x/y") == ("ghcr.io", "x/y", "latest")
+
+
 def test_a_chart_is_read_through_the_blob_redirect_without_the_registry_bearer():
     """ghcr serves a blob through a redirect to its storage; the fake store
     refuses any Authorization header, so reading the chart proves the bearer

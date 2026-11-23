@@ -607,10 +607,15 @@ def resolve(repo: str, chart: str, version: str, user: str, token: str, budget: 
 
 
 def split_image(ref: str) -> tuple[str, str, str]:
-    """(host, name, tag-or-digest) of an image reference with an explicit registry host."""
+    """(host, name, tag-or-digest) of an image reference with an explicit registry host. A reference that
+    carries both, name:tag@digest (the reference grammar's full form; clickhouse-mcp-server 0.1.15 renders
+    ghcr.io/clickhouse/mcp-clickhouse:0.5.0@sha256:...), is pulled by its digest: the tag is dropped from the
+    name (#1575: kept, it made the repository `clickhouse/mcp-clickhouse:0.5.0` and the registry answered 404)."""
     host, _, rest = ref.partition("/")
     if "@" in rest:
         name, _, tag = rest.partition("@")
+        head, sep, last = name.rpartition("/")
+        name = head + sep + last.partition(":")[0]
     else:
         name, _, tag = rest.rpartition(":") if ":" in rest else (rest, "", "latest")
     return host, name, tag
