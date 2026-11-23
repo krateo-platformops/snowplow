@@ -205,12 +205,32 @@ def test_run606_renders_before_any_cluster_and_patches_then_reads_back_before_th
     patched = log.index("installer CR patch: kubectl -n krateo-system patch installers.v")
     back = log.index("installer CR read back: it holds the run's patch")
     assert log.index("=== step install ===") < patched < back < log.index("=== step platform ===")
+    # the calls themselves: one patch, of the CR version the installed chart writes, between the install and its read-back
+    import yaml
+    from tests.test_run606_real_sequence import _calls
+    version = yaml.safe_load((tmp / "out" / "installer-pulled" / "installer" / "Chart.yaml").read_text())["version"]
+    res = f"installers.v{version.replace('.', '-')}.composition.krateo.io"
+    calls = [(c["tool"], c["argv"]) for c in _calls(state)]
+
+    def at(tool, *words):
+        return [i for i, (t, a) in enumerate(calls) if t == tool and all(w in a for w in words)]
+    install = [i for i in at("helm", "install", "installer") if "template" not in calls[i][1]]
+    patches = [i for i in at("kubectl", "patch") if any(x.startswith("installers.") for x in calls[i][1])]
+    reads = [i for i in at("kubectl", "get", "installer") if any(x.startswith("installers.v") for x in calls[i][1])]
+    assert len(install) == 1 and len(patches) == 1 and reads, (install, patches, reads)
+    argv = calls[patches[0]][1]
+    assert res in argv and argv[argv.index("-n") + 1] == "krateo-system"
+    assert argv[argv.index("--type") + 1] == "merge" and argv[argv.index("patch") + 2] == "installer"
+    assert res in calls[reads[0]][1] and install[0] < patches[0] < reads[0]
+    assert (state / "helm-registry-auth.json").exists()
+    _no_registry_username_kept(tmp, state)
 
 
 @pytest.mark.parametrize("mode,why", [
     ("drops", "install FAILED: the Installer CR does not hold the run's patch: spec.internalTls.certManagerNamespace "
               "is None, the patch wrote 'cert-manager'"),
     ("fails", "install FAILED: the Installer CR patch: "),
+    ("unreadable", "install FAILED: the Installer CR could not be read back: "),
 ])
 def test_falsifier_a_cr_that_does_not_hold_the_patch_fails_before_the_platform_wait(harness, mode, why):  # noqa: F811
     env, state, _, tmp = harness
@@ -218,6 +238,50 @@ def test_falsifier_a_cr_that_does_not_hold_the_patch_fails_before_the_platform_w
     log = (tmp / "out" / "run.log").read_text()
     assert p.returncode != 0 and why in log, log[-3000:]
     assert "=== step platform ===" not in log
+    _no_registry_username_kept(tmp, state)
+
+
+@pytest.mark.parametrize("mode,asked", [("blip", "installer CR patch: the API server did not answer; asked again"),
+                                        ("blip-read", "installer CR read back: the API server did not answer; asked again")])
+def test_an_api_that_does_not_answer_once_is_asked_again_within_the_bound(harness, mode, asked):  # noqa: F811
+    env, state, _, tmp = harness
+    p = _run606(env, FAKE_CR_PATCH=mode)
+    log = (tmp / "out" / "run.log").read_text()
+    assert p.returncode == 0 and "run complete" in log, log[-3000:]
+    assert log.count(asked) == 1 and "installer CR read back: it holds the run's patch" in log
+    _no_registry_username_kept(tmp, state)
+
+
+def test_falsifier_an_api_that_never_answers_the_patch_fails_at_its_bound(harness):  # noqa: F811
+    env, state, _, tmp = harness
+    p = _run606(env, FAKE_CR_PATCH="down", CR_PATCH_TIMEOUT_S="3")
+    log = (tmp / "out" / "run.log").read_text()
+    assert p.returncode != 0, log[-3000:]
+    assert "install FAILED: the Installer CR patch: the API server did not answer within 3 s" in log
+    assert "=== step platform ===" not in log
+
+
+def test_the_cr_patchs_bound_is_in_the_runs_budget(harness):  # noqa: F811
+    """One more second of the bound is one more second of the plan (the TTL is derived from it)."""
+    import re
+    env, state, _, tmp = harness
+
+    def plan(s):
+        _run606(dict(env, OUT=str(tmp / f"out-{s}")), BENCH_606_DRY_RUN="1", CR_PATCH_TIMEOUT_S=str(s))
+        log = (tmp / f"out-{s}" / "run.log").read_text()
+        assert f"+ CR patch {s} +" in log, log[:2000]
+        return int(re.search(r"= (\d+) s; fits TTL_HOURS", log).group(1))
+    assert plan(301) - plan(300) == 1
+
+
+def _no_registry_username_kept(tmp, state):
+    """#1590 review B2: the live CR carries the registry username; the read-back keeps no file of it."""
+    from tests.conftest import FAKE_GHCR_USER
+    if (state / "helm-registry-auth.json").exists():          # the CR the fake serves carries it (else: proves nothing)
+        assert json.loads((state / "helm-registry-auth.json").read_text())["username"] == FAKE_GHCR_USER
+    kept = [f for f in (tmp / "out").rglob("*") if f.is_file() and FAKE_GHCR_USER.encode() in f.read_bytes()]
+    assert kept == []
+    assert not [f for f in (tmp / "out").rglob("*readback*")]
 
 
 def test_falsifier_run606_refuses_a_guard_nobody_listed_before_up(harness):  # noqa: F811

@@ -519,7 +519,13 @@ def test_the_bench_enable_rule_is_the_installers(tmp_path, snowplow):
     from bench import diag606
     pulled = _pulled(tmp_path, RECORDED)
     root = pulled / "installer"
-    values = ghcr_pull._merge(_values(snowplow), {"bootstrap": {"coreProvider": {"enabled": False}}})
+    # the run's EFFECTIVE values: the document writes internalTls off, the run's Installer CR patch turns it on
+    # with its certManagerNamespace (bench/installer_render.py, installer#1084)
+    from bench import cert_manager, installer_features, installer_render
+    patch = installer_render.cr_patch(installer_features.bench_features(), cert_manager.NAMESPACE)
+    assert patch["spec"]["features"] == {"internalTls": True}
+    effective = ghcr_pull._merge(_values(snowplow), patch["spec"])
+    values = ghcr_pull._merge(effective, {"bootstrap": {"coreProvider": {"enabled": False}}})
 
     def registered(chart):
         return {d["metadata"]["name"] for d in _render(chart, values, "--show-only", "templates/definitions.yaml")
@@ -538,14 +544,13 @@ def test_the_bench_enable_rule_is_the_installers(tmp_path, snowplow):
     (stripped / "files" / "component-pins.min.yaml").write_text(yaml.safe_dump(bare))
     assert stock - registered(stripped) == {"cert-manager", "cert-manager-issuers"}
     assert registered(stripped) < stock
-    feats = {**yaml.safe_load((root / "values.yaml").read_text())["features"], **_values(snowplow)["features"]}
+    feats = {**yaml.safe_load((root / "values.yaml").read_text())["features"], **effective["features"]}
     core = set(diag606.core_features(str(pulled)))
     # #1572: the bench's rule is the installer's inst.compEnabled (bench/installer_features.py)
-    from bench import installer_features
     rule = {c["name"] for c in pins["components"] if installer_features.component_enabled(c, feats, core)}
     assert rule == stock
     # with coreAgents on (#1572), its private-image components are registered too
-    assert sorted(set(ghcr_pull.private_image_paths(str(pulled), _values(snowplow))) & stock) == [
+    assert sorted(set(ghcr_pull.private_image_paths(str(pulled), effective)) & stock) == [
         "agentgateway-policies", "alert-provider", "config-refs-mcp-server", "core-provider-agent", "kagent",
         "repo-mcp-server"]
 

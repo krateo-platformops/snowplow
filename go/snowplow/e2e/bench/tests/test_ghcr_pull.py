@@ -1556,6 +1556,7 @@ def _s_registry(tmp_path, rc: int, lines: list[str]) -> str:
               f"log() {{ printf '%s\\n' \"$*\" >> {log}; }}\n"
               f"record_failure() {{ log \"RECORD: $1\"; return 1; }}\n"
               "write_installer_values() { :; }\n"
+              "installer_render_check() { :; }\n"        # #1590: before the preflight, tests/test_installer_render.py's
               f"python3() {{ {stub}return {rc}; }}\n"
               f"{fn}s_registry; echo \"rc=$?\" >> {log}\n")
     subprocess.run(["bash", "-c", script], check=True)
@@ -1572,6 +1573,10 @@ def test_run606_says_no_answer_for_the_preflights_exit_4_and_does_not_resolve_fo
     assert "refusing: NO ANSWER from the registry ..." in out              # the preflight's own lines, logged
     out = _s_registry(tmp_path, 3, ["refusing: the ghcr pull token does not resolve ..."])
     assert "RECORD: registry FAILED: the ghcr pull token does not resolve this install's private charts" in out
+    out = _s_registry(tmp_path, 5, ["refusing: a component does not render ..."])
+    last = out.split("a component does not render ...")[-1]
+    assert ("RECORD: registry FAILED: a component this install runs cannot be rendered with the values the run installs "
+            "with") in last and "does not resolve" not in last and last.endswith("rc=1\n")
     out = _s_registry(tmp_path, 0, ["[ghcr] all OK"])
     assert "RECORD" not in out.split("all OK")[-1] and out.endswith("rc=0\n")
 

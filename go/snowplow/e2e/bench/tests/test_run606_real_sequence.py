@@ -284,8 +284,15 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         os.remove(_vj)
     port = os.environ["FAKE_PORT"]
     # #1588 follow-up: s_install's ONE merge patch of the Installer CR, and the CR read back by name (FAKE_CR_PATCH:
-    # drops = the apiserver keeps the CR without internalTls.certManagerNamespace; fails = the patch is refused)
+    # drops = the apiserver keeps the CR without internalTls.certManagerNamespace; fails = the patch is refused;
+    # unreadable = the read-back itself is refused; blip / blip-read = the first patch / read goes unanswered; down =
+    # no patch is ever answered)
     if a[:1] == ["patch"] and a[1:2] and a[1].startswith("installers.") and a[2:3] == ["installer"]:
+        if os.environ.get("FAKE_CR_PATCH") in ("blip", "down"):
+            once = os.path.join(STATE, "cr-patch-blip")
+            if os.environ["FAKE_CR_PATCH"] == "down" or not os.path.exists(once):
+                open(once, "w").close()
+                print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr); sys.exit(1)
         if os.environ.get("FAKE_CR_PATCH") == "fails":
             print('Error from server (Invalid): installers "installer" is invalid', file=sys.stderr); sys.exit(1)
         open(os.path.join(STATE, "installer-cr-patch.json"), "w").write(open(a[a.index("--patch-file") + 1]).read())
@@ -295,8 +302,23 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         spec = (json.load(open(pf)).get("spec") or {}) if os.path.exists(pf) else {}
         if os.environ.get("FAKE_CR_PATCH") == "drops":
             spec.pop("internalTls", None)
+        if os.environ.get("FAKE_CR_PATCH") == "blip-read":
+            once = os.path.join(STATE, "cr-read-blip")
+            if not os.path.exists(once):
+                open(once, "w").close()
+                print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr); sys.exit(1)
+        if os.environ.get("FAKE_CR_PATCH") == "unreadable":
+            print('Error from server (Forbidden): installers "installer" is forbidden', file=sys.stderr); sys.exit(1)
+        # as the live CR: the registryAuth helm installed with, username included (the fresh-install pick carries it),
+        # and again in kubectl's last-applied annotation (the installer's hook applies the CR client-side)
+        meta = {"name": "installer", "namespace": ns}
+        ra = os.path.join(STATE, "helm-registry-auth.json")
+        if os.path.exists(ra):
+            spec["registryAuth"] = json.load(open(ra))
+            meta["annotations"] = {"kubectl.kubernetes.io/last-applied-configuration":
+                                   json.dumps({"spec": {"registryAuth": spec["registryAuth"]}})}
         print(json.dumps({"apiVersion": "composition.krateo.io/" + a[1].split(".")[1], "kind": "Installer",
-                          "metadata": {"name": "installer", "namespace": ns}, "spec": spec}))
+                          "metadata": meta, "spec": spec}))
         sys.exit(0)
     if a[:2] == ["auth", "can-i"]:
         # #1307 L7: GKE's IAM authorizer's answer to the orchestrator's SelfSubjectAccessReview;

@@ -1,6 +1,7 @@
 """The installer's composition render, on the laptop and in every dry pass, before any cluster exists (#1588
 follow-up): every component the run's Installer CR enables, rendered by the installer's own composition template
-with the CR's EFFECTIVE spec, so any `fail` / `required` guard of the installer fires here, not on a paid cluster.
+with the CR's EFFECTIVE spec, so a `fail` / `required` guard the composition templates reach fires here, not on a paid
+cluster (a guard inside inst.emitDecision / inst.depsReady, which the bypass replaces, would not: 0.3.703 has none).
 
 Why: installer 0.3.703 (its guards are byte-identical since 0.3.683) refuses its whole composition render while
 features.internalTls is on and internalTls.certManagerNamespace or componentValues.internal-ca-bundle

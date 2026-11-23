@@ -307,6 +307,7 @@ MEASURE_WAIT_S="${MEASURE_WAIT_S:-$(( (FRESH_EST_S > DRIVER_EST_S ? FRESH_EST_S 
 # its own: a part added to gke-up is counted here, in RUN_BUDGET_S and so in the TTL
 UP_BUDGET_S="${UP_BUDGET_S:-$(python3 -c 'from bench import gke; print(gke.up_budget_s())')}"
 INSTALL_TIMEOUT_S="${INSTALL_TIMEOUT_S:-900}"  # helm install --wait --timeout
+CR_PATCH_TIMEOUT_S="${CR_PATCH_TIMEOUT_S:-300}"  # installer_cr_patch: the patch and its read-back, one bound
 # installer#614 (s_cert_manager): cert-manager's install and its waits share ONE
 # bound, helm's own default --timeout (5m0s), the one cert-manager's documented
 # `helm install` runs under. Not a knob: it goes away with the step.
@@ -420,7 +421,7 @@ SETTLE_LIST_S="$(python3 -c 'from bench import clusterops; print(int(clusterops.
 SETTLE_BOUND_S="$(python3 -c 'import math, sys; print(math.ceil(float(sys.argv[1]) + float(sys.argv[2]) + float(sys.argv[3]) + float(sys.argv[4]) + 70))' \
     "$PREFLIGHT_TIMEOUT_S" "$SETTLE_DEADLINE_S" "$SETTLE_POLL_S" "$SETTLE_LIST_S")"
 SETTLE_STEP_S=$(( SETTLE_BOUND_S + COLLECT_TIMEOUT_S ))
-RUN_BUDGET_S=$(( INC_S + UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + CERT_MANAGER_TIMEOUT_S + INSTALL_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
+RUN_BUDGET_S=$(( INC_S + UP_BUDGET_S + PSI_JOBS * PREFLIGHT_TIMEOUT_S + CERT_MANAGER_TIMEOUT_S + INSTALL_TIMEOUT_S + CR_PATCH_TIMEOUT_S + PLATFORM_TIMEOUT_S + DEPLOY_WAIT_S
                  + ORIGIN_GATE_S + (1 + CLASS_COUNT) * PREFLIGHT_TIMEOUT_S + DATA_TIMEOUT_S + SETTLE_STEP_S
                  + ROLLOUT_TIMEOUT_S + DIGEST_SETTLE_S + GO_RUNTIME_S + MEASURE_WAIT_S
                  + COLLECT_CAP_S + EVALUATE_EST_S + FW_S + DIAG_CAP_S + 2 * DEFS_CAP_S + EVIDENCE_CAP_S + DOWN_BUDGET_S ))
@@ -438,7 +439,7 @@ TTL_SLACK_S=$(( TTL_S - TTL_MARGIN_S - RUN_BUDGET_S ))
 FW_LINE=""
 (( FW_S == 0 )) || FW_LINE=" + full widen ${FW_S} (applies ${FW_APPLIES}x${COLLECT_TIMEOUT_S} + ready ${PREFLIGHT_TIMEOUT_S} + objects ${FW_CREATE_S} + job ${FW_JOB_S} (preflight ${PREFLIGHT_TIMEOUT_S} + register ${FW_BOUND_S} + widen wait ${FW_WIDEN_WAIT_S} + settle ${FW_BOUND_S}) + reads ${FW_READS}x${COLLECT_TIMEOUT_S} + deletes ${FW_DELETES}x${COLLECT_TIMEOUT_S} + CRD delete ${FW_DELETE_S})"
 AGREE_LINE=" + go runtime ${GO_RUNTIME_S}"
-budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + settle ${SETTLE_STEP_S} (warm-up start ${PREFLIGHT_TIMEOUT_S} + deadline ${SETTLE_DEADLINE_S} + poll ${SETTLE_POLL_S} + reads ${SETTLE_LIST_S}+70 + stop ${COLLECT_TIMEOUT_S}) + in-cluster ${INC_S} (observer start ${PREFLIGHT_TIMEOUT_S} + data606 start ${PREFLIGHT_TIMEOUT_S} + its last poll ${INC_POLL_S} + finish ${INC_FINISH_CALLS}x${COLLECT_TIMEOUT_S} + cleanup ${COLLECT_CAP_S}) + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S}${AGREE_LINE} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + evidence ${EVIDENCE_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
+budget_line="up ${UP_BUDGET_S} + psi ${PSI_JOBS}x${PREFLIGHT_TIMEOUT_S} + cert-manager ${CERT_MANAGER_TIMEOUT_S} + install ${INSTALL_TIMEOUT_S} + CR patch ${CR_PATCH_TIMEOUT_S} + platform ${PLATFORM_TIMEOUT_S} + deploy ${DEPLOY_WAIT_S} + origin gate ${ORIGIN_GATE_S} (gateway ${ENDPOINT_WAIT_S} + 2x${ORIGIN_RESYNC_BUDGET_S} resync + ${PLATFORM_POLL_S:-60}) + preflight ${PREFLIGHT_TIMEOUT_S} + classes ${CLASS_COUNT}x${PREFLIGHT_TIMEOUT_S} + data ${DATA_TIMEOUT_S} + settle ${SETTLE_STEP_S} (warm-up start ${PREFLIGHT_TIMEOUT_S} + deadline ${SETTLE_DEADLINE_S} + poll ${SETTLE_POLL_S} + reads ${SETTLE_LIST_S}+70 + stop ${COLLECT_TIMEOUT_S}) + in-cluster ${INC_S} (observer start ${PREFLIGHT_TIMEOUT_S} + data606 start ${PREFLIGHT_TIMEOUT_S} + its last poll ${INC_POLL_S} + finish ${INC_FINISH_CALLS}x${COLLECT_TIMEOUT_S} + cleanup ${COLLECT_CAP_S}) + reboot ${ROLLOUT_TIMEOUT_S} + digest ${DIGEST_SETTLE_S}${AGREE_LINE} + measure ${MEASURE_WAIT_S} (fresh ${FRESH_EST_S}, driver ${DRIVER_EST_S}) + collect ${COLLECT_CAP_S} + evaluate ${EVALUATE_EST_S}${FW_LINE} + diag ${DIAG_CAP_S} + definitions 2x${DEFS_CAP_S} + evidence ${EVIDENCE_CAP_S} + down ${DOWN_BUDGET_S} = ${RUN_BUDGET_S} s"
 if (( RUN_BUDGET_S > TTL_S - TTL_MARGIN_S )); then
   echo "refusing: worst-case run ${RUN_BUDGET_S} s exceeds TTL_HOURS=${TTL_HOURS} (${TTL_S} s) minus margin ${TTL_MARGIN_S} s" >&2
   echo "  budget: ${budget_line}" >&2
@@ -1258,8 +1259,8 @@ s_rehearsal() {
 # token).
 # First the installer's own composition render (bench/installer_render.py): every component the run's Installer CR
 # enables, rendered with its EFFECTIVE spec (the CR a fresh install of these values writes, merged with the run's
-# CR patch), the cluster-state emission gate bypassed in that check's in-memory chart only, so every `fail` guard of
-# the installer fires here. $OUT/installer-cr-patch.json is the patch s_install applies; $OUT/installer-render.json.
+# CR patch), the cluster-state emission gate bypassed in that check's in-memory chart only, so a `fail` guard the
+# composition templates reach fires here (bench/installer_render.py says what it cannot see). $OUT/installer-cr-patch.json is the patch s_install applies; $OUT/installer-render.json.
 s_registry() {
   write_installer_values
   installer_render_check || return 1
@@ -1341,8 +1342,10 @@ installer_render_check() {
 # installer_cr_patch: right after helm install, the run's ONE merge patch of the Installer CR (installer#1084:
 # internalTls.certManagerNamespace is CR-only, set in the same patch as features.internalTls), logged (it holds
 # no identity); then the CR read back, refused unless it holds every field written, before s_platform's wait.
+# Both share CR_PATCH_TIMEOUT_S (in the run's budget). An API that does not answer is waited out within it (the
+# merge patch is idempotent); an answered error, or kubectl's own configuration, is a verdict at once.
 installer_cr_patch() {
-  local api res why
+  local api res why ps=() until left
   api="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["cr_api_version"])' "$OUT/installer-render.json")" \
     || { record_failure "install FAILED: the Installer CR's version is not in $OUT/installer-render.json"; return 1; }
   res="installers.${api#composition.krateo.io/}.composition.krateo.io"
@@ -1351,18 +1354,49 @@ installer_cr_patch() {
     return 0
   fi
   log "installer CR patch: kubectl -n krateo-system patch $res installer --type merge: $(cat "$OUT/installer-cr-patch.json")"
-  run "${K[@]}" -n krateo-system patch "$res" installer --type merge --patch-file "$OUT/installer-cr-patch.json" \
-      >/dev/null 2>"$KERR" || { record_failure "install FAILED: the Installer CR patch: $(kerr_line)"; return 1; }
   if [[ "$DRY" == "1" ]]; then
+    run "${K[@]}" -n krateo-system patch "$res" installer --type merge --patch-file "$OUT/installer-cr-patch.json"
     log "DRY: kubectl -n krateo-system get $res installer -o json | python3 -m bench.installer_render readback (refused unless the CR holds the patch)"
     return 0
   fi
-  bounded "$COLLECT_TIMEOUT_S" "${K[@]}" --request-timeout="${COLLECT_TIMEOUT_S}s" -n krateo-system get "$res" installer \
-      -o json > "$OUT/installer-cr-readback.json" 2>"$KERR" \
-    || { record_failure "install FAILED: the Installer CR could not be read back: $(kerr_line)"; return 1; }
-  if ! python3 -m bench.installer_render readback --patch "$OUT/installer-cr-patch.json" \
-      < "$OUT/installer-cr-readback.json" > "$OUT/.installer-readback.out" 2>"$KERR"; then
-    why="$(sed -n 's/^refusing: //p' "$KERR" | head -1)"
+  until=$(( SECONDS + CR_PATCH_TIMEOUT_S ))
+  while left=$(( until - SECONDS ))
+        ! run bounded "$(( left > 1 ? left : 1 ))" "${K[@]}" --request-timeout=30s -n krateo-system patch "$res" installer \
+            --type merge --patch-file "$OUT/installer-cr-patch.json" >/dev/null 2>"$KERR"; do
+    if local_error || answered_error; then
+      record_failure "install FAILED: the Installer CR patch: $(kerr_line)"; return 1
+    fi
+    if (( SECONDS >= until )); then
+      record_failure "install FAILED: the Installer CR patch: the API server did not answer within ${CR_PATCH_TIMEOUT_S} s: $(kerr_line)"
+      return 1
+    fi
+    log "installer CR patch: the API server did not answer; asked again"
+    sleep 5
+  done
+  # through a pipe, never a file: the Installer CR carries the registry username (registryAuth), as portal_readers_live's
+  # read of it does. readback prints only the patch's own fields. PIPESTATUS tells a read that failed from a CR that
+  # lacks a field (141: readback stopped reading, its own reason is the answer).
+  while :; do
+    left=$(( until - SECONDS ))
+    bounded "$(( left > 1 ? left : 1 ))" "${K[@]}" --request-timeout=30s -n krateo-system get "$res" installer \
+        -o json 2>"$KERR" \
+      | python3 -m bench.installer_render readback --patch "$OUT/installer-cr-patch.json" \
+          > "$OUT/.installer-readback.out" 2>"$OUT/.installer-readback.err" \
+      && ps=("${PIPESTATUS[@]}") || ps=("${PIPESTATUS[@]}")
+    (( ps[0] == 0 || ps[0] == 141 )) && break
+    if local_error || answered_error || (( SECONDS >= until )); then break; fi
+    log "installer CR read back: the API server did not answer; asked again"
+    sleep 5
+  done
+  why="$(sed -n 's/^refusing: //p' "$OUT/.installer-readback.err" | head -1)"
+  rm -f "$OUT/.installer-readback.err"
+  if (( ps[0] != 0 && ps[0] != 141 )); then
+    rm -f "$OUT/.installer-readback.out"
+    record_failure "install FAILED: the Installer CR could not be read back: $(kerr_line)"
+    return 1
+  fi
+  if (( ps[1] != 0 )); then
+    rm -f "$OUT/.installer-readback.out"
     : > "$KERR"
     record_failure "install FAILED: ${why:-the Installer CR does not hold the patch of this run}"
     return 1

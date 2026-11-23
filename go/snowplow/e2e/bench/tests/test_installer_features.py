@@ -99,10 +99,24 @@ def _doc_features(doc: str) -> dict:
     return yaml.safe_load(doc)["features"]
 
 
+def _effective_features(doc: str) -> dict:
+    """What the Installer CR holds once s_install is done: the document's features, the run's CR patch merged in
+    (installer#1084: the patch is the only way installer 0.3.703's CR gets CR_PATCH_FEATURES with their value)."""
+    from bench import cert_manager, installer_render
+    patch = installer_render.cr_patch(installer_features.bench_features(), cert_manager.NAMESPACE)
+    return {**_doc_features(doc), **((patch.get("spec") or {}).get("features") or {})}
+
+
 def test_the_values_write_every_feature_at_057s_value_or_a_named_deviation():
+    from bench import installer_render
     rec = installer_features.load()
-    got = _doc_features(installer_values.document("1.12.75"))
-    assert set(got) == set(rec["features"])                   # every one written: no chart default decides one
+    doc = _doc_features(installer_values.document("1.12.75"))
+    got = _effective_features(installer_values.document("1.12.75"))
+    assert set(doc) == set(rec["features"])                   # every one written: no chart default decides one
+    # the document differs from what the CR ends up with by exactly the CR-patched features: off there, on here
+    assert rec["features"]["internalTls"] is True             # 057 runs it (else the next line proves nothing)
+    assert {f for f in doc if doc[f] is not got[f]} == set(installer_render.CR_PATCH_FEATURES) == {"internalTls"}
+    assert all(doc[f] is False and got[f] is True for f in installer_render.CR_PATCH_FEATURES)
     for f, v in got.items():
         want = installer_features.DEVIATIONS[f][0] if f in installer_features.DEVIATIONS else rec["features"][f]
         assert v is want, f
@@ -124,7 +138,7 @@ def test_falsifier_the_values_follow_the_record_they_are_not_a_second_list(monke
 def test_falsifier_a_deviation_changes_only_its_feature(monkeypatch):
     rec = installer_features.load()
     monkeypatch.setattr(installer_features, "DEVIATIONS", {"auditWorm": (False, "why", "ruling")})
-    got = _doc_features(installer_values.document("1.12.75"))
+    got = _effective_features(installer_values.document("1.12.75"))
     assert got == {**rec["features"], "auditWorm": False}
 
 
