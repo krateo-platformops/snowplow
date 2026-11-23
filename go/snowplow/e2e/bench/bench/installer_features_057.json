@@ -2,9 +2,9 @@
  "kind": "installer_features_057",
  "read": {
   "date": "2026-11-23",
-  "installer_version": "0.3.700",
+  "installer_version": "0.3.703",
   "object": "installers.composition.krateo.io (the one Installer CR), spec.features",
-  "chart": "installer 0.3.700: values.schema.json features, values.yaml defaults"
+  "chart": "installer 0.3.703: values.schema.json features, values.yaml defaults"
  },
  "cr_features": {
   "accessReview": false,
