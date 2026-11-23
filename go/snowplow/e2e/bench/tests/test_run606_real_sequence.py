@@ -1848,9 +1848,9 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         # (offline: never, no CRD is served), at composition.krateo.io/<the tag it returns>. FAKE_INSTALLER_GUARD=
         # new: an installer whose guard also requires a value the bench does not write (the class the bench's
         # composition render exists for: a guard nobody has listed yet)
-        newguard = ("{{- if not (index (.Values.componentValues | default dict) \"internal-ca-bundle\" | default dict)"
-                    ".required }}{{- fail \"features.internalTls is on but componentValues.internal-ca-bundle.required "
-                    "is empty\" }}{{- end }}") if os.environ.get("FAKE_INSTALLER_GUARD") == "new" else ""
+        newguard = ('{{- if not (index (.Values.componentValues | default dict) "internal-ca-bundle" | default dict)'
+                    '.required }}{{- fail "features.internalTls is on but componentValues.internal-ca-bundle.required '
+                    'is empty" }}{{- end }}') if os.environ.get("FAKE_INSTALLER_GUARD") == "new" else ""
         open(os.path.join(d, "templates", "compositions.yaml"), "w").write(chr(10).join([
             "{{- if not ((.Values.bootstrap | default dict).coreProvider | default dict).enabled }}",
             "{{- $top := . }}",
