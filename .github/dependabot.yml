@@ -1,0 +1,10 @@
+# The shared krateo-platformops/.github workflows are pinned to a released commit (the org pin rule), so a
+# breaking change to them arrives here as a reviewed update PR, never as a failed release.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci

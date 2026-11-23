@@ -23,7 +23,7 @@ on:
 
 jobs:
   release-notes:
-    uses: krateo-platformops/.github/.github/workflows/release-notes.yaml@main
+    uses: krateo-platformops/.github/.github/workflows/release-notes.yaml@f6185ef0a8161a4201217d6ce0953718fc736fe0 # 1.1.0
     permissions:
       contents: write # the release body and the CHANGELOG commit
       id-token: write # claude-code-action's GitHub App auth; the reusable cannot grant itself this

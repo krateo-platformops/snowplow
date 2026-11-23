@@ -19,10 +19,19 @@ on:
       app_version:
         description: "App image version (APP_VERSION). Default: the tag this runs on (run from a branch: the latest tag of the app repo)."
         required: false
+      dry_run:
+        description: "Package and run every check, upload the packages as an artifact, push nothing. A manual run defaults to a dry run; a tag push always publishes."
+        type: boolean
+        default: true
 
 jobs:
   release-oci:
-    uses: krateo-platformops/.github/.github/workflows/release-oci.yaml@main
+    # Pinned to a released commit (the org pin rule): a breaking change to the shared workflow then arrives
+    # as a reviewed update here, never as a failed release. @main took release-oci 2.0.0's new required
+    # `index_channel` input on 2026-11-22 (krateo-platformops/.github 77bcf7f), which would have failed this
+    # repo's next release at startup (core-provider 2.13.125). Moving to 2.x is a deliberate later change
+    # (with `index_channel: none`: snowplow's charts are installed by the installer, never indexed).
+    uses: krateo-platformops/.github/.github/workflows/release-oci.yaml@f6185ef0a8161a4201217d6ce0953718fc736fe0 # 1.1.0
     permissions:
       contents: read
       packages: write
@@ -41,3 +50,5 @@ jobs:
     with:
       chart_version: ${{ github.event.inputs.chart_version || (github.ref_type == 'tag' && github.ref_name || '') }}
       app_version: ${{ github.event.inputs.app_version || (github.ref_type == 'tag' && github.ref_name || '') }}
+      # A tag push has no inputs, so it publishes; a manual run is a dry run unless dry_run is set false.
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
