@@ -1,0 +1,9 @@
+[
+  {
+    "namespace": "krateo-system",
+    "name": "kagent-postgresql",
+    "class": null,
+    "request": "500Mi",
+    "source": "helm template of kagent 0.1.22 (installer 0.3.641) and 0.1.24 (installer 0.3.697) with the installer's componentValues.kagent, 2026-11-22: installed with coreAgents"
+  }
+]

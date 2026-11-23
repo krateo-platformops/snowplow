@@ -133,6 +133,12 @@ FAKE_CHART_VALUES = {
     # the portal, in the REAL 1.8.118 shape (helm show values): no reader group and no demo user by
     # default; the installer's componentValues, or the bench's, name the groups that read the shell
     "portal": {"enableCyberjokerUser": False, "readerGroups": []},
+    # #1572: the private-image components coreAgents turns on, their real charts' defaults (see their templates)
+    "repo-mcp-server": {"imagePullSecrets": []},
+    "config-refs-mcp-server": {"imagePullSecrets": []},
+    "core-provider-agent": {"mcpServers": {"chartGate": {"imagePullSecrets": []}}},
+    "kagent": {"kagentapp": {"fullnameOverride": "kagent"},
+               "perUserRbac": {"enabled": False, "toolImagePullSecrets": []}},
     # two page charts, as the real ones declare their readers (1.8.118 values.yaml): the dashboard is
     # for admins and devs, the settings for admins alone; each in its own namespace
     "dashboard-page": {"namespace": "krateo-dashboard", "readerGroups": ["admins", "devs"]},
@@ -251,6 +257,17 @@ subjects:
 - {kind: Group, name: devs, apiGroup: rbac.authorization.k8s.io}
 {{- end }}
 """
+
+
+def _fake_secret_pod(name: str, secrets: str, image: str) -> str:
+    """A Deployment running `image` (tag: the chart's appVersion) whose pod pull secrets are the
+    values at `secrets`, as the real private-image charts render them."""
+    return ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: " + name + "\nspec:\n  template:\n"
+            "    spec:\n      {{- with " + secrets + " }}\n      imagePullSecrets:\n"
+            "        {{- toYaml . | nindent 8 }}\n      {{- end }}\n      containers:\n      - name: main\n"
+            "        image: \"" + image + ":{{ .Chart.AppVersion }}\"\n")
+
+
 #: each chart's templates, real Helm templates (rendered by the real helm)
 FAKE_CHART_TEMPLATES = {
     "portal": {"templates/rbac.shell-readers.yaml": FAKE_PORTAL_SHELL_READERS,
@@ -361,6 +378,49 @@ spec:
       - name: frontend
         image: {{ include "krateo.image" (dict "img" .Values.image "global" .Values.global "defaultTag" .Chart.AppVersion) | quote }}
 """},
+    # #1572: the private-image components coreAgents turns on (installer 0.3.697's
+    # inst.privateImageComponents), in the shape their REAL charts render (helm template, 2026-11-22):
+    # the injected pull secret lands on the pod that runs the private image
+    "repo-mcp-server": {"templates/deployment.yaml": _fake_secret_pod(
+        name="repo-mcp-server", secrets=".Values.imagePullSecrets",
+        image="ghcr.io/krateo-agentiko/repo-mcp-server")},
+    "config-refs-mcp-server": {"templates/deployment.yaml": _fake_secret_pod(
+        name="config-refs", secrets=".Values.imagePullSecrets", image="ghcr.io/krateo-agentiko/config-refs-mcp")},
+    "core-provider-agent": {"templates/chart-gate.yaml": _fake_secret_pod(
+        name="core-provider-chart-gate-mcp-server", secrets=".Values.mcpServers.chartGate.imagePullSecrets",
+        image="ghcr.io/krateo-agentiko/krateo-core-provider-chart-gate-mcp-server")},
+    # kagent 0.1.24: the upstream controller, ui and tools run PUBLIC ghcr.io/kagent-dev images with no
+    # pull secret; the per-user tool server (perUserRbac, off by the chart's default; 057 turns it on in
+    # its componentValues) carries perUserRbac.toolImagePullSecrets
+    "kagent": {"templates/upstream.yaml": """{{- range $n := list "kagent-controller" "kagent-ui" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $n }}
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: "ghcr.io/kagent-dev/kagent/{{ trimPrefix "kagent-" $n }}:0.10.1"
+{{- end }}
+{{- if (dig "kagent-tools" "enabled" true (.Values.kagentapp | default dict)) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kagent-tools
+spec:
+  template:
+    spec:
+      containers:
+      - name: tools
+        image: "ghcr.io/kagent-dev/kagent/tools:0.3.1"
+{{- end }}
+""", "templates/cert-replay-tools.yaml": "{{- if .Values.perUserRbac.enabled }}\n" + _fake_secret_pod(
+        name="kagent-tools", secrets=".Values.perUserRbac.toolImagePullSecrets",
+        image="ghcr.io/krateo-agentiko/kagent-tools") + "{{- end }}\n"},
 }
 
 

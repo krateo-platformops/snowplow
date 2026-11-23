@@ -1421,9 +1421,12 @@ GKE_DISK_CLUSTER_NAME = "goog-k8s-cluster-name"
 GKE_DISK_CLUSTER_ID_KEYS = ("goog-gke-cluster-id-base32", "cluster-id-gke-io")
 PROVISIONED_BY = "pv.kubernetes.io/provisioned-by"
 # One bench cluster's PVCs: run 14's diagnostics/pvcs.json — ClickStack
-# ClickHouse 15Gi + Keeper 5Gi + MongoDB data 10G + logs 2G, each rounded up to
+# ClickHouse 15Gi + Keeper 5Gi + MongoDB data 10G + logs 2G — and, since the
+# install runs krateo-057's installer features (bench/installer_features.py:
+# coreAgents on), kagent's bundled PostgreSQL 500Mi (the kagent chart the
+# installer pins, rendered with the installer's values), each rounded up to
 # whole GB as GCE provisions a disk (pvc_footprint_gb; a test pins the two).
-BENCH_PVC_FOOTPRINT_GB = 32
+BENCH_PVC_FOOTPRINT_GB = 33
 _POLL_S = 15.0
 
 _QTY = re.compile(r"^([0-9.]+)\s*([KMGTPE]i?|[kmgtpe])?$")

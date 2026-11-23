@@ -139,7 +139,7 @@ def test_a_token_that_does_not_resolve_the_charts_is_refused_before_up(harness, 
         "network": lambda: {"GHCR_API_URL": "https://127.0.0.1:1"},
         "http": lambda: {"GHCR_API_URL": env["GHCR_API_URL"].replace("https://", "http://")},
         "redirect": lambda: {"GHCR_PULL_ENV_FILE": token_file("redirect")},
-        "core_feature": lambda: {"FAKE_CORE_FEATURES": "specialistAgents"},
+        "core_feature": lambda: {"FAKE_CORE_FEATURES": "showback"},   # off in the run's values (#1572)
         "image_scope": lambda: {"GHCR_PULL_ENV_FILE": token_file("imgscope403")},
         "bad_digest": lambda: {"FAKE_AGW_VERSION": FAKE_CHART_BAD_DIGEST},
         "http_blob": lambda: {"FAKE_AGW_VERSION": FAKE_CHART_HTTP_BLOB},
@@ -393,6 +393,17 @@ def test_the_images_are_what_the_chart_values_name():
         "ghcr.io/x/job:latest", "ghcr.io/x/pinned@sha256:" + "a" * 64]
     assert ghcr_pull.split_image("ghcr.io/krateo-agentiko/ui-token-hop:0.2.18") == (
         "ghcr.io", "krateo-agentiko/ui-token-hop", "0.2.18")
+
+
+def test_a_reference_with_a_tag_and_a_digest_is_pulled_by_its_digest_from_its_own_repository():
+    """#1575: the real dry pass on installer 0.3.700 refused ghcr.io/clickhouse/mcp-clickhouse:0.5.0@sha256:...
+    (clickhouse-mcp-server 0.1.15) with HTTP 404: the tag stayed in the repository name. Anonymously the
+    registry answers 200 for that repository by the digest (2026-11-23)."""
+    d = "sha256:37564a952d1428984b2fc189cc3ef1e77453c7e1cb65dde286938dac282f9ab0"
+    assert ghcr_pull.split_image(f"ghcr.io/clickhouse/mcp-clickhouse:0.5.0@{d}") == (
+        "ghcr.io", "clickhouse/mcp-clickhouse", d)
+    assert ghcr_pull.split_image(f"ghcr.io/x/pinned@{d}") == ("ghcr.io", "x/pinned", d)
+    assert ghcr_pull.split_image("ghcr.io/x/y") == ("ghcr.io", "x/y", "latest")
 
 
 def test_a_chart_is_read_through_the_blob_redirect_without_the_registry_bearer():

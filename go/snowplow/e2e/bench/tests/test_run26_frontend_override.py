@@ -40,7 +40,14 @@ FD = "sha256:" + "1a" * 32          # the frontend's expected digest
 FD_OTHER = "sha256:" + "2b" * 32
 FTAG = "1.8.38"
 SP_DIG = "sha256:" + "ab" * 32      # the snowplow digest test_606._run606 launches with
-BLOCK = f'\n  frontend:\n    image:\n      tag: "{FTAG}"'
+
+
+def _frontend_with_tag(tag: str) -> dict:
+    """componentValues.frontend as a run writes it with FRONTEND_TAG=`tag`: krateo-057's recorded frontend
+    switches and sizes (#1572, bench/installer_component_values.py), and the bench's image tag beside them."""
+    from bench import installer_component_values as icv
+    want = icv.nest(icv.bench_paths()).get("frontend", {})
+    return {**want, "image": {"tag": tag}}
 
 
 def _fpod(name, digest, terminating=False):
@@ -269,12 +276,17 @@ def test_unset_the_installer_values_are_byte_identical_and_nothing_is_added(tmp_
     assert ps.returncode == 0, ps.stderr[-3000:]
     unset = (a / "out" / "installer-values.yaml").read_text()
     with_fe = (b / "out" / "installer-values.yaml").read_text()
-    # the override is the frontend block under componentValues, and nothing else
-    assert with_fe.count(BLOCK) == 1 and with_fe.replace(BLOCK, "", 1) == unset
-    assert sorted(yaml.safe_load(unset)["componentValues"]) == ["portal", "snowplow"]
-    vals = yaml.safe_load(with_fe)
-    assert vals["componentValues"]["frontend"] == {"image": {"tag": FTAG}}
-    assert vals["componentValues"]["snowplow"] == yaml.safe_load(unset)["componentValues"]["snowplow"]
+    # the override is componentValues.frontend.image.tag, and nothing else: since #1572 the frontend block
+    # also carries krateo-057's recorded frontend switches and sizes, in both documents alike, so the set
+    # document is the unset one with exactly the image block's lines added and none removed
+    import difflib
+    diff = [ln for ln in difflib.ndiff(unset.splitlines(), with_fe.splitlines()) if ln[:2] in ("+ ", "- ")]
+    assert diff == ["+     image:", f"+       tag: {FTAG}"], diff
+    unset_cv, vals = yaml.safe_load(unset)["componentValues"], yaml.safe_load(with_fe)
+    assert "image" not in unset_cv.get("frontend", {})
+    assert vals["componentValues"]["frontend"] == _frontend_with_tag(FTAG)
+    assert {k: v for k, v in vals["componentValues"].items() if k != "frontend"} == \
+        {k: v for k, v in unset_cv.items() if k != "frontend"}
     # unset: no frontend gate, no frontend evaluate arguments, no override log
     assert "frontend pods imageID" not in pu.stderr and "--frontend-tag" not in pu.stderr
     assert "frontend image override" not in pu.stderr
@@ -322,7 +334,7 @@ def test_run606_a_frontend_on_another_digest_aborts_void_before_any_load(harness
     assert rec["kind"] == "frontend_image_digest" and rec["result"] == "VOID"
     assert [r["digest"] for r in rec["pods"]] == [FD_OTHER]
     vals = yaml.safe_load((tmp / "out" / "installer-values.yaml").read_text())
-    assert vals["componentValues"]["frontend"] == {"image": {"tag": FTAG}}
+    assert vals["componentValues"]["frontend"] == _frontend_with_tag(FTAG)   # #1572: 057's frontend switches beside
     pf = json.loads((tmp / "out" / "ghcr-pull-preflight.json").read_text())
     assert any(i["image"] == f"ghcr.io/krateo-platformops/frontend:{FTAG}" for i in pf["images"])
 

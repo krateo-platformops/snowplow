@@ -14,9 +14,11 @@ The rule is the installer's own exposure contract, read from the pulled chart
 (templates/compositions.yaml, values.yaml `exposure`), applied to the chart's
 pins (files/component-pins.yaml) and the run's values:
 
-  - a component is installed when inst.featureEnabled says so: no feature,
-    a feature in inst.coreFeatures, or a feature the values turn on (the
-    chart's values.yaml under the run's); registerOnly pins never are;
+  - a component is installed when inst.compEnabled says so
+    (bench/installer_features.py component_enabled): no feature, a feature
+    in inst.coreFeatures, or its feature or one of its alsoFeatures the
+    values turn on (the chart's values.yaml under the run's); registerOnly
+    pins never are;
   - exposure.type LoadBalancer: every installed `expose: true` component but
     agentgateway-policies gets `service.type: LoadBalancer` (one Service
     each, its svcMatch); NodePort and Gateway flip none to LoadBalancer
@@ -83,7 +85,7 @@ def _lb_types(values, path=()) -> list[str]:
 def planned(installer_pulled: str, values_file: str) -> list[dict]:
     """[{component, service, why}] — one row per LoadBalancer Service the
     install creates, by the installer's exposure contract (module doc)."""
-    from bench import diag606
+    from bench import diag606, installer_features
     root = os.path.join(installer_pulled, "installer")
     core = set(diag606.core_features(installer_pulled))
     from bench import installer_pins
@@ -102,8 +104,7 @@ def planned(installer_pulled: str, values_file: str) -> list[dict]:
     for c in pins:
         if not isinstance(c, dict) or c.get("registerOnly"):
             continue
-        f = c.get("feature") or ""
-        if f and f not in core and not features.get(f, False):
+        if not installer_features.component_enabled(c, features, core):   # inst.compEnabled
             continue
         name = str(c.get("name"))
         svc = c.get("svcMatch") or name

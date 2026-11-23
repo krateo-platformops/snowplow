@@ -873,7 +873,26 @@ s_source() {
     *) record_failure "source FAILED: the installer chart does not resolve or verify ($OUT/installer-preflight.json)"; return 1 ;;
   esac
   log "installer source: $INSTALLER_CHART --version $INSTALLER_VERSION (registry preflight OK$([[ "$VERIFY483" == "1" ]] && echo ', #483 pins present'))"
+  installer_features_check || return 1
   portal_readers
+}
+# installer_features_check (#1572, the owner's ruling 2026-11-22: the bench's install matches krateo-057's
+# installer features): the pulled chart must declare exactly the features of 057's record
+# (bench/installer_features.py), which the run's values write, every one; the deviations the owner
+# rules on are logged by name. BEFORE any cluster exists, in the dry pass too. $OUT/installer-features.json.
+installer_features_check() {
+  local rc=0 ln why
+  python3 -m bench.installer_features check --installer-pulled "$OUT/installer-pulled" \
+      --out "$OUT/installer-features.json" >"$OUT/.installer-features.out" 2>"$KERR" || rc=$?
+  while IFS= read -r ln; do
+    if [[ -n "$ln" ]]; then log "$ln"; fi
+  done < "$OUT/.installer-features.out"
+  rm -f "$OUT/.installer-features.out"
+  (( rc == 0 )) && return 0
+  why="$(sed -n 's/^refusing: //p' "$KERR" | head -1)"
+  : > "$KERR"     # the refusal is the failure's own line, said once
+  record_failure "source FAILED: installer features: ${why:-bench.installer_features exited ${rc} ($OUT/installer-features.json)}"
+  return 1
 }
 # portal_readers (run 26j: three paid clusters, every bench user's boot call 403): the bench's base
 # group must be granted the portal's shell, and the pages its users are driven through must still
@@ -1575,6 +1594,28 @@ s_env() {
   apf_preflight || return 1
   start_netns_sampler
   flowcontrol_attribution || return 1
+  otlp_receiver_gate || return 1
+}
+# otlp_receiver_gate (#1575): where the run's values give the node-local OTLP agent the snowplow pool's
+# toleration (bench/installer_component_values.py: only where the installer can express it, and then
+# snowplow's OTLP switches are 057's), an agent must be Running and Ready on snowplow's node before any
+# load, or the env step fails: snowplow would export into a closed port. Where the values carry no such
+# toleration the bench's recorded deviation says so, and nothing is read. $OUT/otlp-receiver.json.
+otlp_receiver_gate() {
+  local line rc=0
+  if [[ "$DRY" == "1" ]]; then
+    log "DRY: python3 -m bench.tracing receiver-gate --values $OUT/installer-values.yaml --out $OUT/otlp-receiver.json -- ${K[*]} (an OTLP agent on snowplow's node, required where the run's values give it the snowplow pool's toleration)"
+    return 0
+  fi
+  line="$(bounded "$COLLECT_TIMEOUT_S" python3 -m bench.tracing receiver-gate --values "$OUT/installer-values.yaml" \
+            --out "$OUT/otlp-receiver.json" --selector "$SNOWPLOW_POD_SELECTOR" --timeout-s "$COLLECT_TIMEOUT_S" \
+            -- "${K[@]}" 2>"$KERR")" || rc=$?
+  if (( rc == 0 )); then
+    log "$line"
+    return 0
+  fi
+  record_failure "env FAILED: ${line:-the OTLP receiver on the snowplow node could not be read: $(kerr_line)}"
+  return 1
 }
 # start_netns_sampler (#1089): the TCP path under snowplow, from here (the boot
 # included) to collect — every TOP_POLL_S, ONE pod on the snowplow node

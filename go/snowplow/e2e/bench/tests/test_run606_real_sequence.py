@@ -36,7 +36,7 @@ from pathlib import Path
 
 import pytest
 
-from bench import gke
+from bench import gke, installer_component_values, installer_features
 from bench.load606 import SCALEUSER_PASSWORD
 from tests import _planted, fake_gke_api, fake_gke_ops, fake_region
 
@@ -1025,11 +1025,15 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         # (run 24: run606's pre-install tracing reading) there is no snowplow pod.
         if not os.path.exists(os.path.join(STATE, "installer-installed")):
             print(json.dumps({"items": []})); sys.exit(0)
-        cnt = os.path.join(STATE, "snowplow_pod_reads")
+        cnt = os.path.join(STATE, "snowplow_pod_reads")      # FAKE_TERMINATING_READS counts reads (below)
         n = int(open(cnt).read()) if os.path.exists(cnt) else 0
         open(cnt, "w").write(str(n + 1))
-        # read 0 = the digest gate, 1 = the before record, 2+ = after
-        restarted = os.environ.get("FAKE_RESTART_DURING_MEASURE") == "1" and n >= 2
+        # the restart happens DURING measure: once a measuring driver Job is applied (run606 driver_jobs:
+        # load606, or k6load / k6browser), never by the ordinal of a read (#1575: the env step's receiver
+        # gate reads the pod too, before the digest gate)
+        jf = os.path.join(STATE, "applied-jobs")
+        driving = os.path.exists(jf) and bool({"load606", "k6load", "k6browser"} & set(open(jf).read().split()))
+        restarted = os.environ.get("FAKE_RESTART_DURING_MEASURE") == "1" and driving
         cs = {"name": "snowplow", "ready": True, "restartCount": 1 if restarted else 0,
               "image": "ghcr.io/krateo-platformops/snowplow:1.12.50",
               "imageID": "ghcr.io/krateo-platformops/snowplow@" + os.environ["FAKE_IMAGE_DIGEST"],
@@ -1836,7 +1840,8 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
             "components": [
                 {"name": "authn-crd", "kind": "AuthnCrds", "chart": "authn-crds", "version": "0.27.3"},
                 {"name": "snowplow-crd", "kind": "SnowplowCrds", "chart": "snowplow-crds", "version": "1.12.56"},
-                {"name": "alert-provider-crd", "feature": "portal" if good else "specialistAgents"},
+                # not good: gated on a feature the run keeps off (showback: off on krateo-057, #1572)
+                {"name": "alert-provider-crd", "feature": "portal" if good else "showback"},
                 # as at 0.3.468: on through portal, no repo of its own (the installer's ociRepo), a
                 # private-image component (#1041 review F1 / N1)
                 {"name": "alert-provider", "version": "0.2.53", "feature": "portal"},
@@ -1853,9 +1858,10 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
                  "repo": "oci://ghcr.io/krateo-blueprints/charts", "feature": "portal"},
                 {"name": "github-provider-kog", "version": "0.6.0", "repo": "oci://ghcr.io/krateo-blueprints/charts"},
                 # a private pin of a feature that is off unless the chart makes it a core feature,
-                # at a version the fake registry has not published: preflighted only when on
+                # at a version the fake registry has not published: preflighted only when on (showback:
+                # off on krateo-057, so in the run's values, #1572)
                 {"name": "incident-agent", "version": "9.9.9", "repo": "oci://ghcr.io/krateo-agentiko/charts",
-                 "feature": "specialistAgents"}]
+                 "feature": "showback"}]
                 # run 26: the frontend, pinned as 0.3.545 pins it (no repo of its own) at
                 # FAKE_FRONTEND_PIN (0.3.545's own is 1.8.34); by default one that carries the login
                 # form contract (bench/login_contract.py, run 26d); "none": no frontend pin
@@ -1892,10 +1898,32 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
             props = {"agents": {"type": "object"}, "enableCyberjokerUser": {"type": "boolean"}}
             if schema != "no-reader-groups":
                 props["readerGroups"] = {"type": "array", "items": {"type": "string"}}
+            # #1572: the features krateo-057 runs (bench/installer_features_057.json), every one declared, as
+            # installer 0.3.697's schema declares them; FAKE_INSTALLER_FEATURES=drop:<f>: a chart without <f>
+            # (installer 0.3.641 has no internalTls)
+            feats = sorted(json.load(open("@@FEATURES_RECORD@@"))["features"])
+            drop = os.environ.get("FAKE_INSTALLER_FEATURES", "")
+            if drop.startswith("drop:"):
+                feats.remove(drop[len("drop:"):])
+            # #1572: every componentValues path the bench writes from 057's component-values record
+            # (bench/installer_component_values_057.json), declared, as installer 0.3.697's schema declares them
+            cv = {"portal": {"type": "object", "additionalProperties": False, "properties": props}}
+            # #1575: and the schema facts the record keeps, as its installer's schema has them (installer 0.3.700
+            # declares the collector agent's tolerations); FAKE_INSTALLER_SCHEMA=no-agent-tolerations: a chart
+            # without them (0.3.698 and before)
+            cvr = json.load(open("@@CV_RECORD@@"))
+            facts = [p for p, declared in sorted(cvr["installer_schema"].items())
+                     if declared and schema != "no-agent-tolerations"]
+            for path in sorted(cvr["recorded"]) + facts:
+                node, segs = cv, path.split(".")
+                for seg in segs[:-1]:
+                    node = node.setdefault(seg, {"type": "object"}).setdefault("properties", {})
+                node.setdefault(segs[-1], {})
             open(os.path.join(d, "values.schema.json"), "w").write(json.dumps({
                 "$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
-                "properties": {"componentValues": {"type": "object", "properties": {
-                    "portal": {"type": "object", "additionalProperties": False, "properties": props}}}}}))
+                "properties": {"componentValues": {"type": "object", "properties": cv},
+                    "features": {"type": "object", "additionalProperties": False,
+                                 "properties": {f: {"type": "boolean"} for f in feats}}}}))
         sys.exit(0)
     # the subcommand's own args (run606's H=(helm --kubeconfig .. --kube-context ..) comes first)
     sa = [x for i, x in enumerate(a) if x not in ("--kubeconfig", "--kube-context")
@@ -1929,7 +1957,8 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         print(json.dumps([{"name": "installer", "namespace": "krateo-system",
                            "status": "deployed", "chart": "installer-0.3.422"}]))
     sys.exit(0)
-    """)
+    """).replace("@@FEATURES_RECORD@@", installer_features.RECORD_PATH).replace(
+        "@@CV_RECORD@@", installer_component_values.RECORD_PATH)
 
 
 def _fake_server(state: Path):

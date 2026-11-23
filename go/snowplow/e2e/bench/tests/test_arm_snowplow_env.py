@@ -3,8 +3,9 @@ the same image at the Go default.
 
   - declared: SNOWPLOW_ENV="GOGC=100", explicit values only, Go runtime keys only;
   - applied through the installer's values and nothing else, and rendered by the pulled chart before
-    anything is created (real helm, the published installer 0.3.641 archive: the 50 -> 100 override, and
-    that no declaration renders the installer's own 50);
+    anything is created (real helm, the published archive of the installer krateo-057's record was read
+    on, tests/installer_archives.py: the 50 -> 100 override, and that no declaration renders the
+    installer's own 50);
   - proven from the running pod before any load (the run's own reading of the container's env and the
     ConfigMaps it reads): a mismatch fails the arm;
   - agreed between the arms of a launch: the same declared keys or the launch is refused; a key no arm
@@ -16,13 +17,11 @@ Every report is read through the CLI the run uses.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
-import tarfile
 
 import pytest
 
@@ -33,10 +32,6 @@ from tests.test_run22_three_runs import ROOM_FOR_THREE, _launch_env
 from tests.test_run606_real_sequence import BENCH_DIR, RUN_NAME, harness  # noqa: F401  (fixture)
 
 BENCH = BENCH_DIR
-CHARTS = BENCH / "tests" / "fixtures" / "installer_charts"
-# the published chart, as `helm pull oci://ghcr.io/krateo-platformops/charts/installer --version 0.3.641`
-# gave it on 2026-11-14 (the registry's manifest digest: sha256:eb3799df...160ff; the archive's own sha256 below)
-INSTALLER = "0.3.641"
 needs_helm = pytest.mark.skipif(shutil.which("helm") is None, reason="renders with the real helm")
 DIG = "sha256:" + "ab" * 32
 DIG2 = "sha256:" + "cd" * 32
@@ -71,31 +66,35 @@ def test_a_declaration_the_bench_cannot_honour_is_refused(text, why):
     assert p.returncode == 2 and f"refusing: SNOWPLOW_ENV" in p.stderr and why in p.stderr
 
 
+#: krateo-057's recorded snowplow env switch (#1572, copied since installer 0.3.700 lets the bench give the
+#: node-local OTLP agent its snowplow pool, #1575): it rides beside every declaration, and no declaration names it
+OTEL = {"OTEL_LOGS_ENABLED": "true"}
+
+
 def test_the_values_carry_the_declaration_and_nothing_changes_without_one():
     plain = installer_values.document("1.12.70")
-    assert installer_values.document("1.12.70", "", {}) == plain and "env:" not in plain
-    doc = installer_values.document("1.12.70", "1.8.41", {"GOGC": "100", "GOMEMLIMIT": "7GiB"})
     import yaml
+    assert installer_values.document("1.12.70", "", {}) == plain
+    assert yaml.safe_load(plain)["componentValues"]["snowplow"]["env"] == OTEL      # 057's switch alone, no Go key
+    doc = installer_values.document("1.12.70", "1.8.41", {"GOGC": "100", "GOMEMLIMIT": "7GiB"})
     v = yaml.safe_load(doc)
-    assert v["componentValues"]["snowplow"]["env"] == {"GOGC": "100", "GOMEMLIMIT": "7GiB"}     # strings
+    assert v["componentValues"]["snowplow"]["env"] == {"GOGC": "100", "GOMEMLIMIT": "7GiB", **OTEL}     # strings
     assert v["componentValues"]["snowplow"]["image"]["tag"] == "1.12.70"
     assert v["componentValues"]["frontend"]["image"]["tag"] == "1.8.41"
     without = yaml.safe_load(installer_values.document("1.12.70", "1.8.41"))
-    del v["componentValues"]["snowplow"]["env"]
+    for k in ("GOGC", "GOMEMLIMIT"):
+        del v["componentValues"]["snowplow"]["env"][k]
     assert v == without                                           # the declaration adds its keys, only
 
 
-# ─── rendered: the published installer 0.3.641, real helm ───────────────────
+# ─── rendered: the published installer 057's record was read on, real helm ──
 
 @pytest.fixture(scope="module")
 def pulled(tmp_path_factory):
-    src = CHARTS / f"installer-{INSTALLER}.tgz"
-    assert hashlib.sha256(src.read_bytes()).hexdigest() == \
-        "d6692a9f3910d29b7b2ea7bf4fafa1d7499bab5686281259ce31fa25ecbc309b"
-    d = tmp_path_factory.mktemp("pulled")
-    with tarfile.open(src) as tf:
-        tf.extractall(d, filter="data")
-    return d
+    """#1572: a run's values render only against the installer krateo-057's record was read on (an older one
+    cannot express the record's features and is refused before any render); tests/installer_archives.py."""
+    from tests import installer_archives as ia
+    return ia.pull(tmp_path_factory.mktemp("pulled"), ia.RECORDED)
 
 
 def _render(pulled, tmp, declared, in_values=None):
@@ -112,16 +111,17 @@ def _render(pulled, tmp, declared, in_values=None):
 
 
 @needs_helm
-def test_installer_0_3_641_renders_the_override_and_its_own_50_without_one(pulled, tmp_path):
+def test_the_recorded_installer_renders_the_override_and_its_own_50_without_one(pulled, tmp_path):
     p, rec = _render(pulled, tmp_path, "GOGC=100")
-    assert p.returncode == 0 and rec["ok"] is True and rec["rendered"] == {"GOGC": "100"}, p.stdout + p.stderr
-    assert 'rendered: componentValues.snowplow.env of the Installer CR the chart applies: {"GOGC": "100"}' in p.stdout
+    assert p.returncode == 0 and rec["ok"] is True and rec["rendered"] == {"GOGC": "100", **OTEL}, p.stdout + p.stderr
+    assert ('rendered: componentValues.snowplow.env of the Installer CR the chart applies: '
+            '{"GOGC": "100", "OTEL_LOGS_ENABLED": "true"}') in p.stdout
     p, rec = _render(pulled, tmp_path, "GOGC=50")
-    assert p.returncode == 0 and rec["rendered"] == {"GOGC": "50"}
+    assert p.returncode == 0 and rec["rendered"] == {"GOGC": "50", **OTEL}
     # the negative: with no declaration the installer's own default is what a fresh install gets,
     # which is why a run cannot "unset" the key and must declare 100 to get the Go default
     p, rec = _render(pulled, tmp_path, "")
-    assert p.returncode == 0 and rec["rendered"] == {"GOGC": "50"} and rec["declared"] == {}
+    assert p.returncode == 0 and rec["rendered"] == {"GOGC": "50", **OTEL} and rec["declared"] == {}
 
 
 @needs_helm
@@ -546,8 +546,8 @@ def test_run606_installs_the_declaration_and_proves_it_from_the_pod_before_load(
     assert p.returncode == 0 and "run complete" in log, log[-3000:]
     import yaml
     vals = yaml.safe_load((out / "installer-values.yaml").read_text())
-    assert vals["componentValues"]["snowplow"]["env"] == {"GOGC": "100"}
-    assert json.loads((out / "snowplow-env-render.json").read_text())["rendered"] == {"GOGC": "100"}
+    assert vals["componentValues"]["snowplow"]["env"] == {"GOGC": "100", **OTEL}
+    assert json.loads((out / "snowplow-env-render.json").read_text())["rendered"] == {"GOGC": "100", **OTEL}
     rec = json.loads((out / "snowplow-env.json").read_text())
     assert rec["verified"] is True and rec["declared"] == {"GOGC": "100"}
     assert rec["observed"]["GOGC"] == {"state": "set", "value": "100", "from": rec["observed"]["GOGC"]["from"]}
@@ -607,7 +607,7 @@ def test_the_rehearsal_installs_reads_the_pod_prints_one_block_and_tears_down_wi
                  "cluster operations: readable; control CREATE_CLUSTER operation-",
                  "CREATE_NODE_POOL on nodePool/snowplow", "UPDATE_CLUSTER ",
                  'snowplow env, rendered by the installer chart: as declared: componentValues.snowplow.env of the '
-                 'Installer CR the chart applies: {"GOGC": "100"}',
+                 'Installer CR the chart applies: {"GOGC": "100", "OTEL_LOGS_ENABLED": "true"}',
                  "the snowplow process's effective GC settings, read before any load (/debug/vars snowplow_go_runtime, "
                  "as the bench's debug reader): GOGC 100, memory limit 7.00 GiB (7516192768 bytes) (source cgroup_v2; the "
                  "container's limit 8.00 GiB (8589934592 bytes)); raw: {",

@@ -46,6 +46,7 @@ FIX = Path(__file__).resolve().parent / "fixtures"
 BENCH = Path(__file__).resolve().parents[1]
 QUOTAS = json.loads((FIX / "region_europe_west4_quotas_20261025.json").read_text())
 PVCS14 = json.loads((FIX / "pvcs_run14.json").read_text())
+PVCS_KAGENT = json.loads((FIX / "pvcs_kagent.json").read_text())
 
 # real cluster ids (gcloud container clusters list --format=value(name,id))
 # and the disk label values GKE derived from them
@@ -132,11 +133,16 @@ def test_the_cluster_create_carries_the_labels_gke_copies_onto_its_disks():
     assert not hasattr(gke, "label_storageclasses") and not hasattr(gke, "labelled_storageclasses")
 
 
-def test_the_footprint_is_run14s_recorded_pvcs():
+def test_the_footprint_is_run14s_recorded_pvcs_and_kagents():
     """BENCH_PVC_FOOTPRINT_GB is what run 14's PVCs provision (15Gi + 5Gi +
-    10G + 2G, each rounded up to the whole GB a GCE disk has)."""
+    10G + 2G) plus kagent's bundled PostgreSQL (500Mi, installed with
+    coreAgents, which the bench runs as krateo-057 does: bench/installer_features.py),
+    each rounded up to the whole GB a GCE disk has."""
+    from bench import installer_features
     assert [p["request"] for p in PVCS14] == ["15Gi", "5Gi", "10G", "2G"]
-    assert gke.pvc_footprint_gb(PVCS14) == gke.BENCH_PVC_FOOTPRINT_GB == 32
+    assert [p["request"] for p in PVCS_KAGENT] == ["500Mi"]
+    assert installer_features.bench_features()["coreAgents"] is True
+    assert gke.pvc_footprint_gb(PVCS14 + PVCS_KAGENT) == gke.BENCH_PVC_FOOTPRINT_GB == 33
     assert [gke.disk_gb(q) for q in ("15Gi", "10G", "2G", "1Mi", "1.5Gi", "100Gi")] == [15, 10, 2, 1, 2, 100]
     with pytest.raises(ValueError):
         gke.disk_gb("lots")
@@ -165,7 +171,7 @@ def test_quota_fit_on_the_regions_real_quotas():
     ok, msg = quota_line(QUOTAS, runs_footprint(2), "SSD_TOTAL_GB")
     assert ok and "397 of 500 GB used, 103 free" in msg
     ok, msg = quota_line(QUOTAS, runs_footprint(4), "SSD_TOTAL_GB")
-    assert not ok and "needs 128 GB" in msg
+    assert not ok and f"needs {4 * gke.BENCH_PVC_FOOTPRINT_GB} GB" in msg
     ok, msg = quota_line({"name": "x", "quotas": []}, runs_footprint(1), "SSD_TOTAL_GB")
     assert not ok and "unknown" in msg
 
@@ -851,7 +857,7 @@ def test_gke_up_refuses_a_run_that_does_not_fit_and_creates_nothing(fakes, capsy
     (fakes / "quotas.json").write_text(json.dumps(q))
     assert gke.main(["gke-up", "--name", NAME, "--address-need", "1", "--yes"]) == 2
     err = capsys.readouterr().err
-    assert "refusing: SSD_TOTAL_GB in europe-west4: 480 of 500 GB used, 20 free; the run needs 32 GB" in err
+    assert f"refusing: SSD_TOTAL_GB in europe-west4: 480 of 500 GB used, 20 free; the run needs {gke.BENCH_PVC_FOOTPRINT_GB} GB" in err
     assert not any(x[:3] == ["gcloud", "container", "clusters"] for x in _calls(fakes))
 
 
@@ -881,7 +887,7 @@ def test_gke_ssd_quota_for_a_pair(fakes, capsys):
     assert gke.main(["gke-quotas", *footprint_files(fakes, 2)]) == 0
     assert gke.main(["gke-quotas", *footprint_files(fakes, 4)]) == 2
     err = capsys.readouterr().err
-    assert "SSD_TOTAL_GB in europe-west4: 397 of 500 GB used, 103 free; the run needs 128 GB" in err
+    assert f"SSD_TOTAL_GB in europe-west4: 397 of 500 GB used, 103 free; the run needs {4 * gke.BENCH_PVC_FOOTPRINT_GB} GB" in err
     assert "refusing" not in err          # the caller says "refusing" once
 
 
@@ -890,7 +896,7 @@ def test_run606_pair_refuses_when_both_clusters_do_not_fit(pairbed):  # noqa: F8
     p = _launch(repo, env, FAKE_SSD_USAGE="450")
     assert p.returncode == 2 and "refusing: SSD_TOTAL_GB" in p.stderr, p.stderr[-800:]
     assert "refusing: refusing:" not in p.stderr
-    assert "needs 64 GB" in p.stderr and "2 bench cluster(s)" in p.stderr
+    assert f"needs {2 * gke.BENCH_PVC_FOOTPRINT_GB} GB" in p.stderr and "2 bench cluster(s)" in p.stderr
     assert not [c for c in _pair_calls(fake) if " dry=0 " in c]          # neither run started
 
 

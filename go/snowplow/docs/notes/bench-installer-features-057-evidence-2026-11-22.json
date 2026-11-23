@@ -1,0 +1,164 @@
+{
+ "kind": "evidence",
+ "issue": "krateo-platformops/snowplow#1572",
+ "ruling": "the owner, 2026-11-22: the bench's install must match krateo-057's installer features",
+ "times": "Rome (CET, UTC+1)",
+ "reads_057": {
+  "status": "RUN",
+  "when": "2026-11-22 ~07:35 Rome",
+  "how": "kubectl --context <krateo-057> get installers.composition.krateo.io -A -o json, read-only; feature keys and booleans kept (bench.installer_features record); pods, PVCs, CRDs and nodes summed by component, no Secret read",
+  "installer_cr": "krateo-system/installer, composition.krateo.io/v0-3-697 (installer 0.3.697)",
+  "record": "go/snowplow/e2e/bench/bench/installer_features_057.json (24 CR features + 3 chart defaults of 0.3.697)",
+  "drift_after_record": "RUN: python3 -m bench.installer_features drift -> 057's features are the record's (exit 0)"
+ },
+ "feature_diff_bench_run30_vs_057": {
+  "bench": "run 30: installer 0.3.641, values set agentGateway=true coreAgents=false specialistAgents=false, the rest chart defaults",
+  "differ": {
+   "auditWorm": {
+    "057": true,
+    "bench_run30": false
+   },
+   "configConnector": {
+    "057": true,
+    "bench_run30": false
+   },
+   "coreAgents": {
+    "057": true,
+    "bench_run30": false
+   },
+   "internalTls": {
+    "057": true,
+    "bench_run30": "not in installer 0.3.641's schema"
+   },
+   "serviceDesk": {
+    "057": true,
+    "bench_run30": false
+   },
+   "sloRollup": {
+    "057": true,
+    "bench_run30": false
+   },
+   "specialistAgents": {
+    "057": true,
+    "bench_run30": false
+   },
+   "publicPages": {
+    "057": false,
+    "bench_run30": "not in installer 0.3.641's schema (same effect: off)"
+   }
+  },
+  "same": [
+   "accessReview=false",
+   "agentGateway=true",
+   "capabilityRoles=false",
+   "cloudnativePg=false",
+   "codegenAgents=false",
+   "coreProvider=true",
+   "externalDns=false",
+   "githubProviderKogConfig=false",
+   "identityLifecycle=false",
+   "ingress=false",
+   "keycloak=false",
+   "oasgenProvider=true",
+   "openstack=false",
+   "portal=true",
+   "repoGraph=false",
+   "selfservice=false",
+   "showback=false",
+   "structureGraph=false",
+   "tenantOnboarding=false"
+  ],
+  "after_this_change": "every feature at 057's value except the two pending deviations configConnector=false and serviceDesk=false"
+ },
+ "chart_renders": {
+  "status": "RUN",
+  "how": "helm template of each component the feature enables (inst.compEnabled), at the installer's pins, with the installer's componentValues; cdc pods at the pin's resources or core-provider's cdc default (50m/128Mi); kagent makes one pod per Agent (priced at 057's agent pods: 100m, 256-384Mi)",
+  "installer_0.3.641": {
+   "coreAgents": {
+    "cdc": "10 pods 500m/1280Mi",
+    "workloads": "kagent 4 pods 550m/768Mi (+PVC 500Mi), repo-mcp-server 50m/128Mi, config-refs-mcp-server 10m/32Mi, core-provider-agent 100m/256Mi; builder-gate did not render offline (057: 3 pods 150m/288Mi)",
+    "agents": 4,
+    "crds": 9
+   },
+   "specialistAgents": {
+    "cdc": "7 pods 350m/896Mi",
+    "workloads": "clickhouse-mcp-server 100m/224Mi",
+    "agents": 5,
+    "cronjobs": 1,
+    "crds": 2
+   },
+   "auditWorm": {
+    "cdc": "1 pod 50m/128Mi",
+    "cronjobs": 2
+   },
+   "sloRollup": {
+    "cdc": "1 pod 50m/128Mi",
+    "cronjobs": 1
+   },
+   "internalTls": "not in 0.3.641",
+   "configConnector": {
+    "cdc": "2 pods 100m/256Mi",
+    "workloads": "operator 100m/512Mi (cnrm-system then needs the key)",
+    "crds": 8
+   },
+   "serviceDesk": {
+    "cdc": "3 pods 150m/384Mi",
+    "workloads": "zendesk-kog 20m/32Mi"
+   }
+  },
+  "installer_0.3.697": {
+   "coreAgents": "as 0.3.641 (kagent 0.1.24, cdc 1312Mi)",
+   "specialistAgents": "as 0.3.641",
+   "auditWorm": "as 0.3.641",
+   "sloRollup": "as 0.3.641 (0.1.3)",
+   "internalTls": {
+    "cdc": "4 pods 200m/512Mi",
+    "workloads": "cert-manager 3 pods + trust-manager 1 pod, no requests; internal-ca-bundle did not render offline (057: cdc only)",
+    "crds": 7
+   }
+  }
+ },
+ "cluster_fit": {
+  "status": "COMPUTED from renders and 057 live requests; NOT RUN on a bench cluster",
+  "platform_pool": "3 x n2-standard-8, allocatable 7910m CPU / ~27.7 GiB / 110 pods each = 23.7 cores / ~83 GiB / 330 pods (snowplow and loadgen on their own tainted nodes)",
+  "bench_today_estimate": "~10.8-11.1 cores, ~17-18 GiB requested (057's 17.58 cores / 32.1 GiB minus snowplow 2.0/4 GiB and minus the 7 differing features as 057 runs them, 4.80 cores / 10.8 GiB)",
+  "added_by_this_change_0.3.641": "~39 pods, ~2.8 cores, ~6.5 GiB requests, +1 PVC 500Mi",
+  "added_by_this_change_0.3.697": "~47 pods, ~3.0 cores, ~7.0 GiB requests, +1 PVC 500Mi",
+  "added_057_live_same_features": "coreAgents 25 pods 1760m/4320Mi, specialistAgents 13 pods 950m/2528Mi, auditWorm 50m/128Mi, sloRollup 50m/128Mi, internalTls 200m/512Mi (057 kagent is larger: its own componentValues, 8Gi PVC, 2 more agents)",
+  "after": "~14 cores of 23.7 (~59%), ~25 GiB of ~83 GiB, ~200 of 330 pods: FITS. With configConnector and serviceDesk also on (057's sizes): ~15.9 cores (~67%): fits",
+  "gcp_quotas": "nodes unchanged (CPU quotas unchanged); no added component is exposed (IN_USE_ADDRESSES unchanged); SSD_TOTAL_GB +1 GB per cluster: BENCH_PVC_FOOTPRINT_GB 32 -> 33"
+ },
+ "unverified_before_a_paid_run": [
+  "the new components converge on a fresh bench install (agents without a model: vertexAI stays off; nightly-review without 057's ClickHouse secret values)",
+  "with internalTls on (0.3.697), the installer's cert-manager composition over the bench's hand-installed cert-manager release (057 has the same pair, Ready)",
+  "platform convergence time with ~40-47 more pods"
+ ],
+ "blocker_found_kagent_preflight": {
+  "status": "RUN in the suite's real-shaped fake registry (VM job dry697b); NOT RUN against the real registry (needs the pull-token file on the laptop)",
+  "what": "with coreAgents on, the bench's ghcr preflight (bench/ghcr_pull.py path_results, #1041) refuses kagent 0.1.24: the installer injects perUserRbac.toolImagePullSecrets (inst.privateImageComponents), the per-user tool pod is off by the chart's default (perUserRbac.enabled false), and kagent's controller/ui/tools run PUBLIC ghcr.io/kagent-dev images with no pull secret, which the rule (review N2) counts as 'not off'",
+  "real_chart_render": "RUN: helm template kagent 0.1.24 with the installer's componentValues.kagent: kagent-tools, kagent-controller, kagent-ui on ghcr.io/kagent-dev (no pull secrets), kagent-postgresql on docker.io; no per-user tool pod",
+  "057": "componentValues.kagent sets perUserRbac.enabled=true and kagentapp.kagent-tools.enabled=false (keys and booleans read only), so its per-user tool pod carries the secret",
+  "options_for_the_owner": [
+   "write 057's componentValues.kagent switches into the bench's values (match 057 beyond features)",
+   "teach the preflight that public ghcr.io images pulled anonymously do not make an injected path 'not off' (changes a review-won rule)"
+  ]
+ },
+ "tests": {
+  "new_tests_x3": "RUN on snowplow-build-1 at a7570a36: tests/test_installer_features.py + the PVC footprint test, 60 passed x3",
+  "mutation_probes": "RUN on snowplow-build-1 at a7570a36: 10 of 10 mutations caught",
+  "full_suite_a7570a36": "RUN on snowplow-build-1 (pytest -n 8): 4 failed, 4205 passed, 8 skipped; CI bench: 4 failed, 4209 passed. The 4 are the dry passes against the REAL installer chart (0.3.616), refused by design; moved to 0.3.697, they now stop at the kagent preflight blocker above",
+  "check_scripts": "RUN: go/snowplow/scripts/check_*.sh, 5 of 5 rc 0",
+  "new_tests_x3_after_rulings": "RUN locally (light, nice 19) on the tree pushed as the head after the rulings: 64 passed x3",
+  "mutation_probes_after_rulings": "RUN locally (nice 19): 12 of 12 caught (adds: kit version accepted, any chart url)"
+ },
+ "deviations_ruled": {
+  "configConnector": "OFF: the owner (Diego), 2026-11-22. Needs a GCP SA key Secret the bench must not hold. Fidelity gap: ~274 cnrm.cloud.google.com CRDs of 057's 590 not served",
+  "serviceDesk": "OFF: the owner (Diego), 2026-11-22. Needs Krateo's Zendesk token and endpoint; without them the page would add a bench-only failure tail"
+ },
+ "kit_installer_version": {
+  "ruling": "the owner (Diego), 2026-11-22: a kit's INSTALLER_VERSION is the installer tag live on 057 when the kit is built and verified, read from the cluster and recorded, never typed",
+  "source": "compositiondefinitions.core.krateo.io krateo-system/installer spec.chart.version (the chart 057's platform renders from; the helm release record itself is a Secret, which the bench never reads)",
+  "read_2026_11_22": "RUN: python3 -m bench.installer_features installer-version -> 0.3.697",
+  "enforced": "vm606 chart_check refuses, before any pull, a kit whose INSTALLER_VERSION is not the version 057's features were recorded on"
+ }
+}

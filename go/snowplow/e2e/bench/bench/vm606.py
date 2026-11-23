@@ -1771,11 +1771,21 @@ def chart_check(env: dict[str, str], labels: list[str], helm: str = "helm") -> l
     (bench.ghcr_pull.private_image_paths: helm template of the published chart pulled at the env
     file's INSTALLER_VERSION, through bench.installer_src as s_source pulls it), with each run's
     values as run606.sh writes them (bench.installer_values: SNOWPLOW_TAG_<L>, FRONTEND_TAG_<L>).
-    Only registryAuth.username is missing: it lives in the pull-token file, which vm606 never
+    First, the env file's INSTALLER_VERSION must be the installer 057's features were recorded on
+    (bench.installer_features check_kit_version: the kit reads it from 057 at its build), and the chart
+    must declare exactly krateo-057's recorded installer features
+    (bench.installer_features check_chart: the values write every one of them). Only registryAuth.username is missing: it lives in the pull-token file, which vm606 never
     opens; the VM's preflight renders with it. Registry and helm reads only; no GCP call. Returns
     the lines to say; raises Refused with the reason (fail closed)."""
     chart, version = env.get("INSTALLER_CHART") or INSTALLER_CHART, env["INSTALLER_VERSION"]
-    lines = []
+    from bench import installer_features
+    # the owner's ruling (2026-11-22): the kit's INSTALLER_VERSION is 057's live installer, read at the
+    # kit's build (bench.installer_features installer-version); it must be the one 057's features were
+    # recorded on, or nothing is pulled
+    try:
+        lines = installer_features.check_kit_version(version)
+    except installer_features.Refused as e:
+        raise Refused(f"installer {version}: {e}") from None
     with tempfile.TemporaryDirectory(prefix="vm606-chart-check-") as d:
         pulled = os.path.join(d, "installer-pulled")
         res = installer_src.oci_preflight(chart, version, pulled, requirements=())
@@ -1783,6 +1793,12 @@ def chart_check(env: dict[str, str], labels: list[str], helm: str = "helm") -> l
             raise Refused(f"the installer chart {chart} {version} could not be pulled on the laptop"
                           f"{' (NO ANSWER from the registry)' if res.get('no_answer') else ''}: "
                           + "; ".join(res.get("failures") or ["no reason given"]))
+        # the owner's ruling (2026-11-22): the install runs krateo-057's installer features
+        # (bench/installer_features.py); a chart that cannot express them is refused here, on the laptop
+        try:
+            lines += installer_features.check_chart(pulled)
+        except installer_features.Refused as e:
+            raise Refused(f"installer {version}: {e}") from None
         for x in labels:
             from bench import snowplow_env
             try:

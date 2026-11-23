@@ -8,13 +8,14 @@ default of the installer's values schema up to 0.3.625), the boot root answered 
 user, the preflight logged "preflight OK" and the run stopped one step later on a message about
 composite pages.
 
-The installer fixtures are the PUBLISHED charts (0.3.545, 0.3.616, 0.3.641), rendered with real helm;
-the portal and page charts are the suite's fake registry's, in the real charts' shape (conftest).
+The installer fixtures are the PUBLISHED charts (tests/installer_archives.py), rendered with real helm with a
+run's values only on the installer krateo-057's record was read on (#1572: the older ones cannot express the
+record's features and are refused before any render); the portal and page charts are the suite's fake
+registry's, in the real charts' shape (conftest).
 """
 
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import os
@@ -29,7 +30,8 @@ import yaml
 
 from bench import accept1126, data_manifests, ghcr_pull, installer_routes, installer_values, portal_readers, rbac_model, snowplow_env
 from tests.conftest import FAKE_PAGE_READERS, FAKE_PORTAL_DEMO, FAKE_PORTAL_SHELL_READERS
-from tests.test_installer_routes import CHARTS, SHA256
+from tests import installer_archives as ia
+from tests.test_installer_routes import _authn_at
 from tests.test_run606_real_sequence import BENCH_DIR, SCALEUSER_PASSWORD, harness  # noqa: F401  (fixture)
 
 BENCH = BENCH_DIR
@@ -41,18 +43,20 @@ DIG = "sha256:" + "ab" * 32
 DIG2 = "sha256:" + "cd" * 32
 
 
-def _pull(tmp, version):
-    src = CHARTS / f"installer-{version}.tgz"
-    assert hashlib.sha256(src.read_bytes()).hexdigest() == SHA256[version]
-    d = tmp / f"pulled-{version}"
-    with tarfile.open(src) as tf:
-        tf.extractall(d, filter="data")
-    return d
+RECORDED = ia.RECORDED
 
 
 @pytest.fixture(scope="module")
 def pulled(tmp_path_factory):
-    return {v: _pull(tmp_path_factory.mktemp("charts"), v) for v in SHA256}
+    return {v: ia.pull(tmp_path_factory.mktemp("charts") / f"pulled-{v}", v) for v in ia.SHA256}
+
+
+def _portal_block() -> dict:
+    """componentValues.portal as every run writes it: the bench's reader group, beside krateo-057's recorded
+    portal switches (#1572, bench/installer_component_values.py; its identity switches ON on 057 are not
+    written: no demo or admin user)."""
+    from bench import installer_component_values as icv
+    return {**icv.nest(icv.bench_paths()).get("portal", {}), "readerGroups": [rbac_model.BASE_GROUP]}
 
 
 def _values(tmp_path, doc=None):
@@ -71,8 +75,9 @@ def test_every_runs_values_grant_the_base_group_the_shell_and_name_it_once():
     for doc in (installer_values.document("1.12.70"),
                 installer_values.document("1.12.70", "1.8.44", {"GOGC": "100"})):
         v = yaml.safe_load(doc)
-        assert v["componentValues"]["portal"] == {"readerGroups": [rbac_model.BASE_GROUP]}
-        assert "enableCyberjokerUser" not in doc            # no demo user
+        assert v["componentValues"]["portal"] == _portal_block()
+        assert v["componentValues"]["portal"]["readerGroups"] == [rbac_model.BASE_GROUP]
+        assert "enableCyberjokerUser" not in doc and "enableAdminUser" not in doc   # no demo or admin user
     # the group is bench/rbac_model.py's, never a second literal in the module that writes the values
     src = (BENCH / "bench" / "installer_values.py").read_text()
     assert rbac_model.BASE_GROUP == "devs" and not re.search(r"\bdevs\b", src)
@@ -87,7 +92,7 @@ def test_the_group_written_is_the_models_whatever_it_is(monkeypatch):
 
 # ─── the installer's schema takes the key, or the run is refused by name ────
 
-@pytest.mark.parametrize("version", ["0.3.545", "0.3.616", "0.3.641"])
+@pytest.mark.parametrize("version", sorted(ia.SHA256))
 def test_the_published_installers_take_the_key(pulled, version):
     ok, why = portal_readers.schema_accepts(str(pulled[version] / "installer"), "portal")
     assert ok and why == "its values schema declares componentValues.portal.readerGroups"
@@ -220,8 +225,8 @@ def test_a_chart_with_no_reader_template_gives_nothing_to_derive_a_need_from():
 # ─── the whole check, against the published installers and the registry ─────
 
 @needs_helm
-@pytest.mark.parametrize("version", ["0.3.616", "0.3.641"])
-def test_the_published_installers_grant_the_group_the_shell_and_say_which_pages_do(pulled, tmp_path, version):
+def test_the_recorded_installer_grants_the_group_the_shell_and_says_which_pages_do(pulled, tmp_path):
+    version = RECORDED
     out = tmp_path / "portal-readers.json"
     p = subprocess.run([sys.executable, "-m", "bench.portal_readers", "check", "--installer-pulled",
                         str(pulled[version]), "--values", _values(tmp_path), "--ghcr-env-file",
@@ -238,8 +243,10 @@ def test_the_published_installers_grant_the_group_the_shell_and_say_which_pages_
     # chart (it declares reader groups of its own) or not
     deps = {n for n, c in pins.items() if "portal" in (c.get("deps") or [])}
     looked = {x["component"] for x in rec["pages"]} | set(rec["not_pages"])
-    # (the three it leaves out are off for the bench's values: the service desk, and two of the agents')
-    assert looked == deps - {"service-desk-page", "builder-gate", "krateo-capability-roles"}
+    # (the three it leaves out are off for the bench's values: the service desk, a deviation from 057 the
+    # owner rules on; the capability roles and the public pages, off on 057; builder-gate is on with
+    # coreAgents, #1572)
+    assert looked == deps - {"service-desk-page", "krateo-capability-roles", "public-pages"}
     assert len([n for n in looked if n.endswith("-page")]) >= 13 and "portal-agents" in looked
     assert rec["granting"] == ["dashboard-page"] and rec["not_granting"] == ["settings-page"]
     assert f"portal readers: 1 of 2 page chart(s) grant `{GROUP}`: dashboard-page; not granting it: settings-page" \
@@ -251,7 +258,7 @@ def test_the_published_installers_grant_the_group_the_shell_and_say_which_pages_
 def test_a_portal_chart_with_no_reader_groups_is_refused(pulled, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_PORTAL_CHART", "no-readers")
     with pytest.raises(portal_readers.Refused, match="binds a group named in its `readerGroups` to nothing"):
-        portal_readers.check(str(pulled["0.3.641"]), _values(tmp_path), _creds())
+        portal_readers.check(str(pulled[RECORDED]), _values(tmp_path), _creds())
 
 
 @needs_helm
@@ -260,7 +267,7 @@ def test_a_run_whose_values_do_not_reach_the_installers_cr_is_refused(pulled, tm
     del doc["componentValues"]["portal"]
     with pytest.raises(portal_readers.Refused, match=r"does not carry `devs` in componentValues.portal.readerGroups "
                                                      r"\(it renders \[\]\)"):
-        portal_readers.check(str(pulled["0.3.641"]), _values(tmp_path, yaml.safe_dump(doc)), _creds())
+        portal_readers.check(str(pulled[RECORDED]), _values(tmp_path, yaml.safe_dump(doc)), _creds())
 
 
 @needs_helm
@@ -277,7 +284,7 @@ def test_an_installer_that_overrides_the_reader_groups_away_is_refused_at_the_po
     monkeypatch.setattr(portal_readers, "components", without)
     with pytest.raises(portal_readers.Refused, match="does not grant the bench's base group `devs` what a reader of "
                                                      "the shell needs .*every bench user's boot call would answer 403"):
-        portal_readers.check(str(pulled["0.3.641"]), _values(tmp_path), _creds())
+        portal_readers.check(str(pulled[RECORDED]), _values(tmp_path), _creds())
 
 
 @needs_helm
@@ -285,7 +292,7 @@ def test_a_run_no_page_grants_is_refused(pulled, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_PAGE_READERS_ONLY", "admins")
     with pytest.raises(portal_readers.Refused, match=r"none of the 2 page chart\(s\) this installer pins grants the "
                                                      r"bench's base group `devs` \(dashboard-page, settings-page\)"):
-        portal_readers.check(str(pulled["0.3.641"]), _values(tmp_path), _creds())
+        portal_readers.check(str(pulled[RECORDED]), _values(tmp_path), _creds())
 
 
 @needs_helm
@@ -294,7 +301,7 @@ def test_a_registry_that_gives_no_answer_is_not_a_refusal(pulled, tmp_path, monk
         raise portal_readers.NoAnswer(f"no answer from the registry for {pin['chart']}")
     monkeypatch.setattr(portal_readers, "fetch", none)
     with pytest.raises(portal_readers.NoAnswer):
-        portal_readers.check(str(pulled["0.3.641"]), _values(tmp_path), _creds())
+        portal_readers.check(str(pulled[RECORDED]), _values(tmp_path), _creds())
 
 
 # ─── the real run: run606.sh against the fakes ──────────────────────────────
@@ -317,8 +324,7 @@ def test_run606_declares_the_group_and_holds_it_against_the_charts_before_any_cl
     out = tmp / "out"
     log = (out / "run.log").read_text()
     assert p.returncode == 0, log[-3000:]
-    assert yaml.safe_load((out / "installer-values.yaml").read_text())["componentValues"]["portal"] == \
-        {"readerGroups": [GROUP]}
+    assert yaml.safe_load((out / "installer-values.yaml").read_text())["componentValues"]["portal"] == _portal_block()
     rec = json.loads((out / "portal-readers.json").read_text())
     assert rec["ok"] and rec["granting"] == ["dashboard-page"] and rec["not_granting"] == ["settings-page"]
     assert f"portal readers: `{GROUP}` declared in componentValues.portal.readerGroups" in log
@@ -478,11 +484,16 @@ def test_a_rehearsal_report_says_what_it_has_no_record_of(tmp_path):
 # ─── the acceptance run's prefixes are the route table's ────────────────────
 
 @needs_helm
-@pytest.mark.parametrize("version, authn", [("0.3.616", "/auth"), ("0.3.641", "/authn")])
-def test_the_acceptance_run_logs_in_and_reads_at_the_charts_paths(pulled, tmp_path, monkeypatch, version, authn):
+@pytest.mark.parametrize("authn", ["/auth", "/authn"])
+def test_the_acceptance_run_logs_in_and_reads_at_the_charts_paths(pulled, tmp_path, monkeypatch, authn):
+    """At whatever path the chart routes authn: the recorded installer's /authn, and the same chart with
+    authn's pin at /auth (0.3.616's route)."""
+    chart = tmp_path / "chart"
+    shutil.copytree(pulled[RECORDED], chart)
+    _authn_at(chart, authn)
     f = tmp_path / "portal-routes.json"
     p = subprocess.run([sys.executable, "-m", "bench.installer_routes", "table", "--installer-pulled",
-                        str(pulled[version]), "--values", _values(tmp_path), "--out", str(f)],
+                        str(chart), "--values", _values(tmp_path), "--out", str(f)],
                        cwd=BENCH, capture_output=True, text=True, timeout=300)
     assert p.returncode == 0, p.stderr
     monkeypatch.setattr(accept1126, "_ROUTES", None)
@@ -540,7 +551,7 @@ def test_a_portal_chart_that_binds_its_readers_outside_its_release_namespace_is_
     monkeypatch.setenv("FAKE_PORTAL_CHART", "other-namespace")
     with pytest.raises(portal_readers.Refused, match=r"binds a reader group in \['krateo-elsewhere'\], not in its "
                                                      r"release namespace krateo-system"):
-        portal_readers.check(str(pulled["0.3.641"]), _values(tmp_path), _creds())
+        portal_readers.check(str(pulled[RECORDED]), _values(tmp_path), _creds())
 
 
 # ─── #1471 review (g): the LIVE grant, before any load ──────────────────────
