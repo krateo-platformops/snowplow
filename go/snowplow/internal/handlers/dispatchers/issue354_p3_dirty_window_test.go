@@ -337,11 +337,13 @@ func TestIssue354_P3_F6c_PoisonPillEndsDropped(t *testing.T) {
 }
 
 // TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow — #930: ONE virtual
-// clock drives both the store (the rate floor reads the entry's age on it) and
-// the dirty window. Frozen, every dequeue of the young cell is floored, so the
-// first one always is, however late the worker runs. The arm then moves the
-// clock by the floor, and only after that lets the deferred re-resolve return
-// (a re-resolve can run only once the floor has expired on the clock). The one
+// clock drives both the store (the rate floor reads the entry's age on it, at
+// the dequeue and in the floored set's due time, #1570) and the dirty window.
+// Frozen, every dequeue of the young cell is floored, so the first one always
+// is, however late the worker runs, and the floored set keeps it however often
+// its timer fires. The arm then moves the clock by the floor, and only after
+// that lets the deferred re-resolve return (a re-resolve can run only once the
+// floor has expired on the clock). The one
 // sample is then EXACTLY the deferral when the window stays open across the
 // floored dequeue, and 0 ms when that dequeue ends or restarts it. Before #930
 // the bound came from the test's own time.Now() stamps with 5 ms of slack (the
@@ -350,9 +352,9 @@ func TestIssue354_P3_F6c_PoisonPillEndsDropped(t *testing.T) {
 func TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow(t *testing.T) {
 	// #1233: this test writes the store under a complete snapshot.
 	cache.CompleteRBACSnapshotForTest(t)
-	const deferral = time.Second // = RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS
+	const deferral = time.Second // = the SetRefresherRateFloorForTest("1") pin below
 	store := p3Env(t)
-	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "1")
+	t.Cleanup(cache.SetRefresherRateFloorForTest("1"))
 	clk := p3VirtualWindowClock(t)
 	t.Cleanup(store.SetClockForTest(clk.now))
 	advanced := make(chan struct{})
@@ -368,15 +370,16 @@ func TestIssue354_P3_F6c_RateFloorDeferralIsInsideTheWindow(t *testing.T) {
 	_, stop := p3Loop(t)
 	defer stop()
 	f0 := p3RefStat("floored")
+	h0 := cache.FloorDeferralHeldForTest()
 	c := p3PutCell(t, store, "f6c-floor", `{"v":"old"}`)
 	cache.Deps().OnUpdate(p3GVR, p3NS, c.name)
-	// The deferred re-dequeue fires after the floor in REAL time (the delaying
-	// queue's clock), but the store clock has not moved: the cell is still 0 s
-	// old on the clock that stamped it, so that dequeue is floored again and
-	// nothing resolves. A floor that read the entry's age on the wall clock would
-	// resolve here instead. Wait for whichever comes first.
-	p3Wait(t, 10*time.Second, "a second floored dequeue or a resolve", func() bool {
-		return p3RefStat("floored") >= f0+2 || calls.Load() > 0
+	// The floored set's timer fires after the floor in REAL time, but the store
+	// clock has not moved: the cell is still 0 s old on the clock that stamped
+	// it, so the set keeps it floored (the timer's evaluation releases nothing)
+	// and nothing resolves. A floor that read the entry's age on the wall clock
+	// would release and resolve here instead. Wait for whichever comes first.
+	p3Wait(t, 10*time.Second, "the floor's timer keeping the young cell floored, or a resolve", func() bool {
+		return (p3RefStat("floored") > f0 && cache.FloorDeferralHeldForTest() > h0) || calls.Load() > 0
 	})
 	if calls.Load() != 0 {
 		t.Fatalf("F6c RED: a dequeue resolved while the cell was 0 s old on the store clock (calls=%d floored Δ=%d) — "+

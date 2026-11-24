@@ -218,7 +218,7 @@ func (e *r378Env) startRefresher(t *testing.T) {
 	t.Helper()
 	t.Setenv("RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS", "1")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS", "2")
-	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
+	t.Cleanup(cache.SetRefresherRateFloorForTest("0"))
 	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "4")
 	refresh := func(ctx context.Context, _ string, in cache.ResolvedKeyInputs) error {
 		return resolveAndPopulateL1(ctx, in, e.saEP, e.saRC)

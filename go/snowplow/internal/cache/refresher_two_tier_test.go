@@ -43,7 +43,7 @@ func resetRefresherForTwoTierTest(t *testing.T) {
 	// IMMEDIATE drain ordering, which the floor (default 2s) would defer.
 	// floor=0 is the byte-identical kill-switch; the floor's own falsifiers
 	// live in refresher_rate_floor_test.go.
-	t.Setenv(envRefresherRateFloorSeconds, "0")
+	t.Cleanup(SetRefresherRateFloorForTest("0"))
 	ResetResolvedCacheForTest()
 	ResetDepsForTest()
 	resetRefresherForTest()

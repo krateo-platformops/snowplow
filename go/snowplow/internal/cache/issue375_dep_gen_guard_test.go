@@ -547,7 +547,7 @@ func TestIssue375_Arm10_HighChurnStorm_RemarkOncePerResolve_RateFloorBounded(t *
 	CompleteRBACSnapshotForTest(t)
 	cleanup := withCleanRefresher(t, 2, 0)
 	defer cleanup()
-	t.Setenv(envRefresherRateFloorSeconds, "1")
+	t.Cleanup(SetRefresherRateFloorForTest("1"))
 	resetRefresherForTest()
 	c := ResolvedCache()
 	rl := &remarkLog{byKey: map[string]int{}, reasons: map[string]int{}}

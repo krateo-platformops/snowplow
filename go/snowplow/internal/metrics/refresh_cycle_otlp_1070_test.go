@@ -29,7 +29,7 @@ func TestRefreshCycle1070_OTLPAndExpvarAgree(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
-	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
+	t.Cleanup(cache.SetRefresherRateFloorForTest("0"))
 	t.Setenv("REFRESH_COALESCE_WINDOW_MS", "0")
 	cache.ResetResolvedCacheForTest()
 	cache.ResetDepsForTest()
