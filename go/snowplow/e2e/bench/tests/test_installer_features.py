@@ -7,7 +7,7 @@ steps answered 404, and snowplow declined to cache four dashboard widgets (a ben
 
 What is held here, each with its falsifier (break the derivation and the test fails):
   - the committed record IS the reading of 2026-11-23 (feature keys and booleans of 057's Installer
-    CR, installer 0.3.703, READ_VERSION): a record edited by hand, one feature flipped, fails;
+    CR, installer 0.3.707, READ_VERSION): a record edited by hand, one feature flipped, fails;
   - the run's values write every feature of the record, each at 057's value or at a named deviation's:
     a record that changes, changes the values (they are derived, not a second list);
   - the chart check refuses an installer that cannot express 057's features (0.3.641: no internalTls)
@@ -42,14 +42,14 @@ READ_20261122_CR = {
     "publicPages": False, "selfservice": False, "serviceDesk": True, "showback": False, "sloRollup": True,
     "specialistAgents": True, "tenantOnboarding": False,
 }
-# installer 0.3.703 (helm pull, digest sha256:f37134378bb1a4a5821d117d5651e0e431c7c1f0ac30bcd6431c5e9f422554ed):
+# installer 0.3.707 (helm pull, digest sha256:1b1789c547e234f9b2bce99ddeeb280bc351c0f20322f27fa9d87c76da2387aa):
 # the features its values.schema.json declares that the CR leaves out, at their values.yaml defaults
 READ_20261122_DEFAULTS = {"cloudnativePg": False, "repoGraph": False, "structureGraph": False}
-# the installer 057 ran at the reading (re-taken 2026-11-23 09:45 Rome on 0.3.703, a version-only move;
-# readings: 0.3.697 and 0.3.698 on 2026-11-22, 0.3.700 at 01:02 on 2026-11-23; the features never moved): every
+# the installer 057 ran at the reading (re-taken 2026-11-24 13:05 Rome on 0.3.707, no feature moved;
+# readings: 0.3.697 and 0.3.698 on 2026-11-22, 0.3.700 to 0.3.703 on 2026-11-23; the features never moved): every
 # test below names it and the reading's date through these pins
-READ_VERSION = "0.3.703"
-READ_DATE = "2026-11-23"
+READ_VERSION = "0.3.707"
+READ_DATE = "2026-11-24"
 READ_CR_VERSION = "v" + READ_VERSION.replace(".", "-")
 
 
