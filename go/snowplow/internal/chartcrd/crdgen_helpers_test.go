@@ -110,6 +110,18 @@ const (
 	// rule is now a duplicate under this crdgen, kept for core-providers older
 	// than 2.13.107, whose crdgen still drops that `not`; removing it is #1504.
 	//
+	// v1.103.0 → v1.106.0 (#1504): crdgen/ CHANGES, in four files: an untyped
+	// node keeps its default, description, title and example (core-provider#613),
+	// `const: null` is told apart from no const (plumbing#227), and
+	// NormalizeVersionName moves to the new versionname package, unchanged. The
+	// crdgen that compiles the chart moved with it: core-provider 2.13.127
+	// (read from krateo-057's image) requires plumbing v1.106.0, so the two
+	// constants are equal and the invariant holds by identity. Its generateCRD
+	// options are generate()'s (2.13.117 → 2.13.127 adds only a test file in
+	// the generation package). Measured at the bump with generate()'s options:
+	// helm/snowplow's and helm/snowplow-crds' CRDs are both byte-identical
+	// under v1.103.0 and v1.106.0.
+	//
 	// THE TWO CORE-PROVIDER VERSIONS ARE DIFFERENT THINGS. coreProviderVersion
 	// names the status schema in testdata (statusSchemaPath), which the guard
 	// compiles beside the chart because it counts toward the CRD's CEL cost;
@@ -120,10 +132,10 @@ const (
 	// input, so it is its own change (#1488), not part of a plumbing bump.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.103.0"
+	crdgenVersion       = "v1.106.0"
 	// coreProviderCrdgenVersion is the plumbing core-provider compiles with
-	// (core-provider 2.13.117's go/core-provider/go.mod).
-	coreProviderCrdgenVersion = "v1.100.0"
+	// (core-provider 2.13.127's go/core-provider/go.mod).
+	coreProviderCrdgenVersion = "v1.106.0"
 
 	// core-provider's statics/status.schema.json at coreProviderVersion, copied
 	// verbatim. crdgen compiles it into the same CRD, so it counts toward the
