@@ -148,6 +148,9 @@ def summarize_conditions(obj: dict, resource: str | None = None) -> dict:
             out[c["type"]] = {"status": c.get("status"), "reason": c.get("reason"),
                               "message": cc["message"]}
     out["status"] = {"conditions": raw}
+    # why a composition's health is unknown (composition-dynamic-controller, written on every rollup): not_health_evaluated
+    if "unevaluatedChildren" in (obj.get("status") or {}):
+        out["status"]["unevaluatedChildren"] = obj["status"]["unevaluatedChildren"]
     return out
 
 
@@ -158,6 +161,7 @@ Readiness objects (composition-crs.json .installer[] / .components[],
 compositiondefinitions.json [], focus-483.json .components.*.*) carry BOTH:
   flattened   .Ready.status  .Ready.reason  .Ready.message   (same for .Synced)
   raw         .status.conditions[]   exactly as the API returned them
+              .status.unevaluatedChildren   as the API returned it, when it did
   plus        .kind .namespace .name and .id = <resource>/<namespace>/<name>
               (the form the Installer CR's Ready.message uses for children)
 
@@ -174,7 +178,9 @@ Other files:
                                by the Installer CR's spec.components, feature on),
                                allowed_not_ready (allow-listed, reason matched),
                                unexpected_not_ready (declared/<Kind>/<name> = declared,
-                               not created yet), allow_list
+                               not created yet), allow_list, not_health_evaluated
+                               (reconciled, health unreadable, no child unobserved:
+                               accepted, never a required component)
                                composition-crs.json .installer[].declares lists them
   progress.txt                 the one-line platform summary
   chart-inspector-errors.txt   every condition message mentioning chart-inspector, VERBATIM
@@ -329,19 +335,49 @@ def _messages(s: dict | None) -> str:
                      ((s or {}).get("status") or {}).get("conditions") or [])
 
 
-#: the one Ready reason that says a composition reconciled and none of its children has readiness semantics its
-#: controller can read (composition-dynamic-controller, "Composition health is unknown"). The Installer CR itself counts
-#: such a child apart ("N of M managed children not health-evaluated") and stays Ready. krateo-057's InternalCaBundle
-#: reads this since 2026-11-15; a rule that wants Ready=True for every child can never pass where 057 runs.
+#: the Ready reason a composition's controller writes when NONE of its recorded children could be health-evaluated
+#: (core-provider 2.13.127, childhealth.go). It covers two different things: a child that publishes no Ready condition
+#: (a kind with no readiness semantics, or one whose controller has not answered yet), and a child whose own controller
+#: could not observe it, which that source calls an outage. `status.unevaluatedChildren.notObserved` tells them apart.
+#: The Installer CR counts such a child apart ("N of M managed children not health-evaluated") and stays Ready.
+#: krateo-057's InternalCaBundle reads this since 2026-11-15, with notObserved 0; a rule that wants Ready=True for every
+#: child can never pass where 057 runs.
 NOT_HEALTH_EVALUATED = "ZeroEvidence"
 
 
 def not_health_evaluated(s: dict | None) -> bool:
-    """A component CR that reconciled (Synced=True) and whose health its controller says it cannot read (Ready=Unknown,
-    reason ZeroEvidence, exactly). Every other Unknown, False or absent Ready is not ready; so is a CR whose Synced
-    is not True: what reconciled is the claim, and only Synced makes it."""
+    """A component CR that reconciled (Synced=True), whose health its controller says it cannot read (Ready=Unknown,
+    reason ZeroEvidence, exactly), and none of whose children failed to be observed (unevaluatedChildren.notObserved
+    present and 0). Every other Unknown, False or absent Ready is not ready; so is a CR whose Synced is not True, or
+    that does not say why its children were not evaluated.
+
+    What this cannot see: children whose controllers have not answered YET read the same as a kind with no readiness
+    semantics, so a composition can be accepted early; and a child of a kind with no readiness semantics that does not
+    work (no condition says so) stays accepted."""
+    children = ((s or {}).get("status") or {}).get("unevaluatedChildren")
+    not_observed = children.get("notObserved") if isinstance(children, dict) else None
     return (_cond(s, "Ready") == "Unknown" and ((s or {}).get("Ready") or {}).get("reason") == NOT_HEALTH_EVALUATED
-            and _cond(s, "Synced") == "True")
+            and _cond(s, "Synced") == "True" and type(not_observed) is int and not_observed == 0)
+
+
+def _named(ident: str, message: str) -> bool:
+    """`ident` occurs in `message` as a whole id, in any of the Installer CR's forms ("are not ready:", "not healthy:",
+    "could NOT BE OBSERVED", "could NOT BE READ")."""
+    return re.search(r"(?<![\w./-])" + re.escape(ident) + r"(?![\w/-]|\.\w)", message) is not None
+
+
+#: the Installer CR's message when it names more children than it prints
+_NAMES_OMITTED = re.compile(r"\+\d+ more")
+
+
+def accepted_not_evaluated(leaves: list[dict], inst_msg: str, required) -> list[str]:
+    """The component CRs the platform rule accepts as not health-evaluated, which is the one place their scope is
+    decided: component CRs only (callers pass no definitions), never a `required` one, never one the Installer CR's
+    Ready message names in any form, and none at all while that message leaves names out."""
+    if _NAMES_OMITTED.search(inst_msg):
+        return []
+    return sorted(s["id"] for s in leaves if s.get("id") and not_health_evaluated(s)
+                  and s.get("name") not in required and not _named(s["id"], inst_msg))
 
 
 def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
@@ -359,15 +395,14 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
     CR whose declaration cannot be read is not-ready: which components it
     will still create is then unknown.
 
-    A component CR that reconciled and cannot be health-evaluated (not_health_evaluated) is neither ready nor not
-    ready: it is named in `not_health_evaluated` (and in platform_line) and does not hold the run. Only a component
-    CR, never a CompositionDefinition; never a `required` one; and never one the Installer CR names as not ready.
+    A component CR that reconciled and cannot be health-evaluated is neither ready nor not ready: it is named in
+    `not_health_evaluated` (and in platform_line) and does not hold the run. Which ones: accepted_not_evaluated.
     """
     inst = installer[0] if installer else {}
     inst_msg = (inst.get("Ready") or {}).get("message") or ""
     by_id = {s.get("id"): s for s in leaves + cds if s.get("id")}
     not_ready = set(parse_not_ready_children(inst_msg))
-    unevaluated = sorted(s["id"] for s in leaves if s.get("id") and not_health_evaluated(s))
+    unevaluated = accepted_not_evaluated(leaves, inst_msg, required)
     not_ready |= {s["id"] for s in leaves + cds
                   if s.get("id") and _cond(s, "Ready") != "True" and s["id"] not in unevaluated}
     allow_map = dict(allow)
