@@ -745,7 +745,8 @@ def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
     poll also reads the pods whose image cannot be pulled and names each at
     the poll it appears; on a timeout `reason` gets the failure's NAME: those
     image pulls first (with their image and the pull Secrets they reference),
-    then what was not Ready."""
+    then what was not Ready. A live Installer CR that does not declare the
+    `expected` components fails at the poll that sees it."""
     allow = allow_list_from_env() if allow is None else allow
     log("[platform] allow-list (known, unrelated): "
         + (", ".join(f"{i}[{r}]" for i, r in allow) or "(empty)"))
@@ -766,6 +767,15 @@ def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
                    + ", ".join(a["id"] for a in st["allowed_not_ready"]) + ")"
                    if st["allowed_not_ready"] else ""))
             return True
+        # the declared set never becomes the run's by waiting: the installer's bootstrap writes the CR's spec once, whole,
+        # and nothing here edits it, so the first poll that reads it decides (the paid minutes are not spent waiting)
+        wrong = [u for u in st["unexpected_not_ready"] if u["reason"] == "DeclaredSet"]
+        if wrong:
+            why = f"the live Installer CR is not the run's: {wrong[0]['message']}"
+            log(f"[platform] FAILED: {why}")
+            if reason is not None:
+                reason.append(why)
+            return False
         if clock() >= deadline:
             log(f"[platform] TIMEOUT after {timeout_s:.0f}s")
             why = (f"image pull: {'; '.join(image_pull_line(f) for f in pulls)}; then " if pulls else "")

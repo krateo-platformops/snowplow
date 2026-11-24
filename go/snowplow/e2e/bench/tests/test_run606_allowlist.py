@@ -204,6 +204,18 @@ def test_falsifier_the_live_declared_set_must_be_what_the_run_rendered(declared,
     assert why in diag606.platform_line(st)
 
 
+def test_falsifier_a_wrong_declared_set_fails_at_the_poll_that_sees_it(monkeypatch):
+    """It never becomes right by waiting: 45 paid minutes are not spent on it, and the reason names it."""
+    monkeypatch.setattr(diag606, "_leaf_summaries", lambda k, **kw: ([_inst(declares=("authn",))], [_sid("x", "authn")]))
+    monkeypatch.setattr(diag606, "_cd_summaries", lambda k: [])
+    monkeypatch.setattr(diag606, "image_pull_failures", lambda k: [])
+    slept, why, said = [], [], []
+    assert diag606.wait_installer(None, timeout_s=2700, allow=(), required=(), expected=["authn", "trust-manager"],
+                                  log=said.append, clock=lambda: 0, sleep=slept.append, reason=why) is False
+    assert slept == [] and len(why) == 1 and "rendered, not declared: trust-manager" in why[0]
+    assert any(m.startswith("[platform] FAILED: the live Installer CR is not the run's") for m in said)
+
+
 def test_the_same_set_in_any_order_passes_and_none_compares_nothing():
     leaves = [_sid("x", n) for n in diag606.REQUIRED_READY]
     for expected in (list(reversed(diag606.REQUIRED_READY)), None):

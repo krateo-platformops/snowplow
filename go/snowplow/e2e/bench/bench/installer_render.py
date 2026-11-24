@@ -185,8 +185,9 @@ def rendered_names(path: str) -> list[str]:
     record says the render passed and names at least one."""
     with open(path, encoding="utf-8") as fh:
         rec = json.load(fh)
-    names = rec.get("rendered") if isinstance(rec, dict) and rec.get("kind") == "installer_render_check" else None
-    if not (rec or {}).get("ok") or not isinstance(names, list) or not names:
+    passed = isinstance(rec, dict) and rec.get("kind") == "installer_render_check" and rec.get("ok") is True
+    names = rec.get("rendered") if passed else None
+    if not isinstance(names, list) or not names:
         raise Refused(f"{path} is not the record of a composition render that passed")
     return names
 

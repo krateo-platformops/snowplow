@@ -160,7 +160,8 @@ def test_the_install_only_values_are_not_wanted_of_the_cr(pulled):
     {}, {"kind": "installer_render_check", "ok": True, "rendered": []}, {"kind": "installer_render_check", "ok": False,
                                                                         "rendered": ["a"]},
     {"kind": "installer_render_check", "ok": True}, {"kind": "something", "ok": True, "rendered": ["a"]},
-    {"kind": "installer_render_check", "ok": True, "rendered": "a"}, [], None])
+    {"kind": "installer_render_check", "ok": True, "rendered": "a"}, [], None, "x", 3, ["a"],
+    {"kind": "installer_render_check", "ok": "yes", "rendered": ["a"]}])
 def test_falsifier_only_a_render_that_passed_names_what_to_expect(tmp_path, rec):
     p = tmp_path / "r.json"
     p.write_text(json.dumps(rec))
@@ -338,11 +339,12 @@ def test_falsifier_a_live_cr_that_declares_another_set_fails_the_platform_step(h
     """#1598 review B1: what the live Installer CR declares is held to what this run rendered: a feature lost (or gained)
     on the way to the cluster is named, and never only shortens what is waited for."""
     env, state, _, tmp = harness
-    p = _run606(env, PLATFORM_TIMEOUT_S="2", PLATFORM_POLL_S="1", **env_extra)
+    p = _run606(env, **env_extra)               # fails at the first poll that reads the CR, not at the timeout
     log = (tmp / "out" / "run.log").read_text()
     assert p.returncode != 0, log[-3000:]
     reason = (tmp / "out" / "platform-reason.txt").read_text()
-    assert "declared-set" in reason and why in reason, reason
+    assert reason.startswith("the live Installer CR is not the run's: it declares ") and why in reason, reason
+    assert "TIMEOUT after" not in log
     assert "=== step env ===" not in log
 
 

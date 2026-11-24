@@ -1843,7 +1843,7 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
             # FAKE_INSTALLER_DROPS_TLS=1: an installer up to 0.3.703, whose pick omits it (installer#1084)
             "---", "apiVersion: v1", "kind: ConfigMap", "metadata:", "  name: installer-self-cr", "data:",
             "  installer.yaml: |",
-            '    {{- $spec := pick .Values "namespaces" "features" "componentValues" "registryAuth"'
+            '    {{- $spec := pick .Values "ociRepo" "installDefinitions" "namespaces" "exposure" "features" "vertexAI" "hitlApproval" "componentValues" "registryAuth"'
             + ("" if os.environ.get("FAKE_INSTALLER_DROPS_TLS") == "1" else ' "internalTls"') + ' }}',
             '    {{- $_ := set $spec "bootstrap" (dict "coreProvider" (dict "enabled" false)) }}',
             '    {{- dict "apiVersion" (printf "composition.krateo.io/v%s" (.Chart.Version | replace "." "-")) "kind" '
