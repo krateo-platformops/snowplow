@@ -1248,9 +1248,22 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         sys.exit(0)
     if a[:1] == ["get"] and "json" in a:
         what = a[1]
+        # #1598: the components this run's values rendered (installer-render.json) are the ones the installer creates: each
+        # not served by name below is a FakeComponent CR, Ready. FAKE_LIVE_DROPS / FAKE_LIVE_ADDS=<name>: the live Installer
+        # CR does not declare that one / declares one more (a feature lost, or gained, on the way to the cluster)
+        try:
+            rendered = json.load(open(os.path.join(os.environ["OUT"], "installer-render.json"))).get("rendered") or []
+        except (OSError, ValueError, KeyError):
+            rendered = []
+        named = {"authn", "snowplow", "frontend", "portal"}
+        named |= {"alert-provider-crd", "krateo-observability"} if f483 else set()
+        named |= {"alert-provider"} if f483 == "wide" else set()
+        named |= {"github-provider-kog"} if kog else set()
+        named |= {"dashboard-page"} if os.environ.get("FAKE_DECLARED_LATER") == "1" else set()
+        fake_comps = [n for n in rendered if n not in named]
         if what == "crd":
             kinds = [("installers", "Installer"), ("authns", "Authn"), ("snowplows", "Snowplow"),
-                     ("frontends", "Frontend"), ("portals", "Portal")]
+                     ("frontends", "Frontend"), ("portals", "Portal"), ("fakecomponents", "FakeComponent")]
             if f483:
                 kinds += [("alertprovidercrds", "AlertProviderCrds"),
                           ("krateoobservabilities", "KrateoObservability")]
@@ -1258,6 +1271,8 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                 kinds.append(("alertproviders", "AlertProvider"))
             items([{"spec": {"group": "composition.krateo.io",
                              "names": {"plural": p, "kind": k}}} for p, k in kinds])
+        if what.startswith("fakecomponents."):
+            items([cr("FakeComponent", n, True) for n in fake_comps])
         if what.startswith("alertprovidercrds."):
             items([cr("AlertProviderCrds", "alert-provider-crd", True)])
         if what.startswith("krateoobservabilities."):
@@ -1293,6 +1308,9 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
                 decl.append(("github-provider-kog", "GithubProviderKog", None))
             if os.environ.get("FAKE_DECLARED_LATER") == "1":   # run 17: deps on portal, not created yet
                 decl.append(("dashboard-page", "DashboardPage", None))
+            decl += [(n, "FakeComponent", None) for n in fake_comps]
+            drops, adds = os.environ.get("FAKE_LIVE_DROPS"), os.environ.get("FAKE_LIVE_ADDS")
+            decl = [d for d in decl if d[0] != drops] + ([(adds, "FakeComponent", None)] if adds else [])
             ra = os.path.join(STATE, "helm-registry-auth.json")
             inst["spec"] = {"features": {"portal": True, "agentGateway": False},
                             "components": [{"name": n, "kind": k, "feature": f or "portal",

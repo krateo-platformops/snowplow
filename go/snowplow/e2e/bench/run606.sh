@@ -1566,6 +1566,9 @@ s_wait_platform() {
   # others are not) every PLATFORM_POLL_S, so a stall shows WHERE.
   # The pulled chart (source step) gives inst.coreFeatures: what the
   # Installer CR declares is read with the chart's own feature rule.
+  # The components it declares must be exactly the ones this run's values
+  # rendered before any cluster (installer-render.json, #1598): a feature the
+  # CR lost on the way would otherwise only shorten what is waited for.
   # Its failure is NAMED (platform-reason.txt): a pod whose image cannot be
   # pulled is reported with its image and the pull Secrets it references at
   # the poll it appears, and is the failure's reason, not "timeout".
@@ -1574,7 +1577,7 @@ s_wait_platform() {
   run python3 -m bench.diag606 wait-installer --kubeconfig "$KCFG" \
       --context "$KCTX" --timeout-s "$PLATFORM_TIMEOUT_S" \
       --interval-s "$PLATFORM_POLL_S" --installer-chart "$OUT/installer-pulled" \
-      --reason-out "$OUT/platform-reason.txt" || prc=$?
+      --rendered "$OUT/installer-render.json" --reason-out "$OUT/platform-reason.txt" || prc=$?
   # the platform step's end, READY or not: a platform that never got ready is
   # the case the definitions and the controller logs explain
   capped_definitions platform_end

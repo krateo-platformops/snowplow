@@ -381,7 +381,7 @@ def accepted_not_evaluated(leaves: list[dict], inst_msg: str, required) -> list[
 
 
 def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
-                   allow=DEFAULT_ALLOW_NOT_READY, required=REQUIRED_READY) -> dict:
+                   allow=DEFAULT_ALLOW_NOT_READY, required=REQUIRED_READY, expected=None) -> dict:
     """Readiness across BOTH layers (CompositionDefinitions and component CRs).
 
     ok ⇔ an Installer CR exists, every component it DECLARES (its
@@ -394,6 +394,10 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
     other reason, excuses nothing). An Installer
     CR whose declaration cannot be read is not-ready: which components it
     will still create is then unknown.
+
+    `expected`: the names the run's values rendered before the install (bench/installer_render.py rendered_names).
+    What the live CR declares is read from that CR, so it alone cannot say a feature was lost on the way to the cluster;
+    the two sets must be the same, or the platform is not the run's. None: not compared (the diagnostics, verify483).
 
     A component CR that reconciled and cannot be health-evaluated is neither ready nor not ready: it is named in
     `not_health_evaluated` (and in platform_line) and does not hold the run. Which ones: accepted_not_evaluated.
@@ -442,6 +446,15 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
                                                           f"child ({excused['expected_reason']})"})
             else:
                 unexpected.append({**row, "why": "declared, not created yet"})
+        if expected is not None and declares is not None:
+            got, want_names = {c["name"] for c in declares}, set(expected)
+            if got != want_names:
+                unexpected.append({
+                    "id": f"{inst.get('id') or 'installer'}/declared-set", "reason": "DeclaredSet",
+                    "why": "the live Installer CR does not declare what the run rendered",
+                    "message": (f"it declares {len(got)} component(s), the run rendered {len(want_names)}"
+                                + (f"; rendered, not declared: {', '.join(sorted(want_names - got))}" if want_names - got else "")
+                                + (f"; declared, not rendered: {', '.join(sorted(got - want_names))}" if got - want_names else ""))})
     by_name = {s.get("name"): s for s in leaves}
     req = {n: _cond(by_name.get(n), "Ready") == "True" for n in required}
     ok = bool(installer) and not unexpected and all(req.values())
@@ -724,7 +737,7 @@ def image_pull_line(f: dict) -> str:
 
 
 def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
-                   allow=None, required=REQUIRED_READY, core: tuple[str, ...] = (),
+                   allow=None, required=REQUIRED_READY, core: tuple[str, ...] = (), expected=None,
                    log: Callable[[str], None] = print,
                    clock=time.monotonic, sleep=time.sleep, reason: list | None = None) -> bool:
     """Poll until every child (CDs + CRs) is Ready except the allow-listed
@@ -740,7 +753,7 @@ def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
     seen: set = set()
     while True:
         inst, leaves = _leaf_summaries(k, core=core)
-        st = platform_state(inst, leaves, _cd_summaries(k), allow, required)
+        st = platform_state(inst, leaves, _cd_summaries(k), allow, required, expected)
         log(f"[platform] {platform_line(st)}")
         pulls = image_pull_failures(k)
         for f in pulls:
@@ -1244,6 +1257,9 @@ def main(argv=None) -> int:
             s.add_argument("--timeout-s", type=float, default=2700)
             s.add_argument("--interval-s", type=float, default=60)
             s.add_argument("--reason-out", help="file the failure's named reason is written to")
+            s.add_argument("--rendered", required=True,
+                           help="the run's composition render record (installer-render.json): the components the live "
+                                "Installer CR must declare, exactly")
         else:
             s.add_argument("--out", required=True)
         if name == "definitions":
@@ -1310,8 +1326,17 @@ def main(argv=None) -> int:
     if a.cmd == "wait-installer":
         print(f"[platform] installer core features (inst.coreFeatures): {' '.join(core) or '(none)'}",
               flush=True)
+        from bench import installer_render
+        try:
+            expected = installer_render.rendered_names(a.rendered)
+        except (installer_render.Refused, OSError, ValueError) as e:
+            print(f"refusing: {e}", file=sys.stderr, flush=True)
+            if a.reason_out:
+                with open(a.reason_out, "w") as fh:
+                    fh.write(f"the run's composition render record cannot be read: {e}\n")
+            return 2
         why: list = []
-        ok = wait_installer(k, timeout_s=a.timeout_s, interval_s=a.interval_s, core=core,
+        ok = wait_installer(k, timeout_s=a.timeout_s, interval_s=a.interval_s, core=core, expected=expected,
                             log=lambda m: print(m, flush=True), reason=why)
         if not ok and a.reason_out:
             with open(a.reason_out, "w") as fh:

@@ -11,10 +11,11 @@ the composition pass emits a component only once the cluster serves its CRD and 
 
 The effective spec is what the CR holds once s_install is done: the CR the installer's own bootstrap writes on a
 fresh install, its installer-self-cr ConfigMap's installer.yaml (self-bootstrap.yaml), rendered from the run's values
-exactly as s_install installs them. The run's values set internalTls (bench/installer_values.py internal_tls_block);
-an installer whose fresh-install CR does not hold it is refused (0.3.703 and older drop it: installer#1084, fixed by
-#1145 in 0.3.704), and so is a certManagerNamespace that is not where the verified cert-manager chart's controller
-reads cluster CA Secrets (its --cluster-resource-namespace).
+exactly as s_install installs them. A CR that does not hold the run's values is refused, every key but INSTALL_ONLY's
+(0.3.703 and older drop internalTls: installer#1084, fixed by #1145 in 0.3.704), and so is a certManagerNamespace that
+is not where the verified cert-manager chart's controller reads cluster CA Secrets (its --cluster-resource-namespace).
+After the install the platform step holds the LIVE CR to this render: the components it declares must be exactly the
+ones rendered here (bench/diag606.py platform_state `expected`).
 
 THE BYPASS, CONFINED TO THIS CHECK: the chart is rendered from an in-memory copy (ghcr_pull._chart_with; the
 pulled directory, which s_install installs from, is never written) with one added template that redefines
@@ -96,15 +97,21 @@ def self_cr(installer_pulled: str, values: dict, helm: str = "helm") -> dict:
     return cr
 
 
+#: the run's values the installer reads at install only, never from its CR: the bootstrap's own switch (off in the CR by
+#: design) and the engine subchart's values
+INSTALL_ONLY = ("bootstrap", "core-provider")
+
+
 def effective_spec(values: dict, cr: dict, cluster_resource_namespace: str) -> dict:
-    """The CR's spec once s_install is done: the fresh-install CR's. Refused when it does not hold the values'
-    internalTls, or, with features.internalTls on, when its certManagerNamespace is not cert-manager's
-    --cluster-resource-namespace (an empty one is left to the installer's own guard, which names it)."""
+    """The CR's spec once s_install is done: the fresh-install CR's. Refused when it does not hold the run's values
+    (every key but INSTALL_ONLY's: features, componentValues, internalTls, ...), or, with features.internalTls on, when
+    its certManagerNamespace is not cert-manager's --cluster-resource-namespace (an empty one is left to the
+    installer's own guard, which names it)."""
     spec = cr["spec"]
-    lost = not_held((values or {}).get("internalTls") or {}, spec.get("internalTls"), "internalTls")
+    lost = [x for k, v in (values or {}).items() if k not in INSTALL_ONLY for x in not_held({k: v}, spec, "spec")]
     if lost:
         raise Refused(f"the CR a fresh install of this installer ({cr['apiVersion']}) writes does not hold the run's "
-                      f"{'; '.join(lost)} (installers up to 0.3.703 drop it: installer#1084)")
+                      f"{'; '.join(lost)}")
     ns = (spec.get("internalTls") or {}).get("certManagerNamespace")
     if (spec.get("features") or {}).get("internalTls") and ns:
         if not cluster_resource_namespace:
@@ -116,7 +123,8 @@ def effective_spec(values: dict, cr: dict, cluster_resource_namespace: str) -> d
 
 
 def not_held(want: dict, have, path: str) -> list[str]:
-    """The leaves of `want` that `have` does not hold, each as "path=wanted (the CR: what it holds)"."""
+    """The leaves of `want` that `have` does not hold, each as "path=wanted (the CR: what it holds)". An empty map
+    wants nothing of its own."""
     out = []
     for k, v in want.items():
         h = have.get(k) if isinstance(have, dict) else None
@@ -170,6 +178,17 @@ def lines(rec: dict) -> list[str]:
             f"bypassed in this check only), every guard passed: {', '.join(rec['rendered'])}",
             f"installer internalTls in that CR: {json.dumps(rec['internal_tls'], sort_keys=True)}; cert-manager's "
             f"--cluster-resource-namespace: {rec['cluster_resource_namespace']!r}"]
+
+
+def rendered_names(path: str) -> list[str]:
+    """The components a run's composition render rendered, from its record (installer-render.json). Refused unless the
+    record says the render passed and names at least one."""
+    with open(path, encoding="utf-8") as fh:
+        rec = json.load(fh)
+    names = rec.get("rendered") if isinstance(rec, dict) and rec.get("kind") == "installer_render_check" else None
+    if not (rec or {}).get("ok") or not isinstance(names, list) or not names:
+        raise Refused(f"{path} is not the record of a composition render that passed")
+    return names
 
 
 def main(argv: list[str] | None = None) -> int:

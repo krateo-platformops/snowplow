@@ -112,7 +112,62 @@ def _without_the_pick(tmp_path, pulled) -> str:
 def test_falsifier_an_installer_that_drops_internal_tls_is_refused_before_any_cluster(tmp_path, pulled):
     with pytest.raises(installer_render.Refused) as e:
         installer_render.check(_without_the_pick(tmp_path, pulled), _values(), CRN)
-    assert "does not hold the run's internalTls.certManagerNamespace='cert-manager' (the CR: None)" in str(e.value)
+    assert "does not hold the run's spec.internalTls.certManagerNamespace='cert-manager' (the CR: None)" in str(e.value)
+
+
+def _with_spec_edit(tmp_path, pulled, line: str) -> str:
+    """The recorded installer whose fresh-install CR is edited by one template line after its pick."""
+    import shutil
+    root = tmp_path / "edited"
+    shutil.copytree(pulled, root)
+    sb = root / "installer" / "templates" / "self-bootstrap.yaml"
+    text = sb.read_text()
+    at = '{{- $_ := set $spec "bootstrap" (dict "coreProvider" (dict "enabled" false)) }}\n'
+    assert text.count(at) == 1
+    sb.write_text(text.replace(at, at + line + "\n"))
+    return str(root)
+
+
+@pytest.mark.parametrize("line,why", [
+    ('{{- $_ := set $spec "features" (omit $spec.features "internalTls") }}',
+     "spec.features.internalTls=True (the CR: None)"),
+    ('{{- $_ := set $spec "features" (set (deepCopy $spec.features) "internalTls" false) }}',
+     "spec.features.internalTls=True (the CR: False)"),
+    ('{{- $_ := unset $spec "features" }}', "spec.features.internalTls=True (the CR: None)"),
+    ('{{- $_ := set $spec "componentValues" (omit $spec.componentValues "snowplow") }}',
+     "spec.componentValues.snowplow.image.tag='1.12.74' (the CR: None)"),
+    ('{{- $_ := set $spec "exposure" (dict "type" "LoadBalancer") }}', "spec.exposure.type='Gateway' (the CR: 'LoadBalancer')"),
+], ids=["feature dropped", "feature off", "features gone", "a component's values gone", "another value"])
+def test_falsifier_a_cr_that_does_not_hold_the_runs_values_is_refused(tmp_path, pulled, line, why):
+    """#1598 review B1: the CR decides what is installed; what it does not hold of the run's values is named."""
+    with pytest.raises(installer_render.Refused) as e:
+        installer_render.check(_with_spec_edit(tmp_path, pulled, line), _values(), CRN)
+    assert str(e.value).startswith("the CR a fresh install of this installer (composition.krateo.io/v"), str(e.value)
+    assert why in str(e.value), str(e.value)
+
+
+def test_the_install_only_values_are_not_wanted_of_the_cr(pulled):
+    """bootstrap.coreProvider.enabled is true in the values and false in the CR by design; core-provider is the engine
+    subchart's: the recorded installer's CR passes with both in the run's values."""
+    v = _values()
+    assert v["bootstrap"]["coreProvider"]["enabled"] is True and "core-provider" in v
+    cr = installer_render.self_cr(pulled, {**v, "registryAuth": {**v["registryAuth"], "username": "x"}})
+    assert cr["spec"]["bootstrap"]["coreProvider"]["enabled"] is False and "core-provider" not in cr["spec"]
+    assert installer_render.effective_spec(v, cr, CRN) is cr["spec"]
+
+
+@pytest.mark.parametrize("rec", [
+    {}, {"kind": "installer_render_check", "ok": True, "rendered": []}, {"kind": "installer_render_check", "ok": False,
+                                                                        "rendered": ["a"]},
+    {"kind": "installer_render_check", "ok": True}, {"kind": "something", "ok": True, "rendered": ["a"]},
+    {"kind": "installer_render_check", "ok": True, "rendered": "a"}, [], None])
+def test_falsifier_only_a_render_that_passed_names_what_to_expect(tmp_path, rec):
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps(rec))
+    with pytest.raises(installer_render.Refused, match="is not the record of a composition render that passed"):
+        installer_render.rendered_names(str(p))
+    p.write_text(json.dumps({"kind": "installer_render_check", "ok": True, "rendered": ["b", "a"]}))
+    assert installer_render.rendered_names(str(p)) == ["b", "a"]
 
 
 @pytest.mark.parametrize("crn,why", [
@@ -258,7 +313,7 @@ def test_falsifier_run606_refuses_an_installer_that_drops_internal_tls_before_up
     log = (tmp / "out" / "run.log").read_text()
     assert p.returncode != 0, log[-3000:]
     assert ("registry FAILED: installer render: the CR a fresh install of this installer") in log, log[-3000:]
-    assert "does not hold the run's internalTls.certManagerNamespace='cert-manager' (the CR: None)" in log
+    assert "does not hold the run's spec.internalTls.certManagerNamespace='cert-manager' (the CR: None)" in log
     assert "=== step up ===" not in log
 
 
@@ -273,6 +328,22 @@ def test_falsifier_run606_refuses_a_guard_nobody_listed_before_up(harness):  # n
             "effective spec") in log, log[-3000:]
     assert "features.internalTls is on but componentValues.internal-ca-bundle.required is empty" in log
     assert "=== step up ===" not in log
+
+
+@pytest.mark.parametrize("env_extra,why", [
+    ({"FAKE_LIVE_DROPS": "settings-page"}, "rendered, not declared: settings-page"),
+    ({"FAKE_LIVE_ADDS": "surprise"}, "declared, not rendered: surprise"),
+])
+def test_falsifier_a_live_cr_that_declares_another_set_fails_the_platform_step(harness, env_extra, why):  # noqa: F811
+    """#1598 review B1: what the live Installer CR declares is held to what this run rendered: a feature lost (or gained)
+    on the way to the cluster is named, and never only shortens what is waited for."""
+    env, state, _, tmp = harness
+    p = _run606(env, PLATFORM_TIMEOUT_S="2", PLATFORM_POLL_S="1", **env_extra)
+    log = (tmp / "out" / "run.log").read_text()
+    assert p.returncode != 0, log[-3000:]
+    reason = (tmp / "out" / "platform-reason.txt").read_text()
+    assert "declared-set" in reason and why in reason, reason
+    assert "=== step env ===" not in log
 
 
 def test_run606s_dry_pass_renders_the_cr_the_values_write(harness):  # noqa: F811

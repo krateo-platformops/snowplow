@@ -191,6 +191,28 @@ def test_a_name_that_only_contains_the_id_is_not_the_id():
     assert st["ok"] and st["not_health_evaluated"] == [CA]
 
 
+@pytest.mark.parametrize("declared,expected,why", [
+    (("authn", "snowplow"), ["authn", "snowplow", "trust-manager"], "rendered, not declared: trust-manager"),
+    (("authn", "snowplow", "extra"), ["authn", "snowplow"], "declared, not rendered: extra"),
+    ((), ["authn"], "rendered, not declared: authn"),
+])
+def test_falsifier_the_live_declared_set_must_be_what_the_run_rendered(declared, expected, why):
+    leaves = [_sid("x", n) for n in {*declared, *diag606.REQUIRED_READY}]
+    st = diag606.platform_state([_inst(declares=declared)], leaves, [], required=(), expected=expected)
+    u = [x for x in st["unexpected_not_ready"] if x["reason"] == "DeclaredSet"]
+    assert not st["ok"] and len(u) == 1 and why in u[0]["message"], st["unexpected_not_ready"]
+    assert why in diag606.platform_line(st)
+
+
+def test_the_same_set_in_any_order_passes_and_none_compares_nothing():
+    leaves = [_sid("x", n) for n in diag606.REQUIRED_READY]
+    for expected in (list(reversed(diag606.REQUIRED_READY)), None):
+        assert diag606.platform_state([_inst()], leaves, [], expected=expected)["ok"]
+    # a CR whose declaration cannot be read is not ready for that reason alone: nothing to compare
+    st = diag606.platform_state([_inst(declares=())], leaves, [], expected=None)
+    assert st["ok"]
+
+
 def test_verify483_item_6_accepts_it_and_never_a_required_one():
     """evaluate483 reads the same set: a required component at ZeroEvidence fails item 6."""
     obs = _sid("krateoobservabilities", "krateo-observability")
