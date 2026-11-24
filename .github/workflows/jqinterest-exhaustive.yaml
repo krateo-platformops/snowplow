@@ -76,7 +76,7 @@ jobs:
             echo "no watched path changed: nothing to sweep (pass)"
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: steps.watch.outputs.run == 'true'
         with:
           persist-credentials: false
