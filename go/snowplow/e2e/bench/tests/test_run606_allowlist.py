@@ -138,12 +138,32 @@ def test_falsifier_every_other_state_still_holds_the_platform(what, cr):
     _held(diag606.platform_state([_inst()], _required() + [cr], []))
 
 
+#: core-provider 2.13.127's own forms (childhealth.go: rollupManagedChildren, withUnobservable, withUnreadable, joinCap)
+def _not_ready(names, more=""):
+    return f"{len(names)} of 138 managed children are not ready: " + ", ".join(names) + more
+
+
+def _failing(names, more=""):
+    return "managed children not healthy: " + ", ".join(names) + more
+
+
+def _unobservable(names, more=""):
+    return (f"Composition is up-to-date ({len(names)} of 138 managed children could NOT BE OBSERVED by their own controller, "
+            "whose Observe failed; the error is on each child's Synced condition: " + ", ".join(names) + more + ")")
+
+
+def _unreadable(names, more=""):
+    return (f"Composition is up-to-date ({len(names)} of 138 managed children could NOT BE READ \u2014 this controller's "
+            "ServiceAccount was refused access, which is a gap in the generated RBAC rather than a problem with the "
+            "children: " + ", ".join(names) + more + ")")
+
+
 @pytest.mark.parametrize("msg", [
-    "1 of 138 managed children are not ready: " + CA,
-    "1 of 138 managed children not healthy: " + CA,
-    "1 of 138 managed children could NOT BE OBSERVED by their own controllers: " + CA,
-    "1 of 138 managed children could NOT BE READ: x/krateo-system/other, " + CA + ".",
-])
+    _not_ready([CA]), _not_ready(["x/krateo-system/other", CA]), _failing([CA]),
+    _failing(["x/krateo-system/other (Ready=False: boom)", CA + " (Ready=False: no default config found)"]),
+    _failing(["x/krateo-system/other"]) + "; also unhealthy: " + CA,
+    _unobservable([CA]), _unreadable(["x/krateo-system/other", CA]), _unreadable([CA]),
+], ids=["not-ready", "not-ready-list", "failing", "failing-detail", "also-unhealthy", "unobservable", "unreadable-list", "unreadable"])
 def test_falsifier_one_the_installer_names_in_any_form_still_holds_the_platform(msg):
     """The Installer's read and ours can disagree for a moment; what it names wins."""
     st = diag606.platform_state([_inst(False, msg)], _required() + [_cr("internal-ca-bundle", "Unknown", "ZeroEvidence")], [])
@@ -151,14 +171,22 @@ def test_falsifier_one_the_installer_names_in_any_form_still_holds_the_platform(
     assert st["not_health_evaluated"] == [] and "accepted" not in diag606.platform_line(st)
 
 
-def test_falsifier_none_is_accepted_while_the_installer_leaves_names_out():
-    inst = [_inst(False, "9 of 138 managed children not healthy: x/krateo-system/a, x/krateo-system/b, +7 more")]
-    _held(diag606.platform_state(inst, _required() + [_cr("internal-ca-bundle", "Unknown", "ZeroEvidence")], []))
+_THREE = ["x/krateo-system/a", "x/krateo-system/b", "x/krateo-system/c"]
+
+
+@pytest.mark.parametrize("msg", [_not_ready(_THREE, " (+4 more)"), _failing(_THREE, " (+1 more)"),
+                                 _unobservable(_THREE, " (+12 more)"), _unreadable(_THREE, " (+7 more)")],
+                         ids=["not-ready", "failing", "unobservable", "unreadable"])
+def test_falsifier_none_is_accepted_while_the_installer_leaves_names_out(msg):
+    """joinCap prints three names and a count: an id that is not printed may be one of the others."""
+    st = diag606.platform_state([_inst(False, msg)], _required() + [_cr("internal-ca-bundle", "Unknown", "ZeroEvidence")], [])
+    assert not st["ok"] and CA in [u["id"] for u in st["unexpected_not_ready"]]
+    assert st["not_health_evaluated"] == []
 
 
 def test_a_name_that_only_contains_the_id_is_not_the_id():
     """Its neighbour named by the Installer (same id plus a suffix or a prefix) says nothing about it."""
-    inst = [_inst(False, f"2 of 138 managed children not healthy: {CA}-copy, more{CA}, {CA}.v2")]
+    inst = [_inst(False, _failing([CA + "-copy", "more" + CA, CA + ".v2", "x/" + CA]))]
     st = diag606.platform_state(inst, _required() + [_cr("internal-ca-bundle", "Unknown", "ZeroEvidence")], [])
     assert st["ok"] and st["not_health_evaluated"] == [CA]
 
