@@ -47,7 +47,7 @@ jobs:
       run:
         working-directory: go/snowplow
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version-file: go/snowplow/go.mod
