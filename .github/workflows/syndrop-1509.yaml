@@ -48,7 +48,7 @@ jobs:
         working-directory: go/snowplow
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go/snowplow/go.mod
       - name: iptables is usable (the arm fails without it)
