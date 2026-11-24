@@ -520,6 +520,7 @@ def test_the_bench_enable_rule_is_the_installers(tmp_path, snowplow):
     from bench import diag606
     pulled = _pulled(tmp_path, RECORDED)
     root = pulled / "installer"
+    from bench import installer_features
     run = _values(snowplow)
     assert run["features"]["internalTls"] is True             # else the two components below prove nothing
     values = ghcr_pull._merge(run, {"bootstrap": {"coreProvider": {"enabled": False}}})
