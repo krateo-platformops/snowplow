@@ -329,6 +329,21 @@ def _messages(s: dict | None) -> str:
                      ((s or {}).get("status") or {}).get("conditions") or [])
 
 
+#: the one Ready reason that says a composition reconciled and none of its children has readiness semantics its
+#: controller can read (composition-dynamic-controller, "Composition health is unknown"). The Installer CR itself counts
+#: such a child apart ("N of M managed children not health-evaluated") and stays Ready. krateo-057's InternalCaBundle
+#: reads this since 2026-11-15; a rule that wants Ready=True for every child can never pass where 057 runs.
+NOT_HEALTH_EVALUATED = "ZeroEvidence"
+
+
+def not_health_evaluated(s: dict | None) -> bool:
+    """A component CR that reconciled (Synced=True) and whose health its controller says it cannot read (Ready=Unknown,
+    reason ZeroEvidence, exactly). Every other Unknown, False or absent Ready is not ready; so is a CR whose Synced
+    is not True: what reconciled is the claim, and only Synced makes it."""
+    return (_cond(s, "Ready") == "Unknown" and ((s or {}).get("Ready") or {}).get("reason") == NOT_HEALTH_EVALUATED
+            and _cond(s, "Synced") == "True")
+
+
 def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
                    allow=DEFAULT_ALLOW_NOT_READY, required=REQUIRED_READY) -> dict:
     """Readiness across BOTH layers (CompositionDefinitions and component CRs).
@@ -343,13 +358,18 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
     other reason, excuses nothing). An Installer
     CR whose declaration cannot be read is not-ready: which components it
     will still create is then unknown.
+
+    A component CR that reconciled and cannot be health-evaluated (not_health_evaluated) is neither ready nor not
+    ready: it is named in `not_health_evaluated` (and in platform_line) and does not hold the run. Only a component
+    CR, never a CompositionDefinition; never a `required` one; and never one the Installer CR names as not ready.
     """
     inst = installer[0] if installer else {}
     inst_msg = (inst.get("Ready") or {}).get("message") or ""
     by_id = {s.get("id"): s for s in leaves + cds if s.get("id")}
     not_ready = set(parse_not_ready_children(inst_msg))
+    unevaluated = sorted(s["id"] for s in leaves if s.get("id") and not_health_evaluated(s))
     not_ready |= {s["id"] for s in leaves + cds
-                  if s.get("id") and _cond(s, "Ready") != "True"}
+                  if s.get("id") and _cond(s, "Ready") != "True" and s["id"] not in unevaluated}
     allow_map = dict(allow)
     allowed, unexpected = [], []
     for ident in sorted(not_ready):
@@ -397,6 +417,7 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
             "declared_created": (None if declares is None else
                                  f"{sum((c['kind'], c['name']) in present for c in declares)}/{len(declares)}"),
             "required_ready": req, "allowed_not_ready": allowed,
+            "not_health_evaluated": unevaluated,
             "unexpected_not_ready": unexpected,
             "allow_list": [{"id": i, "expected_reason": r} for i, r in allow]}
 
@@ -410,6 +431,8 @@ def platform_line(st: dict) -> str:
     if st["allowed_not_ready"]:
         line += "; ALLOWED(known): " + ", ".join(
             f"{a['id']}[{a['expected_reason']}]" for a in st["allowed_not_ready"])
+    if st.get("not_health_evaluated"):
+        line += "; reconciled, health not evaluated (accepted): " + ", ".join(st["not_health_evaluated"])
     if st["unexpected_not_ready"]:
         line += "; NOT READY: " + ", ".join(
             f"{u['id']}({u['reason']}: {u['message'][:120]})" for u in st["unexpected_not_ready"])

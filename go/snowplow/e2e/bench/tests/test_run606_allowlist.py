@@ -76,6 +76,57 @@ def test_platform_state_allows_only_the_exact_child_with_the_exact_reason():
     assert not st["ok"] and st["required_ready"]["snowplow"] is False
 
 
+def _cr(name, ready, reason="", synced="True", resource="internalcabundles"):
+    conds = [{"type": "Ready", "status": ready, "reason": reason}] if ready is not None else []
+    conds += [{"type": "Synced", "status": synced, "reason": "ReconcileSuccess"}] if synced is not None else []
+    return diag606.summarize_conditions({"kind": "K", "metadata": {"name": name, "namespace": "krateo-system"},
+                                         "status": {"conditions": conds}}, resource)
+
+
+CA = "internalcabundles/krateo-system/internal-ca-bundle"
+
+
+def test_a_reconciled_component_whose_health_cannot_be_read_does_not_hold_the_platform():
+    """krateo-057's InternalCaBundle, read-only 2026-11-24: Ready=Unknown/ZeroEvidence, Synced=True."""
+    leaves = [_sid("x", n) for n in diag606.REQUIRED_READY] + [_cr("internal-ca-bundle", "Unknown", "ZeroEvidence")]
+    st = diag606.platform_state([_inst(True, "Composition is up-to-date (1 of 138 managed children not health-evaluated)")],
+                                leaves, [])
+    assert st["ok"] and st["not_health_evaluated"] == [CA] and st["unexpected_not_ready"] == []
+    assert "reconciled, health not evaluated (accepted): " + CA in diag606.platform_line(st)
+
+
+@pytest.mark.parametrize("what,cr", [
+    ("no Ready condition (the rehearsal of 2026-11-24)", _cr("internal-ca-bundle", None, synced=None)),
+    ("Unknown for another reason", _cr("internal-ca-bundle", "Unknown", "NotObserved")),
+    ("Unknown with no reason", _cr("internal-ca-bundle", "Unknown", "")),
+    ("the reason spelled otherwise", _cr("internal-ca-bundle", "Unknown", "ZeroEvidenceYet")),
+    ("False with the reason", _cr("internal-ca-bundle", "False", "ZeroEvidence")),
+    ("not reconciled", _cr("internal-ca-bundle", "Unknown", "ZeroEvidence", synced="False")),
+    ("never reconciled", _cr("internal-ca-bundle", "Unknown", "ZeroEvidence", synced=None)),
+])
+def test_falsifier_every_other_state_still_holds_the_platform(what, cr):
+    leaves = [_sid("x", n) for n in diag606.REQUIRED_READY] + [cr]
+    st = diag606.platform_state([_inst()], leaves, [])
+    assert not st["ok"] and [u["id"] for u in st["unexpected_not_ready"]] == [CA], what
+    assert st["not_health_evaluated"] == []
+
+
+def test_falsifier_the_acceptance_is_for_component_crs_never_a_definition_a_required_one_or_one_the_installer_names():
+    leaves = [_sid("x", n) for n in diag606.REQUIRED_READY]
+    # a CompositionDefinition in the same state holds the platform
+    cd = _cr("internal-ca-bundle", "Unknown", "ZeroEvidence", resource="compositiondefinitions")
+    st = diag606.platform_state([_inst()], leaves, [cd])
+    assert not st["ok"] and st["unexpected_not_ready"][0]["id"] == "compositiondefinitions/krateo-system/internal-ca-bundle"
+    # a required component is ready only when Ready=True
+    req = [_cr("snowplow", "Unknown", "ZeroEvidence", resource="snowplows")] + leaves[1:]
+    st = diag606.platform_state([_inst()], req, [])
+    assert not st["ok"] and st["required_ready"]["snowplow"] is False
+    # the Installer CR naming the child not ready wins over its own condition
+    inst = [_inst(False, f"1 of 138 managed children are not ready: {CA}")]
+    st = diag606.platform_state(inst, leaves + [_cr("internal-ca-bundle", "Unknown", "ZeroEvidence")], [])
+    assert not st["ok"] and [u["id"] for u in st["unexpected_not_ready"]] == [CA]
+
+
 def test_allow_list_env_override(monkeypatch):
     monkeypatch.setenv("BENCH_ALLOW_NOT_READY", "a/b/c=x y; d/e/f=z")
     assert diag606.allow_list_from_env() == (("a/b/c", "x y"), ("d/e/f", "z"))
