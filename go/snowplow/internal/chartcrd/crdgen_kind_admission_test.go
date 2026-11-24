@@ -32,7 +32,7 @@ import (
 //  2. The same CRD with maxItems/maxLength stripped (the 1.12.45 shape) is
 //     refused with the cost error. If that refusal ever disappears, the guard
 //     fails instead of passing for no reason.
-//  3. CRs exercise the RULES, not just the CRD's admission. Privileged names
+//  3. CRs exercise the item constraints, not just the CRD's admission. Privileged names
 //     are refused per item, ordinary names pass, and maxItems/maxLength are
 //     enforced.
 
@@ -99,8 +99,9 @@ func TestIssue657_Kind_CrdgenCRDAdmittedAndRulesEnforced(t *testing.T) {
 	crds := ext.ApiextensionsV1().CustomResourceDefinitions()
 	dryRun := metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}}
 
-	// 2 first: the unbounded twin, dry-run only, so the name stays free. It
-	// carries the item rule crdgen emitted before plumbing#81, the 1.12.45 shape.
+	// 2 first: the unbounded twin, dry-run only, so the name stays free. Each
+	// constrained item carries the rule crdgen emitted before plumbing#81, the
+	// 1.12.45 shape.
 	unbounded := crd.DeepCopy()
 	for _, v := range unbounded.Spec.Versions {
 		if v.Schema == nil || v.Schema.OpenAPIV3Schema == nil {
@@ -111,9 +112,7 @@ func TestIssue657_Kind_CrdgenCRDAdmittedAndRulesEnforced(t *testing.T) {
 			arr := rbac.Properties[f]
 			arr.MaxItems = nil
 			arr.Items.Schema.MaxLength = nil
-			if f == nativeNotField {
-				arr.Items.Schema.XValidations = apiextensionsv1.ValidationRules{{Rule: costlyItemRule}}
-			}
+			arr.Items.Schema.XValidations = apiextensionsv1.ValidationRules{{Rule: costlyItemRule}}
 			rbac.Properties[f] = arr
 		}
 		v.Schema.OpenAPIV3Schema.Properties["spec"].Properties["rbac"] = rbac
@@ -123,9 +122,13 @@ func TestIssue657_Kind_CrdgenCRDAdmittedAndRulesEnforced(t *testing.T) {
 		t.Fatal("the v1.36 apiserver ACCEPTED an unbounded CEL rule known to be over budget: the estimator changed, " +
 			"so this arm no longer proves the bounds matter")
 	}
-	if !strings.Contains(err.Error(), "properties["+nativeNotField+"].items.x-kubernetes-validations") ||
-		!strings.Contains(err.Error(), costOverBudget) {
-		t.Fatalf("unbounded CRD refused, but not for the impersonateServiceAccounts rule cost: %v", err)
+	if !strings.Contains(err.Error(), costOverBudget) {
+		t.Fatalf("unbounded CRD refused, but not for rule cost: %v", err)
+	}
+	for _, f := range constrainedItemFields {
+		if !strings.Contains(err.Error(), "properties["+f+"].items.x-kubernetes-validations") {
+			t.Fatalf("unbounded CRD refused, but not for the spec.rbac.%s item rule's cost: %v", f, err)
+		}
 	}
 	t.Logf("unbounded twin refused as expected: %v", err)
 
@@ -138,7 +141,7 @@ func TestIssue657_Kind_CrdgenCRDAdmittedAndRulesEnforced(t *testing.T) {
 	}
 	waitEstablished(t, ctx, ext, crd.Name)
 
-	// 3: CRs against the live rules.
+	// 3: CRs against the live constraints.
 	dyn, err := dynamic.NewForConfig(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -173,7 +176,7 @@ func TestIssue657_Kind_CrdgenCRDAdmittedAndRulesEnforced(t *testing.T) {
 			if err == nil {
 				t.Fatalf("the apiserver admitted spec.rbac.%s=[devs, %s]", c.field, c.name)
 			}
-			// Refused by the item RULE, not by something incidental.
+			// Refused by the item's constraint, not by something incidental.
 			if !strings.Contains(err.Error(), "spec.rbac."+c.field+"[1]") {
 				t.Fatalf("spec.rbac.%s=[devs, %s] refused, but not at the item: %v", c.field, c.name, err)
 			}
