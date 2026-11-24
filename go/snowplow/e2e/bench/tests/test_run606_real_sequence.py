@@ -283,43 +283,6 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
     if os.environ.get("FAKE_VERDICT_LOST") == "1" and os.path.exists(_vj) and os.path.getsize(_vj) > 0:
         os.remove(_vj)
     port = os.environ["FAKE_PORT"]
-    # #1588 follow-up: s_install's ONE merge patch of the Installer CR, and the CR read back by name (FAKE_CR_PATCH:
-    # drops = the apiserver keeps the CR without internalTls.certManagerNamespace; fails = the patch is refused;
-    # unreadable = the read-back itself is refused; blip / blip-read = the first patch / read goes unanswered; down =
-    # no patch is ever answered)
-    if a[:1] == ["patch"] and a[1:2] and a[1].startswith("installers.") and a[2:3] == ["installer"]:
-        if os.environ.get("FAKE_CR_PATCH") in ("blip", "down"):
-            once = os.path.join(STATE, "cr-patch-blip")
-            if os.environ["FAKE_CR_PATCH"] == "down" or not os.path.exists(once):
-                open(once, "w").close()
-                print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr); sys.exit(1)
-        if os.environ.get("FAKE_CR_PATCH") == "fails":
-            print('Error from server (Invalid): installers "installer" is invalid', file=sys.stderr); sys.exit(1)
-        open(os.path.join(STATE, "installer-cr-patch.json"), "w").write(open(a[a.index("--patch-file") + 1]).read())
-        sys.exit(0)
-    if a[:1] == ["get"] and a[1:2] and a[1].startswith("installers.") and a[2:3] == ["installer"]:
-        pf = os.path.join(STATE, "installer-cr-patch.json")
-        spec = (json.load(open(pf)).get("spec") or {}) if os.path.exists(pf) else {}
-        if os.environ.get("FAKE_CR_PATCH") == "drops":
-            spec.pop("internalTls", None)
-        if os.environ.get("FAKE_CR_PATCH") == "blip-read":
-            once = os.path.join(STATE, "cr-read-blip")
-            if not os.path.exists(once):
-                open(once, "w").close()
-                print("Unable to connect to the server: net/http: TLS handshake timeout", file=sys.stderr); sys.exit(1)
-        if os.environ.get("FAKE_CR_PATCH") == "unreadable":
-            print('Error from server (Forbidden): installers "installer" is forbidden', file=sys.stderr); sys.exit(1)
-        # as the live CR: the registryAuth helm installed with, username included (the fresh-install pick carries it),
-        # and again in kubectl's last-applied annotation (the installer's hook applies the CR client-side)
-        meta = {"name": "installer", "namespace": ns}
-        ra = os.path.join(STATE, "helm-registry-auth.json")
-        if os.path.exists(ra):
-            spec["registryAuth"] = json.load(open(ra))
-            meta["annotations"] = {"kubectl.kubernetes.io/last-applied-configuration":
-                                   json.dumps({"spec": {"registryAuth": spec["registryAuth"]}})}
-        print(json.dumps({"apiVersion": "composition.krateo.io/" + a[1].split(".")[1], "kind": "Installer",
-                          "metadata": meta, "spec": spec}))
-        sys.exit(0)
     if a[:2] == ["auth", "can-i"]:
         # #1307 L7: GKE's IAM authorizer's answer to the orchestrator's SelfSubjectAccessReview;
         # FAKE_K8S_AUTHZ=no: the conditional container.admin is not honoured (kubectl: "no", rc 1)
@@ -1857,11 +1820,13 @@ FAKE_HELM = _COMMON + textwrap.dedent("""\
         open(os.path.join(d, "templates", "self-bootstrap.yaml"), "w").write(chr(10).join([
             "apiVersion: v1", "kind: ConfigMap", "metadata:", "  name: installer-bootstrap", "data:",
             '  components-patch.json: {{ dict "spec" (dict "componentValues" ' + cv + ') | toJson | quote }}',
-            # #1588 follow-up: the CR a fresh install writes (installer 0.3.703's installer-self-cr ConfigMap): the
-            # values' picked keys (internalTls is NOT among them, installer#1084), the composition pass's bootstrap off
+            # the CR a fresh install writes (the installer's installer-self-cr ConfigMap): the values' picked keys,
+            # internalTls among them since 0.3.704 (installer#1145), the composition pass's bootstrap off.
+            # FAKE_INSTALLER_DROPS_TLS=1: an installer up to 0.3.703, whose pick omits it (installer#1084)
             "---", "apiVersion: v1", "kind: ConfigMap", "metadata:", "  name: installer-self-cr", "data:",
             "  installer.yaml: |",
-            '    {{- $spec := pick .Values "namespaces" "features" "componentValues" "registryAuth" }}',
+            '    {{- $spec := pick .Values "namespaces" "features" "componentValues" "registryAuth"'
+            + ("" if os.environ.get("FAKE_INSTALLER_DROPS_TLS") == "1" else ' "internalTls"') + ' }}',
             '    {{- $_ := set $spec "bootstrap" (dict "coreProvider" (dict "enabled" false)) }}',
             '    {{- dict "apiVersion" (printf "composition.krateo.io/v%s" (.Chart.Version | replace "." "-")) "kind" '
             '"Installer" "metadata" (dict "name" "installer") "spec" $spec | toJson | nindent 4 }}', ""]))

@@ -1799,19 +1799,15 @@ def chart_check(env: dict[str, str], labels: list[str], helm: str = "helm") -> l
             lines += installer_features.check_chart(pulled)
         except installer_features.Refused as e:
             raise Refused(f"installer {version}: {e}") from None
-        # #1588 follow-up: the run's Installer CR patch (cert-manager's --cluster-resource-namespace, from the
-        # verified render of the bench's pinned cert-manager chart, as s_cert_manager_source reads it on the VM)
+        # #1588 follow-up: cert-manager's --cluster-resource-namespace, from the verified render of the bench's
+        # pinned cert-manager chart, as s_cert_manager_source reads it on the VM: the values' internalTls is held to it
         from bench import cert_manager, installer_render
         cm = cert_manager.preflight(os.path.join(d, "cert-manager"))
         if not cm.get("ok"):
             raise Refused("cert-manager's pinned chart could not be read on the laptop"
                           f"{' (NO ANSWER from the registry)' if cm.get('no_answer') else ''}: "
                           + "; ".join(cm.get("failures") or ["no reason given"]))
-        try:
-            patch = installer_render.cr_patch(installer_features.bench_features(),
-                                              cm.get("cluster_resource_namespace") or "")
-        except installer_render.Refused as e:
-            raise Refused(f"installer {version}: {e}") from None
+        crn = cm.get("cluster_resource_namespace") or ""
         for x in labels:
             from bench import snowplow_env
             try:
@@ -1825,10 +1821,10 @@ def chart_check(env: dict[str, str], labels: list[str], helm: str = "helm") -> l
             except (ValueError, ghcr_pull._Refused) as e:
                 raise Refused(f"installer {version}, run {x}'s values: {e}") from None
             try:
-                # every component the run's CR enables, rendered by the installer with the effective spec: any
-                # guard of the installer refuses the launch here (bench/installer_render.py)
+                # every component the run's CR enables, rendered by the installer with that CR's spec: any guard of
+                # the installer refuses the launch here (bench/installer_render.py)
                 lines += [f"run {x}: {ln}" for ln in installer_render.lines(
-                    installer_render.check(pulled, values, patch, helm))]
+                    installer_render.check(pulled, values, crn, helm))]
             except installer_render.Refused as e:
                 raise Refused(f"installer {version}, run {x}'s values: {e}") from None
             lines.append(f"installer {version}, run {x}'s values: private-image components (rendered on the laptop, "

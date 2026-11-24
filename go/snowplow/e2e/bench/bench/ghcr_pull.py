@@ -285,8 +285,7 @@ def creds(path: str) -> tuple[str, str]:
     return kv["GHCR_PULL_USERNAME"], kv["GHCR_PULL_TOKEN"]
 
 
-def private_pins(installer_pulled: str, values: str, include: set[str] | frozenset = frozenset(),
-                 patch: dict | None = None) -> list[dict]:
+def private_pins(installer_pulled: str, values: str, include: set[str] | frozenset = frozenset()) -> list[dict]:
     """Every pinned chart this install pulls from a repo of its OWN (the
     repo-override pins: krateo-agentiko/*, krateo-blueprints/*, ...), whose
     component the installer enables, by its own rule (inst.compEnabled,
@@ -332,8 +331,6 @@ def private_pins(installer_pulled: str, values: str, include: set[str] | frozens
     with open(values, "rb") as fh:
         bench = _load_yaml(fh.read(), f"{values}: ") or {}
     features.update(bench.get("features") or {})
-    # #1588 follow-up: the run's Installer CR patch (bench/installer_render.py) turns on what the values write off
-    features.update(((patch or {}).get("spec") or {}).get("features") or {})
     cv = dict(inst_values.get("componentValues") or {})
     oci = bench.get("ociRepo") or inst_values.get("ociRepo")
     out = []
@@ -1321,8 +1318,6 @@ def main(argv: list[str] | None = None) -> int:
     pf.add_argument("--helm", default="helm", help="the helm that renders each chart (helm template)")
     pf.add_argument("--budget-file", default=None, help="the run's one bound of its pre-cluster registry reads "
                     "(bench/noanswer.py Budget.shared): this step adds its share")
-    pf.add_argument("--cr-patch", default=None, help="the run's Installer CR merge patch (bench.installer_render "
-                    "patch): the features it turns on are this install's too")
     pf.add_argument("--override", action="append", default=[], metavar="COMPONENT=TAG",
                     help="a component whose image this run overrides (its componentValues in --values): "
                          "preflighted whatever its repo; refused unless a ghcr.io image it renders has TAG")
@@ -1355,15 +1350,9 @@ def main(argv: list[str] | None = None) -> int:
         # username document s_install pipes after it (`-f values -f -`), merged as helm merges them
         with open(a.values, "rb") as fh:
             run_values = _merge(_load_yaml(fh.read(), f"{a.values}: ") or {}, {"registryAuth": {"username": user}})
-        patch = {}
-        if a.cr_patch:
-            with open(a.cr_patch, "rb") as fh:
-                patch = _load_yaml(fh.read(), f"{a.cr_patch}: ") or {}
-            # what the CR holds once s_install patched it: its features (and internalTls) over the values'
-            run_values = _merge(run_values, patch.get("spec") or {})
         paths = private_image_paths(a.installer_pulled, run_values, a.helm)
         private = set(paths)
-        pins = private_pins(a.installer_pulled, a.values, include=private | set(overrides), patch=patch)
+        pins = private_pins(a.installer_pulled, a.values, include=private | set(overrides))
     except (ValueError, _Refused) as e:  # the installer's enable rule unreadable: nothing to resolve against
         print(f"refusing: {str(e).replace(user, '<registry user>') if user else e}", file=sys.stderr)
         return 2

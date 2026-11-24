@@ -70,7 +70,7 @@ exposure:
   platformPort: 80
 # The installer's features are krateo-057's, every one written (bench/installer_features.py: the
 # record of 057's Installer CR, and the deviations the owner rules on, named in every check).
-{features}vertexAI:
+{features}{internal_tls}vertexAI:
   enabled: false
 # Installer 0.3.422 schema: top-level additionalProperties=false and the
 # engine subchart key is core-provider (the fresh-install runbook's
@@ -133,19 +133,23 @@ def document(snowplow_tag: str, frontend_tag: str = "", snowplow_env: dict[str, 
             node = node.setdefault(seg, {})
         node[rest[-1]] = [dict(SNOWPLOW_POOL_TOLERATION)]
     cv = icv.merge(icv.nest(icv.bench_paths(rec)), own)
-    return TEMPLATE.format(features=installer_features.values_block(values_features()),
+    feats = installer_features.bench_features()
+    return TEMPLATE.format(features=installer_features.values_block(feats), internal_tls=internal_tls_block(feats),
                            component_values=yaml.safe_dump({"componentValues": cv}, sort_keys=True,
                                                            default_flow_style=False, width=1000),
                            krateo_namespace=KRATEO_NAMESPACE)
 
 
-def values_features() -> dict[str, bool]:
-    """The features the values document writes: 057's (bench/installer_features.py), with each feature the run's
-    Installer CR patch turns on written off here (bench/installer_render.py CR_PATCH_FEATURES: the installer reads
-    internalTls's own value only from its CR, so the feature goes on in the same patch)."""
-    from bench import installer_render
-    feats = installer_features.bench_features()
-    return {f: (False if f in installer_render.CR_PATCH_FEATURES else v) for f, v in feats.items()}
+def internal_tls_block(features: dict[str, bool]) -> str:
+    """features.internalTls's own value: the namespace cert-manager reads cluster CA Secrets from, which the installer
+    copies into the CR a fresh install writes (installer#1145, in 0.3.704; 0.3.703 and older drop it, and their
+    composition render fails on it: bench/installer_render.py refuses them before any cluster). It is the namespace
+    the bench's cert-manager step installs into (bench/cert_manager.py NAMESPACE, ONE definition), and the render
+    check holds it to the --cluster-resource-namespace the verified cert-manager chart renders. Nothing while the
+    feature is off."""
+    if not features.get("internalTls"):
+        return ""
+    return f"internalTls:\n  certManagerNamespace: {cert_manager.NAMESPACE}\n"
 
 
 #: the installer's top-level values the bench writes off where 057 may set them, and why (said by every check;

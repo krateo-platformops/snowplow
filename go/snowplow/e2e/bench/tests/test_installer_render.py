@@ -1,5 +1,5 @@
 """#1588 follow-up: the installer's composition render of the run's effective spec, before any cluster
-(bench/installer_render.py), the run's Installer CR patch and its read-back (run606.sh s_install), and where
+(bench/installer_render.py), internalTls from the run's install values (bench/installer_values.py), and where
 cert-manager reads cluster CA Secrets from (bench/cert_manager.py cluster_resource_namespace).
 
 The renders are of the REAL published installer the records were read on (tests/installer_archives.py RECORDED),
@@ -49,8 +49,7 @@ def _values() -> dict:
     return yaml.safe_load(installer_values.document("1.12.74"))
 
 
-def _patch() -> dict:
-    return installer_render.cr_patch(installer_features.bench_features(), cert_manager.cluster_resource_namespace(_cm_render()))
+CRN = "cert-manager"      # as cert_manager.cluster_resource_namespace reads it from the pinned chart (held below)
 
 
 # ─── where cert-manager reads cluster CA Secrets from ─────────────────────
@@ -79,61 +78,91 @@ def test_falsifier_the_flags_value_is_read_never_assumed():
                                                         [{"name": "X", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}}]))
 
 
-# ─── the run's CR patch ─────────────────────────────────────────────────────
+# ─── internalTls, from the install values ───────────────────────────────────
 
-def test_the_patch_turns_internal_tls_on_with_where_cert_manager_runs():
-    assert _patch() == {"spec": {"features": {"internalTls": True}, "internalTls": {"certManagerNamespace": "cert-manager"}}}
-    # the values write it off: the installer reads its namespace only from the CR, set in the same patch
-    assert _values()["features"]["internalTls"] is False and "internalTls" not in _values()
+def test_the_values_turn_internal_tls_on_with_where_cert_manager_runs():
+    v = _values()
     assert installer_features.bench_features()["internalTls"] is True
+    assert v["features"]["internalTls"] is True and v["internalTls"] == {"certManagerNamespace": cert_manager.NAMESPACE}
+    assert cert_manager.cluster_resource_namespace(_cm_render()) == cert_manager.NAMESPACE == CRN
 
 
-def test_no_patch_when_no_feature_is_cr_only_and_none_without_where_cert_manager_runs():
-    assert installer_render.cr_patch({"internalTls": False}, "cert-manager") == {}
-    with pytest.raises(installer_render.Refused, match="--cluster-resource-namespace is not known"):
-        installer_render.cr_patch({"internalTls": True}, "")
+def test_no_internal_tls_value_while_the_feature_is_off():
+    assert installer_values.internal_tls_block({"internalTls": False}) == installer_values.internal_tls_block({}) == ""
 
 
-def test_readback_names_every_field_the_cr_does_not_hold():
-    p = _patch()
-    assert installer_render.readback({"spec": {**p["spec"], "other": 1}}, p) == []
-    lost = copy.deepcopy(p["spec"])
-    lost.pop("internalTls")
-    assert installer_render.readback({"spec": lost}, p) == [
-        "spec.internalTls.certManagerNamespace is None, the patch wrote 'cert-manager'"]
+def test_the_fresh_install_cr_holds_the_values_internal_tls(pulled):
+    """What installer#1145 (0.3.704) changed: the CR a fresh install writes carries internalTls."""
+    cr = installer_render.self_cr(pulled, {**_values(), "registryAuth": {"username": "x"}})
+    assert cr["spec"]["internalTls"]["certManagerNamespace"] == CRN and cr["spec"]["features"]["internalTls"] is True
+
+
+def _without_the_pick(tmp_path, pulled) -> str:
+    """The recorded installer with internalTls dropped from its fresh-install pick, as 0.3.703 and older have it."""
+    import shutil
+    root = tmp_path / "older"
+    shutil.copytree(pulled, root)
+    sb = root / "installer" / "templates" / "self-bootstrap.yaml"
+    text = sb.read_text()
+    assert text.count('"registryAuth" "internalTls" }}') == 1
+    sb.write_text(text.replace('"registryAuth" "internalTls" }}', '"registryAuth" }}'))
+    return str(root)
+
+
+def test_falsifier_an_installer_that_drops_internal_tls_is_refused_before_any_cluster(tmp_path, pulled):
+    with pytest.raises(installer_render.Refused) as e:
+        installer_render.check(_without_the_pick(tmp_path, pulled), _values(), CRN)
+    assert "does not hold the run's internalTls.certManagerNamespace='cert-manager' (the CR: None)" in str(e.value)
+
+
+@pytest.mark.parametrize("crn,why", [
+    ("elsewhere", "internalTls.certManagerNamespace is 'cert-manager', and cert-manager reads cluster CA Secrets from "
+                  "'elsewhere'"),
+    ("", "features.internalTls is on and cert-manager's --cluster-resource-namespace is not known"),
+])
+def test_falsifier_a_namespace_that_is_not_where_cert_manager_reads_is_refused(pulled, crn, why):
+    with pytest.raises(installer_render.Refused) as e:
+        installer_render.check(pulled, _values(), crn)
+    assert why in str(e.value)
+
+
+def test_not_held_names_every_leaf_the_cr_does_not_hold():
+    want = {"certManagerNamespace": "cert-manager", "deep": {"a": 1, "b": 2}}
+    assert installer_render.not_held(want, {"certManagerNamespace": "cert-manager", "deep": {"a": 1, "b": 2, "c": 3}}, "t") == []
+    assert installer_render.not_held(want, {"deep": {"a": 1}}, "t") == [
+        "t.certManagerNamespace='cert-manager' (the CR: None)", "t.deep.b=2 (the CR: None)"]
+    assert installer_render.not_held(want, None, "t") == [
+        "t.certManagerNamespace='cert-manager' (the CR: None)", "t.deep.a=1 (the CR: None)", "t.deep.b=2 (the CR: None)"]
 
 
 # ─── the composition render ─────────────────────────────────────────────────
 
 def test_the_runs_effective_spec_renders_every_enabled_component(pulled):
-    rec = installer_render.check(pulled, _values(), _patch())
+    rec = installer_render.check(pulled, _values(), CRN)
     assert rec["ok"] and rec["rendered"] == rec["enabled"] and len(rec["rendered"]) > 40
     assert {"trust-manager", "internal-ca-bundle", "cert-manager-issuers", "cert-manager"} <= set(rec["rendered"])
     assert rec["cr_api_version"] == "composition.krateo.io/v" + ia.RECORDED.replace(".", "-")
     ln = installer_render.lines(rec)
     assert ln[0].startswith(f"installer render: rendered {len(rec['rendered'])} of {len(rec['rendered'])} enabled")
+    assert ln[1] == ('installer internalTls in that CR: {"certManagerNamespace": "cert-manager"}; cert-manager\'s '
+                     "--cluster-resource-namespace: 'cert-manager'")
     # the bypass is in the check's in-memory copy only: the pulled chart s_install installs is untouched
     assert not any(n.startswith("00-bench") for n in os.listdir(os.path.join(pulled, "installer", "templates")))
 
 
-@pytest.mark.parametrize("case", ["no_cert_manager_namespace", "no_target_namespaces", "top_level_internal_tls"])
+@pytest.mark.parametrize("case", ["no_cert_manager_namespace", "no_target_namespaces"])
 def test_falsifier_what_the_installer_refuses_is_refused_before_any_cluster(pulled, case):
-    values, patch = _values(), _patch()
+    values = _values()
     if case == "no_cert_manager_namespace":
-        patch["spec"].pop("internalTls")
-    elif case == "no_target_namespaces":
+        values.pop("internalTls")
+    else:
         values["componentValues"].pop("internal-ca-bundle")
-    else:
-        values["internalTls"] = {"certManagerNamespace": "cert-manager"}
     with pytest.raises(installer_render.Refused) as e:
-        installer_render.check(pulled, values, patch)
+        installer_render.check(pulled, values, CRN)
     why = str(e.value)
-    if case == "top_level_internal_tls":
-        assert why.startswith("the run's values set a top-level internalTls, which the installer never writes"), why
-    else:
-        assert why.startswith("the installer refuses to render its components with the run's effective spec"), why
-        assert GUARDS["certManagerNamespace" if case == "no_cert_manager_namespace" else "target"] in why, why
-        assert "installer/templates/compositions.yaml:" in why, why
+    assert why.startswith("the installer refuses to render its components with the run's effective spec"), why
+    assert GUARDS["certManagerNamespace" if case == "no_cert_manager_namespace" else "target"] in why, why
+    assert "installer/templates/compositions.yaml:" in why, why
 
 
 def test_falsifier_a_bypass_that_does_not_take_cannot_pass(pulled, monkeypatch):
@@ -141,7 +170,7 @@ def test_falsifier_a_bypass_that_does_not_take_cannot_pass(pulled, monkeypatch):
     never read as a pass."""
     monkeypatch.setattr(installer_render, "BYPASS_TEMPLATE", "templates/zz-bench-render-check.tpl")
     with pytest.raises(installer_render.Refused, match=r"^rendered 0 components"):
-        installer_render.check(pulled, _values(), _patch())
+        installer_render.check(pulled, _values(), CRN)
 
 
 def test_falsifier_a_component_enabled_but_not_rendered_is_named(pulled, monkeypatch):
@@ -150,7 +179,7 @@ def test_falsifier_a_component_enabled_but_not_rendered_is_named(pulled, monkeyp
         '{{- if and (ne $c.name "trust-manager") (eq (include "inst.compEnabled" (list $top $c)) "true") -}}'))
     with pytest.raises(installer_render.Refused, match=r"^rendered (\d+) of (\d+) enabled components; not rendered: "
                                                        r"trust-manager$"):
-        installer_render.check(pulled, _values(), _patch())
+        installer_render.check(pulled, _values(), CRN)
 
 
 # ─── trust-manager's RBAC with the bench's values (installer guard L1005's reason) ──
@@ -173,7 +202,7 @@ def test_trust_managers_configmap_rbac_is_namespaced_with_the_benchs_values(pull
     """installer guard L1005: with target.namespaces empty, trust-manager puts ConfigMap delete in a ClusterRole. With
     the spec the installer gives trust-manager from the bench's values, every ConfigMap rule is a Role, in the
     namespace the bench installs krateo into and the trust namespace (where cert-manager runs)."""
-    rec = installer_render.check(pulled, _values(), _patch())
+    rec = installer_render.check(pulled, _values(), CRN)
     spec = next(c["spec"] for c in rec["components"] if c["name"] == "trust-manager")
     assert spec["trust-manager"]["app"]["targetNamespaces"] == [installer_values.KRATEO_NAMESPACE]
     assert spec["trust-manager"]["app"]["trust"]["namespace"] == "cert-manager"
@@ -186,102 +215,51 @@ def test_trust_managers_configmap_rbac_is_namespaced_with_the_benchs_values(pull
     assert any(k == "ClusterRole" and "delete" in verbs for k, _, verbs in _trust_manager_rules(empty))
 
 
-# ─── run606.sh: the render before any cluster, the patch and its read-back before the platform wait ──
+# ─── run606.sh: the render before any cluster, internalTls installed from the values ──
 
 def _run606(env, **extra):
     return subprocess.run(["bash", str(BENCH_DIR / "run606.sh")], env=dict(env, **extra), capture_output=True,
                           text=True, timeout=600)
 
 
-def test_run606_renders_before_any_cluster_and_patches_then_reads_back_before_the_platform(harness):  # noqa: F811
+def test_run606_renders_before_any_cluster_installs_internal_tls_from_the_values_and_never_edits_the_cr(harness):  # noqa: F811
     env, state, _, tmp = harness
     p = _run606(env)
     log = (tmp / "out" / "run.log").read_text()
     assert p.returncode == 0 and "run complete" in log, log[-3000:]
-    assert json.loads((tmp / "out" / "installer-cr-patch.json").read_text()) == {
-        "spec": {"features": {"internalTls": True}, "internalTls": {"certManagerNamespace": "cert-manager"}}}
-    r = log.index("installer render: rendered ")
-    assert r < log.index("=== step up ===")
-    patched = log.index("installer CR patch: kubectl -n krateo-system patch installers.v")
-    back = log.index("installer CR read back: it holds the run's patch")
-    assert log.index("=== step install ===") < patched < back < log.index("=== step platform ===")
-    # the calls themselves: one patch, of the CR version the installed chart writes, between the install and its read-back
-    import yaml
+    assert log.index("installer render: rendered ") < log.index("=== step up ===")
+    v = yaml.safe_load((tmp / "out" / "installer-values.yaml").read_text())
+    assert v["features"]["internalTls"] is True and v["internalTls"] == {"certManagerNamespace": "cert-manager"}
+    rec = json.loads((tmp / "out" / "installer-render.json").read_text())
+    assert rec["internal_tls"] == {"certManagerNamespace": "cert-manager"}
     from tests.test_run606_real_sequence import _calls
-    version = yaml.safe_load((tmp / "out" / "installer-pulled" / "installer" / "Chart.yaml").read_text())["version"]
-    res = f"installers.v{version.replace('.', '-')}.composition.krateo.io"
     calls = [(c["tool"], c["argv"]) for c in _calls(state)]
-
-    def at(tool, *words):
-        return [i for i, (t, a) in enumerate(calls) if t == tool and all(w in a for w in words)]
-    install = [i for i in at("helm", "install", "installer") if "template" not in calls[i][1]]
-    patches = [i for i in at("kubectl", "patch") if any(x.startswith("installers.") for x in calls[i][1])]
-    reads = [i for i in at("kubectl", "get", "installer") if any(x.startswith("installers.v") for x in calls[i][1])]
-    assert len(install) == 1 and len(patches) == 1 and reads, (install, patches, reads)
-    argv = calls[patches[0]][1]
-    assert res in argv and argv[argv.index("-n") + 1] == "krateo-system"
-    assert argv[argv.index("--type") + 1] == "merge" and argv[argv.index("patch") + 2] == "installer"
-    assert res in calls[reads[0]][1] and install[0] < patches[0] < reads[0]
-    assert (state / "helm-registry-auth.json").exists()
+    install = [a for t, a in calls if t == "helm" and "install" in a and "installer" in a and "template" not in a]
+    assert len(install) == 1 and str(tmp / "out" / "installer-values.yaml") in install[0], install
+    # nothing writes to the Installer CR after the install
+    writes = ("patch", "apply", "replace", "edit", "annotate", "label")
+    assert [a for t, a in calls if t == "kubectl" and any(w in a for w in writes)
+            and any(str(x).startswith("installers.") for x in a)] == []
+    assert not (tmp / "out" / "installer-cr-patch.json").exists()
     _no_registry_username_kept(tmp, state)
-
-
-@pytest.mark.parametrize("mode,why", [
-    ("drops", "install FAILED: the Installer CR does not hold the run's patch: spec.internalTls.certManagerNamespace "
-              "is None, the patch wrote 'cert-manager'"),
-    ("fails", "install FAILED: the Installer CR patch: "),
-    ("unreadable", "install FAILED: the Installer CR could not be read back: "),
-])
-def test_falsifier_a_cr_that_does_not_hold_the_patch_fails_before_the_platform_wait(harness, mode, why):  # noqa: F811
-    env, state, _, tmp = harness
-    p = _run606(env, FAKE_CR_PATCH=mode)
-    log = (tmp / "out" / "run.log").read_text()
-    assert p.returncode != 0 and why in log, log[-3000:]
-    assert "=== step platform ===" not in log
-    _no_registry_username_kept(tmp, state)
-
-
-@pytest.mark.parametrize("mode,asked", [("blip", "installer CR patch: the API server did not answer; asked again"),
-                                        ("blip-read", "installer CR read back: the API server did not answer; asked again")])
-def test_an_api_that_does_not_answer_once_is_asked_again_within_the_bound(harness, mode, asked):  # noqa: F811
-    env, state, _, tmp = harness
-    p = _run606(env, FAKE_CR_PATCH=mode)
-    log = (tmp / "out" / "run.log").read_text()
-    assert p.returncode == 0 and "run complete" in log, log[-3000:]
-    assert log.count(asked) == 1 and "installer CR read back: it holds the run's patch" in log
-    _no_registry_username_kept(tmp, state)
-
-
-def test_falsifier_an_api_that_never_answers_the_patch_fails_at_its_bound(harness):  # noqa: F811
-    env, state, _, tmp = harness
-    p = _run606(env, FAKE_CR_PATCH="down", CR_PATCH_TIMEOUT_S="3")
-    log = (tmp / "out" / "run.log").read_text()
-    assert p.returncode != 0, log[-3000:]
-    assert "install FAILED: the Installer CR patch: the API server did not answer within 3 s" in log
-    assert "=== step platform ===" not in log
-
-
-def test_the_cr_patchs_bound_is_in_the_runs_budget(harness):  # noqa: F811
-    """One more second of the bound is one more second of the plan (the TTL is derived from it)."""
-    import re
-    env, state, _, tmp = harness
-
-    def plan(s):
-        _run606(dict(env, OUT=str(tmp / f"out-{s}")), BENCH_606_DRY_RUN="1", CR_PATCH_TIMEOUT_S=str(s))
-        log = (tmp / f"out-{s}" / "run.log").read_text()
-        assert f"+ CR patch {s} +" in log, log[:2000]
-        return int(re.search(r"= (\d+) s; fits TTL_HOURS", log).group(1))
-    assert plan(301) - plan(300) == 1
 
 
 def _no_registry_username_kept(tmp, state):
-    """#1590 review B2: the live CR carries the registry username; the read-back keeps no file of it."""
+    """The installer is installed with the registry username, piped in: no file the run keeps holds it."""
     from tests.conftest import FAKE_GHCR_USER
-    if (state / "helm-registry-auth.json").exists():          # the CR the fake serves carries it (else: proves nothing)
-        assert json.loads((state / "helm-registry-auth.json").read_text())["username"] == FAKE_GHCR_USER
+    assert json.loads((state / "helm-registry-auth.json").read_text())["username"] == FAKE_GHCR_USER   # it was used
     kept = [f for f in (tmp / "out").rglob("*") if f.is_file() and FAKE_GHCR_USER.encode() in f.read_bytes()]
     assert kept == []
-    assert not [f for f in (tmp / "out").rglob("*readback*")]
+
+
+def test_falsifier_run606_refuses_an_installer_that_drops_internal_tls_before_up(harness):  # noqa: F811
+    env, state, _, tmp = harness
+    p = _run606(env, BENCH_606_DRY_RUN="1", FAKE_INSTALLER_DROPS_TLS="1")
+    log = (tmp / "out" / "run.log").read_text()
+    assert p.returncode != 0, log[-3000:]
+    assert ("registry FAILED: installer render: the CR a fresh install of this installer") in log, log[-3000:]
+    assert "does not hold the run's internalTls.certManagerNamespace='cert-manager' (the CR: None)" in log
+    assert "=== step up ===" not in log
 
 
 def test_falsifier_run606_refuses_a_guard_nobody_listed_before_up(harness):  # noqa: F811
@@ -297,10 +275,9 @@ def test_falsifier_run606_refuses_a_guard_nobody_listed_before_up(harness):  # n
     assert "=== step up ===" not in log
 
 
-def test_run606s_dry_pass_renders_and_logs_the_patch_it_would_apply(harness):  # noqa: F811
+def test_run606s_dry_pass_renders_the_cr_the_values_write(harness):  # noqa: F811
     env, state, _, tmp = harness
     p = _run606(env, BENCH_606_DRY_RUN="1")
     log = (tmp / "out" / "run.log").read_text()
     assert p.returncode == 0, log[-3000:]
-    assert "installer render: rendered " in log and "DRY: kubectl -n krateo-system get installers.v" in log
-    assert "--patch-file" in log
+    assert "installer render: rendered " in log and "installer internalTls in that CR: " in log
