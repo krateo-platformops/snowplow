@@ -231,7 +231,7 @@ def test_verify483_item_6_accepts_it_and_never_a_required_one():
     others = [x for x in _required() if x["name"] != "snowplow"]
 
     def item6(leaves):
-        r = diag606.evaluate483([_inst()], leaves + [obs], [], True, [])
+        r = diag606.evaluate483([_inst()], leaves + [obs], [], True, [], expected=[])
         return next(c for c in r["checks"] if c["item"] == 6)
     ca = _cr("internal-ca-bundle", "Unknown", "ZeroEvidence")
     assert item6(_required() + [ca])["pass"] is True
@@ -271,11 +271,11 @@ def test_evaluate483_item1_is_observability_only_and_item6_gates_others():
     cds = [_sid("compositiondefinitions", "alert-provider-crd"), kog]
     r = diag606.evaluate483([_inst(False, f"1 of 41 managed children are not ready: {KOG}",
                                    declares=("krateo-observability",))],
-                            [obs], cds, True, [])
+                            [obs], cds, True, [], expected=[])
     assert r["verdict"] == "PASS", r["checks"]
     assert [a["id"] for a in r["known_unrelated_allowed"]] == [KOG]
     cds.append(_sid("compositiondefinitions", "oasgen-provider", False, "timeout"))
-    r = diag606.evaluate483([_inst(declares=("krateo-observability",))], [obs], cds, True, [])
+    r = diag606.evaluate483([_inst(declares=("krateo-observability",))], [obs], cds, True, [], expected=[])
     assert r["verdict"] == "FAIL"
     assert [c["item"] for c in r["checks"] if not c["pass"]] == [6]
 

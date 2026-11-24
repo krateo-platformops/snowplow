@@ -91,12 +91,12 @@ def test_evaluate483_pass_and_item5_recorded_only():
     leaves = [_s("authn"), _s("krateo-observability"), _s("alert-provider-crd")]
     r = diag606.evaluate483([_inst(*DECLARED)], leaves,
                             [_s("authn"), _s("alert-provider-crd")], True,
-                            [{"metadata": {"name": "sre-pod-crashloop"}}])
+                            [{"metadata": {"name": "sre-pod-crashloop"}}], expected=list(DECLARED))
     assert r["verdict"] == "PASS"
     assert r["recorded"]["as_expected"] is True
     # item 5 never gates: no Alert CRs at all still PASSes 1-4
     r = diag606.evaluate483([_inst(*DECLARED)], leaves,
-                            [_s("alert-provider-crd")], True, [])
+                            [_s("alert-provider-crd")], True, [], expected=list(DECLARED))
     assert r["verdict"] == "PASS" and r["recorded"]["as_expected"] is False
 
 
@@ -112,9 +112,37 @@ def test_evaluate483_each_gating_item_fails_alone(mut, item):
     C = [_s("authn"), _s("alert-provider-crd")]
     crd = [True]
     mut(L, C, crd)
-    r = diag606.evaluate483([_inst(*DECLARED)], L, C, crd[0], [])
+    r = diag606.evaluate483([_inst(*DECLARED)], L, C, crd[0], [], expected=list(DECLARED))
     assert r["verdict"] == "FAIL"
     assert [c["item"] for c in r["checks"] if not c["pass"]] == [item]
+
+
+@pytest.mark.parametrize("cds,leaves,ok", [
+    (("alert-provider",), ("alert-provider",), True),
+    ((), ("alert-provider",), False), (("alert-provider",), (), False), ((), (), False),
+])
+def test_item_4_wants_alert_provider_in_both_layers_when_the_install_renders_it(cds, leaves, ok):
+    """Installer 0.3.703+ renders it with the portal feature: absent is then the failure, not present."""
+    r = diag606.evaluate483([_inst(*DECLARED)], [_s(n) for n in (*DECLARED, *leaves)],
+                            [_s(n) for n in ("authn", "alert-provider-crd", *cds)], True, [],
+                            expected=[*DECLARED, "alert-provider"])
+    c = next(c for c in r["checks"] if c["item"] == 4)
+    assert c["pass"] is ok and c["detail"] == {"rendered": True, "in_cds": bool(cds), "as_component": bool(leaves)}
+    assert [x["item"] for x in r["checks"] if not x["pass"]] == ([] if ok else [4])
+
+
+def test_falsifier_verify483_needs_the_record_of_a_render_that_passed(tmp_path, monkeypatch):
+    """Without it nothing says whether alert-provider belongs: refused, and no object is read."""
+    monkeypatch.setattr(diag606, "core_features", lambda p: ())
+    monkeypatch.setattr(diag606, "verify483", lambda *a, **kw: pytest.fail("read the cluster"))
+    rec = tmp_path / "r.json"
+    rec.write_text(json.dumps({"kind": "installer_render_check", "ok": False, "rendered": ["a"]}))
+    argv = ["verify483", "--kubeconfig", "k", "--context", "c", "--installer-chart", str(tmp_path), "--out", str(tmp_path / "o")]
+    for p in (rec, tmp_path / "absent.json"):
+        assert diag606.main([*argv, "--rendered", str(p)]) == 2
+    with pytest.raises(SystemExit):
+        diag606.main(argv)
+    assert not (tmp_path / "o").exists()
 
 
 def test_chart_inspector_error_is_kept_verbatim():
@@ -153,11 +181,13 @@ def test_oci_run_passes_verify483_headline_first_and_continues(harness):
     assert "[platform] verdict READY (with allow-listed known-unrelated" in out
     # HEADLINE: item 4 printed FIRST among the verify483 result lines
     vlines = [ln for ln in out.splitlines() if ln.startswith("[verify483]")]
-    assert vlines[0] == "[verify483] HEADLINE (4) PASS alert-provider ABSENT (present = gate too wide)"
+    assert vlines[0] == "[verify483] HEADLINE (4) PASS alert-provider present exactly when this run's install renders it"
     assert vlines[1].startswith("[verify483] (4) PASS")
     v = json.loads((tmp / "out" / "verify483.json").read_text())
     assert v["verdict"] == "PASS" and v["headline"]["result"] == "PASS"
     assert v["checks"][0]["item"] == 4
+    # the recorded installer renders it (feature portal), and the fake serves what it renders
+    assert v["checks"][0]["detail"] == {"rendered": True, "in_cds": True, "as_component": True}
     assert sorted(c["item"] for c in v["checks"]) == [1, 2, 3, 4, 6]
     # the definition 401s, so its declared CR is never created: both are excused
     assert [a["id"] for a in v["known_unrelated_allowed"]] == [
@@ -221,14 +251,14 @@ def test_local_chart_mode_is_refused(harness, var):
     assert not _calls(state)
 
 
-def test_gate_too_wide_fails_verify483_with_diagnostics_and_teardown(harness):
+def test_a_failed_item_fails_verify483_with_diagnostics_and_teardown(harness):
     env, state, ambient, tmp = harness
     env = _env483(env)
-    env["FAKE_483"] = "wide"
+    env.pop("FAKE_483", None)                           # the Alert CRD is not there (item 2)
     p = _run(env)
     out = p.stdout + p.stderr
     assert p.returncode != 0
-    assert "[verify483] HEADLINE (4) FAIL alert-provider ABSENT" in out
+    assert f"[verify483] (2) FAIL crd {diag606.ALERT_CRD} present" in out
     assert "=== step data ===" not in p.stderr          # no measurement
     diag = tmp / "out" / "diagnostics"
     assert (diag / "focus-483.json").exists()

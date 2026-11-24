@@ -498,9 +498,10 @@ def _cond(s: dict | None, t: str) -> str | None:
 
 
 def evaluate483(installer: list[dict], leaves: list[dict], cds: list[dict],
-                alert_crd_present: bool, alerts: list[dict], *,
+                alert_crd_present: bool, alerts: list[dict], *, expected: list[str],
                 allow=DEFAULT_ALLOW_NOT_READY, required=REQUIRED_READY) -> dict:
-    """Pure: the run-4 assertions, narrowed to the component under test.
+    """Pure: the run-4 assertions, narrowed to the component under test. `expected`: the components this run's install
+    renders (installer_render.rendered_names), which decide whether alert-provider belongs (item 4).
 
     Items 1-4 gate; item 5 is recorded only; item 6 gates that no child
     OUTSIDE the allow-list is not-ready (both layers), so the allow-list can
@@ -520,9 +521,9 @@ def evaluate483(installer: list[dict], leaves: list[dict], cds: list[dict],
          "pass": bool(alert_crd_present)},
         {"item": 3, "check": "alert-provider-crd in CompositionDefinitions",
          "pass": "alert-provider-crd" in cd_names},
-        {"item": 4, "check": "alert-provider ABSENT (present = gate too wide)",
-         "pass": "alert-provider" not in cd_names and "alert-provider" not in by_name,
-         "detail": {"in_cds": "alert-provider" in cd_names,
+        {"item": 4, "check": "alert-provider present exactly when this run's install renders it",
+         "pass": all(("alert-provider" in got) == ("alert-provider" in expected) for got in (cd_names, by_name)),
+         "detail": {"rendered": "alert-provider" in expected, "in_cds": "alert-provider" in cd_names,
                     "as_component": "alert-provider" in by_name}},
         {"item": 6, "check": "no not-ready child outside the allow-list (CDs + CRs)",
          "pass": not st["unexpected_not_ready"],
@@ -537,8 +538,8 @@ def evaluate483(installer: list[dict], leaves: list[dict], cds: list[dict],
             "alerts": alert_rows,
             "as_expected": ("sre-pod-crashloop" in names
                             and not any(r["has_status"] for r in alert_rows))}
-    # Item 4 is the HEADLINE (run 5): the #483 gate must install the CRD
-    # without pulling in alert-provider. It is listed first everywhere.
+    # Item 4 is the HEADLINE (run 5): the #483 gate must install the CRD without pulling in alert-provider where the
+    # install does not render it (installers where it has another feature). It is listed first everywhere.
     checks.sort(key=lambda c: (c["item"] != 4, c["item"]))
     headline = next(c for c in checks if c["item"] == 4)
     return {"verdict": "PASS" if all(c["pass"] for c in checks) else "FAIL",
@@ -555,13 +556,13 @@ def _alert_crd_present(k: "Kube") -> bool:
     return rc == 0
 
 
-def verify483(k: "Kube", allow=None, required=REQUIRED_READY, core: tuple[str, ...] = ()) -> dict:
+def verify483(k: "Kube", expected: list[str], allow=None, required=REQUIRED_READY, core: tuple[str, ...] = ()) -> dict:
     allow = allow_list_from_env() if allow is None else allow
     inst, leaves = _leaf_summaries(k, core=core)
     cds = _cd_summaries(k)
     present = _alert_crd_present(k)
     alerts = k.items(ALERT_CRD, "-A") if present else []
-    return evaluate483(inst, leaves, cds, present, alerts,
+    return evaluate483(inst, leaves, cds, present, alerts, expected=expected,
                        allow=allow, required=required)
 
 
@@ -1267,11 +1268,12 @@ def main(argv=None) -> int:
             s.add_argument("--timeout-s", type=float, default=2700)
             s.add_argument("--interval-s", type=float, default=60)
             s.add_argument("--reason-out", help="file the failure's named reason is written to")
+        else:
+            s.add_argument("--out", required=True)
+        if name in ("wait-installer", "verify483"):
             s.add_argument("--rendered", required=True,
                            help="the run's composition render record (installer-render.json): the components the live "
                                 "Installer CR must declare, exactly")
-        else:
-            s.add_argument("--out", required=True)
         if name == "definitions":
             s.add_argument("--at", required=True, choices=("platform_end", "teardown"))
             s.add_argument("--logs-dir", required=True)
@@ -1312,7 +1314,13 @@ def main(argv=None) -> int:
         core = ()
     k = Kube(a.kubeconfig, a.context)
     if a.cmd == "verify483":
-        res = verify483(k, core=core)
+        from bench import installer_render
+        try:
+            expected = installer_render.rendered_names(a.rendered)
+        except (installer_render.Refused, OSError, ValueError) as e:
+            print(f"refusing: {e}", file=sys.stderr, flush=True)
+            return 2
+        res = verify483(k, expected, core=core)
         with open(a.out, "w") as fh:
             fh.write(redact(json.dumps(redact_credentials(res), indent=2, default=str), _pull_account()))
         h = res["headline"]
@@ -1331,7 +1339,7 @@ def main(argv=None) -> int:
             print(f"[verify483] KNOWN-UNRELATED not ready (allowed): {a['id']} "
                   f"reason matched {a['expected_reason']!r}", flush=True)
         print(f"[verify483] verdict {res['verdict']} "
-              f"(headline: alert-provider ABSENT = {h['result']})", flush=True)
+              f"(headline: {h['check']} = {h['result']})", flush=True)
         return 0 if res["verdict"] == "PASS" else 1
     if a.cmd == "wait-installer":
         print(f"[platform] installer core features (inst.coreFeatures): {' '.join(core) or '(none)'}",

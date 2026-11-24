@@ -991,9 +991,9 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
         items([] if gone else json.loads(os.environ.get("FAKE_PVS", "[]")))
     if a[:2] == ["delete", "pvc"]:
         open(os.path.join(STATE, "pvcs_deleted"), "w").write("1"); sys.exit(0)
-    f483 = os.environ.get("FAKE_483", "")          # "", pass, wide
+    f483 = os.environ.get("FAKE_483", "")          # "", pass
     if a[:3] == ["get", "crd", "alerts.observability.krateo.io"]:
-        sys.exit(0 if f483 in ("pass", "wide") else 1)
+        sys.exit(0 if f483 == "pass" else 1)
     if a[:3] == ["rollout", "restart", "deploy/snowplow"] and os.environ.get("FAKE_GKE_RESIZE_AT_REBOOT") == "1":
         # #1422: GKE starts resizing the control plane as the measured reboot begins (run 27c N2), and has not
         # finished at collect: the operation GKE lists for the cluster this context names
@@ -1257,7 +1257,6 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             rendered = []
         named = {"authn", "snowplow", "frontend", "portal"}
         named |= {"alert-provider-crd", "krateo-observability"} if f483 else set()
-        named |= {"alert-provider"} if f483 == "wide" else set()
         named |= {"github-provider-kog"} if kog else set()
         named |= {"dashboard-page"} if os.environ.get("FAKE_DECLARED_LATER") == "1" else set()
         fake_comps = [n for n in rendered if n not in named]
@@ -1267,8 +1266,6 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             if f483:
                 kinds += [("alertprovidercrds", "AlertProviderCrds"),
                           ("krateoobservabilities", "KrateoObservability")]
-            if f483 == "wide":
-                kinds.append(("alertproviders", "AlertProvider"))
             items([{"spec": {"group": "composition.krateo.io",
                              "names": {"plural": p, "kind": k}}} for p, k in kinds])
         if what.startswith("fakecomponents."):
@@ -1277,8 +1274,6 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             items([cr("AlertProviderCrds", "alert-provider-crd", True)])
         if what.startswith("krateoobservabilities."):
             items([cr("KrateoObservability", "krateo-observability", True)])
-        if what.startswith("alertproviders."):
-            items([cr("AlertProvider", "alert-provider", True)])
         if what.startswith("alerts.observability"):
             items([{"metadata": {"name": "sre-pod-crashloop", "namespace": "krateo-system"}}])
         if what.startswith("installers."):
@@ -1302,8 +1297,6 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             if f483:
                 decl += [("alert-provider-crd", "AlertProviderCrds", None),
                          ("krateo-observability", "KrateoObservability", None)]
-            if f483 == "wide":
-                decl.append(("alert-provider", "AlertProvider", None))
             if kog:
                 decl.append(("github-provider-kog", "GithubProviderKog", None))
             if os.environ.get("FAKE_DECLARED_LATER") == "1":   # run 17: deps on portal, not created yet
@@ -1353,7 +1346,7 @@ FAKE_KUBECTL = _COMMON + _CANON + fake_gke_api.LOADER + textwrap.dedent("""\
             cds = [cr("CompositionDefinition", "authn", True)]
             if f483:
                 cds.append(cr("CompositionDefinition", "alert-provider-crd", True))
-            if f483 == "wide":
+            if f483 and "alert-provider" in rendered:
                 cds.append(cr("CompositionDefinition", "alert-provider", True))
             if kog:
                 cds.append(cr("CompositionDefinition", "github-provider-kog", False, "Creating", "",
