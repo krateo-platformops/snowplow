@@ -201,7 +201,11 @@ import (
 // yet, #1560) and moves names.go's certificate parsing into clientCertificate,
 // which certificateCommonName now calls: OwnsSecret, SessionSecretNames and
 // FromSecret return the same answers.
-const PinnedPlumbingVersion = "v1.103.0"
+//
+// v1.103.0 → v1.106.0 (#1504): re-audited by `diff -r` of every plumbing
+// package this module imports. Only crdgen/ (the chart guard's; see chartcrd)
+// changed; every package this file transcribes is byte-identical.
+const PinnedPlumbingVersion = "v1.106.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
