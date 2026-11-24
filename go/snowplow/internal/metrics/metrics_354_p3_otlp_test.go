@@ -37,7 +37,7 @@ func TestIssue354_P3_DOTLP_DriverSeriesReachOTLP(t *testing.T) {
 	cache.CompleteRBACSnapshotForTest(t)
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
-	t.Setenv("RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS", "0")
+	t.Cleanup(cache.SetRefresherRateFloorForTest("0"))
 	t.Setenv("RESOLVED_CACHE_REFRESHER_PARALLELISM", "1")
 	cache.ResetRefresherForTest()
 	cache.ResetResolvedCacheForTest()
