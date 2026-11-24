@@ -124,7 +124,7 @@ def test_falsifier_the_values_follow_the_record_they_are_not_a_second_list(monke
 def test_falsifier_a_deviation_changes_only_its_feature(monkeypatch):
     rec = installer_features.load()
     monkeypatch.setattr(installer_features, "DEVIATIONS", {"auditWorm": (False, "why", "ruling")})
-    got = _effective_features(installer_values.document("1.12.75"))
+    got = _doc_features(installer_values.document("1.12.75"))
     assert got == {**rec["features"], "auditWorm": False}
 
 

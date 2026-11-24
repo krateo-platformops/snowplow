@@ -541,13 +541,13 @@ def test_the_bench_enable_rule_is_the_installers(tmp_path, snowplow):
     (stripped / "files" / "component-pins.min.yaml").write_text(yaml.safe_dump(bare))
     assert stock - registered(stripped) == {"cert-manager", "cert-manager-issuers"}
     assert registered(stripped) < stock
-    feats = {**yaml.safe_load((root / "values.yaml").read_text())["features"], **effective["features"]}
+    feats = {**yaml.safe_load((root / "values.yaml").read_text())["features"], **run["features"]}
     core = set(diag606.core_features(str(pulled)))
     # #1572: the bench's rule is the installer's inst.compEnabled (bench/installer_features.py)
     rule = {c["name"] for c in pins["components"] if installer_features.component_enabled(c, feats, core)}
     assert rule == stock
     # with coreAgents on (#1572), its private-image components are registered too
-    assert sorted(set(ghcr_pull.private_image_paths(str(pulled), effective)) & stock) == [
+    assert sorted(set(ghcr_pull.private_image_paths(str(pulled), run)) & stock) == [
         "agentgateway-policies", "alert-provider", "config-refs-mcp-server", "core-provider-agent", "kagent",
         "repo-mcp-server"]
 
