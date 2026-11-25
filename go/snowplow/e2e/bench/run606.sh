@@ -1428,7 +1428,7 @@ s_verify483() {
   # installer#483 acceptance. Items 1-4 gate (a FAIL aborts the run with
   # diagnostics before teardown); item 5 is recorded only.
   run python3 -m bench.diag606 verify483 --kubeconfig "$KCFG" --context "$KCTX" \
-      --installer-chart "$OUT/installer-pulled" --rendered "$OUT/installer-render.json" --out "$OUT/verify483.json"
+      --installer-chart "$OUT/installer-pulled" --out "$OUT/verify483.json"
 }
 # platform_definitions <platform_end|teardown>: every RestDefinition and
 # CompositionDefinition (its create markers, Ready/Synced, what it manages;

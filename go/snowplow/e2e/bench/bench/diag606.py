@@ -498,14 +498,21 @@ def _cond(s: dict | None, t: str) -> str | None:
 
 
 def evaluate483(installer: list[dict], leaves: list[dict], cds: list[dict],
-                alert_crd_present: bool, alerts: list[dict], *, expected: list[str],
+                alert_crd_present: bool, alerts: list[dict], *,
                 allow=DEFAULT_ALLOW_NOT_READY, required=REQUIRED_READY) -> dict:
-    """Pure: the run-4 assertions, narrowed to the component under test. `expected`: the components this run's install
-    renders (installer_render.rendered_names), which decide whether alert-provider belongs (item 4).
+    """Pure: the run-4 assertions, narrowed to the component under test: on a portal install, krateo-observability
+    renders and is Ready because the Alert CRD it needs comes with it (installer#482/#483).
 
-    Items 1-4 gate; item 5 is recorded only; item 6 gates that no child
+    Items 1-3 gate; item 5 is recorded only; item 6 gates that no child
     OUTSIDE the allow-list is not-ready (both layers), so the allow-list can
     excuse only the known-unrelated github-provider-kog 401.
+
+    Item 4 ("alert-provider ABSENT: the #483 gate is not too wide") is RETIRED (#1598 review B1). It held while
+    alert-provider had another feature than its CRD (specialistAgents, installer#482). Since installer#502
+    (2026-10-20, "Let alert-provider run on a portal-only install") both have feature portal, so every portal
+    install renders alert-provider by design, and nothing a cluster shows can say whether a gate is too wide: whether a component belongs is decided by the same pins that render it, and what was
+    rendered is already held to the live Installer CR (wait_installer, DeclaredSet) and to readiness (item 6). The
+    number stays unused, so items 1-3, 5 and 6 keep their meaning in every earlier record.
     """
     by_name = {s.get("name"): s for s in leaves}
     cd_names = {s.get("name") for s in cds}
@@ -521,10 +528,6 @@ def evaluate483(installer: list[dict], leaves: list[dict], cds: list[dict],
          "pass": bool(alert_crd_present)},
         {"item": 3, "check": "alert-provider-crd in CompositionDefinitions",
          "pass": "alert-provider-crd" in cd_names},
-        {"item": 4, "check": "alert-provider present exactly when this run's install renders it",
-         "pass": all(("alert-provider" in got) == ("alert-provider" in expected) for got in (cd_names, by_name)),
-         "detail": {"rendered": "alert-provider" in expected, "in_cds": "alert-provider" in cd_names,
-                    "as_component": "alert-provider" in by_name}},
         {"item": 6, "check": "no not-ready child outside the allow-list (CDs + CRs)",
          "pass": not st["unexpected_not_ready"],
          "detail": {"unexpected": st["unexpected_not_ready"]}},
@@ -538,13 +541,7 @@ def evaluate483(installer: list[dict], leaves: list[dict], cds: list[dict],
             "alerts": alert_rows,
             "as_expected": ("sre-pod-crashloop" in names
                             and not any(r["has_status"] for r in alert_rows))}
-    # Item 4 is the HEADLINE (run 5): the #483 gate must install the CRD without pulling in alert-provider where the
-    # install does not render it (installers where it has another feature). It is listed first everywhere.
-    checks.sort(key=lambda c: (c["item"] != 4, c["item"]))
-    headline = next(c for c in checks if c["item"] == 4)
     return {"verdict": "PASS" if all(c["pass"] for c in checks) else "FAIL",
-            "headline": {"item": 4, "check": headline["check"],
-                         "result": "PASS" if headline["pass"] else "FAIL"},
             "checks": checks, "recorded": info,
             "known_unrelated_allowed": st["allowed_not_ready"],
             "allow_list": st["allow_list"],
@@ -556,13 +553,13 @@ def _alert_crd_present(k: "Kube") -> bool:
     return rc == 0
 
 
-def verify483(k: "Kube", expected: list[str], allow=None, required=REQUIRED_READY, core: tuple[str, ...] = ()) -> dict:
+def verify483(k: "Kube", allow=None, required=REQUIRED_READY, core: tuple[str, ...] = ()) -> dict:
     allow = allow_list_from_env() if allow is None else allow
     inst, leaves = _leaf_summaries(k, core=core)
     cds = _cd_summaries(k)
     present = _alert_crd_present(k)
     alerts = k.items(ALERT_CRD, "-A") if present else []
-    return evaluate483(inst, leaves, cds, present, alerts, expected=expected,
+    return evaluate483(inst, leaves, cds, present, alerts,
                        allow=allow, required=required)
 
 
@@ -1270,7 +1267,7 @@ def main(argv=None) -> int:
             s.add_argument("--reason-out", help="file the failure's named reason is written to")
         else:
             s.add_argument("--out", required=True)
-        if name in ("wait-installer", "verify483"):
+        if name == "wait-installer":
             s.add_argument("--rendered", required=True,
                            help="the run's composition render record (installer-render.json): the components the live "
                                 "Installer CR must declare, exactly")
@@ -1314,17 +1311,9 @@ def main(argv=None) -> int:
         core = ()
     k = Kube(a.kubeconfig, a.context)
     if a.cmd == "verify483":
-        from bench import installer_render
-        try:
-            expected = installer_render.rendered_names(a.rendered)
-        except (installer_render.Refused, OSError, ValueError) as e:
-            print(f"refusing: {e}", file=sys.stderr, flush=True)
-            return 2
-        res = verify483(k, expected, core=core)
+        res = verify483(k, core=core)
         with open(a.out, "w") as fh:
             fh.write(redact(json.dumps(redact_credentials(res), indent=2, default=str), _pull_account()))
-        h = res["headline"]
-        print(f"[verify483] HEADLINE (4) {h['result']} {h['check']}", flush=True)
         for c in res["checks"]:
             print(f"[verify483] ({c['item']}) {'PASS' if c['pass'] else 'FAIL'} "
                   f"{c['check']}", flush=True)
@@ -1338,8 +1327,7 @@ def main(argv=None) -> int:
         for a in res["known_unrelated_allowed"]:
             print(f"[verify483] KNOWN-UNRELATED not ready (allowed): {a['id']} "
                   f"reason matched {a['expected_reason']!r}", flush=True)
-        print(f"[verify483] verdict {res['verdict']} "
-              f"(headline: {h['check']} = {h['result']})", flush=True)
+        print(f"[verify483] verdict {res['verdict']}", flush=True)
         return 0 if res["verdict"] == "PASS" else 1
     if a.cmd == "wait-installer":
         print(f"[platform] installer core features (inst.coreFeatures): {' '.join(core) or '(none)'}",

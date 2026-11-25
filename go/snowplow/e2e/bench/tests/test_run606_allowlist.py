@@ -209,10 +209,13 @@ def test_falsifier_a_wrong_declared_set_fails_at_the_poll_that_sees_it(monkeypat
     monkeypatch.setattr(diag606, "_leaf_summaries", lambda k, **kw: ([_inst(declares=("authn",))], [_sid("x", "authn")]))
     monkeypatch.setattr(diag606, "_cd_summaries", lambda k: [])
     monkeypatch.setattr(diag606, "image_pull_failures", lambda k: [])
-    slept, why, said = [], [], []
+    why, said = [], []
+
+    def no_wait(s):  # the clock is frozen: a wait here would never end, so the first one fails the test (#1598 review N1)
+        pytest.fail(f"waited {s}s for a declared set that waiting cannot fix")
     assert diag606.wait_installer(None, timeout_s=2700, allow=(), required=(), expected=["authn", "trust-manager"],
-                                  log=said.append, clock=lambda: 0, sleep=slept.append, reason=why) is False
-    assert slept == [] and len(why) == 1 and "rendered, not declared: trust-manager" in why[0]
+                                  log=said.append, clock=lambda: 0, sleep=no_wait, reason=why) is False
+    assert len(why) == 1 and "rendered, not declared: trust-manager" in why[0]
     assert any(m.startswith("[platform] FAILED: the live Installer CR is not the run's") for m in said)
 
 
@@ -231,7 +234,7 @@ def test_verify483_item_6_accepts_it_and_never_a_required_one():
     others = [x for x in _required() if x["name"] != "snowplow"]
 
     def item6(leaves):
-        r = diag606.evaluate483([_inst()], leaves + [obs], [], True, [], expected=[])
+        r = diag606.evaluate483([_inst()], leaves + [obs], [], True, [])
         return next(c for c in r["checks"] if c["item"] == 6)
     ca = _cr("internal-ca-bundle", "Unknown", "ZeroEvidence")
     assert item6(_required() + [ca])["pass"] is True
@@ -271,11 +274,11 @@ def test_evaluate483_item1_is_observability_only_and_item6_gates_others():
     cds = [_sid("compositiondefinitions", "alert-provider-crd"), kog]
     r = diag606.evaluate483([_inst(False, f"1 of 41 managed children are not ready: {KOG}",
                                    declares=("krateo-observability",))],
-                            [obs], cds, True, [], expected=[])
+                            [obs], cds, True, [])
     assert r["verdict"] == "PASS", r["checks"]
     assert [a["id"] for a in r["known_unrelated_allowed"]] == [KOG]
     cds.append(_sid("compositiondefinitions", "oasgen-provider", False, "timeout"))
-    r = diag606.evaluate483([_inst(declares=("krateo-observability",))], [obs], cds, True, [], expected=[])
+    r = diag606.evaluate483([_inst(declares=("krateo-observability",))], [obs], cds, True, [])
     assert r["verdict"] == "FAIL"
     assert [c["item"] for c in r["checks"] if not c["pass"]] == [6]
 

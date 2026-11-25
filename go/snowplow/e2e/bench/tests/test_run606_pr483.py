@@ -1,7 +1,7 @@
 """Bench run 5: install the RELEASED installer (0.3.425, #483 merged) the
 ordinary OCI way, preflight the registry chart (resolves + carries the #483
-pins) before any cluster exists, and assert the #483 outcome (verify483,
-headline item 4) before the 50K measurement. Local-chart mode is refused:
+pins) before any cluster exists, and assert the #483 outcome (verify483:
+krateo-observability Ready with its Alert CRD) before the 50K measurement. Local-chart mode is refused:
 it cannot work for this installer (run 4; self-bootstrap.yaml:215).
 
 Uses the fake gcloud/kubectl/helm harness from test_run606_real_sequence.
@@ -32,7 +32,7 @@ def _chart(tmp_path, *, feature="portal", obs_deps=("alert-provider-crd",),
         (chart / "charts" / "core-provider-2.13.24.tgz").write_bytes(b"x")
     (chart / "files" / "component-pins.yaml").write_text(yaml.safe_dump({"components": [
         {"name": "alert-provider-crd", "feature": feature},
-        {"name": "alert-provider", "feature": "specialistAgents"},
+        {"name": "alert-provider", "feature": "portal"},        # 0.3.703 and 0.3.707: alert-provider has the CRD's feature
         {"name": "krateo-observability", "feature": "portal", "deps": list(obs_deps)},
     ]}))
     return chart
@@ -91,12 +91,12 @@ def test_evaluate483_pass_and_item5_recorded_only():
     leaves = [_s("authn"), _s("krateo-observability"), _s("alert-provider-crd")]
     r = diag606.evaluate483([_inst(*DECLARED)], leaves,
                             [_s("authn"), _s("alert-provider-crd")], True,
-                            [{"metadata": {"name": "sre-pod-crashloop"}}], expected=list(DECLARED))
+                            [{"metadata": {"name": "sre-pod-crashloop"}}])
     assert r["verdict"] == "PASS"
     assert r["recorded"]["as_expected"] is True
     # item 5 never gates: no Alert CRs at all still PASSes 1-4
     r = diag606.evaluate483([_inst(*DECLARED)], leaves,
-                            [_s("alert-provider-crd")], True, [], expected=list(DECLARED))
+                            [_s("alert-provider-crd")], True, [])
     assert r["verdict"] == "PASS" and r["recorded"]["as_expected"] is False
 
 
@@ -104,45 +104,26 @@ def test_evaluate483_pass_and_item5_recorded_only():
     (lambda L, C, crd: L.__setitem__(1, _s("krateo-observability", synced=False)), 1),
     (lambda L, C, crd: crd.__setitem__(0, False), 2),
     (lambda L, C, crd: C.pop(), 3),
-    (lambda L, C, crd: C.append(_s("alert-provider")), 4),
-    (lambda L, C, crd: L.append(_s("alert-provider")), 4),
 ])
 def test_evaluate483_each_gating_item_fails_alone(mut, item):
     L = [_s("authn"), _s("krateo-observability"), _s("alert-provider-crd")]
     C = [_s("authn"), _s("alert-provider-crd")]
     crd = [True]
     mut(L, C, crd)
-    r = diag606.evaluate483([_inst(*DECLARED)], L, C, crd[0], [], expected=list(DECLARED))
+    r = diag606.evaluate483([_inst(*DECLARED)], L, C, crd[0], [])
     assert r["verdict"] == "FAIL"
     assert [c["item"] for c in r["checks"] if not c["pass"]] == [item]
 
 
-@pytest.mark.parametrize("cds,leaves,ok", [
-    (("alert-provider",), ("alert-provider",), True),
-    ((), ("alert-provider",), False), (("alert-provider",), (), False), ((), (), False),
-])
-def test_item_4_wants_alert_provider_in_both_layers_when_the_install_renders_it(cds, leaves, ok):
-    """Installer 0.3.703+ renders it with the portal feature: absent is then the failure, not present."""
-    r = diag606.evaluate483([_inst(*DECLARED)], [_s(n) for n in (*DECLARED, *leaves)],
-                            [_s(n) for n in ("authn", "alert-provider-crd", *cds)], True, [],
-                            expected=[*DECLARED, "alert-provider"])
-    c = next(c for c in r["checks"] if c["item"] == 4)
-    assert c["pass"] is ok and c["detail"] == {"rendered": True, "in_cds": bool(cds), "as_component": bool(leaves)}
-    assert [x["item"] for x in r["checks"] if not x["pass"]] == ([] if ok else [4])
-
-
-def test_falsifier_verify483_needs_the_record_of_a_render_that_passed(tmp_path, monkeypatch):
-    """Without it nothing says whether alert-provider belongs: refused, and no object is read."""
-    monkeypatch.setattr(diag606, "core_features", lambda p: ())
-    monkeypatch.setattr(diag606, "verify483", lambda *a, **kw: pytest.fail("read the cluster"))
-    rec = tmp_path / "r.json"
-    rec.write_text(json.dumps({"kind": "installer_render_check", "ok": False, "rendered": ["a"]}))
-    argv = ["verify483", "--kubeconfig", "k", "--context", "c", "--installer-chart", str(tmp_path), "--out", str(tmp_path / "o")]
-    for p in (rec, tmp_path / "absent.json"):
-        assert diag606.main([*argv, "--rendered", str(p)]) == 2
-    with pytest.raises(SystemExit):
-        diag606.main(argv)
-    assert not (tmp_path / "o").exists()
+@pytest.mark.parametrize("in_cds,as_component", [(True, True), (False, False), (True, False), (False, True)])
+def test_alert_provider_decides_nothing_item_4_is_retired(in_cds, as_component):
+    """#1598 review B1: item 4 could not tell a gate that is too wide from the design (in 0.3.703 and 0.3.707 alert-provider
+    has its CRD's feature). Retired: whether alert-provider is there changes no check, and no headline names it."""
+    leaves = [_s(n) for n in DECLARED] + ([_s("alert-provider")] if as_component else [])
+    cds = [_s("authn"), _s("alert-provider-crd")] + ([_s("alert-provider")] if in_cds else [])
+    r = diag606.evaluate483([_inst(*DECLARED)], leaves, cds, True, [])
+    assert r["verdict"] == "PASS" and sorted(c["item"] for c in r["checks"]) == [1, 2, 3, 6]
+    assert "headline" not in r and not any("alert-provider ABSENT" in c["check"] for c in r["checks"])
 
 
 def test_chart_inspector_error_is_kept_verbatim():
@@ -179,16 +160,13 @@ def test_oci_run_passes_verify483_headline_first_and_continues(harness):
     assert ("ALLOWED(known): compositiondefinitions/krateo-system/github-provider-kog"
             "[response status code 401]") in out
     assert "[platform] verdict READY (with allow-listed known-unrelated" in out
-    # HEADLINE: item 4 printed FIRST among the verify483 result lines
+    # the items in order, no headline (item 4 is retired, #1598 review B1)
     vlines = [ln for ln in out.splitlines() if ln.startswith("[verify483]")]
-    assert vlines[0] == "[verify483] HEADLINE (4) PASS alert-provider present exactly when this run's install renders it"
-    assert vlines[1].startswith("[verify483] (4) PASS")
+    assert [ln.split(" ")[1] for ln in vlines[:4]] == ["(1)", "(2)", "(3)", "(6)"] and "HEADLINE" not in out
+    assert "[verify483] verdict PASS" in out
     v = json.loads((tmp / "out" / "verify483.json").read_text())
-    assert v["verdict"] == "PASS" and v["headline"]["result"] == "PASS"
-    assert v["checks"][0]["item"] == 4
-    # the recorded installer renders it (feature portal), and the fake serves what it renders
-    assert v["checks"][0]["detail"] == {"rendered": True, "in_cds": True, "as_component": True}
-    assert sorted(c["item"] for c in v["checks"]) == [1, 2, 3, 4, 6]
+    assert v["verdict"] == "PASS" and "headline" not in v
+    assert [c["item"] for c in v["checks"]] == [1, 2, 3, 6]
     # the definition 401s, so its declared CR is never created: both are excused
     assert [a["id"] for a in v["known_unrelated_allowed"]] == [
         "compositiondefinitions/krateo-system/github-provider-kog",
