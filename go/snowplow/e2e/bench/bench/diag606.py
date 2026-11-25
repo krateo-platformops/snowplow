@@ -381,7 +381,7 @@ def accepted_not_evaluated(leaves: list[dict], inst_msg: str, required) -> list[
 
 
 def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
-                   allow=DEFAULT_ALLOW_NOT_READY, required=REQUIRED_READY) -> dict:
+                   allow=DEFAULT_ALLOW_NOT_READY, required=REQUIRED_READY, expected=None) -> dict:
     """Readiness across BOTH layers (CompositionDefinitions and component CRs).
 
     ok ⇔ an Installer CR exists, every component it DECLARES (its
@@ -394,6 +394,10 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
     other reason, excuses nothing). An Installer
     CR whose declaration cannot be read is not-ready: which components it
     will still create is then unknown.
+
+    `expected`: the names the run's values rendered before the install (bench/installer_render.py rendered_names).
+    What the live CR declares is read from that CR, so it alone cannot say a feature was lost on the way to the cluster;
+    the two sets must be the same, or the platform is not the run's. None: not compared (the diagnostics, verify483).
 
     A component CR that reconciled and cannot be health-evaluated is neither ready nor not ready: it is named in
     `not_health_evaluated` (and in platform_line) and does not hold the run. Which ones: accepted_not_evaluated.
@@ -442,6 +446,15 @@ def platform_state(installer: list[dict], leaves: list[dict], cds: list[dict],
                                                           f"child ({excused['expected_reason']})"})
             else:
                 unexpected.append({**row, "why": "declared, not created yet"})
+        if expected is not None and declares is not None:
+            got, want_names = {c["name"] for c in declares}, set(expected)
+            if got != want_names:
+                unexpected.append({
+                    "id": f"{inst.get('id') or 'installer'}/declared-set", "reason": "DeclaredSet",
+                    "why": "the live Installer CR does not declare what the run rendered",
+                    "message": (f"it declares {len(got)} component(s), the run rendered {len(want_names)}"
+                                + (f"; rendered, not declared: {', '.join(sorted(want_names - got))}" if want_names - got else "")
+                                + (f"; declared, not rendered: {', '.join(sorted(got - want_names))}" if got - want_names else ""))})
     by_name = {s.get("name"): s for s in leaves}
     req = {n: _cond(by_name.get(n), "Ready") == "True" for n in required}
     ok = bool(installer) and not unexpected and all(req.values())
@@ -487,11 +500,19 @@ def _cond(s: dict | None, t: str) -> str | None:
 def evaluate483(installer: list[dict], leaves: list[dict], cds: list[dict],
                 alert_crd_present: bool, alerts: list[dict], *,
                 allow=DEFAULT_ALLOW_NOT_READY, required=REQUIRED_READY) -> dict:
-    """Pure: the run-4 assertions, narrowed to the component under test.
+    """Pure: the run-4 assertions, narrowed to the component under test: on a portal install, krateo-observability
+    renders and is Ready because the Alert CRD it needs comes with it (installer#482/#483).
 
-    Items 1-4 gate; item 5 is recorded only; item 6 gates that no child
+    Items 1-3 gate; item 5 is recorded only; item 6 gates that no child
     OUTSIDE the allow-list is not-ready (both layers), so the allow-list can
     excuse only the known-unrelated github-provider-kog 401.
+
+    Item 4 ("alert-provider ABSENT: the #483 gate is not too wide") is RETIRED (#1598 review B1). It held while
+    alert-provider had another feature than its CRD (specialistAgents, installer#482). Since installer#502
+    (2026-10-20, "Let alert-provider run on a portal-only install") both have feature portal, so every portal
+    install renders alert-provider by design, and nothing a cluster shows can say whether a gate is too wide: whether a component belongs is decided by the same pins that render it, and what was
+    rendered is already held to the live Installer CR (wait_installer, DeclaredSet) and to readiness (item 6). The
+    number stays unused, so items 1-3, 5 and 6 keep their meaning in every earlier record.
     """
     by_name = {s.get("name"): s for s in leaves}
     cd_names = {s.get("name") for s in cds}
@@ -507,10 +528,6 @@ def evaluate483(installer: list[dict], leaves: list[dict], cds: list[dict],
          "pass": bool(alert_crd_present)},
         {"item": 3, "check": "alert-provider-crd in CompositionDefinitions",
          "pass": "alert-provider-crd" in cd_names},
-        {"item": 4, "check": "alert-provider ABSENT (present = gate too wide)",
-         "pass": "alert-provider" not in cd_names and "alert-provider" not in by_name,
-         "detail": {"in_cds": "alert-provider" in cd_names,
-                    "as_component": "alert-provider" in by_name}},
         {"item": 6, "check": "no not-ready child outside the allow-list (CDs + CRs)",
          "pass": not st["unexpected_not_ready"],
          "detail": {"unexpected": st["unexpected_not_ready"]}},
@@ -524,13 +541,7 @@ def evaluate483(installer: list[dict], leaves: list[dict], cds: list[dict],
             "alerts": alert_rows,
             "as_expected": ("sre-pod-crashloop" in names
                             and not any(r["has_status"] for r in alert_rows))}
-    # Item 4 is the HEADLINE (run 5): the #483 gate must install the CRD
-    # without pulling in alert-provider. It is listed first everywhere.
-    checks.sort(key=lambda c: (c["item"] != 4, c["item"]))
-    headline = next(c for c in checks if c["item"] == 4)
     return {"verdict": "PASS" if all(c["pass"] for c in checks) else "FAIL",
-            "headline": {"item": 4, "check": headline["check"],
-                         "result": "PASS" if headline["pass"] else "FAIL"},
             "checks": checks, "recorded": info,
             "known_unrelated_allowed": st["allowed_not_ready"],
             "allow_list": st["allow_list"],
@@ -724,7 +735,7 @@ def image_pull_line(f: dict) -> str:
 
 
 def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
-                   allow=None, required=REQUIRED_READY, core: tuple[str, ...] = (),
+                   allow=None, required=REQUIRED_READY, core: tuple[str, ...] = (), expected=None,
                    log: Callable[[str], None] = print,
                    clock=time.monotonic, sleep=time.sleep, reason: list | None = None) -> bool:
     """Poll until every child (CDs + CRs) is Ready except the allow-listed
@@ -732,7 +743,8 @@ def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
     poll also reads the pods whose image cannot be pulled and names each at
     the poll it appears; on a timeout `reason` gets the failure's NAME: those
     image pulls first (with their image and the pull Secrets they reference),
-    then what was not Ready."""
+    then what was not Ready. A live Installer CR that does not declare the
+    `expected` components fails at the poll that sees it."""
     allow = allow_list_from_env() if allow is None else allow
     log("[platform] allow-list (known, unrelated): "
         + (", ".join(f"{i}[{r}]" for i, r in allow) or "(empty)"))
@@ -740,7 +752,7 @@ def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
     seen: set = set()
     while True:
         inst, leaves = _leaf_summaries(k, core=core)
-        st = platform_state(inst, leaves, _cd_summaries(k), allow, required)
+        st = platform_state(inst, leaves, _cd_summaries(k), allow, required, expected)
         log(f"[platform] {platform_line(st)}")
         pulls = image_pull_failures(k)
         for f in pulls:
@@ -753,6 +765,15 @@ def wait_installer(k: Kube, *, timeout_s: float, interval_s: float = 60,
                    + ", ".join(a["id"] for a in st["allowed_not_ready"]) + ")"
                    if st["allowed_not_ready"] else ""))
             return True
+        # the declared set never becomes the run's by waiting: the installer's bootstrap writes the CR's spec once, whole,
+        # and nothing here edits it, so the first poll that reads it decides (the paid minutes are not spent waiting)
+        wrong = [u for u in st["unexpected_not_ready"] if u["reason"] == "DeclaredSet"]
+        if wrong:
+            why = f"the live Installer CR is not the run's: {wrong[0]['message']}"
+            log(f"[platform] FAILED: {why}")
+            if reason is not None:
+                reason.append(why)
+            return False
         if clock() >= deadline:
             log(f"[platform] TIMEOUT after {timeout_s:.0f}s")
             why = (f"image pull: {'; '.join(image_pull_line(f) for f in pulls)}; then " if pulls else "")
@@ -1246,6 +1267,10 @@ def main(argv=None) -> int:
             s.add_argument("--reason-out", help="file the failure's named reason is written to")
         else:
             s.add_argument("--out", required=True)
+        if name == "wait-installer":
+            s.add_argument("--rendered", required=True,
+                           help="the run's composition render record (installer-render.json): the components the live "
+                                "Installer CR must declare, exactly")
         if name == "definitions":
             s.add_argument("--at", required=True, choices=("platform_end", "teardown"))
             s.add_argument("--logs-dir", required=True)
@@ -1289,8 +1314,6 @@ def main(argv=None) -> int:
         res = verify483(k, core=core)
         with open(a.out, "w") as fh:
             fh.write(redact(json.dumps(redact_credentials(res), indent=2, default=str), _pull_account()))
-        h = res["headline"]
-        print(f"[verify483] HEADLINE (4) {h['result']} {h['check']}", flush=True)
         for c in res["checks"]:
             print(f"[verify483] ({c['item']}) {'PASS' if c['pass'] else 'FAIL'} "
                   f"{c['check']}", flush=True)
@@ -1304,14 +1327,22 @@ def main(argv=None) -> int:
         for a in res["known_unrelated_allowed"]:
             print(f"[verify483] KNOWN-UNRELATED not ready (allowed): {a['id']} "
                   f"reason matched {a['expected_reason']!r}", flush=True)
-        print(f"[verify483] verdict {res['verdict']} "
-              f"(headline: alert-provider ABSENT = {h['result']})", flush=True)
+        print(f"[verify483] verdict {res['verdict']}", flush=True)
         return 0 if res["verdict"] == "PASS" else 1
     if a.cmd == "wait-installer":
         print(f"[platform] installer core features (inst.coreFeatures): {' '.join(core) or '(none)'}",
               flush=True)
+        from bench import installer_render
+        try:
+            expected = installer_render.rendered_names(a.rendered)
+        except (installer_render.Refused, OSError, ValueError) as e:
+            print(f"refusing: {e}", file=sys.stderr, flush=True)
+            if a.reason_out:
+                with open(a.reason_out, "w") as fh:
+                    fh.write(f"the run's composition render record cannot be read: {e}\n")
+            return 2
         why: list = []
-        ok = wait_installer(k, timeout_s=a.timeout_s, interval_s=a.interval_s, core=core,
+        ok = wait_installer(k, timeout_s=a.timeout_s, interval_s=a.interval_s, core=core, expected=expected,
                             log=lambda m: print(m, flush=True), reason=why)
         if not ok and a.reason_out:
             with open(a.reason_out, "w") as fh:

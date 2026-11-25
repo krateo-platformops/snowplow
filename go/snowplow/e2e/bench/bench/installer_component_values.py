@@ -109,6 +109,16 @@ IDENTITY_OR_OUTSIDE: dict[str, str] = {
     "gcp-configconnector.configConnector.enabled": "reaches GCP with a service-account key (configConnector is a "
                                                    "feature deviation too)",
     "keycloak-config-kog.auth.bootstrap.enabled": "bootstraps Keycloak identities",
+    # described by the installer's schema from 0.3.705 (0.3.704's #1149), so recorded from the 0.3.707 reading on; the
+    # owner (Diego), 2026-11-24: identity switches, by this rule. The keycloak feature is off on 057 and here.
+    "keycloak-config-kog.restDefinitions.clientoptionalclientscope.enabled": "manages Keycloak clients' scopes",
+    "keycloak-config-kog.restDefinitions.clientpolicies.enabled": "manages Keycloak client policies",
+    "keycloak-config-kog.restDefinitions.clientprofiles.enabled": "manages Keycloak client profiles",
+    "keycloak-config-kog.restDefinitions.clientregistrationpolicy.enabled": "manages who may register Keycloak clients",
+    "keycloak-config-kog.restDefinitions.clientscopeprotocolmapper.enabled": "manages what Keycloak tokens carry",
+    "keycloak-config-kog.restDefinitions.defaultclientregistrationpolicy.enabled": "manages who may register Keycloak clients",
+    "krateo-keycloak-realm.agentRegistration.enabled": "lets agents register Keycloak clients",
+    "krateo-keycloak-realm.hermesClient.enabled": "creates a Keycloak client",
     "zendesk-kog.plugin.webhookReceiver.enabled": "receives Zendesk's webhooks (outside)",
     "zendesk-kog.restDefinitions.request.enabled": "calls Zendesk (outside)",
     "zendesk-kog.restDefinitions.ticket.enabled": "calls Zendesk (outside)",

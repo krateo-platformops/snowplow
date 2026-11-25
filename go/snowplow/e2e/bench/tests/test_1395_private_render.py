@@ -60,10 +60,10 @@ AT_0_3_545 = {
 }
 # installer 0.3.616's: the same, plus kagent's per-user tool server (installer #829), behind a comment
 AT_0_3_616 = {**AT_0_3_545, "kagent": [["perUserRbac", "toolImagePullSecrets"]]}
-# installer 0.3.698's: the same, plus zendesk-kog's wrapper plugin (behind a comment too); 0.3.700's and 0.3.701's (the record's): the same
+# installer 0.3.698's: the same, plus zendesk-kog's wrapper plugin (behind a comment too); 0.3.700's to 0.3.707's (the record's): the same
 AT_0_3_698 = {**AT_0_3_616, "zendesk-kog": [["plugin", "imagePullSecrets"]]}
-AT_0_3_703 = dict(AT_0_3_698)
-AT_RECORDED = {"0.3.703": AT_0_3_703}[RECORDED]
+AT_0_3_707 = dict(AT_0_3_698)
+AT_RECORDED = {"0.3.707": AT_0_3_707}[RECORDED]
 
 
 def _values(snowplow_tag="1.12.69", frontend_tag="1.8.41", **over) -> dict:
@@ -283,8 +283,9 @@ def test_the_values_are_the_heredocs_byte_for_byte(tmp_path, snowplow, frontend,
     k, m = got.index("# The installer's features are krateo-057's"), got.index("vertexAI:")
     c, j = got.index("# componentValues: krateo-057's recorded switches and sizes"), got.index("registryAuth:")
     heredoc = "features:\n  agentGateway: true\n  coreAgents: false\n  specialistAgents: false\n"
-    # the features the values write: 057's, the CR patch's (internalTls) off (bench/installer_render.py)
-    assert got[k:m].split("\n", 2)[2] == installer_features.values_block(installer_values.values_features())
+    # the features the values write: 057's, and internalTls's own value with them (bench/installer_values.py)
+    feats = installer_features.bench_features()
+    assert got[k:m].split("\n", 2)[2] == installer_features.values_block(feats) + installer_values.internal_tls_block(feats)
     wc, wj = want.index("componentValues:\n"), want.index("registryAuth:")
     # every byte outside the two blocks is the heredoc's
     assert got[:k] + heredoc + got[m:c] + want[wc:wj] + got[j:] == want
@@ -392,15 +393,15 @@ def test_the_laptop_renders_every_runs_list(laptop_helm):
     assert _chart_lines(lines) == [f"installer {RECORDED}, run N1's values: {WANT_RECORDED}",
                                    f"installer {RECORDED}, run N2's values: {WANT_RECORDED}"]
     # #1588 follow-up: every run's effective spec rendered by the installer's composition template, every enabled
-    # component, every guard passed; and the CR patch it was rendered with
+    # component, every guard passed; and the internalTls of the CR it was rendered with
     rendered = [ln for ln in lines if "installer render: rendered " in ln]
     assert [ln.split(":", 1)[0] for ln in rendered] == ["run N1", "run N2"], lines
     for ln in rendered:
         n = re.search(r"rendered (\d+) of (\d+) enabled components", ln)
         assert n and n.group(1) == n.group(2) and int(n.group(1)) > 0, ln
         assert "trust-manager" in ln and "internal-ca-bundle" in ln and "cert-manager-issuers" in ln, ln
-    assert sum('installer CR patch (after helm install, one merge patch): {"spec": {"features": {"internalTls": true}, '
-               '"internalTls": {"certManagerNamespace": "cert-manager"}}}' in ln for ln in lines) == 2, lines
+    assert sum('installer internalTls in that CR: {"certManagerNamespace": "cert-manager"}; cert-manager\'s '
+               "--cluster-resource-namespace: 'cert-manager'" in ln for ln in lines) == 2, lines
 
 
 def test_falsifier_the_laptop_refuses_a_run_whose_values_leave_the_ca_bundle_target_empty(laptop_helm, monkeypatch):
@@ -519,19 +520,16 @@ def test_the_bench_enable_rule_is_the_installers(tmp_path, snowplow):
     from bench import diag606
     pulled = _pulled(tmp_path, RECORDED)
     root = pulled / "installer"
-    # the run's EFFECTIVE values: the document writes internalTls off, the run's Installer CR patch turns it on
-    # with its certManagerNamespace (bench/installer_render.py, installer#1084)
-    from bench import cert_manager, installer_features, installer_render
-    patch = installer_render.cr_patch(installer_features.bench_features(), cert_manager.NAMESPACE)
-    assert patch["spec"]["features"] == {"internalTls": True}
-    effective = ghcr_pull._merge(_values(snowplow), patch["spec"])
-    values = ghcr_pull._merge(effective, {"bootstrap": {"coreProvider": {"enabled": False}}})
+    from bench import installer_features
+    run = _values(snowplow)
+    assert run["features"]["internalTls"] is True             # else the two components below prove nothing
+    values = ghcr_pull._merge(run, {"bootstrap": {"coreProvider": {"enabled": False}}})
 
     def registered(chart):
         return {d["metadata"]["name"] for d in _render(chart, values, "--show-only", "templates/definitions.yaml")
                 if d.get("kind") == "CompositionDefinition"}
     pins = yaml.safe_load((root / "files" / "component-pins.min.yaml").read_text())
-    # installer 0.3.701's files/component-pins.min.yaml (as 0.3.698's and 0.3.700's), its entries with alsoFeatures
+    # installer 0.3.707's files/component-pins.min.yaml (as 0.3.698's to 0.3.703's), its entries with alsoFeatures
     assert [(c["name"], c["alsoFeatures"]) for c in pins["components"] if c.get("alsoFeatures")] == [
         ("cert-manager", ["internalTls"]), ("cert-manager-issuers", ["internalTls"]),
         ("cloudnative-pg", ["cloudnativePg"]), ("external-secrets", ["serviceDesk"])]
@@ -544,13 +542,13 @@ def test_the_bench_enable_rule_is_the_installers(tmp_path, snowplow):
     (stripped / "files" / "component-pins.min.yaml").write_text(yaml.safe_dump(bare))
     assert stock - registered(stripped) == {"cert-manager", "cert-manager-issuers"}
     assert registered(stripped) < stock
-    feats = {**yaml.safe_load((root / "values.yaml").read_text())["features"], **effective["features"]}
+    feats = {**yaml.safe_load((root / "values.yaml").read_text())["features"], **run["features"]}
     core = set(diag606.core_features(str(pulled)))
     # #1572: the bench's rule is the installer's inst.compEnabled (bench/installer_features.py)
     rule = {c["name"] for c in pins["components"] if installer_features.component_enabled(c, feats, core)}
     assert rule == stock
     # with coreAgents on (#1572), its private-image components are registered too
-    assert sorted(set(ghcr_pull.private_image_paths(str(pulled), effective)) & stock) == [
+    assert sorted(set(ghcr_pull.private_image_paths(str(pulled), run)) & stock) == [
         "agentgateway-policies", "alert-provider", "config-refs-mcp-server", "core-provider-agent", "kagent",
         "repo-mcp-server"]
 

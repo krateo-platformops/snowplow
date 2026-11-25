@@ -1,7 +1,7 @@
 """Bench run 5: install the RELEASED installer (0.3.425, #483 merged) the
 ordinary OCI way, preflight the registry chart (resolves + carries the #483
-pins) before any cluster exists, and assert the #483 outcome (verify483,
-headline item 4) before the 50K measurement. Local-chart mode is refused:
+pins) before any cluster exists, and assert the #483 outcome (verify483:
+krateo-observability Ready with its Alert CRD) before the 50K measurement. Local-chart mode is refused:
 it cannot work for this installer (run 4; self-bootstrap.yaml:215).
 
 Uses the fake gcloud/kubectl/helm harness from test_run606_real_sequence.
@@ -32,7 +32,7 @@ def _chart(tmp_path, *, feature="portal", obs_deps=("alert-provider-crd",),
         (chart / "charts" / "core-provider-2.13.24.tgz").write_bytes(b"x")
     (chart / "files" / "component-pins.yaml").write_text(yaml.safe_dump({"components": [
         {"name": "alert-provider-crd", "feature": feature},
-        {"name": "alert-provider", "feature": "specialistAgents"},
+        {"name": "alert-provider", "feature": "portal"},        # 0.3.703 and 0.3.707: alert-provider has the CRD's feature
         {"name": "krateo-observability", "feature": "portal", "deps": list(obs_deps)},
     ]}))
     return chart
@@ -104,8 +104,6 @@ def test_evaluate483_pass_and_item5_recorded_only():
     (lambda L, C, crd: L.__setitem__(1, _s("krateo-observability", synced=False)), 1),
     (lambda L, C, crd: crd.__setitem__(0, False), 2),
     (lambda L, C, crd: C.pop(), 3),
-    (lambda L, C, crd: C.append(_s("alert-provider")), 4),
-    (lambda L, C, crd: L.append(_s("alert-provider")), 4),
 ])
 def test_evaluate483_each_gating_item_fails_alone(mut, item):
     L = [_s("authn"), _s("krateo-observability"), _s("alert-provider-crd")]
@@ -115,6 +113,17 @@ def test_evaluate483_each_gating_item_fails_alone(mut, item):
     r = diag606.evaluate483([_inst(*DECLARED)], L, C, crd[0], [])
     assert r["verdict"] == "FAIL"
     assert [c["item"] for c in r["checks"] if not c["pass"]] == [item]
+
+
+@pytest.mark.parametrize("in_cds,as_component", [(True, True), (False, False), (True, False), (False, True)])
+def test_alert_provider_decides_nothing_item_4_is_retired(in_cds, as_component):
+    """#1598 review B1: item 4 could not tell a gate that is too wide from the design (in 0.3.703 and 0.3.707 alert-provider
+    has its CRD's feature). Retired: whether alert-provider is there changes no check, and no headline names it."""
+    leaves = [_s(n) for n in DECLARED] + ([_s("alert-provider")] if as_component else [])
+    cds = [_s("authn"), _s("alert-provider-crd")] + ([_s("alert-provider")] if in_cds else [])
+    r = diag606.evaluate483([_inst(*DECLARED)], leaves, cds, True, [])
+    assert r["verdict"] == "PASS" and sorted(c["item"] for c in r["checks"]) == [1, 2, 3, 6]
+    assert "headline" not in r and not any("alert-provider ABSENT" in c["check"] for c in r["checks"])
 
 
 def test_chart_inspector_error_is_kept_verbatim():
@@ -151,14 +160,13 @@ def test_oci_run_passes_verify483_headline_first_and_continues(harness):
     assert ("ALLOWED(known): compositiondefinitions/krateo-system/github-provider-kog"
             "[response status code 401]") in out
     assert "[platform] verdict READY (with allow-listed known-unrelated" in out
-    # HEADLINE: item 4 printed FIRST among the verify483 result lines
+    # the items in order, no headline (item 4 is retired, #1598 review B1)
     vlines = [ln for ln in out.splitlines() if ln.startswith("[verify483]")]
-    assert vlines[0] == "[verify483] HEADLINE (4) PASS alert-provider ABSENT (present = gate too wide)"
-    assert vlines[1].startswith("[verify483] (4) PASS")
+    assert [ln.split(" ")[1] for ln in vlines[:4]] == ["(1)", "(2)", "(3)", "(6)"] and "HEADLINE" not in out
+    assert "[verify483] verdict PASS" in out
     v = json.loads((tmp / "out" / "verify483.json").read_text())
-    assert v["verdict"] == "PASS" and v["headline"]["result"] == "PASS"
-    assert v["checks"][0]["item"] == 4
-    assert sorted(c["item"] for c in v["checks"]) == [1, 2, 3, 4, 6]
+    assert v["verdict"] == "PASS" and "headline" not in v
+    assert [c["item"] for c in v["checks"]] == [1, 2, 3, 6]
     # the definition 401s, so its declared CR is never created: both are excused
     assert [a["id"] for a in v["known_unrelated_allowed"]] == [
         "compositiondefinitions/krateo-system/github-provider-kog",
@@ -221,14 +229,14 @@ def test_local_chart_mode_is_refused(harness, var):
     assert not _calls(state)
 
 
-def test_gate_too_wide_fails_verify483_with_diagnostics_and_teardown(harness):
+def test_a_failed_item_fails_verify483_with_diagnostics_and_teardown(harness):
     env, state, ambient, tmp = harness
     env = _env483(env)
-    env["FAKE_483"] = "wide"
+    env.pop("FAKE_483", None)                           # the Alert CRD is not there (item 2)
     p = _run(env)
     out = p.stdout + p.stderr
     assert p.returncode != 0
-    assert "[verify483] HEADLINE (4) FAIL alert-provider ABSENT" in out
+    assert f"[verify483] (2) FAIL crd {diag606.ALERT_CRD} present" in out
     assert "=== step data ===" not in p.stderr          # no measurement
     diag = tmp / "out" / "diagnostics"
     assert (diag / "focus-483.json").exists()

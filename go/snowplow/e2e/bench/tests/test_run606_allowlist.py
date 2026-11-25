@@ -191,6 +191,43 @@ def test_a_name_that_only_contains_the_id_is_not_the_id():
     assert st["ok"] and st["not_health_evaluated"] == [CA]
 
 
+@pytest.mark.parametrize("declared,expected,why", [
+    (("authn", "snowplow"), ["authn", "snowplow", "trust-manager"], "rendered, not declared: trust-manager"),
+    (("authn", "snowplow", "extra"), ["authn", "snowplow"], "declared, not rendered: extra"),
+    ((), ["authn"], "rendered, not declared: authn"),
+])
+def test_falsifier_the_live_declared_set_must_be_what_the_run_rendered(declared, expected, why):
+    leaves = [_sid("x", n) for n in {*declared, *diag606.REQUIRED_READY}]
+    st = diag606.platform_state([_inst(declares=declared)], leaves, [], required=(), expected=expected)
+    u = [x for x in st["unexpected_not_ready"] if x["reason"] == "DeclaredSet"]
+    assert not st["ok"] and len(u) == 1 and why in u[0]["message"], st["unexpected_not_ready"]
+    assert why in diag606.platform_line(st)
+
+
+def test_falsifier_a_wrong_declared_set_fails_at_the_poll_that_sees_it(monkeypatch):
+    """It never becomes right by waiting: 45 paid minutes are not spent on it, and the reason names it."""
+    monkeypatch.setattr(diag606, "_leaf_summaries", lambda k, **kw: ([_inst(declares=("authn",))], [_sid("x", "authn")]))
+    monkeypatch.setattr(diag606, "_cd_summaries", lambda k: [])
+    monkeypatch.setattr(diag606, "image_pull_failures", lambda k: [])
+    why, said = [], []
+
+    def no_wait(s):  # the clock is frozen: a wait here would never end, so the first one fails the test (#1598 review N1)
+        pytest.fail(f"waited {s}s for a declared set that waiting cannot fix")
+    assert diag606.wait_installer(None, timeout_s=2700, allow=(), required=(), expected=["authn", "trust-manager"],
+                                  log=said.append, clock=lambda: 0, sleep=no_wait, reason=why) is False
+    assert len(why) == 1 and "rendered, not declared: trust-manager" in why[0]
+    assert any(m.startswith("[platform] FAILED: the live Installer CR is not the run's") for m in said)
+
+
+def test_the_same_set_in_any_order_passes_and_none_compares_nothing():
+    leaves = [_sid("x", n) for n in diag606.REQUIRED_READY]
+    for expected in (list(reversed(diag606.REQUIRED_READY)), None):
+        assert diag606.platform_state([_inst()], leaves, [], expected=expected)["ok"]
+    # a CR whose declaration cannot be read is not ready for that reason alone: nothing to compare
+    st = diag606.platform_state([_inst(declares=())], leaves, [], expected=None)
+    assert st["ok"]
+
+
 def test_verify483_item_6_accepts_it_and_never_a_required_one():
     """evaluate483 reads the same set: a required component at ZeroEvidence fails item 6."""
     obs = _sid("krateoobservabilities", "krateo-observability")

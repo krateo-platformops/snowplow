@@ -9,13 +9,13 @@ features.internalTls is on and internalTls.certManagerNamespace or componentValu
 the composition pass emits a component only once the cluster serves its CRD and its dependencies are Ready
 (inst.emitDecision, a `lookup` that `helm template` answers empty), so offline it emits none.
 
-The effective spec is what the CR holds once s_install is done:
-  1. the CR the installer's own bootstrap writes on a fresh install: its installer-self-cr ConfigMap's
-     installer.yaml (self-bootstrap.yaml), rendered from the run's values exactly as s_install installs them;
-  2. merged with the run's CR patch (installer_cr_patch): features.internalTls and
-     internalTls.certManagerNamespace, which the installer never writes to the CR (installer#1084: its fresh
-     -install pick omits internalTls), set in ONE merge patch as the installer's values.yaml:351 prescribes.
-A top-level internalTls in the run's values is refused: the installer drops it, so it could only mislead.
+The effective spec is what the CR holds once s_install is done: the CR the installer's own bootstrap writes on a
+fresh install, its installer-self-cr ConfigMap's installer.yaml (self-bootstrap.yaml), rendered from the run's values
+exactly as s_install installs them. A CR that does not hold the run's values is refused, every key but INSTALL_ONLY's
+(0.3.703 and older drop internalTls: installer#1084, fixed by #1145 in 0.3.704), and so is a certManagerNamespace that
+is not where the verified cert-manager chart's controller reads cluster CA Secrets (its --cluster-resource-namespace).
+After the install the platform step holds the LIVE CR to this render: the components it declares must be exactly the
+ones rendered here (bench/diag606.py platform_state `expected`).
 
 THE BYPASS, CONFINED TO THIS CHECK: the chart is rendered from an in-memory copy (ghcr_pull._chart_with; the
 pulled directory, which s_install installs from, is never written) with one added template that redefines
@@ -28,9 +28,7 @@ them out), and the check refuses unless exactly those rendered ("rendered N of N
 NOT CONFIRMED by this check: values the installer derives from the live cluster (Service IPs, the node-IP
 ConfigMap, existing Secrets) read empty here, so a guard on one of those cannot fire offline.
 
-    python3 -m bench.installer_render patch --cert-manager-preflight P --out installer-cr-patch.json
-    python3 -m bench.installer_render check --installer-pulled D --values V --patch installer-cr-patch.json --out R
-    kubectl get installers.<ver>.composition.krateo.io installer -o json | python3 -m bench.installer_render readback --patch P
+    python3 -m bench.installer_render check --installer-pulled D --values V --cert-manager-preflight P --out R
 """
 
 from __future__ import annotations
@@ -61,39 +59,10 @@ SELF_CR = ("installer-self-cr", "installer.yaml")
 #: the registry user the CR carries: the run pipes the real one into helm at install (never in a file); this
 #: check renders with a placeholder, as nothing it checks depends on it
 REGISTRY_USER_PLACEHOLDER = "bench-render-check"
-#: the features the installer's CR takes from the run's CR patch, not from its values (installer#1084), and why
-CR_PATCH_FEATURES = {
-    "internalTls": "its internalTls.certManagerNamespace is CR-only (installer#1084: the fresh-install pick omits "
-                   "it) and must be set in the SAME patch as the feature (installer values.yaml:351)",
-}
-CR_KIND, CR_NAME = "installers", "installer"
 
 
 class Refused(ValueError):
     """Why the run's installer would not render, or why that cannot be read."""
-
-
-def _merge(base: dict, over: dict) -> dict:
-    out = copy.deepcopy(base)
-    for k, v in over.items():
-        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else copy.deepcopy(v)
-    return out
-
-
-def cr_patch(features: dict, cluster_resource_namespace: str) -> dict:
-    """The run's ONE merge patch of the Installer CR, after helm install: every CR_PATCH_FEATURES feature the
-    bench's features turn on, and, with internalTls, the namespace cert-manager RUNS in (its controller's
-    --cluster-resource-namespace, as the bench's cert-manager step renders it: bench/cert_manager.py). {} when
-    nothing is to be patched."""
-    spec: dict = {}
-    on = {f: True for f in CR_PATCH_FEATURES if features.get(f)}
-    if on:
-        spec["features"] = on
-    if on.get("internalTls"):
-        if not cluster_resource_namespace:
-            raise Refused("features.internalTls is on and cert-manager's --cluster-resource-namespace is not known")
-        spec["internalTls"] = {"certManagerNamespace": cluster_resource_namespace}
-    return {"spec": spec} if spec else {}
 
 
 def _render(installer_pulled: str, values: dict, extra: dict, show: list[str], helm: str) -> list:
@@ -128,22 +97,50 @@ def self_cr(installer_pulled: str, values: dict, helm: str = "helm") -> dict:
     return cr
 
 
-def effective_spec(values: dict, patch: dict, cr: dict) -> dict:
-    """The CR's spec once s_install is done: the fresh-install CR, the run's CR patch merged into it."""
-    if "internalTls" in (values or {}):
-        raise Refused("the run's values set a top-level internalTls, which the installer never writes to its CR "
-                      "(installer#1084: CR-only); the bench writes it with the CR patch")
-    return _merge(cr["spec"], (patch or {}).get("spec") or {})
+#: the run's values the installer reads at install only, never from its CR: the bootstrap's own switch (off in the CR by
+#: design) and the engine subchart's values
+INSTALL_ONLY = ("bootstrap", "core-provider")
 
 
-def check(installer_pulled: str, values: dict, patch: dict, helm: str = "helm") -> dict:
-    """The record of the composition render of the run's effective spec, or Refused naming why: a guard of the
-    installer that fails (helm's own message, which names the template line), or a component the CR enables
-    that does not render."""
+def effective_spec(values: dict, cr: dict, cluster_resource_namespace: str) -> dict:
+    """The CR's spec once s_install is done: the fresh-install CR's. Refused when it does not hold the run's values
+    (every key but INSTALL_ONLY's: features, componentValues, internalTls, ...), or, with features.internalTls on, when
+    its certManagerNamespace is not cert-manager's --cluster-resource-namespace (an empty one is left to the
+    installer's own guard, which names it)."""
+    spec = cr["spec"]
+    lost = [x for k, v in (values or {}).items() if k not in INSTALL_ONLY for x in not_held({k: v}, spec, "spec")]
+    if lost:
+        raise Refused(f"the CR a fresh install of this installer ({cr['apiVersion']}) writes does not hold the run's "
+                      f"{'; '.join(lost)}")
+    ns = (spec.get("internalTls") or {}).get("certManagerNamespace")
+    if (spec.get("features") or {}).get("internalTls") and ns:
+        if not cluster_resource_namespace:
+            raise Refused("features.internalTls is on and cert-manager's --cluster-resource-namespace is not known")
+        if ns != cluster_resource_namespace:
+            raise Refused(f"internalTls.certManagerNamespace is {ns!r}, and cert-manager reads cluster CA Secrets from "
+                          f"{cluster_resource_namespace!r} (its --cluster-resource-namespace)")
+    return spec
+
+
+def not_held(want: dict, have, path: str) -> list[str]:
+    """The leaves of `want` that `have` does not hold, each as "path=wanted (the CR: what it holds)". An empty map
+    wants nothing of its own."""
+    out = []
+    for k, v in want.items():
+        h = have.get(k) if isinstance(have, dict) else None
+        out += not_held(v, h, f"{path}.{k}") if isinstance(v, dict) else (
+            [] if h == v else [f"{path}.{k}={v!r} (the CR: {h!r})"])
+    return out
+
+
+def check(installer_pulled: str, values: dict, cluster_resource_namespace: str, helm: str = "helm") -> dict:
+    """The record of the composition render of the run's effective spec, or Refused naming why: the values'
+    internalTls not in the CR or not where cert-manager reads (effective_spec), a guard of the installer that fails
+    (helm's own message, which names the template line), or a component the CR enables that does not render."""
     vals = copy.deepcopy(values or {})
     vals.setdefault("registryAuth", {}).setdefault("username", REGISTRY_USER_PLACEHOLDER)
     cr = self_cr(installer_pulled, vals, helm)
-    spec = effective_spec(values, patch, cr)
+    spec = effective_spec(values, cr, cluster_resource_namespace)
     probe = f"templates/zz-bench-render-check-{secrets.token_hex(4)}.yaml"
     try:
         docs = _render(installer_pulled, spec, {BYPASS_TEMPLATE: BYPASS, probe: PROBE}, [COMPOSITIONS, probe], helm)
@@ -151,8 +148,7 @@ def check(installer_pulled: str, values: dict, patch: dict, helm: str = "helm") 
         if f"could not find template {COMPOSITIONS}" in str(e):
             raise Refused(f"rendered 0 components: the composition template rendered nothing with the effective "
                           f"spec ({e})") from None
-        raise Refused(f"the installer refuses to render its components with the run's effective spec (its values "
-                      f"and CR patch): {e}") from None
+        raise Refused(f"the installer refuses to render its components with the run's effective spec: {e}") from None
     enabled_cm = [d for d in docs if isinstance(d, dict) and d.get("kind") == "ConfigMap"
                   and (d.get("metadata") or {}).get("name") == "bench-render-check-enabled"]
     try:
@@ -169,7 +165,8 @@ def check(installer_pulled: str, values: dict, patch: dict, helm: str = "helm") 
                       + (f"; not rendered: {', '.join(missing)}" if missing else "")
                       + (f"; rendered though not enabled: {', '.join(extra)}" if extra else ""))
     return {"kind": "installer_render_check", "ok": True, "cr_api_version": cr["apiVersion"],
-            "patch": patch, "enabled": sorted(enabled), "rendered": rendered,
+            "internal_tls": spec.get("internalTls"), "cluster_resource_namespace": cluster_resource_namespace,
+            "enabled": sorted(enabled), "rendered": rendered,
             "components": [{"name": (d.get("metadata") or {}).get("name"), "kind": d.get("kind"),
                             "namespace": (d.get("metadata") or {}).get("namespace"), "spec": d.get("spec")}
                            for d in comps]}
@@ -177,72 +174,50 @@ def check(installer_pulled: str, values: dict, patch: dict, helm: str = "helm") 
 
 def lines(rec: dict) -> list[str]:
     return [f"installer render: rendered {len(rec['rendered'])} of {len(rec['enabled'])} enabled components with "
-            f"the run's effective spec (its values and CR patch; the installer's cluster-state emission gate "
+            f"the run's effective spec (the CR its values write; the installer's cluster-state emission gate "
             f"bypassed in this check only), every guard passed: {', '.join(rec['rendered'])}",
-            f"installer CR patch (after helm install, one merge patch): {json.dumps(rec['patch'], sort_keys=True)}"]
+            f"installer internalTls in that CR: {json.dumps(rec['internal_tls'], sort_keys=True)}; cert-manager's "
+            f"--cluster-resource-namespace: {rec['cluster_resource_namespace']!r}"]
 
 
-def readback(cr: dict, patch: dict) -> list[str]:
-    """What the live CR does not hold of the run's patch (each leaf), empty when it holds all of it."""
-    out = []
-
-    def walk(want, have, path):
-        for k, v in want.items():
-            h = have.get(k) if isinstance(have, dict) else None
-            if isinstance(v, dict):
-                walk(v, h, f"{path}.{k}")
-            elif h != v:
-                out.append(f"{path}.{k} is {h!r}, the patch wrote {v!r}")
-    walk((patch or {}).get("spec") or {}, (cr or {}).get("spec") or {}, "spec")
-    return out
+def rendered_names(path: str) -> list[str]:
+    """The components a run's composition render rendered, from its record (installer-render.json). Refused unless the
+    record says the render passed and names at least one."""
+    with open(path, encoding="utf-8") as fh:
+        rec = json.load(fh)
+    passed = isinstance(rec, dict) and rec.get("kind") == "installer_render_check" and rec.get("ok") is True
+    names = rec.get("rendered") if passed else None
+    if not isinstance(names, list) or not names:
+        raise Refused(f"{path} is not the record of a composition render that passed")
+    return names
 
 
 def main(argv: list[str] | None = None) -> int:
     import yaml
     ap = argparse.ArgumentParser(prog="bench.installer_render")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("patch", help="the run's Installer CR merge patch")
-    p.add_argument("--cert-manager-preflight", required=True, help="bench.cert_manager's preflight record")
-    p.add_argument("--out", required=True)
     c = sub.add_parser("check", help="the installer's composition render of the run's effective spec")
     c.add_argument("--installer-pulled", required=True)
     c.add_argument("--values", required=True)
-    c.add_argument("--patch", required=True)
+    c.add_argument("--cert-manager-preflight", required=True, help="bench.cert_manager's preflight record")
     c.add_argument("--helm", default="helm")
     c.add_argument("--out", required=True)
-    r = sub.add_parser("readback", help="the live Installer CR (kubectl -o json) on stdin must hold the patch")
-    r.add_argument("--patch", required=True)
     a = ap.parse_args(argv)
     try:
-        if a.cmd == "patch":
-            from bench import installer_features
-            with open(a.cert_manager_preflight, encoding="utf-8") as fh:
-                crn = json.load(fh).get("cluster_resource_namespace") or ""
-            doc = cr_patch(installer_features.bench_features(), crn)
+        with open(a.values, encoding="utf-8") as fh:
+            values = yaml.safe_load(fh) or {}
+        with open(a.cert_manager_preflight, encoding="utf-8") as fh:
+            crn = json.load(fh).get("cluster_resource_namespace") or ""
+        try:
+            rec = check(a.installer_pulled, values, crn, a.helm)
+        except Refused as e:
             with open(a.out, "w", encoding="utf-8") as fh:
-                json.dump(doc, fh, sort_keys=True)
-            print(f"installer CR patch: {json.dumps(doc, sort_keys=True)}")
-        elif a.cmd == "check":
-            with open(a.values, encoding="utf-8") as fh:
-                values = yaml.safe_load(fh) or {}
-            with open(a.patch, encoding="utf-8") as fh:
-                patch = json.load(fh)
-            try:
-                rec = check(a.installer_pulled, values, patch, a.helm)
-            except Refused as e:
-                with open(a.out, "w", encoding="utf-8") as fh:
-                    json.dump({"kind": "installer_render_check", "ok": False, "patch": patch, "why": str(e)}, fh)
-                raise
-            with open(a.out, "w", encoding="utf-8") as fh:
-                json.dump(rec, fh, indent=1, sort_keys=True)
-            print("\n".join(lines(rec)))
-        else:
-            with open(a.patch, encoding="utf-8") as fh:
-                patch = json.load(fh)
-            gaps = readback(json.load(sys.stdin), patch)
-            if gaps:
-                raise Refused("the Installer CR does not hold the run's patch: " + "; ".join(gaps))
-            print(f"installer CR read back: it holds the run's patch {json.dumps(patch, sort_keys=True)}")
+                json.dump({"kind": "installer_render_check", "ok": False, "cluster_resource_namespace": crn,
+                           "why": str(e)}, fh)
+            raise
+        with open(a.out, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh, indent=1, sort_keys=True)
+        print("\n".join(lines(rec)))
     except (Refused, OSError, ValueError) as e:
         print(f"refusing: {e}", file=sys.stderr)
         return 2

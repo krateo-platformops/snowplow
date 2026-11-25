@@ -23,7 +23,7 @@ import yaml
 from bench import installer_component_values as icv
 from bench import installer_features, installer_values
 
-# the reading of 2026-11-23 (installer 0.3.701): the record's bytes, and what the owner's ruling turns on
+# the reading of 2026-11-24 (installer 0.3.707): the record's bytes, and what the owner's ruling turns on
 KAGENT_SWITCHES = {"kagent.perUserRbac.enabled": True, "kagent.kagentapp.kagent-tools.enabled": False}
 
 
@@ -31,18 +31,19 @@ def _sha(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-# sha256 of bench/installer_component_values_057.json as re-taken 2026-11-23 09:45 Rome on installer 0.3.703
-# (read first on 0.3.697, then 0.3.698 and 0.3.700; no recorded switch or size ever moved. On 0.3.700 three
-# not-recorded paths left 057's CR, agentgateway-policies.llm.retry.*, and the installer's schema declared the
-# agent's toleration, installer #1121: installer_schema true. 0.3.701 moved only the version: the same
-# switches, sizes, not-recorded paths and schema fact)
-PINNED = "7182cfb7e9bf570e749da0342bf90f203547785d2440bc8ca19f089326f27f32"
+# sha256 of bench/installer_component_values_057.json as re-taken 2026-11-24 13:05 Rome on installer 0.3.707
+# (read first on 0.3.697, then 0.3.698, 0.3.700, 0.3.701 and 0.3.703; no recorded switch or size of 057's ever moved.
+# On 0.3.700 three not-recorded paths left 057's CR, agentgateway-policies.llm.retry.*, and the installer's schema
+# declared the agent's toleration, installer #1121: installer_schema true. On 0.3.707 the installer's schema describes
+# nine more switches (0.3.704's and 0.3.705's #1144, #1147, #1149), each at its default: the record gains them, 057 changed
+# nothing)
+PINNED = "1e2a944048ee8d3a0c3217fcd261f620e5f02922d56523457f9f1e0a9d263489"
 
 
-def test_the_committed_record_is_the_reading_of_2026_11_23():
+def test_the_committed_record_is_the_reading_of_2026_11_24():
     rec = icv.load()
-    assert rec["read"]["date"] == "2026-11-23" and rec["read"]["installer_version"] == "0.3.703"
-    assert len(rec["recorded"]) == 57 and len(rec["not_recorded"]) == 132
+    assert rec["read"]["date"] == "2026-11-24" and rec["read"]["installer_version"] == "0.3.707"
+    assert len(rec["recorded"]) == 66 and len(rec["not_recorded"]) == 147
     assert {p: rec["recorded"][p] for p in KAGENT_SWITCHES} == KAGENT_SWITCHES
     assert rec["recorded"]["kagent.kagentapp.database.postgres.bundled.storage"] == "8Gi"
     assert rec["recorded"]["snowplow.env.OTEL_LOGS_ENABLED"] == "true"
@@ -278,7 +279,8 @@ def test_falsifier_a_deviation_keeps_a_switch_out(monkeypatch):
 
 
 def test_an_identity_or_outside_switch_is_copied_off_and_never_copied_on():
-    """The owner's ruling (2026-11-22): OFF on 057, written off; ON on 057, a deviation. Read from the record."""
+    """The owner's rulings (2026-11-22; the Keycloak ones 2026-11-24): OFF on 057, written off; ON on 057, a
+    deviation. Read from the record."""
     rec = icv.load()
     off = icv.copied_off(rec)
     on = {p: d for p, d in icv.deviations(rec).items() if p in icv.IDENTITY_OR_OUTSIDE}
@@ -287,14 +289,20 @@ def test_an_identity_or_outside_switch_is_copied_off_and_never_copied_on():
     assert sorted(off) == [
         "agentgateway-policies.cors.allowCredentials", "agentgateway-policies.cors.enabled",
         "agentgateway-policies.uiTokenHop.impersonation.enabled", "cert-manager-issuers.acmeDns01.enabled",
-        "frontend.ingress.enabled", "krateo-observability.hyperdxLoadBalancer.enabled",
+        "frontend.ingress.enabled", "krateo-keycloak-realm.agentRegistration.enabled",
+        "krateo-keycloak-realm.hermesClient.enabled", "krateo-observability.hyperdxLoadBalancer.enabled",
         "zendesk-kog.plugin.webhookReceiver.enabled", "zendesk-kog.restDefinitions.ticket.enabled",
         "zendesk-kog.restDefinitions.webhook.enabled", "zendesk-kog.snowplow.restActions.enabled"]
     assert sorted(on) == [
         "agentgateway-policies.mcpEntry.enabled", "agentgateway-policies.stt.enabled",
         "agentgateway-policies.tts.enabled", "frontend.serviceAccount.automount", "frontend.serviceAccount.create",
         "gcp-configconnector.configConnector.enabled", "keycloak-config-kog.auth.bootstrap.enabled",
-        "portal.enableAdminUser", "portal.enableCyberjokerUser", "portal.enableIncidentResponse",
+        "keycloak-config-kog.restDefinitions.clientoptionalclientscope.enabled",
+        "keycloak-config-kog.restDefinitions.clientpolicies.enabled",
+        "keycloak-config-kog.restDefinitions.clientprofiles.enabled",
+        "keycloak-config-kog.restDefinitions.clientregistrationpolicy.enabled",
+        "keycloak-config-kog.restDefinitions.clientscopeprotocolmapper.enabled",
+        "keycloak-config-kog.restDefinitions.defaultclientregistrationpolicy.enabled", "portal.enableAdminUser", "portal.enableCyberjokerUser", "portal.enableIncidentResponse",
         "zendesk-kog.restDefinitions.request.enabled"]
     written = icv.bench_paths(rec)
     assert {p: written[p] for p in off} == {p: False for p in off} and not set(on) & set(written)
@@ -372,7 +380,7 @@ def test_falsifier_the_chart_check_refuses_an_installer_that_cannot_express_a_re
     with pytest.raises(icv.Refused, match=r"installer 0\.3\.641 cannot express \d+ of 057's recorded component"):
         icv.check_chart(schema, "0.3.641")
     full = _schema_with(icv.bench_paths(), icv.receiver_on_snowplow_node())
-    icv.check_chart(full, "0.3.703")
+    icv.check_chart(full, "0.3.707")
 
 
 def test_drift_names_what_moved():
@@ -402,7 +410,7 @@ def _schema_with(paths, receiver: bool) -> dict:
 
 
 def test_the_record_keeps_that_the_recorded_installer_can_express_the_agents_toleration(tmp_path):
-    """Read from installer 0.3.701's own values schema (the archive the record was taken against; installer
+    """Read from installer 0.3.707's own values schema (the archive the record was taken against; installer
     #1121 declared the collector agent's tolerations in 0.3.700)."""
     from bench import installer_features
     from tests import installer_archives as ia
@@ -420,7 +428,7 @@ def test_falsifier_without_the_toleration_in_the_schema_the_deviation_is_said_an
     rec = _rec_with_receiver(False)
     monkeypatch.setattr(icv, "load", lambda path=icv.RECORD_PATH: rec)
     why, ruling = icv.deviations(rec)["snowplow.env.OTEL_LOGS_ENABLED"]
-    assert why == ("no OTLP receiver on the bench's snowplow node: installer 0.3.703 cannot express the daemonset "
+    assert why == ("no OTLP receiver on the bench's snowplow node: installer 0.3.707 cannot express the daemonset "
                    "toleration (componentValues.otel-collector-daemonset.opentelemetry-collector.tolerations is not in "
                    "its values schema; 057 has a receiver there)") and ruling == icv.RULING_RECEIVER
     cv = _cv_of(installer_values.document("1.12.75"))
@@ -434,7 +442,7 @@ def test_falsifier_without_the_toleration_in_the_schema_the_deviation_is_said_an
 
 
 def test_with_the_toleration_in_the_schema_the_bench_writes_it_and_copies_otel_logs():
-    """The branch in force (installer 0.3.701 declares the path): the bench's own toleration, 057's OTEL_LOGS_ENABLED."""
+    """The branch in force (installer 0.3.707 declares the path): the bench's own toleration, 057's OTEL_LOGS_ENABLED."""
     assert icv.load()["installer_schema"][icv.RECEIVER_TOLERATION] is True
     assert "snowplow.env.OTEL_LOGS_ENABLED" not in icv.deviations()
     cv = _cv_of(installer_values.document("1.12.75", "", {"GOGC": "100"}))

@@ -304,14 +304,7 @@ def check_chart(installer_pulled: str, rec: dict | None = None, deviations: dict
     if feats.get("internalTls"):
         cm_check(installer_pulled, version)
     return [f"installer features: {len(feats)} written, as {src} runs them, {len(on)} on: {', '.join(on)}"] \
-        + deviation_lines(rec, deviations) + cr_patch_lines(feats) + cv_lines + installer_values.top_level_lines()
-
-
-def cr_patch_lines(feats: dict) -> list[str]:
-    """The features the run's values write off and its Installer CR patch turns on (bench/installer_render.py)."""
-    from bench import installer_render
-    return [f"installer features: {f} is written by the CR patch after helm install, recorded ON (the values write it "
-            f"off): {why}" for f, why in sorted(installer_render.CR_PATCH_FEATURES.items()) if feats.get(f)]
+        + deviation_lines(rec, deviations) + cv_lines + installer_values.top_level_lines()
 
 
 def cm_check(installer_pulled: str, version: str) -> None:

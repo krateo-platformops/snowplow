@@ -248,12 +248,10 @@ def test_the_ttl_is_derived_from_the_plan_when_unset(tmp_path):
     # + the 300 s wait of the runtime606 Job (the process's effective GC settings, before the measure)
     # + #1422's settle step, 3,126 s (warm-up start 300 + deadline 2,275.82 + poll 60.07 + reads 190, rounded up,
     # + its stop 300): 48,762 s, with the margin 50,562 s -> 15 h
-    # + #1590's Installer CR patch and its read-back, one 300 s bound: 49,062 s, with the margin 50,862 s -> 15 h
-    assert "= 49062 s" in p.stderr and "fits TTL_HOURS=15 (54000 s; derived: the plan's 49062 s" in p.stderr
+    assert "= 48762 s" in p.stderr and "fits TTL_HOURS=15 (54000 s; derived: the plan's 48762 s" in p.stderr
     # a longer plan derives a longer TTL; it is not refused
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800")
-    # (#1590: 52,462 s, with the margin 54,262 s: past 15 h by 262 s)
-    assert p.returncode == 0 and "fits TTL_HOURS=16 (57600 s; derived" in p.stderr
+    assert p.returncode == 0 and "fits TTL_HOURS=15 (54000 s; derived" in p.stderr
 
 
 @pytest.mark.parametrize("env", [{"TTL_HOURS": "8"}, {"TTL_HOURS": "11"},
@@ -271,10 +269,10 @@ def test_a_hand_set_ttl_inside_the_margin_but_over_the_plan_is_refused(tmp_path)
     budget to the default 38,718 s (DATA_TIMEOUT_S=5800): 42,118 s, under a
     hand-set 12 h (43,200 s) but inside its margin (41,400 s) -> refused, with (#1297: + 4,803 s
     in-cluster = 47,821 s, now over the 12 h outright; #1422: + 915 s of gke-up = 48,736 s; + 300 s runtime606
-    and 3,126 s of settle = 52,162 s; #1590: + 300 s of CR patch = 52,462 s) the hours it needs."""
+    and 3,126 s of settle = 52,162 s) the hours it needs."""
     p = _run606(tmp_path, BENCH_606_DRY_RUN="1", THINK_S="60", DATA_TIMEOUT_S="5800", TTL_HOURS="12")
-    assert p.returncode == 2 and "refusing: worst-case run 52462 s" in p.stderr
-    assert "needs TTL_HOURS >= 16" in p.stderr
+    assert p.returncode == 2 and "refusing: worst-case run 52162 s" in p.stderr
+    assert "needs TTL_HOURS >= 15" in p.stderr
 
 
 def test_fresh606_phases_are_bounded_and_truncation_is_recorded():
