@@ -14,4 +14,4 @@ permissions:
 
 jobs:
   security:
-    uses: krateo-platformops/.github/.github/workflows/security.yml@f6185ef0a8161a4201217d6ce0953718fc736fe0 # 1.1.0
+    uses: krateo-platformops/.github/.github/workflows/security.yml@7da11cb60cee5cbfc7d9e8c9328692807b43cefd # 2.0.0
