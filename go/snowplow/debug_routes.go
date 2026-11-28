@@ -301,11 +301,11 @@ func isDebugPattern(pattern string) bool {
 // Callers MUST have registered every expvar publisher (cache.RegisterRBACSnapshotExpvar,
 // rbac.RegisterAuthzMemoExpvar, …) BEFORE calling this — the mount accepts
 // scrapes as soon as the server starts.
-func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySource) {
+func registerDebugRoutes(mux debugMux, chain use.Chain, jwtKeys jwtutil.KeySource, aud ...jwtutil.ValidateOption) {
 	// #1362: authenticate (RefreshAuth), THEN authorize (DebugAuthz) every
 	// route. Both are in this one chain, so no route can take one without the
 	// other.
-	gated := chain.Append(middleware.RefreshAuth(jwtKeys), middleware.DebugAuthz())
+	gated := chain.Append(middleware.RefreshAuth(jwtKeys, aud...), middleware.DebugAuthz())
 	// mount is the only call of handleDebug: every route below goes through
 	// it, so every route takes the gated chain.
 	mount := func(pattern string, handler http.Handler) {

@@ -332,6 +332,13 @@ func TestCredentialStatus1029_DocExamplesEqualTheWire(t *testing.T) {
 			wireSub = []string{endpoints.DelegatedSecretName("alice", "my-agent", nil), d1560Name()}
 			return rec
 		},
+		// #1596 — a token for another recipient only.
+		"TokenAudienceMismatch": func(t *testing.T) *httptest.ResponseRecorder {
+			t.Setenv("CACHE_ENABLED", "false")
+			rec, _ := p1076Serve(middleware.UserConfig(testKeys, testAuthnNS, middleware.AudienceOptions(a1596Name)...),
+				bearer("Bearer "+a1596Token(t, []string{"other.ns"}, "")))
+			return rec
+		},
 		"DelegatedCredentialMismatch": func(t *testing.T) *httptest.ResponseRecorder {
 			session := su994Secret(credsecret.SessionNames(su994User)[0], su994Session)
 			su994Informer(t, session)

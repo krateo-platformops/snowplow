@@ -11,10 +11,10 @@ This guide is for a frontend session, and for any other client of snowplow
 
 The rule is short:
 
-- **A 401 whose `details.causes[0].reason` is one of the eight in section 2**
+- **A 401 whose `details.causes[0].reason` is one of the nine in section 2**
   is a snowplow refusal **before dispatch**. Nothing was sent upstream: no
   apiserver call, no RESTAction stage, no write.
-- **Any other 401** (no `details`, or a reason outside the eight) is one
+- **Any other 401** (no `details`, or a reason outside the nine) is one
   snowplow does **not** vouch for. It may have been relayed from upstream
   after the request was dispatched, and a write may already have happened. Do
   **not** drop the token and replay the request on it.
@@ -129,7 +129,7 @@ name.
 
 ## 2. The closed set
 
-Snowplow emits exactly these eight reasons, and every one of them means
+Snowplow emits exactly these nine reasons, and every one of them means
 **nothing was dispatched**:
 
 | reason | emitted when | middleware | `WWW-Authenticate` | portal outcome |
@@ -138,6 +138,7 @@ Snowplow emits exactly these eight reasons, and every one of them means
 | `TokenInvalid` | the token failed validation: malformed, bad signature, wrong algorithm | both | `Bearer error="invalid_token"` | **log in again** |
 | `TokenExpired` | the token is correctly signed but expired | both | `Bearer error="invalid_token"` | **log in again** (the session-resume flow) |
 | `KeyNotPublished` | the token names a signing key (`kid`) that authn no longer publishes: authn's key set, fetched after the token was issued, does not hold it. The key was retired, for example to revoke the tokens it signed. No retry makes the token valid | both | `Bearer error="invalid_token"` | **log in again** |
+| `TokenAudienceMismatch` | the token verified, but its `aud` names other recipients only, or is an empty list (a token with no `aud` is accepted); section 2i | both | `Bearer error="invalid_token"` | **configuration fault**: tell the admin; never "log in again" |
 | `SessionCredentialMissing` | a valid token without `krateo:loa:2`; its session credential Secret is missing | `UserConfig` | `Bearer error="invalid_token"` | **log in again** |
 | `StepUpRequired` | a valid token with `krateo:loa:2`; its step-up credential Secret is missing | `UserConfig` | `Bearer error="insufficient_user_authentication"` | **prompt to step up** |
 | `DelegatedCredentialMissing` | a valid token with `act`; its delegated credential Secret is missing, or is not authn's credential for this person through this actor | `UserConfig` | `Bearer error="invalid_token"` | **exchange the token again** (`/delegate`) |
@@ -267,7 +268,32 @@ WWW-Authenticate: Bearer error="invalid_token"
 For an expired credential the `message` is `the delegated credential has
 expired`. Neither names a Secret or an identity.
 
-### 2i. What is guaranteed
+### 2i. TokenAudienceMismatch
+
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+WWW-Authenticate: Bearer error="invalid_token"
+
+{"kind":"Status","apiVersion":"v1","status":"Failure","message":"token is invalid: token is for another audience","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"TokenAudienceMismatch","message":"the bearer token was issued for another recipient; this is a configuration fault, not a login problem"}]}}
+```
+
+The token verified, and its `aud` claim names other recipients only (or is an
+empty list). Snowplow is called `<service>.<namespace>` (`snowplow.krateo-system`
+in the standard install; the chart's `TOKEN_AUDIENCE`). A token with **no**
+`aud`, which every sign-in, step-up and service-account token is, is accepted,
+and so is one whose `aud` lists snowplow's name, alone or among others. Neither
+`message` names an audience, a service or a caller. Signing in again does not
+help: it is the same kind of token again, so the portal shows it as a
+**configuration fault** (tell the administrator; the token was issued for
+another recipient), never as "log in again", and it is not in
+`LOGIN_REPLAY_CAUSES`. Snowplow counts these refusals
+(`snowplow_token_audience_mismatch`, by the token's signed actor class) and,
+on an audited route, writes one audit row: denied, reason `audience_mismatch`
+(audit v0.17.0), naming the sender and its signed class from the token, which
+verified. A token that does not verify is counted and never a row.
+
+### 2j. What is guaranteed
 
 - **The body is the contract.** Read `details.causes[0].reason`.
 - **The set is closed.** Snowplow writes no other reason on a 401. A future
@@ -307,7 +333,7 @@ expired`. Neither names a Secret or an identity.
 
 ## 3. A 401 without a snowplow cause: snowplow does not vouch that nothing was dispatched
 
-A 401 with no `details`, or with a reason outside the eight, is one snowplow
+A 401 with no `details`, or with a reason outside the nine, is one snowplow
 does not vouch for. It may be an upstream 401 snowplow relayed, a route
 mounted without its auth middleware (no route is, today), or a hop in front
 of snowplow.
@@ -391,6 +417,7 @@ components. Keep them distinct; never collapse them into one.
 | `TokenInvalid` | **snowplow** | 401 | log in again |
 | `TokenExpired` | **snowplow** | 401 | log in again (session resume) |
 | `KeyNotPublished` | **snowplow** | 401 | log in again |
+| `TokenAudienceMismatch` | **snowplow** | 401 | **configuration fault**: tell the admin; never log in again |
 | `SessionCredentialMissing` | **snowplow** | 401 | log in again (session resume) |
 | `StepUpRequired` | **snowplow** | 401 | **prompt to step up** |
 | `DelegatedCredentialMissing` | **snowplow** | 401 | the delegated client exchanges the token again |
@@ -499,12 +526,13 @@ A client that re-sends a request by itself must gate the replay on
 five reasons a fresh login fixes may trigger "drop the token, log in, replay":
 
 ```ts
-// The eight snowplow pre-dispatch causes (#1029, #1076, plumbing v1.36.0, #1560): nothing was dispatched.
+// The nine snowplow pre-dispatch causes (#1029, #1076, plumbing v1.36.0, #1560, #1596): nothing was dispatched.
 export const SNOWPLOW_PRE_DISPATCH_CAUSES = [
   'TokenMissing',
   'TokenInvalid',
   'TokenExpired',
   'KeyNotPublished',
+  'TokenAudienceMismatch',
   'SessionCredentialMissing',
   'StepUpRequired',
   'DelegatedCredentialMissing',
@@ -531,7 +559,7 @@ export function causeOf(body: unknown): string | null {
   return typeof r === 'string' && r.length > 0 ? r : null
 }
 
-/** True only for a 401 whose cause is one of snowplow's eight: nothing was dispatched. */
+/** True only for a 401 whose cause is one of snowplow's nine: nothing was dispatched. */
 export function refusedBeforeDispatch(status: number, body: unknown): boolean {
   return status === 401 && has(SNOWPLOW_PRE_DISPATCH_CAUSES, causeOf(body))
 }
@@ -558,7 +586,7 @@ if (res.status === 401 && causeOf(body) === 'StepUpRequired') {
 At the two sites that hold the `Response` (`useWidgetQuery.ts`,
 `sseClient.ts`), you may additionally log
 `res.headers.get('WWW-Authenticate')` for diagnostics (same-origin only; see
-section 2i). Do not branch on it.
+section 2j). Do not branch on it.
 
 **A delegated client** (an agent holding a token from authn's `/delegate`)
 handles the two `Delegated*` causes the same way, with "exchange again" in
