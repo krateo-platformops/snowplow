@@ -1448,25 +1448,42 @@ def _by(points, *keys):
             for k, v in sorted(g.items(), key=lambda kv: tuple(str(x) for x in kv[0]))}
 
 
-def final_page_report(p: dict) -> dict:
+def final_page_report(o: dict) -> dict:
     """The page-load definition in force and its split, per visit (first / warm).
 
     A load ends when the page is FINAL (pageload.js): its last skeleton gone, last own /call answered or last counted
     DOM change. `ended_by` says which; `live_update` whether a live update's re-fetch reached the load (it does not
-    extend it). `first_load_skeleton_end` is the first loads' time the OLD way (their skeleton's end), the series
-    runs before the final-page definition (run 31 and earlier) were judged on: compare THAT to old evidence, the
-    first-load bars above to new evidence. Evidence with no `ended_by` tag predates the definition."""
-    loads = [(v, t) for v, t in p.get("browser_page_load_ms", []) if t.get("timeout") != "yes"]
+    extend it). `live_first_loads`: loads where a request read as a live update's re-fetch was the load's FIRST for
+    its key, i.e. where an armed key's frame preceded a request that may be the load's own (the one residual of the
+    key rule; always toward a SHORTER load, so an upper bound on how many loads it can touch). A key no answer had
+    carried before the frame cannot be frame-triggered, so a first load is exact. `first_load_skeleton_end` is the
+    first loads' time the OLD way (their skeleton's end), the series runs before the final-page definition (run 31
+    and earlier) were judged on: compare THAT to old evidence, the first-load bars above to new evidence. Evidence
+    with no `ended_by` tag predates the definition."""
+    from bench import calltiming
+    p = o["points"]
+    loads = []
+    for v, t, md, _ in calltiming._aligned(o, "browser_page_load_ms"):
+        if t.get("timeout") == "yes":
+            continue
+        raw = md.get("load_final")
+        try:
+            first = int(json.loads(raw).get("live_first") or 0) if isinstance(raw, str) else 0
+        except (ValueError, AttributeError, TypeError):
+            first = 0
+        loads.append((v, t, first))
     by: dict = {}
     for visit in ("first", "warm"):
-        ls = [(v, t) for v, t in loads if t.get("visit") == visit]
-        ended = Counter(t.get("ended_by") or "untagged" for _, t in ls)
-        live = sum(1 for _, t in ls if t.get("live_update") == "yes")
+        ls = [(v, t, f) for v, t, f in loads if t.get("visit") == visit]
+        ended = Counter(t.get("ended_by") or "untagged" for _, t, _ in ls)
+        live = sum(1 for _, t, _ in ls if t.get("live_update") == "yes")
+        unsure = sum(1 for _, _, f in ls if f)
         by[visit] = {"n": len(ls), "ended_by": dict(sorted(ended.items())),
                      "ended_by_share": {k: round(c / len(ls), 4) for k, c in sorted(ended.items())} if ls else {},
-                     "live_update_loads": live, "live_update_share": round(live / len(ls), 4) if ls else None}
+                     "live_update_loads": live, "live_update_share": round(live / len(ls), 4) if ls else None,
+                     "live_first_loads": unsure, "live_first_share": round(unsure / len(ls), 4) if ls else None}
     skel = [v for v, _ in p.get("browser_first_load_skeleton_ms", [])]
-    tagged = sum(c for k, c in Counter(t.get("ended_by") or "untagged" for _, t in loads).items() if k != "untagged")
+    tagged = sum(1 for _, t, _ in loads if t.get("ended_by"))
     return {"load_definition": ("final-page (a load ends when its own requests answered and the page is quiet)"
                                 if tagged else "skeleton end (before the final-page definition)"),
             "page_load_by_visit_ended_by": by,
@@ -1523,7 +1540,7 @@ def browser_report(o: dict | None) -> dict | None:
             # answered and the page stopped changing (pageload.js; `ended_by`), never 0 by construction
             "page_load_by_visit_skeleton": _by(p.get("browser_page_load_ms", []), "visit", "skeleton"),
             # what ended each load, and the loads a live update reached (they are NOT extended by it)
-            **final_page_report(p),
+            **final_page_report(o),
             # the sign-in (submit -> the app leaves /login): authn, not a page load
             "signin_by_session": _by(p.get("browser_signin_ms", []), "session"),
             # all sessions together (run 11's reader found no flat value)

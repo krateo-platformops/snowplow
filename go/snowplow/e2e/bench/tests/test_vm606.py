@@ -603,6 +603,17 @@ def test_launch_says_launched_only_once_every_run_passed_its_paid_only_checks(fa
     assert _state()["started"] == "refused"
 
 
+def test_the_started_check_samples_the_launchers_liveness_before_it_reads_the_logs():
+    """CI 6fd0c842: a launcher that refuses writes its line and exits at once; liveness sampled AFTER the read let it
+    write and die in between, and the check said "exited" with the refusal unread (assert 'exited' == 'refused')."""
+    sh = vm606.launch_script(RUN, "0" * 40, {"RUN_NAME_N1": "a", "RUN_NAME_N2": "b"}, ["N1", "N2"], "pin.json", "0" * 64,
+                             "n", 60)
+    loop = sh[sh.index("while :; do"):]
+    assert loop.index('kill -0 "$pid"') < loop.index("grep -m1 '^refusing: '")
+    assert loop.index('if [ "$up" -eq 0 ]') > loop.index("VM606_STARTED=refused")
+    assert sh.count('kill -0 "$pid"') == 1
+
+
 def test_launch_refuses_a_checkout_that_is_not_the_sha_asked(fake, capsys, tmp_path):
     """An annotated tag's object id fetches, and checks out its commit: HEAD is not the id asked."""
     repo, sha, tag = _repo(tmp_path)

@@ -461,7 +461,7 @@ async function runClass (s, user, k, last, deadline, prevToken, secrets) {
         await page.evaluate((p) => {
           const b = window.__bench
           b.navT0 = performance.now(); b.saw = false; b.goneAt = 0; b.lastAnswer = null
-          b.liveFrames = 0; b.liveRefetches = 0; b.liveEv = []; b.armClick = false
+          b.liveFrames = 0; b.liveRefetches = 0; b.liveFirst = 0; b.liveEv = []; b.loadKeys = {}; b.armClick = false
           window.history.pushState({}, '', p)
           window.dispatchEvent(new PopStateEvent('popstate'))
         }, route)

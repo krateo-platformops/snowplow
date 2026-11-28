@@ -1460,7 +1460,7 @@ def test_pageload_load_time_and_widget_states(tmp_path):
     assert t0 == pytest.approx(out["origin"] + 100)
     assert out["loads"][0] == {"ms": 403, "saw": True, "ended": "skeleton", "path": "/err",
                                "final": {"skeletonMs": 403, "requestMs": None, "mutationMs": None,
-                                         "liveRefetches": 0, "liveFrames": 0},
+                                         "liveRefetches": 0, "liveFrames": 0, "liveFirst": 0},
                                "states": {"error": 1, "timeout": 0, "forbidden": 2, "notfound": 0}}
     # a load that asked for nothing and changed nothing after its click ends at the click
     assert out["loads"][1]["ms"] == 0 and out["loads"][1]["saw"] is False and out["loads"][1]["ended"] == "start"

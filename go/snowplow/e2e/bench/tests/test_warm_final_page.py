@@ -286,6 +286,38 @@ def test_a_live_update_refetch_during_a_load_does_not_extend_it(tmp_path):
 
 
 @needs_node
+def test_a_key_no_answer_had_carried_cannot_be_frame_triggered_so_a_first_load_is_exact(tmp_path):
+    """A frame for K reaches the page after the click and before the load's OWN first request for K. No earlier answer
+    carried K, so the portal had nothing armed under it: the request is the load's own, and it ends the load."""
+    steps = [*_stream_open(), {"op": "click", "at": 5000}, _frame("K", 5100),
+             {"op": "fetch", "at": 5110, "url": "/call?a"}, {"op": "answer", "at": 5600, "url": "/call?a", "key": "K"}]
+    load, _ = run(tmp_path, steps, 6600)
+    assert load["ms"] == 600 and load["ended"] == "request"
+    assert load["final"]["liveRefetches"] == 0 and load["final"]["liveFirst"] == 0 and load["final"]["liveFrames"] == 1
+
+
+@needs_node
+def test_a_warm_load_whose_armed_key_has_a_frame_before_its_own_request_is_read_as_live_and_counted(tmp_path):
+    """The one residual: K was armed by an answer of an EARLIER load; a frame for K precedes this load's own request for
+    K. It is read as the live update's re-fetch (the load ends earlier) and counted in liveFirst, for the report."""
+    steps = [*_stream_open(), {"op": "click", "at": 3000}, {"op": "fetch", "at": 3010, "url": "/call?prev"},
+             {"op": "answer", "at": 3100, "url": "/call?prev", "key": "K"},
+             {"op": "click", "at": 5000}, _frame("K", 5100),
+             {"op": "fetch", "at": 5110, "url": "/call?a"}, {"op": "answer", "at": 5600, "url": "/call?a", "key": "K"}]
+    load, _ = run(tmp_path, steps, 6600)
+    assert load["final"]["liveRefetches"] == 1 and load["final"]["liveFirst"] == 1 and load["ms"] == 0
+
+
+@needs_node
+def test_a_refetch_of_a_key_the_load_already_fetched_is_live_and_not_the_residual(tmp_path):
+    steps = [*_stream_open(), {"op": "click", "at": 5000}, {"op": "fetch", "at": 5010, "url": "/call?a"},
+             {"op": "answer", "at": 5050, "url": "/call?a", "key": "K"}, _frame("K", 5100),
+             {"op": "fetch", "at": 5110, "url": "/call?b"}, {"op": "answer", "at": 5600, "url": "/call?b", "key": "K"}]
+    load, _ = run(tmp_path, steps, 6600)
+    assert load["ms"] == 50 and load["final"]["liveRefetches"] == 1 and load["final"]["liveFirst"] == 0
+
+
+@needs_node
 def test_the_own_request_that_carries_the_same_key_but_started_before_the_frame_stays_own(tmp_path):
     """The key alone does not make a request live: the frame must have reached the page BEFORE the request started."""
     steps = [*_stream_open(), {"op": "click", "at": 5000}, {"op": "fetch", "at": 5010, "url": "/call?a"},
@@ -345,13 +377,15 @@ def test_a_load_a_live_update_reached_says_so(tmp_path):
              {"op": "answer", "at": 5210, "url": "/call?a", "key": "K"}, _frame("K", 5300), _frame("K2", 5301),
              {"op": "fetch", "at": 5310, "url": "/call?live"}, {"op": "answer", "at": 5400, "url": "/call?live", "key": "K"}]
     load, _ = run(tmp_path, steps, 6400)
-    assert load["final"] == {"skeletonMs": None, "requestMs": 210, "mutationMs": None, "liveRefetches": 1, "liveFrames": 2}
+    assert load["final"] == {"skeletonMs": None, "requestMs": 210, "mutationMs": None, "liveRefetches": 1, "liveFrames": 2,
+                             "liveFirst": 0}
     ops = _record_ops(tmp_path, load, {"route": "/x", "visit": "warm"})
     assert ops[0][2]["live_update"] == "yes" and ops[0][2]["ended_by"] == "request"
     quiet, _ = run(tmp_path, _warm(), 6300)
     assert _record_ops(tmp_path, quiet, {"route": "/x", "visit": "warm"})[0][2]["live_update"] == "no"
     fin = json.loads(_node_json(tmp_path, "pl.loadFinalOf(JSON.parse(process.argv[2]))", json.dumps(load)))
-    assert fin == {"skeleton_ms": None, "request_ms": 210, "mutation_ms": None, "live_refetches": 1, "live_frames": 2}
+    assert fin == {"skeleton_ms": None, "request_ms": 210, "mutation_ms": None, "live_refetches": 1, "live_frames": 2,
+                   "live_first": 0}
 
 
 @needs_node
@@ -387,6 +421,13 @@ def test_an_older_spas_refresh_event_source_names_a_live_key_too(tmp_path):
 
 
 @needs_node
+def test_the_load_final_metadata_carries_the_residual_count(tmp_path):
+    r = {"final": {"skeletonMs": None, "requestMs": 5, "mutationMs": None, "liveRefetches": 2, "liveFrames": 3, "liveFirst": 2}}
+    fin = json.loads(_node_json(tmp_path, "pl.loadFinalOf(JSON.parse(process.argv[2]))", json.dumps(r)))
+    assert fin["live_first"] == 2 and fin["live_refetches"] == 2
+
+
+@needs_node
 def test_a_live_calls_timing_metadata_says_so(tmp_path):
     c = '{fetch: 1, connectStart: 1, connectEnd: 1, requestStart: 2, responseStart: 3, responseEnd: 9, start: 5, live: %s}'
     got = [json.loads(_node_json(tmp_path, f"pl.callTiming({c % v}, 0, 'v:1')", "")) for v in ("true", "false")]
@@ -418,12 +459,15 @@ def test_refresh_frames_are_read_across_chunks_and_only_refresh_frames_name_a_ke
 @needs_node
 def test_only_a_frame_before_the_request_with_its_key_since_the_click_makes_a_refetch(tmp_path):
     t = json.loads(_node_json(tmp_path, "JSON.stringify(["
-                   "pl.isLiveRefetch('K', 100, [{key:'K', at:50}], 0),"       # frame before the request: live
-                   "pl.isLiveRefetch('K', 100, [{key:'K', at:150}], 0),"      # frame after it started: not
-                   "pl.isLiveRefetch('K', 100, [{key:'J', at:50}], 0),"       # another key
-                   "pl.isLiveRefetch('', 100, [{key:'', at:50}], 0),"         # an answer with no key
-                   "pl.isLiveRefetch('K', 100, [{key:'K', at:50}], 60)])", ""))  # frame before the click
-    assert t == [True, False, False, False, False]
+                   "pl.isLiveRefetch('K', 100, [{key:'K', at:50}], 0, {K:10}),"       # armed, frame before the request: live
+                   "pl.isLiveRefetch('K', 100, [{key:'K', at:150}], 0, {K:10}),"      # frame after it started: not
+                   "pl.isLiveRefetch('K', 100, [{key:'J', at:50}], 0, {K:10}),"       # another key
+                   "pl.isLiveRefetch('', 100, [{key:'', at:50}], 0, {}),"             # an answer with no key
+                   "pl.isLiveRefetch('K', 100, [{key:'K', at:50}], 60, {K:10}),"      # frame before the click
+                   "pl.isLiveRefetch('K', 100, [{key:'K', at:50}], 0, {}),"           # no answer ever carried K
+                   "pl.isLiveRefetch('K', 100, [{key:'K', at:50}], 0, {K:70}),"       # K armed only AFTER the frame
+                   "pl.isLiveRefetch('K', 100, [{key:'K', at:50}], 0, {K:50})])", ""))  # armed at the frame: not before it
+    assert t == [True, False, False, False, False, False, False, False]
 
 
 @needs_node
@@ -559,19 +603,35 @@ def test_browser_checks_carries_the_warm_final_check():
 
 # ─── the report: what ended the loads, the live updates, and the old first-load series ─────────────
 
+def _o(loads, skel=()):
+    """a browser stream: loads [(ms, tags, load_final or None)]"""
+    return {"points": {"browser_page_load_ms": [(v, t) for v, t, _ in loads],
+                       "browser_first_load_skeleton_ms": [(v, {}) for v in skel]},
+            "metadata": {"browser_page_load_ms": [{"load_final": json.dumps(f)} if f else {} for _, _, f in loads]},
+            "times": {}}
+
+
 def test_the_report_splits_ended_by_per_visit_counts_live_update_loads_and_keeps_the_old_first_load_series():
-    pts = {"browser_page_load_ms": [
-        (210.0, {"visit": "warm", "ended_by": "request", "live_update": "no", "timeout": "no"}),
-        (400.0, {"visit": "warm", "ended_by": "mutation", "live_update": "yes", "timeout": "no"}),
-        (900.0, {"visit": "first", "ended_by": "request", "live_update": "no", "timeout": "no"}),
-        (700.0, {"visit": "first", "ended_by": "skeleton", "live_update": "yes", "timeout": "no"}),
-        (60000.0, {"visit": "first", "timeout": "yes"})],
-        "browser_first_load_skeleton_ms": [(600.0, {}), (700.0, {})]}
-    r = k6eval.final_page_report(pts)
+    o = _o([
+        (210.0, {"visit": "warm", "ended_by": "request", "live_update": "no", "timeout": "no"}, {"live_first": 0}),
+        (400.0, {"visit": "warm", "ended_by": "mutation", "live_update": "yes", "timeout": "no"}, {"live_first": 2}),
+        (900.0, {"visit": "first", "ended_by": "request", "live_update": "no", "timeout": "no"}, {"live_first": 0}),
+        (700.0, {"visit": "first", "ended_by": "skeleton", "live_update": "yes", "timeout": "no"}, {"live_first": 0}),
+        (60000.0, {"visit": "first", "timeout": "yes"}, {"live_first": 5})], skel=[600.0, 700.0])
+    r = k6eval.final_page_report(o)
     assert r["load_definition"].startswith("final-page")
     w, f = r["page_load_by_visit_ended_by"]["warm"], r["page_load_by_visit_ended_by"]["first"]
     assert w["n"] == 2 and w["ended_by"] == {"mutation": 1, "request": 1} and w["live_update_share"] == 0.5
+    assert w["live_first_loads"] == 1 and w["live_first_share"] == 0.5          # the residual's upper bound
     assert f["n"] == 2 and f["ended_by_share"] == {"request": 0.5, "skeleton": 0.5} and f["live_update_loads"] == 1
+    assert f["live_first_loads"] == 0                                           # the timed-out load is not counted
     assert r["first_load_skeleton_end"]["n"] == 2 and r["first_load_skeleton_end"]["max_ms"] == 700.0
-    old = k6eval.final_page_report({"browser_page_load_ms": [(0.0, {"visit": "warm", "timeout": "no"})]})
+
+
+def test_evidence_without_ended_by_reads_untagged_and_predates_the_definition():
+    old = k6eval.final_page_report(_o([(0.0, {"visit": "warm", "timeout": "no"}, None),
+                                       (300.0, {"visit": "first", "timeout": "no"}, None)]))
     assert old["load_definition"].startswith("skeleton end") and old["first_load_skeleton_end"] is None
+    assert old["page_load_by_visit_ended_by"]["warm"]["ended_by"] == {"untagged": 1}
+    assert old["page_load_by_visit_ended_by"]["first"]["ended_by_share"] == {"untagged": 1.0}
+    assert old["page_load_by_visit_ended_by"]["warm"]["live_first_loads"] == 0
