@@ -122,6 +122,13 @@ const (
 	// helm/snowplow's and helm/snowplow-crds' CRDs are both byte-identical
 	// under v1.103.0 and v1.106.0.
 	//
+	// v1.106.0 → v1.111.0 (#1596): `diff -r` of the module trees: crdgen/ and
+	// crdgen/schemas/ change only in test files (constnull_test.go, oldself_test.go,
+	// oldself_envtest_test.go); no non-test file differs, so the crdgen CODE is
+	// v1.106.0's. crdgenVersion moves with go.mod; coreProviderCrdgenVersion
+	// stays v1.106.0 (core-provider 2.13.127 is what the installer deploys), and
+	// the invariant holds by byte identity of crdgen/ and crdgen/schemas/.
+	//
 	// The impersonateGroups CEL rule is removed (#1504): under every crdgen from
 	// v1.88.0 (core-provider 2.13.107) its `not` is native, and a rule restating
 	// it was one constraint stated twice. A core-provider at or below 2.13.106
@@ -138,7 +145,7 @@ const (
 	// input, so it is its own change (#1488), not part of a plumbing bump.
 	coreProviderVersion = "2.13.71"
 	crdgenModule        = "github.com/krateo-platformops/plumbing"
-	crdgenVersion       = "v1.106.0"
+	crdgenVersion       = "v1.111.0"
 	// coreProviderCrdgenVersion is the plumbing core-provider compiles with
 	// (crdgenCoreProvider's go/core-provider/go.mod).
 	coreProviderCrdgenVersion = "v1.106.0"

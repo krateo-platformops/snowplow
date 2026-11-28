@@ -125,7 +125,7 @@ func Prefixed(prefix, s string) string {
 // where the namespace is a DNS-1123 label and the name a DNS-1123 subdomain.
 //
 // delegated matches a delegated credential Secret name (#1560, authn#167):
-// "delegated-" and the 64 hex digits of a SHA-256 of (username, actor). It
+// "delegated-" and the 64 hex digits of a SHA-256 of (username, actor, set of groups). It
 // names no one in clear, but usernames come from a small known set, so the
 // digest is guessable and counts as identity. The shape is fixed, so it is
 // matched quoted or not. This leaf cannot import plumbing's

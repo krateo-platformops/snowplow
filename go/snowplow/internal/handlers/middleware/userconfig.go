@@ -205,7 +205,13 @@ import (
 // v1.103.0 → v1.106.0 (#1504): re-audited by `diff -r` of every plumbing
 // package this module imports. Only crdgen/ (the chart guard's; see chartcrd)
 // changed; every package this file transcribes is byte-identical.
-const PinnedPlumbingVersion = "v1.106.0"
+//
+// v1.106.0 → v1.111.0 (#1596): re-audited by `diff -r` of the two module trees.
+// Non-test changes are in endpoints/ (DelegatedSecretName takes the groups; a
+// caller, credsecret.Select, passes them), jwtutil/ (audience options on the
+// validators, not used here), and helm/, helm/v3 (not imported). server/use,
+// which this file transcribes, is byte-identical.
+const PinnedPlumbingVersion = "v1.111.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
@@ -416,7 +422,7 @@ func userConfig(keys jwtutil.KeySource, authnNS string, public *PublicIdentity) 
 			// #1560 — credsecret.Select is the one selector, shared with
 			// every RESTAction own-credential stage. A token that carries
 			// `act` reads its delegated credential,
-			// endpoints.DelegatedSecretName(username, outermost act.sub),
+			// endpoints.DelegatedSecretName(username, outermost act.sub, groups),
 			// proven the token's by endpoints.CheckDelegatedCredential with
 			// the token's groups as issued; it has no step-up branch and no
 			// fallback to the person's session Secret. A token without `act`

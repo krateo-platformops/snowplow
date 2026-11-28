@@ -58,14 +58,14 @@ func d1560Token(t *testing.T, actor string, groups ...string) string {
 func d1560Secret(t *testing.T, actor, url string, groups []string, nb, na time.Time) *corev1.Secret {
 	t.Helper()
 	s := delegatedcred.Secret(t, delegatedcred.Spec{Namespace: su994SecretsNS, Username: su994User, Actor: actor,
-		Groups: groups, NotBefore: nb, NotAfter: na, ServerURL: url, Token: "tok-delegated"})
+		Groups: groups, NameGroups: []string{su994Group}, NotBefore: nb, NotAfter: na, ServerURL: url, Token: "tok-delegated"})
 	if len(s.Labels) != 0 {
 		t.Fatalf("PRE: authn writes a delegated Secret with no labels; the fixture has %v", s.Labels)
 	}
 	return s
 }
 
-func d1560Name() string { return endpoints.DelegatedSecretName(su994User, d1560Actor) }
+func d1560Name() string { return endpoints.DelegatedSecretName(su994User, d1560Actor, []string{su994Group}) }
 
 func d1560Cause(t *testing.T, body string) string {
 	t.Helper()
