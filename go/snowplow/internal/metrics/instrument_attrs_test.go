@@ -253,6 +253,12 @@ var closedAttributeKeys = map[string]struct{}{
 	// outcome; cause on _cold_total): handler is {restactions, widgets},
 	// class_warm {none} until P3; pinned by customer_serves_otlp_1265_test.go.
 	"handler": {}, "class_warm": {},
+	// viewer_key on snowplow_viewer_context_dropped_total: the fixed
+	// viewercontext.DroppedKeyEnum() set (viewer-context keys that have a
+	// validator, today {tz}); never the dropped value. Named viewer_key so it
+	// cannot be read as a cache key. Pinned by
+	// metrics_viewer_context_dropped_otlp_test.go.
+	"viewer_key": {},
 }
 
 // closedSpanAttributeKeys is the set of attribute keys the restaction.resolve and
