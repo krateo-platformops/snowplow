@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+
+	"github.com/krateo-platformops/snowplow/internal/viewercontext"
 )
 
 // extrasCtxKey is the private context key under which a pre-decoded extras
@@ -53,7 +55,7 @@ func ParseExtras(req *http.Request) (res map[string]any, err error) {
 	res = map[string]any{}
 
 	if m, ok := ExtrasFromContext(req.Context()); ok {
-		return m, nil
+		return viewercontext.DropInvalid(m), nil
 	}
 
 	extrasParam := req.URL.Query().Get("extras")
@@ -67,5 +69,9 @@ func ParseExtras(req *http.Request) (res map[string]any, err error) {
 		return
 	}
 
+	// A viewer-context value that is not acceptable (a tz that is not an IANA
+	// name) is dropped here, so every consumer (key, Put decision, resolve, the
+	// RESTAction route) sees the request as if it had not been sent.
+	res = viewercontext.DropInvalid(res)
 	return
 }

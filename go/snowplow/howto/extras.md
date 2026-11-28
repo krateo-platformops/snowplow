@@ -144,7 +144,7 @@ a deterministic `fmt.Sprintf("%v", …)` so the key still varies with content.
   Identity keys (`username`, `groups`, `displayName`) are handled one step
   earlier and never reach the resolve dict unless the widget declares them.
   A client-supplied identity extra is **stripped** inside `widgets.Resolve`
-  (`sanitizeUndeclaredIdentityExtras`), so every caller — the `/call` dispatcher,
+  (`sanitizeUndeclaredViewerContextExtras`), so every caller — the `/call` dispatcher,
   the refresher, the boot seed and nested resolves — gets the same contract.
   It survives only when the widget names that key in
   `spec.identityContext` — where the server overwrites it with the JWT's own
@@ -153,6 +153,19 @@ a deterministic `fmt.Sprintf("%v", …)` so the key still varies with content.
   `spec.identityContext`**; reading `.username` from the request extras
   yields nothing, because a value the client chose would otherwise shape a
   body written into the cell its whole RBAC cohort reads.
+
+  **Viewer time zone (`tz`).** The frontend sends the viewer's IANA time zone
+  (e.g. `Europe/Rome`) as the extra `tz` on every read, so a RESTAction can
+  start a day-sized slot at the viewer's midnight. It is a viewer-context key
+  like the identity keys, with one difference: it is client-asserted (the server
+  cannot inject or verify it). A widget that does not declare it never sees it
+  and its cache key does not change. **To use it, declare `keyExtras: [tz]` on
+  the widget and read `.extras.tz` in the RESTAction** (the widget's apiRef
+  hands declared extras to the RESTAction like route params). It then
+  partitions the key, so each zone gets its own cell. A value that is not a
+  tzdata zone name, spelled exactly as tzdata spells it (`Europe/Rome`, not
+  `europe/rome`), is dropped before anything sees it, so it is safe to
+  pass to a query; do not rely on it for anything but presentation.
 
   The same filtered union feeds all four key consumers — dispatch lookup,
   the shared `widgetContent` cell, subscription arming, and the boot/keepwarm
