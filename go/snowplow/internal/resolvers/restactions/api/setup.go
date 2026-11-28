@@ -250,7 +250,8 @@ func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds an
 		// dials. It is the #288 collapse, read from the template's pieces, so it
 		// is that class: inspect enumerates it from the skeleton (#504).
 		out.Path = pathErr.Error()
-		return out, false, skipReason{class: reasonEmptyInterp, detail: pathErr.Error(), collapsed: true}
+		rendered, _ := pathtemplate.RenderedOfEmptySegment(pathErr)
+		return out, false, skipReason{class: reasonEmptyInterp, detail: pathErr.Error(), collapsed: true, namespace: cache.RenderedNamespace(rendered.Value())}
 	}
 	if pathErr != nil && pathtemplate.IsRefused(pathErr) {
 		// #1123 — a value tried to be more than one segment, or a '.'/'..'
@@ -297,6 +298,9 @@ func createRequestOptionWith(in *templates.API, pt *pathtemplate.Template, ds an
 		return
 	}
 	valid, sr = validInterpolatedPath(out.Path, ptr.Deref(out.Verb, http.MethodGet))
+	if !valid && sr.class == reasonEmptyInterp {
+		sr.namespace = cache.RenderedNamespace(out.Path)
+	}
 	if !valid && sr.refusesAValue() {
 		// #1185 item C — the path was refused for what a value put in it, so the
 		// rendered path is that value, escaped or not: `%3F` hides it from a
