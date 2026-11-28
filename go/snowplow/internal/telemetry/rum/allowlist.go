@@ -12,7 +12,8 @@
 // one.
 //
 // Seven span names are forwarded, each with its own attribute set
-// (spanAllowlist): krateo.widget.fetch and the four page-level spans carry the
+// (spanAllowlist): krateo.widget.fetch (which also carries krateo.widget.resource,
+// .namespace and .name, each a DNS-1123 name) and the four page-level spans carry the
 // http.* keys (and the three interaction spans krateo.interaction.abandoned,
 // #1060); krateo.agentiko.claim.unbacked carries ONLY
 // krateo.agentiko.claim.family and krateo.agentiko.claim.outcome, each a
@@ -92,6 +93,15 @@ const (
 	// AttrA2AMethod is the A2A JSON-RPC method of a krateo.agentiko.a2a span
 	// (#1398): one of a closed set (a2aMethods), never free text.
 	AttrA2AMethod = "krateo.a2a.method"
+	// AttrWidgetResource, AttrWidgetNamespace and AttrWidgetName name the widget
+	// a krateo.widget.fetch span fetched (frontend contract, 2026-11-28): the
+	// plural from the /call URL (for example tables), and the widget's
+	// namespace and name. Each is a DNS-1123 name (dnsLabel or dnsSubdomain),
+	// never free text, a URL or an identity; they join a browser fetch to
+	// snowplow's server spans by widget.
+	AttrWidgetResource  = "krateo.widget.resource"
+	AttrWidgetNamespace = "krateo.widget.namespace"
+	AttrWidgetName      = "krateo.widget.name"
 )
 
 // valueCheck returns the value to forward for one attribute, rebuilt from the
@@ -128,9 +138,14 @@ type valueCheck func(v anyValue, routes RouteSet) (*commonpb.AnyValue, bool)
 //     http.route as a template (routeTemplate: the A2A route is the
 //     gateway's, not snowplow's, so registeredRoute cannot apply), and
 //     krateo.a2a.method from a closed set (a2aMethod). No other key (#1398).
+//   - krateo.widget.resource, krateo.widget.namespace and krateo.widget.name
+//     are allowed only on krateo.widget.fetch, each a DNS-1123 name (resource
+//     and namespace a label of at most 63 characters, name a subdomain of at
+//     most 253); anything else is dropped and counted.
 var spanAllowlist = map[string]map[string]valueCheck{
 	SpanWidgetFetch: {
 		AttrRoute: registeredRoute, AttrMethod: methodToken, AttrStatus: statusCode,
+		AttrWidgetResource: dnsLabel, AttrWidgetNamespace: dnsLabel, AttrWidgetName: dnsSubdomain,
 	},
 	SpanPageLoad: {
 		AttrRoute: routeTemplate, AttrMethod: methodToken, AttrStatus: statusCode,
@@ -232,6 +247,60 @@ func claimToken(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
 		return strValue(*s), true
 	}
 	return nil, false
+}
+
+// dnsLabel: exactly a string (no other member of the value, as claimToken)
+// that is a DNS-1123 label: lower-case alphanumerics and '-', starting and
+// ending with an alphanumeric, at most 63 characters. Anything else is
+// dropped, never coerced.
+func dnsLabel(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
+	if s := v.StringValue; s != nil && v.members == 1 && validDNSLabel(*s) {
+		return strValue(*s), true
+	}
+	return nil, false
+}
+
+// dnsSubdomain: as dnsLabel, for a DNS-1123 subdomain: dot-separated labels,
+// at most 253 characters in all.
+func dnsSubdomain(v anyValue, _ RouteSet) (*commonpb.AnyValue, bool) {
+	if s := v.StringValue; s != nil && v.members == 1 && validDNSSubdomain(*s) {
+		return strValue(*s), true
+	}
+	return nil, false
+}
+
+const (
+	maxDNSLabelLen     = 63
+	maxDNSSubdomainLen = 253
+)
+
+// validDNSLabel reports whether v is a DNS-1123 label, byte by byte so no
+// Unicode letter or case folding can pass.
+func validDNSLabel(v string) bool {
+	if v == "" || len(v) > maxDNSLabelLen {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		alnum := c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
+		if !alnum && (c != '-' || i == 0 || i == len(v)-1) {
+			return false
+		}
+	}
+	return true
+}
+
+// validDNSSubdomain reports whether v is a DNS-1123 subdomain.
+func validDNSSubdomain(v string) bool {
+	if v == "" || len(v) > maxDNSSubdomainLen {
+		return false
+	}
+	for _, l := range strings.Split(v, ".") {
+		if !validDNSLabel(l) {
+			return false
+		}
+	}
+	return true
 }
 
 // maxClaimTokenLen bounds a claim token (the {0,31} after the first letter).

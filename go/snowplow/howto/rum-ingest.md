@@ -74,6 +74,9 @@ Everything not listed here is dropped. Nothing is forwarded as sent: the payload
 | `krateo.agentiko.claim.family` | `krateo.agentiko.claim.unbacked` only | a string (`stringValue`) matching `^[a-z][a-z0-9_]{0,31}$`. See below. |
 | `krateo.agentiko.claim.outcome` | `krateo.agentiko.claim.unbacked` only | a string (`stringValue`) matching `^[a-z][a-z0-9_]{0,31}$`. See below. |
 | `krateo.a2a.method` | `krateo.agentiko.a2a` only | exactly one of `message/stream`, `message/send`, `tasks/get`, `tasks/resubscribe` (`stringValue`). See below. |
+| `krateo.widget.resource` | `krateo.widget.fetch` only | the widget plural from the `/call` URL (for example `tables`): a DNS-1123 label (`stringValue`; lower-case `a-z 0-9 -`, starts and ends alphanumeric, at most 63 characters). |
+| `krateo.widget.namespace` | `krateo.widget.fetch` only | the widget's namespace: a DNS-1123 label, as above. |
+| `krateo.widget.name` | `krateo.widget.fetch` only | the widget's name: a DNS-1123 subdomain (`stringValue`; dot-separated labels as above, at most 253 characters in all). |
 
 Every other attribute is dropped and counted, as is an allowlisted key on a span that does not list it, or whose value fails its check. That includes `enduser.id`, `url.full` and any header.
 
