@@ -16,12 +16,14 @@
 package viewercontext
 
 import (
+	_ "embed"
 	"expvar"
+	"strings"
+	"sync"
 	"sync/atomic"
-	"time"
-	// The IANA database travels with the binary: a distroless image has no
-	// /usr/share/zoneinfo, and without it LoadLocation would reject every
-	// zone, which would silently turn the validator into "drop all tz".
+	// The IANA database travels with the binary (a distroless image has no
+	// /usr/share/zoneinfo): zones.txt describes this database, and every name
+	// in it is resolvable by time.LoadLocation (TestEveryListedZoneLoads).
 	_ "time/tzdata"
 )
 
@@ -78,15 +80,33 @@ func Valid(k string, v any) bool {
 	return e.valid(v)
 }
 
-// validTZ accepts only a real IANA zone name: a string of at most MaxTZLen
-// bytes made of letters, digits and / _ + - , that time.LoadLocation resolves,
-// and that is neither empty nor "Local" (LoadLocation maps "" to UTC and
-// "Local" to the server's zone, neither of which is a viewer assertion). The
-// character allow-list runs first, so nothing quote-, space-, newline- or
-// control-shaped ever reaches LoadLocation or, downstream, an SQL literal.
+// validTZ accepts a value only if it is byte-for-byte a zone name the embedded
+// tzdata carries (zones.txt). time.LoadLocation is NOT the test: it joins the
+// name onto a zoneinfo directory, so it also accepts spellings of a zone that
+// are not its name (`Europe//Rome`, `Europe/./Rome`, and on a case-insensitive
+// filesystem `europe/rome`), and non-zone entries such as `Factory`. Each
+// spelling would be its own cache cell for one zone, and what is accepted would
+// depend on the OS. Exact membership has neither problem. Zone aliases that
+// tzdata itself names (`UTC`, `Etc/UTC`, `Zulu`) are accepted as they are, not
+// folded together. Empty and `Local` are not zone names, so they are refused
+// without a special case.
 func validTZ(v any) bool {
 	s, ok := v.(string)
-	if !ok || s == "" || len(s) > MaxTZLen || s == "Local" {
+	if !ok || !shapeOK(s) {
+		return false
+	}
+	_, member := zoneNames()[s]
+	return member
+}
+
+// shapeOK is the cheap first filter: a non-empty string of at most MaxTZLen
+// bytes made only of ASCII letters, digits and / _ + - . Nothing quote-, space-,
+// newline-, control- or non-ASCII-shaped goes further, so it never reaches the
+// set lookup, a log line or, downstream, an SQL literal. Every real zone name
+// passes it (pinned by a test), so on its own it is only a filter; it is tested
+// directly because the set lookup would hide a mistake in it.
+func shapeOK(s string) bool {
+	if s == "" || len(s) > MaxTZLen {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
@@ -98,8 +118,36 @@ func validTZ(v any) bool {
 			return false
 		}
 	}
-	_, err := time.LoadLocation(s)
-	return err == nil
+	return true
+}
+
+// zonesTxt is the zone-name list of the IANA database the binary embeds
+// (time/tzdata is the Go toolchain's lib/time/zoneinfo.zip), one name per line,
+// without the non-zone entry `Factory`. The embedded database cannot be
+// enumerated at run time (its archive is unexported), so the list is generated
+// from that same zip and a test fails if a newer toolchain's zip names a zone
+// the list lacks (regenerate: see TestZonesListMatchesToolchainZip).
+//
+//go:embed zones.txt
+var zonesTxt string
+
+var (
+	zonesOnce sync.Once
+	zones     map[string]struct{}
+)
+
+// zoneNames builds the set once, on first use.
+func zoneNames() map[string]struct{} {
+	zonesOnce.Do(func() {
+		lines := strings.Split(zonesTxt, "\n")
+		zones = make(map[string]struct{}, len(lines))
+		for _, l := range lines {
+			if l != "" {
+				zones[l] = struct{}{}
+			}
+		}
+	})
+	return zones
 }
 
 var droppedTotal atomic.Uint64

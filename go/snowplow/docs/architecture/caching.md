@@ -668,8 +668,12 @@ and the SPA's recovery are OPEN rows owned by the chart review checklist and fro
    and partitions the key, so a forged value only reaches a cell for that value. `tz` (the
    viewer's IANA zone) is client-asserted — not in the JWT, never an `identityContext`
    value, never injected — so those two rules are its only protection, plus a value check:
-   a `tz` that is not a real IANA zone name (letters, digits and `/ _ + -`, at most 64
-   bytes, resolvable by `time.LoadLocation`, not empty, not `Local`) is dropped at the
+   a `tz` that is not, byte for byte, a zone name the embedded tzdata carries
+   (`internal/viewercontext/zones.txt`, so `Europe/Rome` and `UTC` pass, while `europe/rome`,
+   `Europe//Rome`, `Local`, `Factory` and the empty string do not; each zone has exactly one
+   accepted spelling, so it cannot fork the cache, and the result does not depend on the OS;
+   a cheap first filter allows only ASCII letters, digits and `/ _ + -`, at most 64 bytes)
+   is dropped at the
    request edge (`util.ParseExtras`, and the `/refreshes` coordinates) before the key, the
    Put decision and the resolve, exactly as if it had not been sent
    (`snowplow_viewer_context_dropped_total`; values are never logged).

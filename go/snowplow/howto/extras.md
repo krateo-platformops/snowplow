@@ -163,7 +163,8 @@ a deterministic `fmt.Sprintf("%v", …)` so the key still varies with content.
   the widget and read `.extras.tz` in the RESTAction** (the widget's apiRef
   hands declared extras to the RESTAction like route params). It then
   partitions the key, so each zone gets its own cell. A value that is not a
-  real IANA zone name is dropped before anything sees it, so it is safe to
+  tzdata zone name, spelled exactly as tzdata spells it (`Europe/Rome`, not
+  `europe/rome`), is dropped before anything sees it, so it is safe to
   pass to a query; do not rely on it for anything but presentation.
 
   The same filtered union feeds all four key consumers — dispatch lookup,
