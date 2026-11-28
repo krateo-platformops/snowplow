@@ -114,7 +114,7 @@ func TestAudit_Audience1596_UserConfigRefusalIsOneRow(t *testing.T) {
 	}
 }
 
-// A token that does NOT verify (a bad signature) is counted and never a row,
+// A token that does NOT verify (a bad signature) is refused 401 and never a row (no caller is marked verified),
 // even with an aud that would mismatch.
 func TestAudit_Audience1596_AnUnverifiedTokenIsNeverARow(t *testing.T) {
 	login := e2eLogin{groups: []string{"devs"}, seed: []string{credsecret.SessionNames(e2eUser)[0]},

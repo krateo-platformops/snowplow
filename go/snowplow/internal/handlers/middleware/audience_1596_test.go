@@ -104,6 +104,9 @@ func TestAudience1596_AcceptedAndRefused(t *testing.T) {
 		{"ours as a bare string", a1596Name, false},
 		{"only others", []string{"agentiko.krateo-system", "other.ns"}, true},
 		{"a near miss", []string{"snowplow.other-ns"}, true},
+		// The match is exact: no case folding, no trailing dot.
+		{"the name in another case", []string{"SNOWPLOW.KRATEO-SYSTEM"}, true},
+		{"the name with a trailing dot", []string{a1596Name + "."}, true},
 		{"an empty list", []string{}, true},
 	}
 	for _, rt := range a1596Routes() {

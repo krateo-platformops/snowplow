@@ -14,9 +14,10 @@
 // looked at, so the sender is known: the audited route's one record is
 // denied with reason audience_mismatch (audit v0.17.0, Diego's ruling
 // 2026-11-28), naming the actor and its signed class from the claims plumbing
-// returns with the error. A token that did not verify is counted and never a
-// row (and never reaches this). The count is by the token's signed actor
-// class (ActorPrincipal()), a closed set, never a name.
+// returns with the error. A token that did not verify is refused 401
+// (TokenInvalid and the like), marks no caller verified, and is never a row;
+// it does not reach this. The count is by the token's signed actor class
+// (ActorPrincipal()), a closed set, never a name.
 package middleware
 
 import (
@@ -60,7 +61,7 @@ func AudienceMismatchCount(class string) int64 {
 func rejectToken(w http.ResponseWriter, req *http.Request, ui jwtutil.UserInfo, err error) error {
 	// ErrAudienceMismatch is tested FIRST: plumbing wraps it with
 	// ErrTokenInvalid, so any test of ErrTokenInvalid before it sends the
-	// refusal down the counted, no-row branch.
+	// refusal down the no-row branch.
 	if errors.Is(err, jwtutil.ErrAudienceMismatch) {
 		// The token verified: ui is its signed claims, so it is safe to name.
 		audit.SetCaller(req.Context(), ui)

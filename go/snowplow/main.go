@@ -530,8 +530,7 @@ func main() {
 	jwtKeys := credhttp.JWKSKeySource(resolvedJWKSURL, *jwksTimeout,
 		jwtutil.WithJWKSCacheTTL(*jwksCacheTTL),
 		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh))
-	tokenAudience := middleware.AudienceOptions(*tokenAudienceName)
-	log.Info("token audience", slog.Bool("checked", len(tokenAudience) > 0))
+	tokenAudience := tokenAudienceOptions(log, *tokenAudienceName)
 	log.Info("JWT verification keys sourced from authn JWKS",
 		slog.String("jwks_url", resolvedJWKSURL),
 		slog.Duration("cache_ttl", *jwksCacheTTL),
