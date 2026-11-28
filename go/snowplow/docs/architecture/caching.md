@@ -356,9 +356,15 @@ here is load-bearing:
    - `serveFromCacheEligible(inputs)` — never write the shared empty-`BindingUID` row from the
      dispatch path;
    - the **F6 undeclared-extras quarantine** — request extras must all be declared in the
-     widget's `spec.keyExtras` or belong to the identity axis (`spec.identityContext`
-     username/groups), else the Put is skipped
-     (`filterDeclaredKeyExtras` / `snowplow_widget_skipped_undeclared_extras_put_total`).
+     widget's `spec.keyExtras` or belong to the **viewer-context vocabulary** (`username`,
+     `groups`, `displayName`, `tz`), else the Put is skipped
+     (`filterDeclaredKeyExtras` / `snowplow_widget_skipped_undeclared_extras_put_total`). A
+     viewer-context key is exempt because `widgets.Resolve` strips it from the resolve input
+     when the widget does not declare it (`sanitizeUndeclaredViewerContextExtras`), so the
+     body cannot depend on it and the key does not move. The one exception is an
+     inline-embedding parent, whose children receive the raw request extras: an undeclared
+     `tz` still declines its Put (the identity keys are covered there by the per-user inline
+     marker).
    Finally `Deps().Record(cacheKey, gvr, ns, name)` records the self-edge after
    `ensureWatcherInformerForGVR` guarantees the GVR's informer is wired, and
    `cache.PublishRefresh(key)` signals any `/refreshes` SSE subscriber of the committed entry.
@@ -654,6 +660,25 @@ and the SPA's recovery are OPEN rows owned by the chart review checklist and fro
 6. **Author-declared key surface.** Request extras partition the key only where the widget
    author declared them (`spec.keyExtras`) or on the identity axis (`spec.identityContext`);
    an undeclared-extras resolve is served-but-not-cached, never a silent cell fork.
+   **Viewer context** (`username`, `groups`, `displayName`, `tz`) is one closed vocabulary
+   (`internal/viewercontext`, mirrored by the strip set in `widgets/resolve.go` and the
+   exemption set in `dispatchers/helpers.go`, pinned together by
+   `TestA3_ViewerContextVocabularyIsInSync`): undeclared, a key is stripped from the resolve
+   input and does not move the key; declared in `spec.keyExtras`, it reaches the resolve
+   and partitions the key, so a forged value only reaches a cell for that value. `tz` (the
+   viewer's IANA zone) is client-asserted — not in the JWT, never an `identityContext`
+   value, never injected — so those two rules are its only protection, plus a value check:
+   a `tz` that is not, byte for byte, a zone name the embedded tzdata carries
+   (`internal/viewercontext/zones.txt`, so `Europe/Rome` and `UTC` pass, while `europe/rome`,
+   `Europe//Rome`, `Local`, `Factory` and the empty string do not; a zone name has exactly one
+   accepted spelling, so a misspelling cannot fork the cache, while tzdata's own aliases
+   (`UTC`, `Etc/UTC`, `Zulu`, ...) are each names in their own right and each accepted as
+   spelled, not folded together; the result does not depend on the OS;
+   a cheap first filter allows only ASCII letters, digits and `/ _ + -`, at most 64 bytes)
+   is dropped at the
+   request edge (`util.ParseExtras`, and the `/refreshes` coordinates) before the key, the
+   Put decision and the resolve, exactly as if it had not been sent
+   (`snowplow_viewer_context_dropped_total`; values are never logged).
 7. **No per-resource special cases.** Key shape is per *class*, uniform across every GVR;
    behaviour is expressed via the entry-class discriminant (or a general annotation like the
    external TTL), never hardcoded resource names.

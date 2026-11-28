@@ -392,11 +392,11 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 
 // resolveInputExtras is the request extras as Resolve hands them on: the
 // identity keys the widget has not declared stripped (A-3,
-// sanitizeUndeclaredIdentityExtras), then its declared identity injected,
+// sanitizeUndeclaredViewerContextExtras), then its declared identity injected,
 // injection winning on collision (A2, DeclaredIdentity). Resolve calls it once;
 // ApiRefExtras derives from it, so the two cannot drift.
 func resolveInputExtras(ctx context.Context, obj map[string]any, requestExtras map[string]any) map[string]any {
-	extras := sanitizeUndeclaredIdentityExtras(obj, requestExtras)
+	extras := sanitizeUndeclaredViewerContextExtras(obj, requestExtras)
 	if inj := DeclaredIdentity(ctx, obj); len(inj) > 0 {
 		merged := make(map[string]any, len(extras)+len(inj))
 		for k, v := range extras {
@@ -587,27 +587,35 @@ func injectSlice(ds map[string]any, perPage, page int) {
 	}
 }
 
-// sanitizeUndeclaredIdentityExtras returns the request extras with
-// identity-dimension keys the widget has NOT declared removed. See the A-3 block
+// sanitizeUndeclaredViewerContextExtras returns the request extras with
+// viewer-context keys the widget has NOT declared removed. See the A-3 block
 // in Resolve for the full rationale.
 //
-// identityDimensionKeys is the closed set the frontend can put on the wire as
-// caller identity: buildExtrasParam sends username + displayName when
-// SNOWPLOW_IDENTITY_INJECTION is off, and groups is the other identityContext
-// enum value. It is a fixed, mechanism-level identity vocabulary — not a
-// widget-name/route table (feedback_no_special_cases) — and it is the same axis
-// DeclaredIdentity honours.
+// viewerContextKeys is the closed set the frontend can put on the wire as a fact
+// about the viewer: caller identity (buildExtrasParam sends username +
+// displayName when SNOWPLOW_IDENTITY_INJECTION is off; groups is the other
+// identityContext enum value) and the viewer's IANA time zone (tz, always
+// client-asserted: the server cannot inject or verify it). It is a fixed,
+// mechanism-level vocabulary, not a widget-name/route table
+// (feedback_no_special_cases). The identity keys are the axis DeclaredIdentity
+// honours; tz is NOT on that axis (it is not in the JWT, and never an
+// identityContext value), so its only protections are this strip when undeclared
+// and key partitioning when declared in keyExtras. Whether a client-supplied
+// VALUE is acceptable is decided once, in internal/viewercontext, at the request
+// edge (util.ParseExtras); this set only decides strip-vs-keep by declaration.
+// It is pinned to that package's vocabulary by TestA3_ViewerContextVocabularyIsInSync.
 //
 // Returns the input map UNCHANGED (no copy) when nothing needs stripping — the
-// overwhelmingly common path, so the identity-free and fully-declared corpora
-// pay one map walk and no allocation.
-var identityDimensionKeys = map[string]struct{}{
+// overwhelmingly common path, so the viewer-context-free and fully-declared
+// corpora pay one map walk and no allocation.
+var viewerContextKeys = map[string]struct{}{
 	"username":    {},
 	"groups":      {},
 	"displayName": {},
+	"tz":          {},
 }
 
-func sanitizeUndeclaredIdentityExtras(cr map[string]any, requestExtras map[string]any) map[string]any {
+func sanitizeUndeclaredViewerContextExtras(cr map[string]any, requestExtras map[string]any) map[string]any {
 	if len(requestExtras) == 0 {
 		return requestExtras
 	}
@@ -629,7 +637,7 @@ func sanitizeUndeclaredIdentityExtras(cr map[string]any, requestExtras map[strin
 	}
 	strip := false
 	for k := range requestExtras {
-		if _, isIdentity := identityDimensionKeys[k]; isIdentity && !authoritative(k) {
+		if _, isViewerContext := viewerContextKeys[k]; isViewerContext && !authoritative(k) {
 			strip = true
 			break
 		}
@@ -639,7 +647,7 @@ func sanitizeUndeclaredIdentityExtras(cr map[string]any, requestExtras map[strin
 	}
 	out := make(map[string]any, len(requestExtras))
 	for k, v := range requestExtras {
-		if _, isIdentity := identityDimensionKeys[k]; isIdentity && !authoritative(k) {
+		if _, isViewerContext := viewerContextKeys[k]; isViewerContext && !authoritative(k) {
 			continue
 		}
 		out[k] = v

@@ -153,7 +153,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	//
 	// If this path ever adopts a declared-key filter, it inherits the A-3 defect
 	// with it and needs the same sanitiser — widgets.Resolve's
-	// sanitizeUndeclaredIdentityExtras — applied to the resolve input.
+	// sanitizeUndeclaredViewerContextExtras — applied to the resolve input.
 
 	// #375 — the dep-generation epoch is taken at handler ENTRY, BEFORE the dispatched
 	// CR is read: an edit of that CR anywhere in [fetch, Put] must remark the Put (its

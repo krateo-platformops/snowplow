@@ -41,6 +41,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/objects"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
+	"github.com/krateo-platformops/snowplow/internal/viewercontext"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -213,6 +214,12 @@ func deriveSubscription(ctx context.Context, coords SubscriptionCoordinates) (st
 // coord) from any other fail-closed skip, for the handler's INFO summary.
 func deriveSubscriptionWithReason(ctx context.Context, coords SubscriptionCoordinates) (string, *cache.ResolvedKeyInputs, bool, SubscriptionSkipReason) {
 	coords.PerPage, coords.Page = normalizePagination(coords.PerPage, coords.Page)
+
+	// The /refreshes body does not pass through util.ParseExtras, so apply the
+	// same viewer-context value check the dispatch path got there, for EVERY
+	// class: an invalid tz is "not sent" on both sides, which keeps the armed
+	// key equal to the key the dispatch Put under.
+	coords.Extras = viewercontext.DropInvalid(coords.Extras)
 
 	// #449: an identity-free class (cache.IdentityFreeClasses) is one cell
 	// shared by every user, so a connection may arm it only through an arm that
