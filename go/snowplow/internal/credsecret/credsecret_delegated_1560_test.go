@@ -4,7 +4,8 @@ package credsecret
 // (authn#167) in the one selector.
 //
 //   - a token with `act` selects endpoints.DelegatedSecretName(username,
-//     outermost act.sub), whatever its groups (no step-up branch);
+//     outermost act.sub, groups): the groups name it, but never pick a kind
+//     (no step-up branch);
 //   - a token without `act` selects exactly what For selected before;
 //   - Check maps every endpoints.CheckDelegatedCredential outcome, and a
 //     label-less Secret (authn writes none on a delegated one) is held;
@@ -21,6 +22,7 @@ import (
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/jwtutil"
+	corev1 "k8s.io/api/core/v1"
 
 	"github.com/krateo-platformops/snowplow/internal/redact"
 	"github.com/krateo-platformops/snowplow/internal/testsupport/delegatedcred"
@@ -35,7 +37,6 @@ const (
 var d1560Groups = []string{"d1560-devs", "d1560-ops"}
 
 func TestSelect1560_ActSelectsTheDelegatedCredential(t *testing.T) {
-	want := []string{endpoints.DelegatedSecretName(d1560User, d1560Actor)}
 	cases := []struct {
 		name string
 		act  *jwtutil.Actor
@@ -48,6 +49,7 @@ func TestSelect1560_ActSelectsTheDelegatedCredential(t *testing.T) {
 		{"no groups", &jwtutil.Actor{Sub: d1560Actor}, nil},
 	}
 	for _, c := range cases {
+		want := []string{endpoints.DelegatedSecretName(d1560User, d1560Actor, c.grps)}
 		got := Select(jwtutil.UserInfo{Username: d1560User, Groups: c.grps, Act: c.act})
 		if got.Kind != KindDelegated || !slices.Equal(got.Names, want) {
 			t.Errorf("%s: Select = %v %q, want delegated %q", c.name, got.Kind, got.Names, want)
@@ -60,7 +62,8 @@ func TestSelect1560_ActSelectsTheDelegatedCredential(t *testing.T) {
 	}
 	// Another actor for the same person is another Secret: two actors never
 	// share a credential.
-	other := Select(jwtutil.UserInfo{Username: d1560User, Act: &jwtutil.Actor{Sub: d1560Actor + "-2"}})
+	want := Select(jwtutil.UserInfo{Username: d1560User, Groups: d1560Groups, Act: &jwtutil.Actor{Sub: d1560Actor}}).Names
+	other := Select(jwtutil.UserInfo{Username: d1560User, Groups: d1560Groups, Act: &jwtutil.Actor{Sub: d1560Actor + "-2"}})
 	if other.Names[0] == want[0] {
 		t.Fatal("two actors of one person select the same delegated Secret")
 	}
@@ -158,7 +161,7 @@ func TestCheck1560_EveryOutcome(t *testing.T) {
 // IsSessionName) never reads it as a login.
 func TestIsPerUserName1560_ReservesDelegatedNames(t *testing.T) {
 	for _, pair := range [][2]string{{d1560User, d1560Actor}, {"alice", "agentiko"}, {"", ""}, {"a\x00b", "c"}} {
-		n := endpoints.DelegatedSecretName(pair[0], pair[1])
+		n := endpoints.DelegatedSecretName(pair[0], pair[1], d1560Groups)
 		if !IsPerUserName(n) || !IsDelegatedName(n) || IsSessionName(n) || IsStepUpName(n) {
 			t.Errorf("%q: perUser=%v delegated=%v session=%v stepup=%v; want true,true,false,false",
 				n, IsPerUserName(n), IsDelegatedName(n), IsSessionName(n), IsStepUpName(n))
@@ -175,7 +178,7 @@ func TestIsPerUserName1560_ReservesDelegatedNames(t *testing.T) {
 // scrubber removes it from error text, quoted (an apiserver NotFound, JSON
 // escaped or not) or bare.
 func TestRedact1560_ScrubsDelegatedNames(t *testing.T) {
-	n := endpoints.DelegatedSecretName(d1560User, d1560Actor)
+	n := endpoints.DelegatedSecretName(d1560User, d1560Actor, d1560Groups)
 	for _, s := range []string{
 		`secrets "` + n + `" not found`,
 		`{"message":"secrets \"` + n + `\" not found"}`,
@@ -195,5 +198,60 @@ func TestRedact1560_ScrubsDelegatedNames(t *testing.T) {
 	// Text with no name and no quote is returned untouched.
 	if got := redact.ErrorText("delegated credentials are rotated"); got != "delegated credentials are rotated" {
 		t.Fatalf("ErrorText changed text holding no name: %q", got)
+	}
+}
+
+// #1596 - the groups are part of the name. One person with two tokens of
+// different groups through one actor reads two different Secrets; the order of
+// the groups and repeats in them don't change the name; the name keeps its
+// shape; and the Secret proven the token's is the one named for its groups,
+// while another token's is refused.
+func TestSelect1596_TheTokensGroupsNameTheDelegatedCredential(t *testing.T) {
+	sel := func(groups []string) Credential {
+		return Select(jwtutil.UserInfo{Username: d1560User, Groups: groups, Act: &jwtutil.Actor{Sub: d1560Actor}})
+	}
+	a, b := sel([]string{"g-devs"}), sel([]string{"g-devs", "g-ops"})
+	if a.Names[0] == b.Names[0] {
+		t.Fatal("two tokens of one person and actor with different groups select the same delegated Secret")
+	}
+	base := sel([]string{"g-ops", "g-devs"}).Names[0]
+	for name, g := range map[string][]string{
+		"reordered":            {"g-devs", "g-ops"},
+		"repeated":             {"g-devs", "g-ops", "g-devs", "g-ops"},
+		"reordered + repeated": {"g-ops", "g-devs", "g-ops"},
+	} {
+		if got := sel(g).Names[0]; got != base {
+			t.Errorf("%s: the name changed with the order or repeats of the groups", name)
+		}
+	}
+	for _, c := range []Credential{a, b, sel(nil)} {
+		n := c.Names[0]
+		if len(n) != len("delegated-")+64 || !IsDelegatedName(n) || !IsPerUserName(n) {
+			t.Errorf("%q: not delegated- and 64 hex", n)
+		}
+	}
+
+	// CheckDelegatedCredential path: each token holds its own Secret, and is
+	// refused the other's.
+	now := time.Now()
+	secretFor := func(groups []string) *corev1.Secret {
+		return delegatedcred.Secret(t, delegatedcred.Spec{Namespace: d1560NS, Username: d1560User, Actor: d1560Actor,
+			Groups: groups, ServerURL: "https://k8s.example", Token: "tok"})
+	}
+	sa, sb := secretFor([]string{"g-devs"}), secretFor([]string{"g-devs", "g-ops"})
+	if sa.Name != a.Names[0] || sb.Name != b.Names[0] {
+		t.Fatal("the fixture's Secret is not named as Select names it")
+	}
+	if got := a.Check(sa, now); got != Held {
+		t.Errorf("a token's own Secret: Check = %v, want held", got)
+	}
+	if got := b.Check(sb, now); got != Held {
+		t.Errorf("a token's own Secret: Check = %v, want held", got)
+	}
+	if got := a.Check(sb, now); got == Held {
+		t.Error("a token read another token's Secret (other groups) as its own")
+	}
+	if got := b.Check(sa, now); got == Held {
+		t.Error("a token read another token's Secret (other groups) as its own")
 	}
 }

@@ -36,9 +36,10 @@
 // (TestIssue1382_NoLocalClientconfigDerivation).
 //
 // #1560 — a third kind: the DELEGATED credential authn's /delegate mints for a
-// token that carries `act` (authn#167). There is one per (person, actor):
-// endpoints.DelegatedSecretName(username, actor), where actor is the token's
-// outermost act.sub. It is proven the token's by
+// token that carries `act` (authn#167). There is one per (person, actor, set of groups):
+// endpoints.DelegatedSecretName(username, actor, groups), where actor is the
+// token's outermost act.sub and groups the token's groups claim (a set: order
+// and repeats don't change the name). It is proven the token's by
 // endpoints.CheckDelegatedCredential (annotations, certificate CN and validity,
 // and Organizations equal to the token's groups as issued), never by
 // OwnsSecret. Select is the one selector for all three kinds, used by the auth
@@ -137,7 +138,7 @@ const (
 	// KindStepUp is `<name>-clientconfig-stepup`, for a token whose groups
 	// carry StepUpGroup (#994).
 	KindStepUp
-	// KindDelegated is endpoints.DelegatedSecretName(username, actor), for a
+	// KindDelegated is endpoints.DelegatedSecretName(username, actor, groups), for a
 	// token that carries `act` (#1560, authn#167).
 	KindDelegated
 )
@@ -172,9 +173,10 @@ type Credential struct {
 // with the validated token's UserInfo, so they always read the same Secret:
 //
 //   - a token with `act` reads its delegated credential,
-//     endpoints.DelegatedSecretName(Username, Actor()), Actor() being the
-//     outermost act.sub. Its groups are not looked at to choose: a delegated
-//     token has no step-up branch (authn strips krateo:loa:* when it issues
+//     endpoints.DelegatedSecretName(Username, Actor(), Groups), Actor() being the
+//     outermost act.sub. Its groups name the Secret (two sign-ins of one
+//     person whose groups differ read different Secrets) but are not looked
+//     at to choose a kind: a delegated token has no step-up branch (authn strips krateo:loa:* when it issues
 //     one);
 //   - any other token reads For(Username, Groups): the step-up names when the
 //     groups carry StepUpGroup, else the session names. Unchanged by #1560.
@@ -186,7 +188,7 @@ func Select(user jwtutil.UserInfo) Credential {
 		actor := user.Actor()
 		return Credential{
 			Kind:     KindDelegated,
-			Names:    []string{endpoints.DelegatedSecretName(user.Username, actor)},
+			Names:    []string{endpoints.DelegatedSecretName(user.Username, actor, user.Groups)},
 			username: user.Username,
 			actor:    actor,
 			groups:   append([]string(nil), user.Groups...),

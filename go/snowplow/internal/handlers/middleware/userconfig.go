@@ -416,7 +416,7 @@ func userConfig(keys jwtutil.KeySource, authnNS string, public *PublicIdentity) 
 			// #1560 — credsecret.Select is the one selector, shared with
 			// every RESTAction own-credential stage. A token that carries
 			// `act` reads its delegated credential,
-			// endpoints.DelegatedSecretName(username, outermost act.sub),
+			// endpoints.DelegatedSecretName(username, outermost act.sub, groups),
 			// proven the token's by endpoints.CheckDelegatedCredential with
 			// the token's groups as issued; it has no step-up branch and no
 			// fallback to the person's session Secret. A token without `act`

@@ -144,11 +144,13 @@ func d1560Session(url string) *corev1.Secret {
 
 // d1560Delegated is the person's delegated credential for d1560Actor (no
 // labels, as authn writes it), its certificate carrying groups and valid from
-// nb to na (zero: valid now).
+// nb to na (zero: valid now). The NAME is always the token's (d1560Group), so
+// a Secret whose certificate carries other groups models a stale copy of the
+// token's own Secret, which CheckDelegatedCredential refuses.
 func d1560Delegated(t *testing.T, url, tok string, groups []string, nb, na time.Time) *corev1.Secret {
 	t.Helper()
 	return delegatedcred.Secret(t, delegatedcred.Spec{Namespace: su994NS, Username: d1560User, Actor: d1560Actor,
-		Groups: groups, NotBefore: nb, NotAfter: na, ServerURL: url, Token: tok})
+		Groups: groups, NameGroups: []string{d1560Group}, NotBefore: nb, NotAfter: na, ServerURL: url, Token: tok})
 }
 
 // d1560Ctx is a verified request context for the person, delegated through
@@ -208,7 +210,7 @@ func TestStage1560_S3_InformerMissReadsTheDelegatedSecretOnce(t *testing.T) {
 	if b[d1560TokDeleg] != 1 || len(b) != 1 {
 		t.Fatalf("the stage must dial the delegated credential read from the apiserver; bearers=%v", b)
 	}
-	if want := endpoints.DelegatedSecretName(d1560User, d1560Actor); len(gets) != 1 || gets[0] != want {
+	if want := endpoints.DelegatedSecretName(d1560User, d1560Actor, []string{d1560Group}); len(gets) != 1 || gets[0] != want {
 		t.Fatalf("want exactly one GET of the delegated name; gets=%v", gets)
 	}
 }
@@ -268,7 +270,7 @@ func TestStage1560_S4_StaleInformerCopyIsReReadOnce(t *testing.T) {
 			if tc.want == "" && len(b) != 0 {
 				t.Fatalf("a stale delegated credential must dial nothing (never the session's %s); bearers=%v", d1560TokSess, b)
 			}
-			if want := endpoints.DelegatedSecretName(d1560User, d1560Actor); len(gets) != 1 || gets[0] != want {
+			if want := endpoints.DelegatedSecretName(d1560User, d1560Actor, []string{d1560Group}); len(gets) != 1 || gets[0] != want {
 				t.Fatalf("the stale hit must be re-read exactly once, for the delegated name only; gets=%v", gets)
 			}
 		})

@@ -73,7 +73,7 @@ JWT's `act` and `groups`**:
 
 | token | Secret read |
 |---|---|
-| carries `act` (a delegated token, authn `/delegate`, #1560) | the delegated credential for the person and the token's outermost actor (`act.sub`), named by plumbing's `endpoints.DelegatedSecretName`: `delegated-` and 64 hex digits |
+| carries `act` (a delegated token, authn `/delegate`, #1560) | the delegated credential for the person, the token's outermost actor (`act.sub`) and the token's set of groups (order and repeats don't matter; two sign-ins of one person whose groups differ read different Secrets), named by plumbing's `endpoints.DelegatedSecretName`: `delegated-` and 64 hex digits |
 | no `act`, `groups` contains `krateo:loa:2` (a step-up login, authn `POST /oidc/stepup`) | `<user>-clientconfig-stepup` |
 | any other token | `<user>-clientconfig` |
 
