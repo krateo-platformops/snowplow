@@ -249,8 +249,8 @@ WWW-Authenticate: Bearer error="invalid_token"
 {"kind":"Status","apiVersion":"v1","status":"Failure","message":"secrets \"delegated-a4d6011698e0658a0df9755b91f9ff6c82b3b20bf9df2e39c78bdd0d462e7b8d\" not found","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"DelegatedCredentialMissing","message":"the delegated credential is missing; exchange the token again"}]}}
 ```
 
-The `message` names the delegated Secret, a SHA-256 of the username and the
-actor. It goes only to the caller holding that token. Snowplow scrubs the name
+The `message` names the delegated Secret, a SHA-256 of the username, the actor and the token's set of
+groups. It goes only to the caller holding that token. Snowplow scrubs the name
 from its own logs. A Secret that exists but is someone else's gets the same
 answer, under the same name.
 

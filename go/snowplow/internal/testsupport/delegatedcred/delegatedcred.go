@@ -35,7 +35,7 @@ import (
 // Spec is one delegated credential Secret.
 type Spec struct {
 	Namespace string
-	// Username and Actor name the Secret and fill its two annotations.
+	// Username and Actor, with Groups (or NameGroups), name the Secret; they fill its two annotations (Username, Actor).
 	Username string
 	Actor    string
 	// Groups are the certificate's Organizations, and part of the name.
