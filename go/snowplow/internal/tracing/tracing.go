@@ -35,6 +35,7 @@ package tracing
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/krateo-platformops/plumbing/env"
@@ -120,6 +121,22 @@ const (
 	serviceName = otelresource.ServiceName
 )
 
+// active is set once Setup has registered a real TracerProvider.
+var active atomic.Bool
+
+// Active reports whether Setup registered a TracerProvider. It is false for the
+// whole life of a process whose tracing gate is off, so an instrumentation site
+// that would START a span of its own (the global no-op tracer still allocates
+// a context value per Start) tests it first and pays one atomic load.
+func Active() bool { return active.Load() }
+
+// SetActiveForTest flips Active for a test that installs its own provider and
+// returns the restore func.
+func SetActiveForTest(v bool) (restore func()) {
+	prev := active.Swap(v)
+	return func() { active.Store(prev) }
+}
+
 // ShutdownFunc flushes and stops the trace pipeline. Always non-nil so the
 // caller can `defer shutdown(ctx)` unconditionally; it is a no-op when
 // tracing was not enabled.
@@ -182,6 +199,7 @@ func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
 	tp := newTracerProvider(exp, sdktrace.WithResource(res))
 
 	otel.SetTracerProvider(tp)
+	active.Store(true)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
 		propagation.Baggage{},

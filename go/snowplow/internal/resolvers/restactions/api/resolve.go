@@ -1904,7 +1904,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 // The per-stage mutable primitives (dictMu, g, gctx, itemErrs, iterStart,
 // wireVerbose) are method-locals here, bundled into the method-local stageCtx
 // — never resolveRun fields (the concurrency flag / PM CONDITION 2).
-func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop bool) {
+func (r *resolveRun) runStage(spanCtx context.Context, st *stageTrace, id string, apiMap map[string]*templates.API) (stop bool) {
 	// Get the api with this identifier
 	apiCall, ok := apiMap[id]
 	if !ok {
@@ -1999,7 +1999,10 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 		return true
 	}
 	heldCred := stageHoldsCredential(uafActive, apiCall.EndpointRef)
-	planCtx := credhttp.WithHeldCredentialValue(r.ctx, heldCred)
+	// spanCtx carries the stage span (stage_trace.go): the plan, the endpoint
+	// hop and the errgroup all derive from it, so a stage's dial and client
+	// spans are its children.
+	planCtx := credhttp.WithHeldCredentialValue(spanCtx, heldCred)
 	elems, planned := r.planStage(planCtx, id, apiCall)
 	if !planned {
 		recordStageTiming()
@@ -2161,6 +2164,8 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// empty tmp (every item refused) is C-3 (emptyPlan ran inside) — the
 	// orchestrator owns the recordStageTiming()+continue.
 	tmp := r.collapseOrFanoutPlan(provCtx, id, apiCall, ep, elems, &stageTiming)
+	st.planned(apiCall.DependsOn != nil && ptr.Deref(apiCall.DependsOn.Iterator, "") != "",
+		isSA || apiCall.EndpointRef == nil, len(tmp))
 	if len(tmp) == 0 {
 		recordStageTiming()
 		return false
@@ -2319,7 +2324,9 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// error — NOT in #313's scope) or a genuine ctx-cancellation
 	// surfacing through such a handler. For THOSE we preserve the
 	// pre-0.30.257 short-circuit + truncated-dict return verbatim.
-	if err := g.Wait(); err != nil {
+	err := g.Wait()
+	st.noteItemErrs(itemErrs)
+	if err != nil {
 		r.log.Debug("api stage short-circuited on hard error",
 			slog.String("name", id), slog.Any("err", err))
 		stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
@@ -2399,6 +2406,19 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	if len(opts.Items) == 0 {
 		return map[string]any{}, nil
 	}
+	// One span per resolve and one per stage (stage_trace.go). Off: one atomic load.
+	ctx, rt := startResolveTrace(ctx, opts)
+	completed := false
+	var failure *StageFailure
+	defer func() { rt.end(failure, completed) }() // a panic still ends the span
+	var dict map[string]any
+	dict, failure = resolveStages(ctx, opts)
+	completed = true
+	return dict, failure
+}
+
+// resolveStages is ResolveWithFailure's body, run under the resolve span.
+func resolveStages(ctx context.Context, opts ResolveOptions) (map[string]any, *StageFailure) {
 
 	// #1476 — this resolve is one failure-log round of its cell (or joins the
 	// round its caller opened for the same cell): a failure unchanged since the
@@ -2511,6 +2531,7 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 		// (an iterator of zero items, a failed dependency) and nothing is sent
 		// (uaf_non_read.go).
 		if r.refuseUAFOnNonReadVerb(id, apiMap[id]) {
+			r.traceNotRun(id)
 			continue
 		}
 		// #904 — a write stage whose dependsOn stage did not succeed is not
@@ -2518,14 +2539,15 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 		// of it is ever dispatched.
 		if dep, skip := r.dependentWriteBlocked(apiMap[id]); skip {
 			r.skipDependentWrite(id, apiMap[id], dep)
+			r.traceNotRun(id)
 			continue
 		}
 		r.outcomes.ran(id)
-		if r.runStage(id, apiMap) {
+		if r.runStageTraced(id, apiMap) {
 			// A truncating exit: this stage failed (its own item errors, if
 			// any, already carry a more specific reason).
 			r.taintNarrow() // #603 PR-2
-			r.outcomes.fail(id, StageReasonError)
+			// (runStageTraced recorded the stage's Error reason before ending its span.)
 			// #709 — a truncating exit is a failure of this stage whatever its
 			// continueOnError says. Reported by class only: the endpoint error
 			// can name the requester's clientconfig Secret, so its text stays
