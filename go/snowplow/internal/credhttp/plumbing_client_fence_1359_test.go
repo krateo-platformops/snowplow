@@ -77,6 +77,8 @@ var plumbingAllowed = map[string]string{
 	importJWTUtil + ".Validate":                    "verifies against a key it is given; sends nothing",
 	importJWTUtil + ".ValidateWithKeySource":       "asks a KeySource for the key; the only fetching one, a JWKSKeySource, can be built only by credhttp (NewJWKSKeySource and its literal are fenced)",
 	importJWTUtil + ".ValidateClaimsWithKeySource": "as ValidateWithKeySource",
+	importJWTUtil + ".WithAudience":                "plumbing v1.109.0: a validator option that names the audiences to accept; sends nothing",
+	importJWTUtil + ".WithRequiredAudience":        "plumbing v1.109.0: a validator option that requires an audience; sends nothing",
 	importJWTUtil + ".WithJWKSCacheTTL":            "a key-source option that sets no client",
 	importJWTUtil + ".WithJWKSMinRefreshInterval":  "a key-source option that sets no client",
 	importJWTUtil + ".WithJWKSRequestTimeout":      "a key-source option that sets the timeout of the client the source already has",

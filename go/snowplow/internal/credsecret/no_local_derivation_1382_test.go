@@ -242,7 +242,7 @@ func TestIssue1382_FenceCatchesEveryShape(t *testing.T) {
 		"plumbing names":        {"internal/x/x.go", hdr + "func N(u string) []string { return ep.SessionSecretNames(u) }\n", false},
 		"dns1123 alone":         {"internal/x/x.go", hdr + "func N(u string) string { return kubeutil.MakeDNS1123Compatible(u) }\n", false},
 		"delegated prefix":      {"internal/x/x.go", hdr + "func N(h string) string { return \"delegated-\" + h }\n", true},
-		"delegated by plumbing": {"internal/x/x.go", hdr + "func N(u, a string) string { return ep.DelegatedSecretName(u, a) }\n", false},
+		"delegated by plumbing": {"internal/x/x.go", hdr + "func N(u, a string) string { return ep.DelegatedSecretName(u, a, nil) }\n", false},
 	}
 	for name, c := range cases {
 		fset := token.NewFileSet()

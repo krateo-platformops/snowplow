@@ -134,7 +134,7 @@ func dependencyFailureMessage(ctx context.Context, msg string) string {
 var identityShapes = []*regexp.Regexp{
 	regexp.MustCompile(`\buser\s*"[^"]*"`),                           // the apiserver's requester: User "…"
 	regexp.MustCompile(`-clientconfig\b`),                            // an authn <user>-clientconfig Secret, quoted or not, in a path or not
-	regexp.MustCompile(`\bdelegated-[0-9a-f]{64}\b`),                 // an authn delegated credential Secret (#1560): a guessable hash of (user, actor)
+	regexp.MustCompile(`\bdelegated-[0-9a-f]{64}\b`),                 // an authn delegated credential Secret (#1560): a guessable hash of (user, actor, set of groups)
 	regexp.MustCompile(`\bcn\s*=`),                                   // a certificate subject
 	regexp.MustCompile(`\buser(name)?\s*[:=]`),                       // username: … / user=…
 	regexp.MustCompile(`\b(access_|id_|refresh_)?token\s*[:=]`),      // token=… / ?token=…
