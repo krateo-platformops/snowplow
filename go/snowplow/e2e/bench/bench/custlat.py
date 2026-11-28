@@ -1016,9 +1016,11 @@ def page_loads_by_phase(browser: dict | None, k6o: dict | None, wins) -> dict:
     profile): page-load time by phase, against the page goal. `browser`: the
     real Chrome loads (the north-star's); `browser_by_skeleton`: the same split
     by pageload.js's `skeleton` tag (no: painted from the SPA's own React Query
-    cache, no request, ~0 ms; yes: a load that waited on the server; timeout:
+    cache, no skeleton, its time the last own request answered / page change; yes: a
+    load that waited on the server; timeout:
     did not settle), so a phase's p95 is also read on the server-dependent
-    loads alone (#1064 review: 53.5 % of run 20b's loads were cache paints);
+    loads alone (#1064 review: 53.5 % of run 20b's loads were cache paints; before the final-page
+    definition those read 0 ms, run 31);
     `k6`: k6's protocol-level page loads by kind (first_load in the login
     storm, composite_first_load in the burst, route clicks)."""
     navs = [n for n in k6eval.browser_navs(browser) if n.get("start") is not None]

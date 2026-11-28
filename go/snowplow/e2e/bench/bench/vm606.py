@@ -1934,6 +1934,9 @@ python3 -m bench.detach --log "$R/launch.log" --pidfile "$R/launch.pid" -- bash 
 pid="$(cat "$R/launch.pid")"
 deadline=$(( $(date +%s) + {int(started_timeout_s)} ))
 while :; do
+  # liveness is sampled BEFORE the logs are read: a launcher that refuses writes its line and exits at once, and
+  # sampled after the read it can write and die between the two, which read as "exited" with its refusal unread
+  if kill -0 "$pid" 2>/dev/null; then up=1; else up=0; fi
   ok=0; refused=""
   r="$(grep -m1 '^refusing: ' <(since "$R/launch.log" "$L0") || true)"
   if [ -n "$r" ]; then refused="launcher: $r;"; fi
@@ -1946,7 +1949,7 @@ while :; do
   # a refusal anywhere is not a start; started is EVERY arm's run budget, written by this launch
   if [ -n "$refused" ]; then echo "VM606_STARTED=refused"; echo "vm606: $refused"; break; fi
   if [ "$ok" -eq {len(labels)} ]; then echo "VM606_STARTED=ok"; break; fi
-  if ! kill -0 "$pid" 2>/dev/null; then
+  if [ "$up" -eq 0 ]; then
     echo "VM606_STARTED=exited"; tail -n 15 "$R/launch.log" | sed 's/^/vm606: launcher: /'; break
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then echo "VM606_STARTED=timeout"; break; fi

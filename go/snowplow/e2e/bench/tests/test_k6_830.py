@@ -1453,14 +1453,17 @@ def test_pageload_load_time_and_widget_states(tmp_path):
     out = _pageload(tmp_path, {"settled": [], "ops": [], "loads": [
         {"b": _b(saw=True, navT0=100, goneAt=503), "here": "/err",
          "ids": ["widget-error", "widget-forbidden", "widget-forbidden", "widget-other"]},
-        {"b": _b(saw=False, navT0=100, goneAt=0), "here": "/x", "ids": []},     # app cache: 0 ms
+        {"b": _b(saw=False, navT0=100, goneAt=0), "here": "/x", "ids": []},     # app cache, nothing asked, nothing changed: 0 ms
     ]})
     # #1043 review B1: the load's own start, on the wall clock, from the clock its time is measured on
     t0 = out["loads"][0].pop("t0")
     assert t0 == pytest.approx(out["origin"] + 100)
-    assert out["loads"][0] == {"ms": 403, "saw": True, "path": "/err",
+    assert out["loads"][0] == {"ms": 403, "saw": True, "ended": "skeleton", "path": "/err",
+                               "final": {"skeletonMs": 403, "requestMs": None, "mutationMs": None,
+                                         "liveRefetches": 0, "liveFrames": 0, "liveFirst": 0},
                                "states": {"error": 1, "timeout": 0, "forbidden": 2, "notfound": 0}}
-    assert out["loads"][1]["ms"] == 0 and out["loads"][1]["saw"] is False
+    # a load that asked for nothing and changed nothing after its click ends at the click
+    assert out["loads"][1]["ms"] == 0 and out["loads"][1]["saw"] is False and out["loads"][1]["ended"] == "start"
 
 
 @needs_node

@@ -2,7 +2,28 @@
 // functions with no k6 import, so node runs them (tests/test_k6_830.py) and
 // browser.js ships `settledNow` / `loadOf` into the page as source text.
 //
-// "Page loaded": no `[data-widget-renderer]` element left for QUIET_MS.
+// "Page loaded" = the page is FINAL (owner's decision, 2026-11-26): from the click until the page's OWN data
+// requests have answered AND the page has stopped changing, for QUIET_MS. One definition for every load, first
+// and warm alike. A load ends at the LAST of: its last `[data-widget-renderer]` skeleton gone, its last own
+// request answered, its last DOM change; and it is settled once QUIET_MS have passed since that end with no own
+// request still pending. A revisit is painted from the portal's React Query cache with no skeleton, yet it still
+// refreshes its data with /call requests: before this, `saw` false made every warm load 0 ms by construction
+// (run 31: 2,767 of 2,767), so the warm navigation bar was not measured at all. Its `ended` field says what
+// ended the load: 'skeleton', 'request', 'mutation', or 'start' (nothing changed after the click).
+// Long-lived streams (/refreshes, /notifications: sseStreamOf) never count as own requests.
+//
+// OWN requests are the page's data requests to snowplow as the URL shows them: a path ending in /call (callOf).
+// Anything else (the OTel exporter's batch POST, config, assets) is not named and not counted.
+// LIVE UPDATES DO NOT EXTEND A LOAD (owner's ruling, 2026-11-28; they count as freshness, measured apart). A
+// /call is a live-update re-fetch, not the load's own, when its response's X-Snowplow-Refresh-Key equals the key
+// of a `refresh` frame the page's /refreshes stream carried since the click, the frame arriving before the request
+// started (isLiveRefetch). That is snowplow's own link: refreshes.go writes `event: refresh\ndata: <l1Key>` and
+// the dispatchers stamp the same l1Key on the /call answer (setRefreshKeyHeader); the portal's refreshSse.ts
+// dispatchRefresh(data) re-fetches the widgets whose last answer carried that key. No time window is involved.
+// A DOM change counts toward the load unless the latest answered data request was a live re-fetch and no own
+// request is pending (countsAsChange): the render a live answer causes is the live update's.
+//
+// The skeleton part: no `[data-widget-renderer]` element left.
 // WidgetLoading, the skeleton every pending widget shows (components/
 // WidgetRenderer/WidgetRenderer.tsx:131-134 and the Suspense fallback :69), is
 // the ONLY element carrying that attribute (components/WidgetStates/
@@ -23,11 +44,28 @@ export const QUIET_MS = 1000
 // Installed in every document before the app runs (context.addInitScript).
 export const OBSERVER = `(() => {
   const b = window.__bench = { count: 0, goneAt: 0, navT0: 0, saw: false,
-                               armLogin: false, submitAt: 0, signinMs: null, armClick: false };
+                               armLogin: false, submitAt: 0, signinMs: null, armClick: false,
+                               reqEnd: 0, lastMut: 0, open: [], lastAnswer: null, liveEv: [],
+                               liveFrames: 0, liveRefetches: 0, liveFirst: 0, callClass: [],
+                               armedAt: {}, loadKeys: {} };
   const sel = '[data-widget-renderer]';
-  const tick = () => {
+  const sseStreamOf = ${sseStreamOf.toString()};
+  const callOf = ${callOf.toString()};
+  const timingOf = ${timingOf.toString()};
+  const refreshKeysOf = ${refreshKeysOf.toString()};
+  const isLiveRefetch = ${isLiveRefetch.toString()};
+  const countsAsChange = ${countsAsChange.toString()};
+  // a new load starts: what the last one saw of live updates and answers is not this one's
+  const restart = (now) => {
+    b.navT0 = now; b.saw = false; b.goneAt = 0; b.lastAnswer = null;
+    b.liveFrames = 0; b.liveRefetches = 0; b.liveFirst = 0; b.liveEv = []; b.loadKeys = {};
+  };
+  const tick = (records) => {
     const n = document.querySelectorAll(sel).length;
     const now = performance.now();
+    // the app's tree: a change under <body> (not the <head> a style library writes into)
+    if ((!records || !document.body || records.some((r) => document.body.contains(r.target))) &&
+        countsAsChange(b.open.filter((o) => o.t >= b.navT0).length, b.lastAnswer)) b.lastMut = now;
     if (n > 0) b.saw = true;
     if (n === 0 && b.count > 0) b.goneAt = now;
     b.count = n;
@@ -39,7 +77,7 @@ export const OBSERVER = `(() => {
     const now = performance.now();
     b.armLogin = false;
     b.signinMs = now - b.submitAt;
-    b.navT0 = now; b.goneAt = 0;
+    restart(now);
     b.count = document.querySelectorAll(sel).length;
     b.saw = b.count > 0;
   };
@@ -53,7 +91,7 @@ export const OBSERVER = `(() => {
   document.addEventListener('click', () => {
     if (!b.armClick) return;
     b.armClick = false;
-    b.navT0 = performance.now(); b.saw = false; b.goneAt = 0;
+    restart(performance.now());
   }, true);
   // live updates: each SSE stream counted when it OPENS (an answered request).
   // The SPA reads both with fetch + Bearer (refreshSse.ts; sseClient.ts from
@@ -64,16 +102,69 @@ export const OBSERVER = `(() => {
   // review B1). An older SPA opens /notifications as an EventSource: counted
   // at its 'open' (the browser opens one only on text/event-stream).
   const sse = window.__benchSse = { refreshes: 0, notifications: 0 };
-  const sseStreamOf = ${sseStreamOf.toString()};
   const f = window.fetch;
+  // a refresh frame arrived: the key it names (isLiveRefetch matches it to a /call's answer by the key alone)
+  const liveFrame = (key) => {
+    const now = performance.now();
+    if (now >= b.navT0) { b.liveFrames++; b.liveEv.push({ key, at: now }); }
+  };
+  // read a cloned response to its end; chunk() sees each decoded piece. Never throws, never blocks the app's own read.
+  const drain = (clone, chunk) => {
+    try {
+      const reader = clone.body.getReader();
+      const dec = new TextDecoder();
+      const step = () => reader.read().then((x) => {
+        if (x.done) return;
+        chunk(x.value === undefined ? '' : dec.decode(x.value, { stream: true }));
+        return step();
+      });
+      return step().catch(() => {});
+    } catch (e) { return Promise.resolve(); }
+  };
   window.fetch = function (input, init) {
-    const s = sseStreamOf(String((input && input.url) || input), window.location.href);
+    const url = String((input && input.url) || input);
+    const s = sseStreamOf(url, window.location.href);
     const p = f.apply(this, arguments);
     if (s) {
       p.then((r) => {
         const type = (r.headers && r.headers.get && r.headers.get('content-type')) || '';
-        if (r.ok && type.toLowerCase().indexOf('text/event-stream') === 0) sse[s]++
+        if (r.ok && type.toLowerCase().indexOf('text/event-stream') === 0) {
+          sse[s]++
+          // the refresh frames' keys: what a live update is, to tell its re-fetches from the load's own requests
+          if (s === 'refreshes' && r.clone) {
+            let buf = '';
+            drain(r.clone(), (text) => {
+              const x = refreshKeysOf(buf + text);
+              buf = x.rest;
+              for (const k of x.keys) liveFrame(k);
+            });
+          }
+        }
       }, () => {});
+    } else if (callOf(url, window.location.href, 0, 0) !== null) {
+      // an own request candidate: a /call. Pending until its body has been read to the end (or it failed).
+      const tok = { t: performance.now() };
+      b.open.push(tok);
+      const done = () => {
+        const i = b.open.indexOf(tok);
+        if (i >= 0) b.open.splice(i, 1);
+        if (tok.t < b.navT0) return;
+        if (tok.live) { b.liveRefetches++; b.lastAnswer = 'live'; }
+        else { b.reqEnd = Math.max(b.reqEnd, performance.now()); b.lastAnswer = 'own'; }
+      };
+      p.then((r) => {
+        // at the answer's headers: is it a live update's re-fetch? (its Resource Timing entry is flagged the same)
+        const key = (r.headers && r.headers.get && r.headers.get('X-Snowplow-Refresh-Key')) || '';
+        tok.live = tok.t >= b.navT0 && isLiveRefetch(key, tok.t, b.liveEv, b.navT0, b.armedAt);
+        // a live-read request that is the load's FIRST for its key may be the load's own request that followed an
+        // armed key's frame (the one residual of the key rule): counted, so the report can bound it
+        if (tok.live && key && !b.loadKeys[key]) b.liveFirst++;
+        if (tok.t >= b.navT0 && key) b.loadKeys[key] = true;
+        // from now on this key is armed (the portal arms a widget for refreshes from an answer carrying its key)
+        if (key && b.armedAt[key] === undefined) b.armedAt[key] = performance.now();
+        try { b.callClass.push({ url: new URL(url, window.location.href).href, t: tok.t, live: tok.live }); } catch (e) { /* no URL */ }
+        if (r.clone) drain(r.clone(), () => {}).then(done); else done();
+      }, done);
     }
     return p;
   };
@@ -84,23 +175,32 @@ export const OBSERVER = `(() => {
       const s = sseStreamOf(String(url), window.location.href);
       if (s) {
         es.addEventListener('open', () => { sse[s]++ });
+        if (s === 'refreshes') es.addEventListener('refresh', (e) => { if (e && e.data) liveFrame(String(e.data)) });
       }
       return es;
     };
     window.EventSource.prototype = ES.prototype;
     ['CONNECTING', 'OPEN', 'CLOSED'].forEach((k) => { window.EventSource[k] = ES[k] });
   }
+  // the entry of a /call IS the request the fetch wrapper classified: the same URL, the nearest start (a pairing of
+  // one request's two records, not an attribution). A call it never classified is not a live re-fetch.
+  const takeLive = (name, startTime) => {
+    let best = -1;
+    b.callClass.forEach((c, i) => {
+      if (c.url === name && (best < 0 || Math.abs(c.t - startTime) < Math.abs(b.callClass[best].t - startTime))) best = i;
+    });
+    return best < 0 ? false : b.callClass.splice(best, 1)[0].live;
+  };
   // #919: every /call the page fetches, from its own Resource Timing entry
   // (callOf); browser.js drains window.__benchCalls into browser_call_ms
   const calls = window.__benchCalls = [];
-  const callOf = ${callOf.toString()};
-  const timingOf = ${timingOf.toString()};
   if (window.PerformanceObserver) {
     try {
       new window.PerformanceObserver((list) => {
         for (const e of list.getEntries()) {
           const c = callOf(e.name, window.location.href, e.duration, e.responseStatus);
-          if (c) calls.push(Object.assign(c, timingOf(e, window.performance && window.performance.timeOrigin)));
+          if (c) calls.push(Object.assign(c, timingOf(e, window.performance && window.performance.timeOrigin),
+            { live: takeLive(e.name, e.startTime) }));
         }
       }).observe({ type: 'resource', buffered: true });
     } catch (e) { /* no Resource Timing: no call recorded, the evaluator says none came */ }
@@ -128,6 +228,45 @@ function sseStreamOf (url, base) {
   try { u = new URL(url, base) } catch (e) { return null }
   const m = /\/(refreshes|notifications)\/?$/.exec(u.pathname)
   return m ? m[1] : null
+}
+
+// The l1Keys of the `refresh` frames complete in a stream buffer, and the rest (an unfinished frame). snowplow's
+// frame (handlers/refreshes.go): `event: refresh\ndata: <l1Key>\n\n`; `: keepalive` comments and `resync`
+// frames carry no key. Self-contained, shipped into the page as source text.
+function refreshKeysOf (buffer) {
+  const keys = []
+  let rest = buffer
+  let at = rest.indexOf('\n\n')
+  while (at !== -1) {
+    let event = ''
+    let data = ''
+    for (const line of rest.slice(0, at).split('\n')) {
+      if (line.indexOf('event:') === 0) event = line.slice(6).trim()
+      else if (line.indexOf('data:') === 0) data = line.slice(5).replace(/^ /, '')
+    }
+    if (event === 'refresh' && data) keys.push(data)
+    rest = rest.slice(at + 2)
+    at = rest.indexOf('\n\n')
+  }
+  return { keys, rest }
+}
+
+// Is a /call that started at `startedAt` and whose answer carried `key` (X-Snowplow-Refresh-Key) the re-fetch of
+// a live update? Yes when a refresh frame naming that key reached the page since the load's click (`navT0`) and
+// before the request started, AND an earlier answer in this document had already carried that key (`armedAt`: key
+// to the moment of its first answer): the portal arms a widget for refreshes only from an answer carrying its key
+// (refreshSse.ts:381), so a key no answer has carried yet cannot be frame-triggered (a first load is exact). No key
+// (not cache-keyed): never. `events`: [{key, at}] of this load. Self-contained.
+function isLiveRefetch (key, startedAt, events, navT0, armedAt) {
+  if (!key || armedAt[key] === undefined) return false
+  return events.some((e) => e.key === key && e.at >= navT0 && e.at <= startedAt && e.at > armedAt[key])
+}
+
+// Does a DOM change count toward the load? Yes while an own request is pending, and unless the latest answered data
+// request was a live re-fetch (the render it causes is the live update's). `pending`: own requests in flight.
+// Self-contained.
+function countsAsChange (pending, lastAnswer) {
+  return pending > 0 || lastAnswer !== 'live'
 }
 
 function callOf (url, base, duration, status) {
@@ -190,6 +329,7 @@ export function callTiming (c, loadT0, loadId) {
   if (!c || !('fetch' in c)) return null
   const m = { fetch: c.fetch, connect_start: c.connectStart, connect_end: c.connectEnd,
               request_start: c.requestStart, response_start: c.responseStart, response_end: c.responseEnd }
+  if (c.live) m.live = true            // the re-fetch of a live update (isLiveRefetch): not the load's own
   if (Number.isFinite(loadT0) && typeof c.start === 'number' && loadId) {
     m.from_load_ms = Math.round((c.start - loadT0) * 10) / 10
     m.load_id = String(loadId)
@@ -345,7 +485,8 @@ function settledNow (b, here, now, arg) {
     return false
   }
   if (b.count > 0) return false
-  const end = b.saw ? b.goneAt : b.navT0
+  if ((b.open || []).some((o) => o.t >= b.navT0)) return false
+  const end = Math.max(b.navT0, b.saw ? b.goneAt : 0, b.reqEnd || 0, b.lastMut || 0)
   return now - end >= arg.quiet
 }
 
@@ -353,7 +494,13 @@ function settledNow (b, here, now, arg) {
 // states (data-testid widget-error / -timeout / -forbidden / -notfound,
 // WidgetStates.tsx:34,54,75,89). Self-contained, like settledNow.
 function loadOf (b, here, testids) {
-  const end = b.saw ? b.goneAt : b.navT0
+  const skel = b.saw ? b.goneAt : 0
+  const end = Math.max(b.navT0, skel, b.reqEnd || 0, b.lastMut || 0)
+  // what ended the load: the latest of the three; a tie goes to the skeleton (its removal is itself a change),
+  // then the request
+  const ended = b.saw && skel === end ? 'skeleton'
+    : (b.reqEnd || 0) === end && end > b.navT0 ? 'request'
+    : (b.lastMut || 0) === end && end > b.navT0 ? 'mutation' : 'start'
   const states = { error: 0, timeout: 0, forbidden: 0, notfound: 0 }
   for (const id of testids) {
     const k = String(id).replace(/^widget-/, '')
@@ -361,13 +508,19 @@ function loadOf (b, here, testids) {
   }
   // t0: the load's own start on the wall clock (epoch ms), from the same clock its time is
   // measured on: where its interval sits against the CPU windows (#1042, #1043 review B1)
-  return { ms: end - b.navT0, saw: b.saw, path: here, states, t0: performance.timeOrigin + b.navT0 }
+  // the three ends, ms from the click (null: none after it) and the live updates that reached the load
+  const off = (v) => (v > b.navT0 ? v - b.navT0 : null)
+  const finalOf = { skeletonMs: b.saw ? skel - b.navT0 : null, requestMs: off(b.reqEnd || 0), mutationMs: off(b.lastMut || 0),
+                    liveRefetches: b.liveRefetches || 0, liveFrames: b.liveFrames || 0,
+                    liveFirst: b.liveFirst || 0 }
+  return { ms: end - b.navT0, saw: b.saw, ended, final: finalOf, path: here, states, t0: performance.timeOrigin + b.navT0 }
 }
 
 // The metric points one load writes. A page that did not settle within its
 // timeout is a TIMEOUT and still a load, at its timeout value, so it counts in
 // the p95 as well as in the timeout check (#831 gate). skeleton=no: painted
-// from the app's own React Query cache (App.tsx:25-30), no request.
+// from the app's own React Query cache (App.tsx:25-30), no skeleton; its time is
+// still when its own requests answered and the page stopped changing (`ended_by`).
 // Every point of a load carries its start, t0 (epoch ms, integer): the page's
 // own (loadOf), or for a load that never settled, `actionAt`, the driver's
 // clock just before the action (the same system clock) (#1043 review B1).
@@ -398,12 +551,28 @@ export function recordOps (r, tags, timeoutMs, actionAt, watch) {
     }
     return ops
   }
-  const t = Object.assign({}, tags, at, { skeleton: r.saw ? 'yes' : 'no', timeout: 'no' })
+  const t = Object.assign({}, tags, at, { skeleton: r.saw ? 'yes' : 'no', timeout: 'no' },
+    r.ended ? { ended_by: r.ended } : {},
+    r.final ? { live_update: r.final.liveRefetches > 0 ? 'yes' : 'no' } : {})
   const ops = [['browser_page_load_ms', r.ms, t], ['browser_page_loads', 1, t]]
+  // the first-load series the OLD way (its skeleton's end; 0 for a load that never showed one), so a run stays
+  // comparable with run 31 and earlier, which ended every load there
+  if (tags && tags.visit === 'first' && r.final) {
+    ops.push(['browser_first_load_skeleton_ms', r.saw && r.final.skeletonMs !== null ? r.final.skeletonMs : 0, t])
+  }
   for (const k of Object.keys(r.states || {})) {
     if (r.states[k]) ops.push(['browser_widget_states', r.states[k], Object.assign({}, t, { state: k })])
   }
   return ops
+}
+
+// A settled load's own ends and the live updates that reached it, as the JSON string browser.js sets on the load's
+// page-load point as metadata `load_final` (never tags: per-load numbers). Null for a load that never settled.
+export function loadFinalOf (r) {
+  if (!r || !r.final) return null
+  return JSON.stringify({ skeleton_ms: r.final.skeletonMs, request_ms: r.final.requestMs,
+                          mutation_ms: r.final.mutationMs, live_refetches: r.final.liveRefetches,
+                          live_frames: r.final.liveFrames, live_first: r.final.liveFirst || 0 })
 }
 
 // #1508: why the watch of a load ended without it settling: one line, at most 200 characters, never an
@@ -458,4 +627,4 @@ export function signinBoundMs (cfg, tries, retryMs, readMs) {
   return tries * page + (tries - 1) * retryMs + 3 * page + page + signin + readMs
 }
 
-export { callOf, loadOf, settledNow, sseStreamOf, timingOf }
+export { callOf, countsAsChange, isLiveRefetch, loadOf, refreshKeysOf, settledNow, sseStreamOf, timingOf }

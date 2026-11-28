@@ -30,7 +30,7 @@ import exec from 'k6/execution'
 import http from 'k6/http'
 import { Counter, Trend } from 'k6/metrics'
 import {
-  LOGIN, OBSERVER, QUIET_MS, callOps, freshClassTags, loadOf, loadStart, recordOps, requestLedger, sessionEndTags,
+  LOGIN, OBSERVER, QUIET_MS, callOps, freshClassTags, loadFinalOf, loadOf, loadStart, recordOps, requestLedger, sessionEndTags,
   settledNow, signinBoundMs, switchDue, watchCause,
 } from './pageload.js'
 
@@ -54,6 +54,7 @@ const SIGNED_IN = new Counter('browser_first_signins')
 
 const METRICS = {
   browser_page_load_ms: new Trend('browser_page_load_ms', true),
+  browser_first_load_skeleton_ms: new Trend('browser_first_load_skeleton_ms', true),
   browser_page_loads: new Counter('browser_page_loads'),
   browser_widget_states: new Counter('browser_widget_states'),
   browser_page_timeouts: new Counter('browser_page_timeouts'),
@@ -116,7 +117,7 @@ export const options = {
 async function markStart (page) {
   await page.evaluate(() => {
     const b = window.__bench
-    b.navT0 = performance.now(); b.saw = false; b.goneAt = 0; b.armClick = true
+    b.navT0 = performance.now(); b.saw = false; b.goneAt = 0; b.lastAnswer = null; b.armClick = true
   })
 }
 
@@ -161,11 +162,14 @@ async function settled (page, path, deadline, secrets) {
 function record (res, tags, actionAt, loadId) {
   const md = exec.vu.metrics.metadata
   md.load_id = loadId
+  const fin = loadFinalOf(res.load)
+  if (fin !== null) md.load_final = fin
   try {
     const watch = { ms: res.ms, cause: res.cause }
     for (const [metric, value, t] of recordOps(res.load, tags, res.bound, actionAt, watch)) METRICS[metric].add(value, t)
   } finally {
     delete md.load_id
+    delete md.load_final
   }
 }
 
@@ -456,7 +460,8 @@ async function runClass (s, user, k, last, deadline, prevToken, secrets) {
         method = 'history'
         await page.evaluate((p) => {
           const b = window.__bench
-          b.navT0 = performance.now(); b.saw = false; b.goneAt = 0; b.armClick = false
+          b.navT0 = performance.now(); b.saw = false; b.goneAt = 0; b.lastAnswer = null
+          b.liveFrames = 0; b.liveRefetches = 0; b.liveFirst = 0; b.liveEv = []; b.loadKeys = {}; b.armClick = false
           window.history.pushState({}, '', p)
           window.dispatchEvent(new PopStateEvent('popstate'))
         }, route)
@@ -493,7 +498,7 @@ export function teardown () { FRAME.add(1, { frame: 'end' }) }
 export function handleSummary (data) {
   const keep = {}
   for (const [name, m] of Object.entries(data.metrics)) {
-    if (/^(browser_page_load_ms|browser_page_loads|browser_widget_states|browser_page_timeouts|browser_logins|browser_signin_ms|browser_sse_opened|browser_call_ms|browser_request_incomplete_ms|browser_request_failed_start_unseen|browser_fresh_class|browser_session_end|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
+    if (/^(browser_page_load_ms|browser_first_load_skeleton_ms|browser_page_loads|browser_widget_states|browser_page_timeouts|browser_logins|browser_signin_ms|browser_sse_opened|browser_call_ms|browser_request_incomplete_ms|browser_request_failed_start_unseen|browser_fresh_class|browser_session_end|bench_frame)(\{|$)/.test(name)) keep[name] = m.values
   }
   return { [__ENV.SUMMARY_FILE || '/out/browser-summary.json']: JSON.stringify({
     kind: 'browser_summary', sessions: CFG.sessions.map((x) => x.name),
