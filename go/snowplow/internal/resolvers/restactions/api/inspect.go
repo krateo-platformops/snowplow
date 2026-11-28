@@ -107,12 +107,17 @@ type Resource struct {
 }
 
 // Unresolved names a stage the inspect pass could not enumerate from the
-// empty (extras-only) dict, with a human reason. Any non-empty Unresolved
-// slice makes the handler fail loud (non-200) — under-enumerating the read-set
-// would silently under-grant RBAC at the first /call.
+// empty (extras-only) dict. Any non-empty Unresolved slice makes the handler
+// answer 422 (never 200) — under-enumerating the read-set would silently
+// under-grant RBAC at the first /call.
+//
+// Reason is one of the stable tokens (UnresolvedReasons): what a client
+// switches on. Message is the prose for a person; it can change and is never
+// parsed (#1619).
 type Unresolved struct {
-	Stage  string `json:"stage"`
-	Reason string `json:"reason"`
+	Stage   string `json:"stage"`
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
 }
 
 // saRESTConfigForInspectFn is the package-private seam over the SA
@@ -189,16 +194,40 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 		byName[s.Name] = s
 	}
 
-	order, err := topologicalSort(stages)
-	if err != nil {
-		// A cyclic api[] never resolves at /call either — fail loud.
-		return nil, nil, fmt.Errorf("inspect: %w", err)
-	}
-
 	var (
 		out        []Resource
 		unresolved []Unresolved
 	)
+
+	// #1619 — a stage the dependsOn graph cannot order is UNRESOLVED, by cause,
+	// and the other stages are still enumerated. Two causes, which used to be one
+	// "cyclic dependency detected" and a 500:
+	//   - a dependsOn naming a stage the RESTAction does not declare: the
+	//     RESTAction is invalid, not the request and not the server. Its edge is
+	//     dropped for the ordering so it cannot hide a real cycle behind it;
+	//   - a real cycle, or a stage downstream of one.
+	// Neither is an error of the inspect pass: the read-set of every stage that
+	// can be enumerated is still correct, and a 422 body carries it.
+	var (
+		sortable   = make([]*templates.API, 0, len(stages))
+		unknownDep = map[string]bool{}
+	)
+	for _, s := range stages {
+		if s.DependsOn != nil && s.DependsOn.Name != "" && byName[s.DependsOn.Name] == nil {
+			unresolved = append(unresolved, Unresolved{Stage: s.Name, Reason: ReasonUnknownDependency,
+				Message: fmt.Sprintf("dependsOn names stage %q, which this RESTAction does not declare", s.DependsOn.Name)})
+			unknownDep[s.Name] = true
+			cp := *s
+			cp.DependsOn = nil
+			s = &cp
+		}
+		sortable = append(sortable, s)
+	}
+	order, stuck := stageOrder(sortable)
+	for _, name := range stuck {
+		unresolved = append(unresolved, Unresolved{Stage: name, Reason: ReasonCyclicDependency,
+			Message: "the stage is on a dependsOn cycle, or depends on a stage that is"})
+	}
 
 	// discoveryClientFor is keyed on the SA *rest.Config pointer; acquire the
 	// rc once. A build failure is fatal (we cannot validate any GVR).
@@ -209,8 +238,8 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 
 	for _, name := range order {
 		stage := byName[name]
-		if stage == nil {
-			continue
+		if stage == nil || unknownDep[name] {
+			continue // an invalid stage is reported above, not enumerated
 		}
 
 		// (1) UAF stages — classified FIRST, mirroring the dispatcher's
@@ -229,14 +258,15 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 				// resourcesFrom referenced upstream stage data not present in
 				// the empty dict (or otherwise failed closed) — UNRESOLVABLE.
 				unresolved = append(unresolved, Unresolved{
-					Stage:  name,
-					Reason: "userAccessFilter.resourcesFrom not materializable from empty dict (references upstream stage data)",
+					Stage:   name,
+					Reason:  ReasonStageDataInResourcesFrom,
+					Message: "userAccessFilter.resourcesFrom not materializable from empty dict (references upstream stage data)",
 				})
 				continue
 			}
 			rows, sErr := inspectUAFStage(ctx, rc, uaf, resources)
 			if sErr != nil {
-				unresolved = append(unresolved, Unresolved{Stage: name, Reason: sErr.Error()})
+				unresolved = append(unresolved, unresolvedOf(name, sErr))
 				continue
 			}
 			out = append(out, rows...)
@@ -255,7 +285,7 @@ func InspectReadSet(ctx context.Context, in *templates.RESTAction, extras map[st
 		// WITHOUT dispatching, then classify the concrete URI.
 		rows, sErr := inspectInClusterStage(ctx, rc, stage, dict, log)
 		if sErr != nil {
-			unresolved = append(unresolved, Unresolved{Stage: name, Reason: sErr.Error()})
+			unresolved = append(unresolved, unresolvedOf(name, sErr))
 			continue
 		}
 		out = append(out, rows...)
@@ -314,7 +344,7 @@ func inspectInClusterStage(ctx context.Context, rc *rest.Config, stage *template
 	// enumerates what it enumerated, exactly as before.
 	opts, skips, _ := createRequestOptionsWithSkips(pagebudget.Detach(ctx), log, stage, dict, true) // an in-cluster stage
 	if len(opts) == 0 && len(skips) == 0 {
-		return nil, fmt.Errorf("stage produced no request path")
+		return nil, unresolvedf(ReasonNoRequestPath, "stage produced no request path")
 	}
 
 	var rows []Resource
@@ -336,11 +366,14 @@ func inspectInClusterStage(ctx context.Context, rc *rest.Config, stage *template
 			if len(opts) > 0 {
 				continue
 			}
-			return nil, fmt.Errorf("stage path is not enumerable: %s", sk.reason.detail)
+			return nil, unresolvedf(skipToken(sk.reason.class), "stage path is not enumerable: %s", sk.reason.detail)
 		}
 		co := cache.ReadSetFromCollapsed(stage.Path, sk.reason.namespace)
 		if !co.OK {
-			return nil, fmt.Errorf("stage path has no static (group, version, resource) to enumerate: %s", sk.reason.detail)
+			if co.ResourceTemplated {
+				return nil, unresolvedf(ReasonTemplatedResource, "the stage's RESOURCE segment is templated and collapsed — the read coordinate is undetermined (#504): %s", sk.reason.detail)
+			}
+			return nil, unresolvedf(ReasonNoStaticResource, "stage path has no static (group, version, resource) to enumerate: %s", sk.reason.detail)
 		}
 		if err := validateGVR(ctx, rc, co.GVR); err != nil {
 			return nil, fmt.Errorf("discovery validation failed for %s: %w", co.GVR.String(), err)
@@ -421,7 +454,7 @@ func inspectInClusterStage(ctx context.Context, rc *rest.Config, stage *template
 		// /apis/apps/v1/ stays a legitimate discovery path, as it is today.
 		if _, ok := cache.ParseAPIServerDiscoveryPath(path); ok {
 			if co := cache.ReadSetSkeleton(stage.Path); co.ResourceTemplated {
-				return nil, fmt.Errorf("path %q renders as bare discovery but the stage's RESOURCE segment is templated — "+
+				return nil, unresolvedf(ReasonTemplatedResource, "path %q renders as bare discovery but the stage's RESOURCE segment is templated — "+
 					"the read coordinate is undetermined (#504)", redact.Path(path))
 			}
 			continue
@@ -429,7 +462,7 @@ func inspectInClusterStage(ctx context.Context, rc *rest.Config, stage *template
 
 		// Anything else: residual ${...}, upstream-dependent, or non-kube →
 		// the whole stage is UNRESOLVABLE.
-		return nil, fmt.Errorf("path %q is not an enumerable in-cluster apiserver path (residual template, upstream-dependent, or non-kube)", redact.Path(path))
+		return nil, unresolvedf(ReasonNotEnumerablePath, "path %q is not an enumerable in-cluster apiserver path (residual template, upstream-dependent, or non-kube)", redact.Path(path))
 	}
 
 	return rows, nil
@@ -454,10 +487,10 @@ func inspectUAFStage(ctx context.Context, rc *rest.Config, uaf *templates.UserAc
 		}
 		exists, err := pluralExistsInGroup(ctx, rc, uaf.Group, plural)
 		if err != nil {
-			return nil, fmt.Errorf("userAccessFilter resource %q (group %q): %w", plural, uaf.Group, err)
+			return nil, fmt.Errorf("userAccessFilter resource %q (group %q): %w", plural, uaf.Group, discoveryErr(err))
 		}
 		if !exists {
-			return nil, fmt.Errorf("userAccessFilter resource %q served by no version of group %q", plural, uaf.Group)
+			return nil, unresolvedf(ReasonResourceNotServed, "userAccessFilter resource %q served by no version of group %q", plural, uaf.Group)
 		}
 	}
 	out := make([]Resource, 0, len(resources))
@@ -485,15 +518,15 @@ func inspectUAFStage(ctx context.Context, rc *rest.Config, uaf *templates.UserAc
 func validateGVR(ctx context.Context, rc *rest.Config, gvr schema.GroupVersionResource) error {
 	cli, err := discoveryClientFor(rc)
 	if err != nil {
-		return err
+		return discoveryErr(err)
 	}
 	gv := schema.GroupVersion{Group: gvr.Group, Version: gvr.Version}.String()
 	list, err := serverResourcesForGroupVersion(ctx, cli, gv) // #1115 N1: on the request ctx
 	if err != nil {
-		return fmt.Errorf("discovery for %s: %w", gv, err)
+		return fmt.Errorf("discovery for %s: %w", gv, discoveryErr(err))
 	}
 	if !pluralServed(list, gvr.Resource) {
-		return fmt.Errorf("resource %q not served under %s", gvr.Resource, gv)
+		return unresolvedf(ReasonResourceNotServed, "resource %q not served under %s", gvr.Resource, gv)
 	}
 	return nil
 }

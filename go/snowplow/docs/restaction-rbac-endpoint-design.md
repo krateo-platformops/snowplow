@@ -123,10 +123,47 @@ the user must hold, so that is precisely what we emit.
     { "group": "composition.krateo.io",    "resource": "fireworksapps",  "verb": "watch" }
   ],
   "unresolved": [
-    { "stage": "detail", "reason": "path templates off upstream stage data; not materializable from empty dict" }
+    { "stage": "detail", "reason": "unrenderedTemplate", "message": "stage path is not enumerable: unrendered ${...} template (#293)" }
   ]
 }
 ```
+
+### Status and the `unresolved` entries (#1619)
+
+- **200**: every stage was enumerated. The body is `{restaction, readSet}`; there is **no**
+  `unresolved` key.
+- **422**: at least one stage was not. The body is **the same JSON** plus `unresolved`, and
+  `readSet` holds the rows of the stages that **were** enumerated, in exactly the 200's row
+  shape (one decoder reads both). The status is what says the read-set is incomplete: do not
+  grant from a 422's `readSet` as though it were whole. (Before #1619 the 422 body was a prose
+  string and the resolved rows were dropped.)
+- Every `unresolved` entry is `{stage, reason, message}`. `reason` is a **stable, closed token**
+  to switch on; it is never reworded and never parsed from `message`. `message` is prose for a
+  person and may change.
+- Status codes are otherwise unchanged: 400 (missing/invalid parameters, reserved extras keys),
+  401, 500 (the inspect pass itself failed, e.g. no ServiceAccount rest.Config).
+
+| `reason` | Cause |
+|---|---|
+| `stageDataInResourcesFrom` | a `userAccessFilter.resourcesFrom` reads upstream stage output, which does not exist before dispatch |
+| `resourceNotServed` | the apiserver serves no such resource, group or version; the stage would 404 at `/call` |
+| `discoveryFailed` | discovery could not be read, so the resource could not be validated (retryable; says nothing about the stage) |
+| `noRequestPath` | the stage plans no request (an iterator that yields nothing) |
+| `unrenderedTemplate` | a literal `${...}` survived rendering (#293) |
+| `pathNotAsServed` | the rendered path is one the apiserver would read as a different path (#1137): no leading `/`, an empty segment, or more than one `${...}` embedded in one path |
+| `pathValueRefused` | a value spliced into the path could not be one segment or query value, the path has a `.`/`..` segment, or an apiserver path carries a percent-escape (#1123) |
+| `jqPathError`, `jqPayloadError`, `jqHeaderError` | the stage's path, payload or header jq expression errored |
+| `templatedResource` | the RESOURCE segment of the path is an expression, so what is read is undetermined (#504) |
+| `noStaticResource` | the path template has no static (group, version, resource) to enumerate from |
+| `notEnumerablePath` | the rendered path is not an in-cluster apiserver resource path (residual template, upstream-dependent, or non-kube) |
+| `unknownDependency` | the stage's `dependsOn` names a stage the RESTAction does not declare |
+| `cyclicDependency` | the stage is on a `dependsOn` cycle, or depends on a stage that is |
+
+A `dependsOn` naming a stage that does not exist is an `unresolved` entry (`unknownDependency`),
+not a 400 and not a 500: the request is fine and the server is fine, and the RESTAction is what
+is invalid, which is what 422 says. The other stages are still enumerated, so the consumer gets
+every row that can be known plus the stage to fix. (A cycle used to share the "cyclic dependency
+detected" 500 with it.)
 
 Field rules (the digest/dedupe key is the full triple, so this stays stable):
 

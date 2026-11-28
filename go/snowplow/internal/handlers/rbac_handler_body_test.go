@@ -6,8 +6,9 @@
 // two package-private seams (rbacGetObjectFn / rbacInspectReadSetFn, rbac.go)
 // for in-memory fakes:
 //
-//	(a) an unresolvable stage  -> 422 whose message NAMES the stage
-//	    (formatUnresolved) — a partial read-set is NEVER returned as success;
+//	(a) an unresolvable stage  -> 422 whose JSON body NAMES the stage with its
+//	    reason token and carries the rows that did enumerate (#1619) — a partial
+//	    read-set is NEVER returned as success;
 //	(b) a missing apiRefName / apiRefNamespace -> 400 (before any load);
 //	(c) an all-external RESTAction (readSet nil) -> 200 with "readSet": []
 //	    (marshalled as an empty array, NOT null);
@@ -28,6 +29,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
@@ -91,16 +93,15 @@ func okGet(name, namespace string) func(context.Context, templatesv1.ObjectRefer
 }
 
 // TestRBAC_Body_Unresolvable422NamesStage — arm (a): when the inspect pass
-// reports an unresolvable stage, the handler MUST 422 and the body message MUST
-// name that stage (formatUnresolved) — never return a partial read-set as 200.
+// reports an unresolvable stage, the handler MUST 422 (never 200) and the JSON
+// body MUST name that stage with its reason token and message, and carry the
+// rows that did enumerate (#1619).
 func TestRBAC_Body_Unresolvable422NamesStage(t *testing.T) {
 	withRBACSeams(t,
 		okGet("foo", "krateo-system"),
 		func(_ context.Context, _ *templatesv1.RESTAction, _ map[string]any) ([]api.Resource, []api.Unresolved, error) {
-			// A partial read-set AND an unresolved stage: the handler must
-			// prefer the 422 over shipping the partial set.
 			return []api.Resource{{Group: "", Version: "v1", Resource: "configmaps", Verb: "get"}},
-				[]api.Unresolved{{Stage: "listPods", Reason: "needs upstream output"}},
+				[]api.Unresolved{{Stage: "listPods", Reason: api.ReasonUnrenderedTemplate, Message: "needs upstream output"}},
 				nil
 		},
 	)
@@ -109,12 +110,23 @@ func TestRBAC_Body_Unresolvable422NamesStage(t *testing.T) {
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("H5(a): unresolvable stage must yield 422, got %d; body=%s", rec.Code, rec.Body.String())
 	}
-	var st response.Status
-	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("H5(a): 422 content type = %q", ct)
+	}
+	var got rbacResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("H5(a): decode 422 body: %v (%s)", err, rec.Body.String())
 	}
-	if !containsStr(st.Message, "listPods") {
-		t.Fatalf("H5(a): 422 message must NAME the unresolvable stage 'listPods'; got %q", st.Message)
+	if got.RESTAction != (restActionRef{Name: "foo", Namespace: "krateo-system"}) {
+		t.Errorf("H5(a): restaction = %+v", got.RESTAction)
+	}
+	wantRows := []api.Resource{{Version: "v1", Resource: "configmaps", Verb: "get"}}
+	if !reflect.DeepEqual(got.ReadSet, wantRows) {
+		t.Errorf("H5(a): 422 readSet = %+v, want the enumerated rows %+v", got.ReadSet, wantRows)
+	}
+	wantUn := []api.Unresolved{{Stage: "listPods", Reason: "unrenderedTemplate", Message: "needs upstream output"}}
+	if !reflect.DeepEqual(got.Unresolved, wantUn) {
+		t.Errorf("H5(a): unresolved = %+v, want %+v", got.Unresolved, wantUn)
 	}
 }
 

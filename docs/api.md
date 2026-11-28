@@ -70,7 +70,7 @@ authoritative machine-readable spec is
 | `POST /export` | The same export with the extras in the request body (`{"extras":{...}}`, as `POST /call/read`), for filters too large for a URL; pages go through the `/call/read` read lane ([export.md](../go/snowplow/howto/export.md)). |
 | `GET /list` | List resources by category in a namespace. |
 | `GET /api-info/names` | API names/plurals discovery helper. |
-| `GET /rbac` | Enumerates the (group, version, resource, verb) read-set a RESTAction *would* perform, without dispatching — for RBAC pre-generation. |
+| `GET /rbac` | Enumerates the (group, version, resource, verb) read-set a RESTAction *would* perform, without dispatching — for RBAC pre-generation. `200` when every stage was enumerated; `422` with the same JSON body plus `unresolved: [{stage, reason, message}]` (stable `reason` tokens) and the rows that were enumerated, when some stage was not ([design §4](../go/snowplow/docs/restaction-rbac-endpoint-design.md)). |
 | `GET /refreshes` | Per-subject live-refresh SSE stream (cookie-or-header JWT). |
 | `POST /jq` | Evaluate a JQ expression against a JSON input. |
 | `GET /health`, `GET /readyz` | Liveness (always 200 once serving) / readiness (200 on prewarm-complete). |
