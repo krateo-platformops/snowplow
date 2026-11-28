@@ -71,7 +71,6 @@ func cdSetup(t *testing.T) (serve func(order cdOrder) cdRun, deleteSecret func()
 	t.Cleanup(idynamic.ResetServiceAccountRESTConfigForTest)
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
-	dispatch := RESTAction()
 
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
@@ -134,6 +133,7 @@ func cdSetup(t *testing.T) (serve func(order cdOrder) cdRun, deleteSecret func()
 		})
 	t.Cleanup(restore)
 
+	dispatch := RESTAction()
 	auth := middleware.UserConfig(keys, cdAuthnNS)
 	serve = func(order cdOrder) cdRun {
 		resolves = 0
