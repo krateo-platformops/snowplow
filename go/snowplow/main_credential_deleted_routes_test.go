@@ -42,6 +42,7 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
 )
 
 func TestCredentialDeleted_RouteTable_ReadAndWriteGet401(t *testing.T) {
@@ -57,8 +58,10 @@ func TestCredentialDeleted_RouteTable_ReadAndWriteGet401(t *testing.T) {
 	cache.ResetSecretsInformerForTest()
 	t.Cleanup(func() { cache.ResetSecretsSnapshotForTest(); cache.ResetSecretsInformerForTest() })
 
-	// Build the routes first: the handlers capture the process-wide SA rest.Config
-	// singleton (no exported reset), so it must not see the override below.
+	// The handlers capture the process-wide SA rest.Config singleton when built;
+	// clear it before and after so the override below never outlives this test.
+	idynamic.ResetServiceAccountRESTConfigForTest()
+	t.Cleanup(idynamic.ResetServiceAccountRESTConfigForTest)
 	mux := http.NewServeMux()
 	mountCallerIdentityRoutes(newRouteTable(mux), use.NewChain(), debugAuthTestKeys, authnNS, nil)
 

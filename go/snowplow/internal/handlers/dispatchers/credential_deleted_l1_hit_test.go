@@ -34,6 +34,7 @@ import (
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/credhttp"
+	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	corev1 "k8s.io/api/core/v1"
@@ -62,10 +63,12 @@ func cdSetup(t *testing.T) (serve func(order cdOrder) cdRun, deleteSecret func()
 	t.Helper()
 	h1BuildWatcher(t) // CACHE_ENABLED=true, RBAC snapshot granting h1User the RA GVR
 
-	// The handler captures the process-wide SA rest.Config singleton
-	// (idynamic.ServiceAccountRESTConfig, which has no exported reset) when it is
-	// built. Build it BEFORE the in-cluster override below, or the singleton
-	// caches this test's server for every later test in the package.
+	// The handler captures the process-wide SA rest.Config singleton when it is
+	// built, and the in-cluster override below would be what it captures. Clear
+	// the singleton before and after, so no order of tests can see this test's
+	// server.
+	idynamic.ResetServiceAccountRESTConfigForTest()
+	t.Cleanup(idynamic.ResetServiceAccountRESTConfigForTest)
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
 	dispatch := RESTAction()
