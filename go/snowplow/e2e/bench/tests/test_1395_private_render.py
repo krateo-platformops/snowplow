@@ -418,7 +418,7 @@ def test_falsifier_the_laptop_refuses_a_run_whose_values_leave_the_ca_bundle_tar
         REAL_CHART_CHECK(_env(), ["N1", "N2"])
     assert str(e.value).startswith(f"installer {RECORDED}, run N1's values: the installer refuses to render its "
                                    "components with the run's effective spec"), str(e.value)
-    assert ("compositions.yaml:1005:4): features.internalTls is on but componentValues.internal-ca-bundle.target"
+    assert ("compositions.yaml:1055:4): features.internalTls is on but componentValues.internal-ca-bundle.target"
             ".namespaces is empty") in str(e.value), str(e.value)
 
 
