@@ -27,6 +27,7 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -254,6 +255,23 @@ var closedAttributeKeys = map[string]struct{}{
 	"handler": {}, "class_warm": {},
 }
 
+// closedSpanAttributeKeys is the set of attribute keys the restaction.resolve and
+// restaction.stage spans (restactions/api/stage_trace.go) may carry. Like the
+// metric allowlist it is a KEY list: a new key is how an identity or an
+// unbounded value reaches a span, so adding one means editing this list in the
+// same change, where a reviewer sees it. spanForbiddenKeyWords are names a key
+// must never contain, whatever the list says.
+var closedSpanAttributeKeys = map[string]struct{}{
+	"snowplow.restaction.source": {}, "snowplow.restaction.namespace": {},
+	"snowplow.restaction.name": {}, "snowplow.restaction.stage_count": {},
+	"snowplow.restaction.outcome": {}, "snowplow.restaction.stage": {},
+	"snowplow.restaction.stage.target": {}, "snowplow.restaction.stage.shape": {},
+	"snowplow.restaction.stage.items": {}, "snowplow.restaction.stage.outcome": {},
+	"snowplow.restaction.stage.budget_cause": {},
+}
+
+var spanForbiddenKeyWords = []string{"user", "group", "token", "cn", "secret", "url", "query", "body", "path", "header"}
+
 // neverAnAttribute lists the three expvar keys whose VALUES carry
 // object-identifying or unbounded material (design §3.4). They stay
 // expvar-only, where /debug/vars is JWT-gated and the map is not a
@@ -279,6 +297,25 @@ var neverAnAttribute = []string{
 // vacuously (the instruments it guards do not exist there), and is
 // declared as a guard rather than a red-then-green.
 func TestF8_AttributeHygiene(t *testing.T) {
+	// The RESTAction resolve and stage spans: every key they declare is in the
+	// closed span set, the set has no stale entry, and no key names identity.
+	declared := map[string]struct{}{}
+	for _, k := range restactionsapi.TraceAttrKeys() {
+		declared[k] = struct{}{}
+		if _, ok := closedSpanAttributeKeys[k]; !ok {
+			t.Errorf("span attribute key %q is not in the closed span set", k)
+		}
+		for _, w := range spanForbiddenKeyWords {
+			if strings.Contains(strings.ToLower(k), w) {
+				t.Errorf("span attribute key %q names %q: identity and unbounded material never ride a span", k, w)
+			}
+		}
+	}
+	for k := range closedSpanAttributeKeys {
+		if _, ok := declared[k]; !ok {
+			t.Errorf("closed span set lists %q, which the spans no longer declare", k)
+		}
+	}
 	t.Setenv("CACHE_ENABLED", "true")
 	dispatchers.ResetL1LookupCellsForTest()
 	t.Cleanup(dispatchers.ResetL1LookupCellsForTest)

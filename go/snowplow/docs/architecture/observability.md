@@ -345,6 +345,38 @@ A RESTAction resolve whose stages failed is answered **HTTP 200**: the failure i
 
 **No identity.** The parser drops the header's stage names: no stage, RESTAction or target name, user, message or body reaches the span. Distinct from #1265's `snowplow.serve.*`.
 
+### RESTAction resolve and stage spans
+Defined in `internal/resolvers/restactions/api/stage_trace.go`; started in `api.ResolveWithFailure` (the one function every resolve path goes through) and in the stage loop. Gated by `tracing.Active()` (set by `tracing.Setup` when the trace pipeline is on): with tracing off the cost is one atomic load and no allocation (`BenchmarkStageTraceOff`: 0 allocs/op; the paired `BenchmarkResolveThreeStages` is 710 allocs/op before and after).
+
+| Span | One per | Parent | Attributes |
+|---|---|---|---|
+| `restaction.resolve` | RESTAction resolve | the request's Server span on a customer `/call`; a root for the refresher and the prewarms | `snowplow.restaction.source` (`customer` \| `refresher` \| `prewarm` \| `background`), `.namespace`, `.name`, `.stage_count`, `.outcome` (`ok` \| `failed`) |
+| `restaction.stage` | stage the loop reached, in order (stages run one after another) | the resolve span | `snowplow.restaction.namespace`, `.name`, `snowplow.restaction.stage` (the stage's name), `.stage.target` (`in_cluster` \| `external`), `.stage.shape` (`single` \| `iterator`), `.stage.items` (calls planned), `.stage.outcome` (`ok` \| `item_errors` \| `failed` \| `not_executed`), `.stage.budget_cause` (`not_sent` \| `exhausted_connect` \| `exhausted_answer`, only when the page budget cut an exchange of the stage) |
+
+A stage's dial and client spans (`HTTP GET`, `HTTP POST`) are children of its stage span, so a trace shows the stage tree. `failed` is a truncating exit; `item_errors` a stage that ran and recorded a failure (the resolve went on); `not_executed` a stage snowplow did not run (a write behind a failed stage, a refused write, a dry run). Status stays Unset, as for #1264. **No identity:** namespace, name and stage are author config; a span never carries a username, group, token, CN, Secret name, URL, query value or response content. The key set is closed (`TestF8_AttributeHygiene` in `internal/metrics`, `TestStageTrace_AttributesAreAClosedSet`).
+
+Per-stage p50/p95/max for one RESTAction, from `otel_traces` (ClickHouse, durations in ms):
+
+```sql
+SELECT
+    SpanAttributes['snowplow.restaction.stage']         AS stage,
+    SpanAttributes['snowplow.restaction.source']        AS source,
+    count()                                             AS n,
+    quantile(0.5)(Duration)  / 1e6                      AS p50_ms,
+    quantile(0.95)(Duration) / 1e6                      AS p95_ms,
+    max(Duration) / 1e6                                 AS max_ms
+FROM otel_traces
+WHERE ServiceName = 'snowplow'
+  AND SpanName = 'restaction.stage'
+  AND SpanAttributes['snowplow.restaction.namespace'] = 'krateo-system'
+  AND SpanAttributes['snowplow.restaction.name']      = 'dashboard-inbox'
+  AND Timestamp > now() - INTERVAL 1 HOUR
+GROUP BY stage, source
+ORDER BY p95_ms DESC
+```
+
+The `source` split matters: a refresher or prewarm stage runs on a different clock than a customer's. Traces are tail-sampled at the collectors (every error trace, 5% of the rest), so read these as a sample of the distribution, not a count.
+
 ### Self-loopback recursion guard — cycle and depth stops (#1274)
 Defined in `internal/cache/nested_loopback_guard_metrics.go`; on OTLP in `internal/metrics/nested_loopback_guard_metrics.go`.
 
