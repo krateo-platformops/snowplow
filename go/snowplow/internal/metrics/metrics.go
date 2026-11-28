@@ -71,6 +71,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/viewercontext"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -817,6 +818,17 @@ func registerInstruments(m metric.Meter, build string) error {
 		return err
 	}
 
+	// Viewer-context drop detector, per fixed viewer-context key. Same shape as
+	// malformedDialSkipped: one counter + a `viewer_key` attribute drawn from the fixed
+	// vocabulary-derived enum (viewercontext.DroppedKeyEnum), never request data
+	// and never the dropped value.
+	viewerContextDropped, err := m.Int64ObservableCounter(
+		"snowplow_viewer_context_dropped_total",
+		metric.WithDescription("Viewer-context values (today only tz) dropped at the request edge because they failed their key's validator, by viewer-context key (attribute viewer_key) {tz}. The request is served as if the value had not been sent. Expected 0, or a slow trickle from odd clients; a jump means the frontend or portal sends names snowplow refuses. Counts only, never the value."))
+	if err != nil {
+		return err
+	}
+
 	// --- #375: dep-generation guard DETECTOR. Non-zero = an ACCEPTED gen-guarded L1
 	// Put whose resolve ctx carried no dep-gen sink (a resolve entry outside
 	// WithL1KeyContext / WithDepGenSink) — the PUT-THEN-REMARK guard could not tell
@@ -1152,6 +1164,12 @@ func registerInstruments(m metric.Meter, build string) error {
 				metric.WithAttributes(attribute.String("reason", reason)))
 		}
 
+		// --- viewer-context drop detector, per fixed key ---
+		for key, n := range viewercontext.DroppedByKeySnapshot() {
+			o.ObserveInt64(viewerContextDropped, int64(n),
+				metric.WithAttributes(attribute.String("viewer_key", key)))
+		}
+
 		// --- #375: dep-generation guard detector (expected 0) ---
 		o.ObserveInt64(unguardedPutTotal, int64(cache.UnguardedPutTotal()))
 		// --- #408: moved remarks by carrier ---
@@ -1229,6 +1247,7 @@ func registerInstruments(m metric.Meter, build string) error {
 		unparseableCADelegations,
 		// --- #311/#293 ---
 		malformedDialSkipped,
+		viewerContextDropped,
 		// --- #375 ---
 		unguardedPutTotal,
 		// --- #408 ---
