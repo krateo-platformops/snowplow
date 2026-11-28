@@ -173,6 +173,11 @@ const (
 // carries the value (the value is caller input; it is not logged).
 type RefusedError struct {
 	Reason string
+	// Rendered is, on a ReasonEmptySegment refusal only, the path as the
+	// template rendered it, empty segments and all (#1617). It is for the
+	// read-set enumeration to see which segments rendered, never to be dialed
+	// or logged: Error() does not carry it, and a caller must not either.
+	Rendered RenderedPath
 }
 
 func (e *RefusedError) Error() string {
@@ -188,6 +193,27 @@ func (e *RefusedError) Error() string {
 	default:
 		return "path template: refused (" + e.Reason + ")"
 	}
+}
+
+// RenderedPath is a path as a template rendered it, values and all. It prints as
+// a placeholder under every fmt verb, so a struct that holds one and reaches a
+// log line (%v, %+v, %#v) carries no value; Value reads it deliberately.
+type RenderedPath string
+
+func (RenderedPath) String() string   { return "[rendered path]" }
+func (RenderedPath) GoString() string { return "[rendered path]" }
+
+// Value is the path itself, for the one caller that reads its segments.
+func (p RenderedPath) Value() string { return string(p) }
+
+// RenderedOfEmptySegment returns the path an empty-segment refusal rendered
+// (#1617), and false for any other error.
+func RenderedOfEmptySegment(err error) (RenderedPath, bool) {
+	var r *RefusedError
+	if errors.As(err, &r) && r.Reason == ReasonEmptySegment {
+		return r.Rendered, true
+	}
+	return "", false
 }
 
 // IsRefused reports whether err is a RefusedError.
@@ -855,7 +881,7 @@ func assemble(v any) (string, error) {
 		return "", &RefusedError{Reason: ReasonDotSegment}
 	}
 	if segs.emptied || (segs.unrooted && namesNoPath(out)) {
-		return "", &RefusedError{Reason: ReasonEmptySegment}
+		return "", &RefusedError{Reason: ReasonEmptySegment, Rendered: RenderedPath(out)}
 	}
 	return out, nil
 }

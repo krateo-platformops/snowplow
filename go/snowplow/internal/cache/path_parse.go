@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // ExtractAPIServerGroupFromTemplatedPath extracts the static apiserver
@@ -459,6 +460,62 @@ func ReadSetSkeleton(path string) ReadSetCoord {
 		return ReadSetCoord{GVR: schema.GroupVersionResource{Version: version, Resource: resource}, Name: nameAt(parts, 2), OK: true}
 	}
 	return ReadSetCoord{}
+}
+
+// ReadSetFromCollapsed is ReadSetSkeleton for a stage whose render was refused
+// because a segment came out empty or invalid (#1617). The template alone says
+// which GVR is read and whether it is one object; it cannot say which namespace,
+// because the namespace is an expression there. The RENDER can: a collapsed
+// segment keeps its slashes, so the segments before it are exactly what the
+// template produced. renderedNS is the namespace the render held, from
+// RenderedNamespace ("" when that segment did not render as a valid one).
+//
+// No segment is special: a collapsed name, or anything after the namespace,
+// leaves the namespace segment as rendered, and the namespace is unknown only
+// when that segment itself did not render. Rows the template alone settles (a
+// literal namespace, a cluster-scoped read) are returned as the skeleton gave
+// them.
+func ReadSetFromCollapsed(template, renderedNS string) ReadSetCoord {
+	co := ReadSetSkeleton(template)
+	if co.OK && co.NamespaceUnknown && renderedNS != "" {
+		co.Namespace = renderedNS
+		co.NamespaceUnknown = false
+	}
+	return co
+}
+
+// RenderedNamespace reads the namespace segment of a rendered namespaced
+// apiserver path (/api/<v>/namespaces/<ns>/<resource>... or
+// /apis/<g>/<v>/namespaces/<ns>/<resource>...), and returns "" unless it is
+// present and a valid namespace. It returns the namespace and nothing else of
+// the path, so what a caller keeps of a refused render is a validated name, not
+// the rendered values around it.
+func RenderedNamespace(rendered string) string {
+	p := rendered
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	var parts []string
+	switch {
+	case strings.HasPrefix(p, "/apis/"):
+		parts = strings.Split(strings.TrimPrefix(p, "/apis/"), "/")
+		if len(parts) < 2 {
+			return ""
+		}
+		parts = parts[1:] // drop the group
+	case strings.HasPrefix(p, "/api/"):
+		parts = strings.Split(strings.TrimPrefix(p, "/api/"), "/")
+	default:
+		return ""
+	}
+	// parts: version, "namespaces", <ns>, <resource>, ...
+	if len(parts) < 4 || parts[1] != "namespaces" {
+		return ""
+	}
+	if ns := parts[2]; len(validation.IsDNS1123Label(ns)) == 0 {
+		return ns
+	}
+	return ""
 }
 
 // NameKind is the three-state name a read-set needs: the VERB depends on whether

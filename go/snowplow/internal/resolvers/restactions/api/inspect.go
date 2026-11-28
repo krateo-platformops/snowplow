@@ -338,7 +338,7 @@ func inspectInClusterStage(ctx context.Context, rc *rest.Config, stage *template
 			}
 			return nil, fmt.Errorf("stage path is not enumerable: %s", sk.reason.detail)
 		}
-		co := cache.ReadSetSkeleton(stage.Path)
+		co := cache.ReadSetFromCollapsed(stage.Path, sk.reason.namespace)
 		if !co.OK {
 			return nil, fmt.Errorf("stage path has no static (group, version, resource) to enumerate: %s", sk.reason.detail)
 		}
