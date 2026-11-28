@@ -279,7 +279,7 @@ func TestPreDispatch401_1076_KeyUnavailableIs503WithNoCause(t *testing.T) {
 			{"UserConfig", func(k jwtutil.KeySource) func(http.Handler) http.Handler {
 				return middleware.UserConfig(k, testAuthnNS)
 			}},
-			{"RefreshAuth", middleware.RefreshAuth},
+			{"RefreshAuth", func(k jwtutil.KeySource) func(http.Handler) http.Handler { return middleware.RefreshAuth(k) }},
 		} {
 			t.Run(src.name+"/"+mw.name, func(t *testing.T) {
 				r := httptest.NewRequest(http.MethodGet, "/call?x=1", nil)

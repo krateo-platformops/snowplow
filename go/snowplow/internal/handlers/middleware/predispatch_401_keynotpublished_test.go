@@ -136,7 +136,7 @@ var knpMiddlewares = []struct {
 	{"UserConfig", func(k jwtutil.KeySource) func(http.Handler) http.Handler {
 		return middleware.UserConfig(k, testAuthnNS)
 	}},
-	{"RefreshAuth", middleware.RefreshAuth},
+	{"RefreshAuth", func(k jwtutil.KeySource) func(http.Handler) http.Handler { return middleware.RefreshAuth(k) }},
 }
 
 func knpRequest(token string) *http.Request {
