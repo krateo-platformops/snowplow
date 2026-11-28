@@ -23,6 +23,8 @@ func TestPreDispatch401_1076_TheCauseSetIsClosed(t *testing.T) {
 		// #1560
 		"DelegatedCredentialMissing":  `Bearer error="invalid_token"`,
 		"DelegatedCredentialMismatch": `Bearer error="invalid_token"`,
+		// #1596
+		"TokenAudienceMismatch": `Bearer error="invalid_token"`,
 	}
 	var got []string
 	for k, c := range preDispatchCauses {
@@ -35,7 +37,7 @@ func TestPreDispatch401_1076_TheCauseSetIsClosed(t *testing.T) {
 		}
 	}
 	sort.Strings(got)
-	if strings.Join(got, ",") != "DelegatedCredentialMismatch,DelegatedCredentialMissing,KeyNotPublished,SessionCredentialMissing,StepUpRequired,TokenExpired,TokenInvalid,TokenMissing" {
+	if strings.Join(got, ",") != "DelegatedCredentialMismatch,DelegatedCredentialMissing,KeyNotPublished,SessionCredentialMissing,StepUpRequired,TokenAudienceMismatch,TokenExpired,TokenInvalid,TokenMissing" {
 		t.Fatalf("the closed set is %v", got)
 	}
 	for k := range want {

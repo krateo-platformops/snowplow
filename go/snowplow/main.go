@@ -240,11 +240,11 @@ func newRequestChain(log *slog.Logger) use.Chain {
 //
 // It is a function so the route the pod serves is the one the tests drive
 // (main_telemetry_1015_test.go).
-func mountTelemetryRoute(mux routeRegistrar, chain use.Chain, keys jwtutil.KeySource, ingest http.Handler) {
+func mountTelemetryRoute(mux routeRegistrar, chain use.Chain, keys jwtutil.KeySource, ingest http.Handler, aud ...jwtutil.ValidateOption) {
 	var h http.Handler = http.NotFoundHandler()
 	if ingest != nil {
 		h = rum.CountAuthFailures(chain.Append(
-			middleware.RefreshAuth(keys),
+			middleware.RefreshAuth(keys, aud...),
 			cache.FallthroughScopeMiddleware(cache.ScopeTelemetry)).
 			Then(ingest))
 	}
@@ -345,6 +345,14 @@ func main() {
 	port := flag.Int("port", env.ServicePort("PORT", 8081), "port to listen on")
 	authnNS := flag.String("authn-namespace", env.String("AUTHN_NAMESPACE", ""),
 		"krateo authn service clientconfig secrets namespace")
+	// #1596 — the name snowplow is called by as a recipient of authn's tokens:
+	// <service>.<namespace>, which the chart renders from the Service it
+	// creates (TOKEN_AUDIENCE in its ConfigMap; env.TOKEN_AUDIENCE overrides).
+	// A token whose `aud` lists only other names is refused 401
+	// TokenAudienceMismatch; one with no `aud` (every sign-in token) is
+	// accepted. Empty: no audience is checked.
+	tokenAudienceName := flag.String("token-audience", env.String("TOKEN_AUDIENCE", ""),
+		"the audience snowplow is called by (<service>.<namespace>); a token for other audiences only is refused")
 	// JWT verification keys come from authn's JWKS endpoint, not from a mounted
 	// Secret: snowplow holds no copy of authn's public key, and authn can rotate
 	// its keypair without a snowplow redeploy. Empty URL → derived from
@@ -522,6 +530,7 @@ func main() {
 	jwtKeys := credhttp.JWKSKeySource(resolvedJWKSURL, *jwksTimeout,
 		jwtutil.WithJWKSCacheTTL(*jwksCacheTTL),
 		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh))
+	tokenAudience := tokenAudienceOptions(log, *tokenAudienceName)
 	log.Info("JWT verification keys sourced from authn JWKS",
 		slog.String("jwks_url", resolvedJWKSURL),
 		slog.Duration("cache_ttl", *jwksCacheTTL),
@@ -1380,7 +1389,7 @@ func main() {
 	// #1334 — every route whose work is authorized by the caller's identity:
 	// mountCallerIdentityRoutes (public_identity.go), so the route table that
 	// decides which routes accept the public identity is testable.
-	mountCallerIdentityRoutes(routes, chain, jwtKeys, *authnNS, newPublicIdentity(*publicIdentityOn))
+	mountCallerIdentityRoutes(routes, chain, jwtKeys, *authnNS, newPublicIdentity(*publicIdentityOn), tokenAudience...)
 
 	routes.Handle("GET /swagger/", httpSwagger.WrapHandler)
 	//mux.Handle("POST /convert", chain.Then(handlers.Converter()))
@@ -1409,7 +1418,7 @@ func main() {
 	// REFRESH_SSE_ENABLED=false the handler serves a clean idle stream
 	// (transparent fallback, project_cache_off_is_transparent_fallback).
 	refreshesHandler := chain.Append(
-		middleware.RefreshAuth(jwtKeys)).
+		middleware.RefreshAuth(jwtKeys, tokenAudience...)).
 		Then(handlers.Refreshes())
 	routes.Handle("GET /refreshes", refreshesHandler)
 	// #560 — the SAME handler on POST. The GET form carries the subscription set
@@ -1432,7 +1441,7 @@ func main() {
 	// runs until main returns.
 	rumCtx, rumStop := context.WithCancel(context.Background())
 	defer rumStop()
-	mountTelemetryRoute(routes, chain, jwtKeys, newRUMIngest(rumCtx, mux))
+	mountTelemetryRoute(routes, chain, jwtKeys, newRUMIngest(rumCtx, mux), tokenAudience...)
 	rum.RegisterExpvar()
 
 	// Ship 0.30.249 / Task #250 Block 2a — register
@@ -1506,7 +1515,7 @@ func main() {
 	// JWT's identity, so an authenticated caller without the grant gets 403.
 	//
 	// MUST come after the expvar publishers registered just above.
-	registerDebugRoutes(routes, chain, jwtKeys)
+	registerDebugRoutes(routes, chain, jwtKeys, tokenAudience...)
 
 	// The signals that start a graceful shutdown: shutdown_signals.go on a
 	// server build, shutdown_signals_js.go on js/wasm, which has no SIGHUP.

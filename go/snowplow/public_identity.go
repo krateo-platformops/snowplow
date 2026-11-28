@@ -39,8 +39,8 @@ func newPublicIdentity(on bool) *middleware.PublicIdentity {
 // ServiceAccount, never under the caller's credential, so serving it token-less
 // would act as the ServiceAccount for an anonymous caller
 // (TestIssue1334_RouteTable_RBACNeverServesThePublicIdentity).
-func mountCallerIdentityRoutes(routes routeRegistrar, chain use.Chain, keys jwtutil.KeySource, authnNS string, public *middleware.PublicIdentity) {
-	callerIdentity := middleware.UserConfigOrPublic(keys, authnNS, public)
+func mountCallerIdentityRoutes(routes routeRegistrar, chain use.Chain, keys jwtutil.KeySource, authnNS string, public *middleware.PublicIdentity, aud ...jwtutil.ValidateOption) {
+	callerIdentity := middleware.UserConfigOrPublic(keys, authnNS, public, aud...)
 
 	routes.Handle("GET /list", chain.Append(
 		callerIdentity,
@@ -111,7 +111,7 @@ func mountCallerIdentityRoutes(routes routeRegistrar, chain use.Chain, keys jwtu
 	// like /refreshes above, it issues ZERO per-user apiserver reads, so it sits
 	// outside the read-path-scoped invariant (fallthrough_assert.go).
 	routes.Handle("GET /rbac", chain.Append(
-		middleware.UserConfig(keys, authnNS)).
+		middleware.UserConfig(keys, authnNS, aud...)).
 		Then(handlers.RBAC()))
 
 	mountCallWriteRoutes(routes, chain, callerIdentity)

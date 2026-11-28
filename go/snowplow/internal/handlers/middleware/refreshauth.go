@@ -102,7 +102,7 @@ func refreshTokenFromRequest(req *http.Request) (string, bool) {
 // asymmetric-signing migration the "key" is resolved through a
 // jwtutil.KeySource — in production authn's JWKS endpoint, fetched and cached
 // (see main.go) rather than mounted from a Secret.
-func RefreshAuth(keys jwtutil.KeySource) func(http.Handler) http.Handler {
+func RefreshAuth(keys jwtutil.KeySource, opts ...jwtutil.ValidateOption) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(wri http.ResponseWriter, req *http.Request) {
 			if keys == nil {
@@ -125,13 +125,13 @@ func RefreshAuth(keys jwtutil.KeySource) func(http.Handler) http.Handler {
 			// ErrTokenExpired / ErrTokenInvalid; tokenRejected names which);
 			// a key we cannot fetch is OUR fault, so it maps to 503 instead,
 			// with no cause.
-			userInfo, err := jwtutil.ValidateWithKeySource(keys, token)
+			userInfo, err := jwtutil.ValidateWithKeySource(keys, token, opts...)
 			if err != nil {
 				if errors.Is(err, jwtutil.ErrKeyUnavailable) {
 					response.ServiceUnavailable(wri, err)
 					return
 				}
-				tokenRejected(wri, err)
+				rejectToken(wri, req, userInfo, err)
 				return
 			}
 			// The caller is verified from here on, as UserConfig names it: an

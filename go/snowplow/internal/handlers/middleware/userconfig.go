@@ -289,8 +289,8 @@ const PinnedPlumbingVersion = "v1.111.0"
 // is invoked on every call → apiserver-side rate returns to within
 // ±10% of the pre-D.3 baseline. The flag is verified-removable
 // (`project_caching_is_provisional`).
-func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.Handler {
-	return userConfig(keys, authnNS, nil)
+func UserConfig(keys jwtutil.KeySource, authnNS string, opts ...jwtutil.ValidateOption) func(http.Handler) http.Handler {
+	return userConfig(keys, authnNS, nil, opts)
 }
 
 // UserConfigOrPublic is UserConfig with the #1334 public identity: a request
@@ -298,11 +298,11 @@ func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.
 // (public_identity.go) instead of 401 TokenMissing. A nil public is exactly
 // UserConfig. Every request that carries an Authorization header — valid or
 // not — takes UserConfig's path unchanged.
-func UserConfigOrPublic(keys jwtutil.KeySource, authnNS string, public *PublicIdentity) func(http.Handler) http.Handler {
-	return userConfig(keys, authnNS, public)
+func UserConfigOrPublic(keys jwtutil.KeySource, authnNS string, public *PublicIdentity, opts ...jwtutil.ValidateOption) func(http.Handler) http.Handler {
+	return userConfig(keys, authnNS, public, opts)
 }
 
-func userConfig(keys jwtutil.KeySource, authnNS string, public *PublicIdentity) func(http.Handler) http.Handler {
+func userConfig(keys jwtutil.KeySource, authnNS string, public *PublicIdentity, opts []jwtutil.ValidateOption) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(wri http.ResponseWriter, req *http.Request) {
 			// #1115 — a customer request's network exchanges share the page's
@@ -375,7 +375,7 @@ func userConfig(keys jwtutil.KeySource, authnNS string, public *PublicIdentity) 
 			// names: ErrKeyNotPublished (a retired signing key) →
 			// KeyNotPublished, ErrTokenExpired → TokenExpired, anything else
 			// → TokenInvalid (tokenRejected).
-			userInfo, err := jwtutil.ValidateWithKeySource(keys, parts[1])
+			userInfo, err := jwtutil.ValidateWithKeySource(keys, parts[1], opts...)
 			if err != nil {
 				// Upstream — an unresolvable key (JWKS unreachable, or a kid
 				// the cached set may predate) is OUR failure, not a bad
@@ -390,7 +390,7 @@ func userConfig(keys jwtutil.KeySource, authnNS string, public *PublicIdentity) 
 					response.ServiceUnavailable(wri, err)
 					return
 				}
-				tokenRejected(wri, err)
+				rejectToken(wri, req, userInfo, err)
 				return
 			}
 			// #1379 re-review — the caller is verified from here on: an

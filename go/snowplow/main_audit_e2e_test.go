@@ -94,6 +94,10 @@ type e2eLogin struct {
 	// spentBudget gives the request an already-spent page budget, so the
 	// credential re-read is never sent (504).
 	spentBudget bool
+	// checkAudience is the name the middleware is called by (#1596), "" for
+	// none; tokenAudience is the token's aud, nil for no claim.
+	checkAudience string
+	tokenAudience []string
 }
 
 func e2eEnvWith(t *testing.T, login e2eLogin, extra func(rt *routeTable, chain use.Chain, login func(http.Handler) http.Handler)) (http.Handler, string, *audittest.Recorder) {
@@ -173,7 +177,7 @@ func e2eEnvWith(t *testing.T, login e2eLogin, extra func(rt *routeTable, chain u
 		t.Fatal(err)
 	}
 	tok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{Username: e2eUser, Groups: login.groups,
-		Duration: time.Hour, KeyID: e2eKID, PrivateKey: key, Principal: jwtutil.PrincipalHuman})
+		Duration: time.Hour, KeyID: e2eKID, PrivateKey: key, Principal: jwtutil.PrincipalHuman, Audience: login.tokenAudience})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +190,7 @@ func e2eEnvWith(t *testing.T, login e2eLogin, extra func(rt *routeTable, chain u
 	mux := http.NewServeMux()
 	rt := newRouteTable(mux)
 	chain := newRequestChain(slog.New(slog.DiscardHandler))
-	userConfig := middleware.UserConfig(jwtutil.NewStaticKeySource(&key.PublicKey), e2eNS)
+	userConfig := middleware.UserConfig(jwtutil.NewStaticKeySource(&key.PublicKey), e2eNS, middleware.AudienceOptions(login.checkAudience)...)
 	mountCallWriteRoutes(rt, chain, userConfig)
 	mountExportRoutes(rt, chain, userConfig)
 	if extra != nil {
