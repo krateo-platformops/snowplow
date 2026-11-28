@@ -62,6 +62,14 @@ func cdSetup(t *testing.T) (serve func(order cdOrder) cdRun, deleteSecret func()
 	t.Helper()
 	h1BuildWatcher(t) // CACHE_ENABLED=true, RBAC snapshot granting h1User the RA GVR
 
+	// The handler captures the process-wide SA rest.Config singleton
+	// (idynamic.ServiceAccountRESTConfig, which has no exported reset) when it is
+	// built. Build it BEFORE the in-cluster override below, or the singleton
+	// caches this test's server for every later test in the package.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+	dispatch := RESTAction()
+
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
 	t.Setenv("TEST_MODE", "true")
@@ -126,7 +134,6 @@ func cdSetup(t *testing.T) (serve func(order cdOrder) cdRun, deleteSecret func()
 	auth := middleware.UserConfig(keys, cdAuthnNS)
 	serve = func(order cdOrder) cdRun {
 		resolves = 0
-		dispatch := RESTAction()
 		var hdl http.Handler
 		switch order {
 		case cdAuthThenDispatch:
@@ -171,7 +178,7 @@ func cdSetup(t *testing.T) (serve func(order cdOrder) cdRun, deleteSecret func()
 	return serve, deleteSecret, k, h, w
 }
 
-func TestCredentialDeleted_AfterSuccess_ReadAndWriteGet401_NeverCache(t *testing.T) {
+func TestCredentialDeleted_AfterSuccess_ReadGet401_NeverCache(t *testing.T) {
 	serve, deleteSecret, key, handle, warm := cdSetup(t)
 
 	// CONTROL: credential present -> the production chain serves the cell.

@@ -79,9 +79,12 @@ func TestCredentialDeleted_Middleware_AfterSuccess_ReadAndWriteGet401(t *testing
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
+	for {
 		if _, ok := cache.SecretsSnapshotLoad().ByName[sec.Name]; !ok {
 			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the informer snapshot still holds the deleted Secret after 3s")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

@@ -1,17 +1,25 @@
 // main_credential_deleted_routes_test.go — through the REAL route table
 // (mountCallerIdentityRoutes, the one main() mounts) and the real
-// middleware.UserConfig: a caller whose credential Secret is gone gets 401
-// SessionCredentialMissing on the read routes that serve from L1 (GET /call,
-// POST /call/read, GET /list) and on the write route (POST /call), whatever
-// the dispatcher behind them could serve.
+// middleware.UserConfig: a caller whose credential Secret is gone is answered
+// 401 SessionCredentialMissing on EVERY identity route, read or write, and
+// nothing is dialled for them.
+//
+// Routes covered: GET /call, POST /call/read, GET /list, GET and POST /export,
+// POST /jq, POST/PUT/PATCH/DELETE /call, POST/PUT/PATCH /call/dry-run.
 //
 // CONTROL first: the same token with its Secret present gets past the auth
-// middleware (anything but the credential-missing 401).
+// middleware on each route (anything but a 401).
 //
-// The route-order mutants (the dispatcher ahead of the lookup, a hit served
-// before it) are exercised against this file by editing public_identity.go;
-// see the PR's RUN / NOT RUN table. The dispatcher-level cell-in-L1 form of
-// the arm is internal/handlers/dispatchers/credential_deleted_l1_hit_test.go.
+// Why no L1 cell is seeded here: a /call read reaches the L1 Get only after the
+// dispatcher's fetchObject and RBAC gate, whose seams (setFetchObjectForTest and
+// friends) are unexported test shims inside package dispatchers, and a hit needs
+// a key derived from a live RBAC snapshot. Exporting a seam from production code
+// only for this test is not the clean way, so the cell-in-L1 form of the arm is
+// internal/handlers/dispatchers/credential_deleted_l1_hit_test.go (real
+// UserConfig in front of the real RESTAction handler, a warm cell, control =
+// served as a hit). This file pins the part that one cannot: the ROUTE WIRING
+// (UserConfig ahead of the dispatcher and of every write handler) and that no
+// request is dialled for a caller with no credential.
 package main
 
 import (
@@ -20,6 +28,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,10 +57,36 @@ func TestCredentialDeleted_RouteTable_ReadAndWriteGet401(t *testing.T) {
 	cache.ResetSecretsInformerForTest()
 	t.Cleanup(func() { cache.ResetSecretsSnapshotForTest(); cache.ResetSecretsInformerForTest() })
 
+	// Build the routes first: the handlers capture the process-wide SA rest.Config
+	// singleton (no exported reset), so it must not see the override below.
+	mux := http.NewServeMux()
+	mountCallerIdentityRoutes(newRouteTable(mux), use.NewChain(), debugAuthTestKeys, authnNS, nil)
+
+	// One stand-in server: the apiserver for the Secret re-read (this user's
+	// Secret is never there) and the user's own endpoint. It records every
+	// request that is not a Secret read: those are DIALS made for the caller.
+	var mu sync.Mutex
+	var dials []string
+	apisrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/"+authnNS+"/secrets/") {
+			mu.Lock()
+			dials = append(dials, r.Method+" "+r.URL.Path)
+			mu.Unlock()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{"kind": "Status", "apiVersion": "v1", "status": "Failure",
+			"reason": "NotFound", "code": 404, "message": "not found"})
+	}))
+	t.Cleanup(apisrv.Close)
+	t.Cleanup(credhttp.SetInClusterConfigForTest(func() (*rest.Config, error) {
+		return &rest.Config{Host: apisrv.URL, BearerToken: "sa"}, nil
+	}))
+
 	sec := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: authnNS, Name: user + "-clientconfig",
 			Annotations: map[string]string{endpoints.UsernameAnnotation: user}},
-		Data: map[string][]byte{"server-url": []byte("https://cd.example/k8s"), "token": []byte("tok")},
+		Data: map[string][]byte{"server-url": []byte(apisrv.URL), "token": []byte("tok")},
 	}
 	cli := fake.NewSimpleClientset(sec)
 	t.Cleanup(cache.SetSecretsClientForTest(cli))
@@ -60,19 +95,7 @@ func TestCredentialDeleted_RouteTable_ReadAndWriteGet401(t *testing.T) {
 	if err := cache.StartSecretsInformer(ctx, nil, authnNS); err != nil {
 		t.Fatalf("StartSecretsInformer: %v", err)
 	}
-	apisrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(map[string]any{"kind": "Status", "apiVersion": "v1", "status": "Failure",
-			"reason": "NotFound", "code": 404, "message": "secrets not found"})
-	}))
-	t.Cleanup(apisrv.Close)
-	t.Cleanup(credhttp.SetInClusterConfigForTest(func() (*rest.Config, error) {
-		return &rest.Config{Host: apisrv.URL, BearerToken: "sa"}, nil
-	}))
 
-	mux := http.NewServeMux()
-	mountCallerIdentityRoutes(newRouteTable(mux), use.NewChain(), debugAuthTestKeys, authnNS, nil)
 	tok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{
 		Username: user, Groups: []string{"devs"}, Duration: time.Hour,
 		KeyID: debugAuthTestKeyID, PrivateKey: debugAuthTestPrivateKey,
@@ -82,24 +105,28 @@ func TestCredentialDeleted_RouteTable_ReadAndWriteGet401(t *testing.T) {
 	}
 
 	const q = "?apiVersion=templates.krateo.io/v1&resource=restactions&namespace=krateo-system&name=ra"
+	const w = "?apiVersion=v1&resource=configmaps&namespace=krateo-system&name=cm"
 	routes := []struct{ method, path string }{
 		{http.MethodGet, "/call" + q},
 		{http.MethodPost, "/call/read" + q},
 		{http.MethodGet, "/list" + q},
-		{http.MethodPost, "/call" + q},
+		{http.MethodGet, "/export" + q},
+		{http.MethodPost, "/export" + q},
+		{http.MethodPost, "/jq"},
+		{http.MethodPost, "/call" + w},
+		{http.MethodPut, "/call" + w},
+		{http.MethodPatch, "/call" + w},
+		{http.MethodDelete, "/call" + w},
+		{http.MethodPost, "/call/dry-run" + w},
+		{http.MethodPut, "/call/dry-run" + w},
+		{http.MethodPatch, "/call/dry-run" + w},
 	}
 	drive := func(method, path string) (int, string) {
-		var body *strings.Reader
-		if method == http.MethodPost {
-			body = strings.NewReader(`{}`)
-		} else {
-			body = strings.NewReader("")
-		}
-		r := httptest.NewRequest(method, path, body)
+		r := httptest.NewRequest(method, path, strings.NewReader(`{}`))
 		r.Header.Set("Authorization", "Bearer "+tok)
 		rec := httptest.NewRecorder()
 		func() {
-			defer func() { _ = recover() }() // a mutant that runs the dispatcher with no identity may panic
+			defer func() { _ = recover() }() // a route that runs a handler with no identity may panic
 			mux.ServeHTTP(rec, r)
 		}()
 		return rec.Code, rec.Body.String()
@@ -110,8 +137,9 @@ func TestCredentialDeleted_RouteTable_ReadAndWriteGet401(t *testing.T) {
 
 	// CONTROL: Secret present -> past the auth middleware on every route.
 	for _, rt := range routes {
-		if code, body := drive(rt.method, rt.path); missing(code, body) || code == http.StatusUnauthorized {
-			t.Fatalf("CONTROL %s %s: with the credential present the auth middleware answered %d %s", rt.method, rt.path, code, body)
+		if code, body := drive(rt.method, rt.path); code == http.StatusUnauthorized {
+			t.Fatalf("CONTROL %s %s: the caller's credential is present, yet the route answered 401 %s "+
+				"(a handler ran ahead of the credential lookup, or the lookup is broken)", rt.method, rt.path, body)
 		}
 	}
 
@@ -119,16 +147,29 @@ func TestCredentialDeleted_RouteTable_ReadAndWriteGet401(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
+	for {
 		if _, ok := cache.SecretsSnapshotLoad().ByName[sec.Name]; !ok {
 			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the informer snapshot still holds the deleted Secret after 3s")
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	mu.Lock()
+	dials = nil // anything dialled before this point was the control
+	mu.Unlock()
 
 	for _, rt := range routes {
 		if code, body := drive(rt.method, rt.path); !missing(code, body) {
-			t.Errorf("%s %s with the credential deleted: got %d %s; want 401 SessionCredentialMissing", rt.method, rt.path, code, body)
+			t.Errorf("%s %s: the caller's credential is gone, so the route must answer 401 SessionCredentialMissing "+
+				"before any handler runs; it answered %d %s (route wiring: a handler or cache hit is ahead of the credential lookup)",
+				rt.method, rt.path, code, body)
 		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dials) != 0 {
+		t.Errorf("a caller with no credential was dialled for: %v (nothing may be sent)", dials)
 	}
 }
