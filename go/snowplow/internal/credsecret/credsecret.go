@@ -105,7 +105,7 @@ func For(username string, groups []string) []string {
 // AllNames is every name either of username's credential Secrets may have:
 // the step-up names, then the session names. It is for the sites that must
 // recognise or scrub them all (a log redaction), never for a read. A
-// delegated name is not in it: it depends on the actor too, and the log
+// delegated name is not in it: it depends on the actor and the groups too, and the log
 // scrubber recognises its fixed shape instead (redact.ErrorText).
 func AllNames(username string) []string {
 	return append(StepUpNames(username), SessionNames(username)...)
