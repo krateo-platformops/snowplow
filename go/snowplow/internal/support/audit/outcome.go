@@ -92,6 +92,10 @@ const (
 	// DenialRBACNotAllowed: snowplow's own RBAC evaluation refused the
 	// verified caller before its handler ran (audit v0.13.0).
 	DenialRBACNotAllowed = krateoaudit.DenialReasonRbacNotAllowed
+	// DenialAudienceMismatch: a token that verified, issued for other
+	// recipients only (audit v0.17.0, #1596). The signature is verified, so
+	// the sender is known and the record names it.
+	DenialAudienceMismatch = krateoaudit.DenialReasonAudienceMismatch
 )
 
 // MessageRefused is the body of a denied record: snowplow refused before

@@ -288,9 +288,10 @@ help: it is the same kind of token again, so the portal shows it as a
 **configuration fault** (tell the administrator; the token was issued for
 another recipient), never as "log in again", and it is not in
 `LOGIN_REPLAY_CAUSES`. Snowplow counts these refusals
-(`snowplow_token_audience_mismatch`, by the token's signed actor class); the
-audit schema says an audience mismatch is a counted refusal, never an audit
-row.
+(`snowplow_token_audience_mismatch`, by the token's signed actor class) and,
+on an audited route, writes one audit row: denied, reason `audience_mismatch`
+(audit v0.17.0), naming the sender and its signed class from the token, which
+verified. A token that does not verify is counted and never a row.
 
 ### 2j. What is guaranteed
 

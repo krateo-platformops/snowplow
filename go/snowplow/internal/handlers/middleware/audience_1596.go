@@ -10,11 +10,13 @@
 // WithRequiredAudience is NOT used: it would refuse every sign-in token.
 //
 // The refusal is the 401 cause TokenAudienceMismatch (credential_status.go).
-// It is COUNTED here and never recorded as an audit row: the audit schema says
-// AudienceMismatch "is part of verifying the token, so it is a counted
-// pre-verification refusal and never a row", and the request writer declares
-// no denial reason for it (audit v0.13.0 to v0.16.0). The count is by the
-// token's signed actor class (ActorPrincipal()), a closed set, never a name.
+// It is COUNTED and RECORDED. The signature has verified when the audience is
+// looked at, so the sender is known: the audited route's one record is
+// denied with reason audience_mismatch (audit v0.17.0, Diego's ruling
+// 2026-11-28), naming the actor and its signed class from the claims plumbing
+// returns with the error. A token that did not verify is counted and never a
+// row (and never reaches this). The count is by the token's signed actor
+// class (ActorPrincipal()), a closed set, never a name.
 package middleware
 
 import (
@@ -24,6 +26,8 @@ import (
 
 	krateoaudit "github.com/krateo-platformops/audit"
 	"github.com/krateo-platformops/plumbing/jwtutil"
+
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
 )
 
 // AudienceOptions are the validator options a recipient called name passes to
@@ -53,8 +57,14 @@ func AudienceMismatchCount(class string) int64 {
 // refused for the token's own fault, counting an audience mismatch first.
 // ui is what the validator returned with the error (the verified claims on a
 // mismatch).
-func rejectToken(w http.ResponseWriter, ui jwtutil.UserInfo, err error) error {
+func rejectToken(w http.ResponseWriter, req *http.Request, ui jwtutil.UserInfo, err error) error {
+	// ErrAudienceMismatch is tested FIRST: plumbing wraps it with
+	// ErrTokenInvalid, so any test of ErrTokenInvalid before it sends the
+	// refusal down the counted, no-row branch.
 	if errors.Is(err, jwtutil.ErrAudienceMismatch) {
+		// The token verified: ui is its signed claims, so it is safe to name.
+		audit.SetCaller(req.Context(), ui)
+		audit.DenyRoute(req.Context(), audit.DenialAudienceMismatch)
 		class := "unknown"
 		if c, ok := krateoaudit.ParseClaim(ui.ActorPrincipal()); ok {
 			class = string(c)

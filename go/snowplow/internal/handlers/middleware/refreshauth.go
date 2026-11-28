@@ -131,7 +131,7 @@ func RefreshAuth(keys jwtutil.KeySource, opts ...jwtutil.ValidateOption) func(ht
 					response.ServiceUnavailable(wri, err)
 					return
 				}
-				rejectToken(wri, userInfo, err)
+				rejectToken(wri, req, userInfo, err)
 				return
 			}
 			// The caller is verified from here on, as UserConfig names it: an

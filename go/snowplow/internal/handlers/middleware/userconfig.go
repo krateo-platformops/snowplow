@@ -390,7 +390,7 @@ func userConfig(keys jwtutil.KeySource, authnNS string, public *PublicIdentity, 
 					response.ServiceUnavailable(wri, err)
 					return
 				}
-				rejectToken(wri, userInfo, err)
+				rejectToken(wri, req, userInfo, err)
 				return
 			}
 			// #1379 re-review — the caller is verified from here on: an
