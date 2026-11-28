@@ -21,6 +21,20 @@ import (
 // A dependency cycle, or a dependency on a stage the spec does not declare, is an
 // error. A name declared twice is one stage.
 func topologicalSort(items []*templates.API) ([]string, error) {
+	sorted, stuck := stageOrder(items)
+	if len(stuck) > 0 {
+		return nil, fmt.Errorf("cyclic dependency detected")
+	}
+	return sorted, nil
+}
+
+// stageOrder is topologicalSort's walk, returning what it could not order rather
+// than an error: sorted is every stage that became ready, and stuck is the rest,
+// in declared order, each name once. A stage is stuck when it sits on a
+// dependency cycle, is downstream of one, or depends on a stage the spec does not
+// declare (such a dependency never becomes ready). /rbac reports the stuck
+// stages by cause (#1619) instead of failing on them; the resolve still fails.
+func stageOrder(items []*templates.API) (sorted, stuck []string) {
 	graph := make(map[string][]string)
 	inDegree := make(map[string]int)
 	itemSet := make(map[string]bool)
@@ -61,9 +75,15 @@ func topologicalSort(items []*templates.API) ([]string, error) {
 		}
 	}
 
-	if len(sortedItems) != len(itemSet) {
-		return nil, fmt.Errorf("cyclic dependency detected")
+	done := make(map[string]bool, len(sortedItems))
+	for _, n := range sortedItems {
+		done[n] = true
 	}
-
-	return sortedItems, nil
+	for _, item := range items {
+		if !done[item.Name] {
+			done[item.Name] = true
+			stuck = append(stuck, item.Name)
+		}
+	}
+	return sortedItems, stuck
 }

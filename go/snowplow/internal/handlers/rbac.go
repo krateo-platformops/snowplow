@@ -36,14 +36,20 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// rbacResponse is the GET /rbac 200 body (design §4): the RESTAction identity
-// plus readSet — the canonical, deduped, sorted (group, version, resource,
-// namespace, verb) list. Unresolvable stages are NOT carried in this body; they
-// fail loud via the 422 error string (formatUnresolved), so a partial read-set
-// is never returned as a success.
+// rbacResponse is the GET /rbac body (design §4), on 200 and on 422 alike, so
+// one decoder reads both: the RESTAction identity plus readSet — the canonical,
+// deduped, sorted (group, version, resource, namespace, verb) list.
+//
+// A 200 carries no "unresolved" key (every stage was enumerated). A 422
+// (#1619) carries the rows of the stages that WERE enumerated and, in
+// unresolved, one entry per stage that was not: a stable reason token to switch
+// on and a prose message. The status is what says the read-set is incomplete: a
+// partial read-set is never returned as a success, and a consumer must not
+// grant from a 422's readSet as though it were whole.
 type rbacResponse struct {
-	RESTAction restActionRef  `json:"restaction"`
-	ReadSet    []api.Resource `json:"readSet"`
+	RESTAction restActionRef    `json:"restaction"`
+	ReadSet    []api.Resource   `json:"readSet"`
+	Unresolved []api.Unresolved `json:"unresolved,omitempty"`
 }
 
 type restActionRef struct {
@@ -68,6 +74,23 @@ var (
 // RBAC returns the GET /rbac handler. It is constructed once at mount and is
 // stateless — every request reads the RA fresh from objects.Get (informer cache
 // or apiserver), so a CR edit is reflected on the next call.
+//
+// @Summary RESTAction read-set
+// @Description Enumerates the (group, version, resource, namespace, verb) read-set a RESTAction would perform, without dispatching.
+// @Description 200: every stage was enumerated; body {restaction, readSet}.
+// @Description 422: at least one stage was not; same body plus "unresolved": [{stage, reason, message}], and readSet holds the rows of the stages that were enumerated. It is incomplete: do not grant from it as if whole.
+// @Description reason is a stable token, never parsed from message: stageDataInResourcesFrom, resourceNotServed, discoveryFailed, noRequestPath, unrenderedTemplate, pathNotAsServed, pathValueRefused, jqPathError, jqPayloadError, jqHeaderError, templatedResource, noStaticResource, notEnumerablePath, unknownDependency, cyclicDependency.
+// @ID rbac
+// @Param  apiRefName       query   string  true  "RESTAction name"
+// @Param  apiRefNamespace  query   string  true  "RESTAction namespace"
+// @Param  extras           query   string  false "JSON encoded map of extras seeding the enumeration"
+// @Produce  json
+// @Success 200 {object} rbacResponse
+// @Failure 400 {object} response.Status
+// @Failure 401 {object} response.Status
+// @Failure 422 {object} rbacResponse
+// @Failure 500 {object} response.Status
+// @Router /rbac [get]
 func RBAC() http.Handler {
 	return http.HandlerFunc(func(wri http.ResponseWriter, req *http.Request) {
 		log := xcontext.Logger(req.Context())
@@ -131,18 +154,18 @@ func RBAC() http.Handler {
 			response.InternalError(wri, err)
 			return
 		}
+		status := http.StatusOK
 		if len(unresolved) > 0 {
 			// At least one stage could not be enumerated from the empty dict.
-			// Returning a partial read-set would silently under-grant RBAC at
-			// the first /call — fail loud, naming every unresolvable stage.
-			log.WarnContext(req.Context(), "rbac: RESTAction has unresolvable stage(s); refusing partial read-set",
+			// The status stays 422 so a partial read-set is never taken for a
+			// whole one, and under-granting RBAC at the first /call stays
+			// impossible by accident (#1619): the body now says WHICH stages and
+			// WHY (stable tokens), and carries the rows that did enumerate.
+			status = http.StatusUnprocessableEntity
+			log.WarnContext(req.Context(), "rbac: RESTAction has unresolvable stage(s); answering 422 with the partial read-set",
 				slog.String("name", name),
 				slog.String("namespace", namespace),
 				slog.Any("unresolved", unresolved))
-			response.Encode(wri, response.New(http.StatusUnprocessableEntity,
-				fmt.Errorf("RESTAction %s/%s has stage(s) that cannot be enumerated without dispatching: %s",
-					namespace, name, formatUnresolved(unresolved))))
-			return
 		}
 
 		if readSet == nil {
@@ -154,30 +177,20 @@ func RBAC() http.Handler {
 		body := rbacResponse{
 			RESTAction: restActionRef{Name: name, Namespace: namespace},
 			ReadSet:    readSet,
+			Unresolved: unresolved,
 		}
 
-		log.Info("rbac read-set enumerated",
-			slog.String("name", name),
-			slog.String("namespace", namespace),
-			slog.Int("read_set_rows", len(readSet)))
+		if status == http.StatusOK {
+			log.Info("rbac read-set enumerated",
+				slog.String("name", name),
+				slog.String("namespace", namespace),
+				slog.Int("read_set_rows", len(readSet)))
+		}
 
 		wri.Header().Set("Content-Type", "application/json")
-		wri.WriteHeader(http.StatusOK)
+		wri.WriteHeader(status)
 		enc := json.NewEncoder(wri)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(body)
 	})
-}
-
-// formatUnresolved renders the unresolvable stages into a single error string
-// ("stage=<name> reason=<reason>; ...").
-func formatUnresolved(u []api.Unresolved) string {
-	s := ""
-	for i, e := range u {
-		if i > 0 {
-			s += "; "
-		}
-		s += fmt.Sprintf("stage=%s reason=%s", e.Stage, e.Reason)
-	}
-	return s
 }

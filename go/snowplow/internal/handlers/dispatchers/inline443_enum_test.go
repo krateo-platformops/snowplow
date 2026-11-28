@@ -305,6 +305,10 @@ var cacheAllow443 = map[string]cacheClass443{
 	// above (ParseAPIServerListDepSkeleton in particular) because they share the
 	// skeletonizer and differ only in policy.
 	"ReadSetSkeleton": readOnly443, "NameKind.IsSingleObject": readOnly443,
+	// #1617 — the collapsed-render siblings: strings in, a value out (a
+	// validated namespace, or the skeleton's row with it applied); no
+	// cache/informer/dep/refresher state, nothing that outlives the request.
+	"ReadSetFromCollapsed": readOnly443, "RenderedNamespace": readOnly443,
 	"PrewarmIterSerialFromContext": readOnly443,
 	// #563 — pure ctx classification (which driver is resolving); reads three
 	// context values and returns a constant string. It SUBSUMES

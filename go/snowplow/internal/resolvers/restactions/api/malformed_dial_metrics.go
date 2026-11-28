@@ -68,6 +68,11 @@ type skipReason struct {
 	// the collapse check also judges a named endpoint's path, which need not
 	// be a Kubernetes object path at all.
 	collapsed bool
+	// namespace is, on a reasonEmptyInterp skip, the namespace the path rendered
+	// with, when that segment rendered as a valid one (#1617): the one part of a
+	// refused render inspect may keep, because it is validated, and the only part
+	// that is not a value around the refusal. "" when it did not render.
+	namespace string
 }
 
 // malformedDialSkipped counts api-call plan entries dropped by the guard, broken
