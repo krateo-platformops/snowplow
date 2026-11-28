@@ -2,7 +2,17 @@
 // functions with no k6 import, so node runs them (tests/test_k6_830.py) and
 // browser.js ships `settledNow` / `loadOf` into the page as source text.
 //
-// "Page loaded": no `[data-widget-renderer]` element left for QUIET_MS.
+// "Page loaded" = the page is FINAL (owner's decision, 2026-11-26): from the click until the page's OWN data
+// requests have answered AND the page has stopped changing, for QUIET_MS. One definition for every load, first
+// and warm alike. A load ends at the LAST of: its last `[data-widget-renderer]` skeleton gone, its last own
+// request answered, its last DOM change; and it is settled once QUIET_MS have passed since that end with no own
+// request still pending. A revisit is painted from the portal's React Query cache with no skeleton, yet it still
+// refreshes its data with /call requests: before this, `saw` false made every warm load 0 ms by construction
+// (run 31: 2,767 of 2,767), so the warm navigation bar was not measured at all. Its `ended` field says what
+// ended the load: 'skeleton', 'request', 'mutation', or 'start' (nothing changed after the click).
+// Long-lived streams (/refreshes, /notifications: sseStreamOf) never count as own requests.
+//
+// The skeleton part: no `[data-widget-renderer]` element left.
 // WidgetLoading, the skeleton every pending widget shows (components/
 // WidgetRenderer/WidgetRenderer.tsx:131-134 and the Suspense fallback :69), is
 // the ONLY element carrying that attribute (components/WidgetStates/
@@ -23,11 +33,14 @@ export const QUIET_MS = 1000
 // Installed in every document before the app runs (context.addInitScript).
 export const OBSERVER = `(() => {
   const b = window.__bench = { count: 0, goneAt: 0, navT0: 0, saw: false,
-                               armLogin: false, submitAt: 0, signinMs: null, armClick: false };
+                               armLogin: false, submitAt: 0, signinMs: null, armClick: false,
+                               reqEnd: 0, lastMut: 0, open: [] };
   const sel = '[data-widget-renderer]';
-  const tick = () => {
+  const tick = (records) => {
     const n = document.querySelectorAll(sel).length;
     const now = performance.now();
+    // the app's tree: a change under <body> (not the <head> a style library writes into)
+    if (!records || !document.body || records.some((r) => document.body.contains(r.target))) b.lastMut = now;
     if (n > 0) b.saw = true;
     if (n === 0 && b.count > 0) b.goneAt = now;
     b.count = n;
@@ -69,6 +82,17 @@ export const OBSERVER = `(() => {
   window.fetch = function (input, init) {
     const s = sseStreamOf(String((input && input.url) || input), window.location.href);
     const p = f.apply(this, arguments);
+    if (!s) {
+      // an own request, pending until its response arrives (a stream never is one)
+      const tok = { t: performance.now() };
+      b.open.push(tok);
+      const done = () => {
+        const i = b.open.indexOf(tok);
+        if (i >= 0) b.open.splice(i, 1);
+        if (tok.t >= b.navT0) b.reqEnd = Math.max(b.reqEnd, performance.now());
+      };
+      p.then(done, done);
+    }
     if (s) {
       p.then((r) => {
         const type = (r.headers && r.headers.get && r.headers.get('content-type')) || '';
@@ -99,6 +123,9 @@ export const OBSERVER = `(() => {
     try {
       new window.PerformanceObserver((list) => {
         for (const e of list.getEntries()) {
+          // an own data request's last byte is its end too (the fetch promise settles at the headers)
+          if ((e.initiatorType === 'fetch' || e.initiatorType === 'xmlhttprequest') && e.startTime >= b.navT0 &&
+              !sseStreamOf(e.name, window.location.href)) b.reqEnd = Math.max(b.reqEnd, e.responseEnd);
           const c = callOf(e.name, window.location.href, e.duration, e.responseStatus);
           if (c) calls.push(Object.assign(c, timingOf(e, window.performance && window.performance.timeOrigin)));
         }
@@ -345,7 +372,8 @@ function settledNow (b, here, now, arg) {
     return false
   }
   if (b.count > 0) return false
-  const end = b.saw ? b.goneAt : b.navT0
+  if ((b.open || []).some((o) => o.t >= b.navT0)) return false
+  const end = Math.max(b.navT0, b.saw ? b.goneAt : 0, b.reqEnd || 0, b.lastMut || 0)
   return now - end >= arg.quiet
 }
 
@@ -353,7 +381,13 @@ function settledNow (b, here, now, arg) {
 // states (data-testid widget-error / -timeout / -forbidden / -notfound,
 // WidgetStates.tsx:34,54,75,89). Self-contained, like settledNow.
 function loadOf (b, here, testids) {
-  const end = b.saw ? b.goneAt : b.navT0
+  const skel = b.saw ? b.goneAt : 0
+  const end = Math.max(b.navT0, skel, b.reqEnd || 0, b.lastMut || 0)
+  // what ended the load: the latest of the three; a tie goes to the skeleton (its removal is itself a change),
+  // then the request
+  const ended = b.saw && skel === end ? 'skeleton'
+    : (b.reqEnd || 0) === end && end > b.navT0 ? 'request'
+    : (b.lastMut || 0) === end && end > b.navT0 ? 'mutation' : 'start'
   const states = { error: 0, timeout: 0, forbidden: 0, notfound: 0 }
   for (const id of testids) {
     const k = String(id).replace(/^widget-/, '')
@@ -361,13 +395,14 @@ function loadOf (b, here, testids) {
   }
   // t0: the load's own start on the wall clock (epoch ms), from the same clock its time is
   // measured on: where its interval sits against the CPU windows (#1042, #1043 review B1)
-  return { ms: end - b.navT0, saw: b.saw, path: here, states, t0: performance.timeOrigin + b.navT0 }
+  return { ms: end - b.navT0, saw: b.saw, ended, path: here, states, t0: performance.timeOrigin + b.navT0 }
 }
 
 // The metric points one load writes. A page that did not settle within its
 // timeout is a TIMEOUT and still a load, at its timeout value, so it counts in
 // the p95 as well as in the timeout check (#831 gate). skeleton=no: painted
-// from the app's own React Query cache (App.tsx:25-30), no request.
+// from the app's own React Query cache (App.tsx:25-30), no skeleton; its time is
+// still when its own requests answered and the page stopped changing (`ended_by`).
 // Every point of a load carries its start, t0 (epoch ms, integer): the page's
 // own (loadOf), or for a load that never settled, `actionAt`, the driver's
 // clock just before the action (the same system clock) (#1043 review B1).
@@ -398,7 +433,8 @@ export function recordOps (r, tags, timeoutMs, actionAt, watch) {
     }
     return ops
   }
-  const t = Object.assign({}, tags, at, { skeleton: r.saw ? 'yes' : 'no', timeout: 'no' })
+  const t = Object.assign({}, tags, at, { skeleton: r.saw ? 'yes' : 'no', timeout: 'no' },
+    r.ended ? { ended_by: r.ended } : {})
   const ops = [['browser_page_load_ms', r.ms, t], ['browser_page_loads', 1, t]]
   for (const k of Object.keys(r.states || {})) {
     if (r.states[k]) ops.push(['browser_widget_states', r.states[k], Object.assign({}, t, { state: k })])
