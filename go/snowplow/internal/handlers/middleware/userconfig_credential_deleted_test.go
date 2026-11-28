@@ -20,10 +20,10 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 )
 
-// Investigation arm: a token whose user's credential Secret existed for an
+// Regression arm: a token whose user's credential Secret existed for an
 // earlier request and was then deleted. Control = request before deletion;
 // then the same token on a write verb and a read verb after deletion.
-func TestInv_CredentialDeletedAfterSuccess_WriteAndRead(t *testing.T) {
+func TestCredentialDeleted_Middleware_AfterSuccess_ReadAndWriteGet401(t *testing.T) {
 	const user = "invx"
 	const xURL = "https://x.inv.example/k8s"
 	sec := &corev1.Secret{
