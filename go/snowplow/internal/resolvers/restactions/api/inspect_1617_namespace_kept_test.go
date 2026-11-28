@@ -102,6 +102,20 @@ func TestIssue1617_QueryValueFromPriorStageStaysConcreteList(t *testing.T) {
 	}
 }
 
+// A known namespace with an INVALID name (refused by the #288 DNS-1123 check, not
+// by the empty-segment one) keeps its namespace: a bad name says nothing about
+// the namespace. On main this was namespaceUnknown; ns1 is the intended answer.
+// Pins the second source of the namespace (setup.go, the validInterpolatedPath skip).
+func TestIssue1617_InvalidNameKeepsKnownNamespace(t *testing.T) {
+	rows := inspect1617(t, `${ "/api/v1/namespaces/" + .compositionNamespace + "/services/" + .badName }`,
+		map[string]any{"compositionNamespace": "ns1", "badName": "Bad_Name"})
+	got := targetRow(t, rows, "services")
+	want := Resource{Version: "v1", Resource: "services", Namespace: "ns1", Verb: "get"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("want %+v, got %+v", want, got)
+	}
+}
+
 // An invalid rendered namespace is not kept: it stays unknown.
 func TestIssue1617_InvalidRenderedNamespaceStaysUnknown(t *testing.T) {
 	rows := inspect1617(t, `${ "/api/v1/namespaces/" + .compositionNamespace + "/services/" + .prior.name }`,
