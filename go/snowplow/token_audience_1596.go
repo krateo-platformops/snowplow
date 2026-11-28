@@ -21,6 +21,7 @@ func tokenAudienceOptions(log *slog.Logger, name string) []jwtutil.ValidateOptio
 	opts := middleware.AudienceOptions(name)
 	if len(opts) == 0 {
 		tokenAudienceChecked.Set(0)
+		// log-ctx-waiver: boot: main reads the audience once at start, before a context exists
 		log.Warn("token audience check is OFF: no audience is configured (TOKEN_AUDIENCE / --token-audience is empty), so a token issued for another service is accepted; the chart sets it to <service>.<namespace>")
 		return nil
 	}
