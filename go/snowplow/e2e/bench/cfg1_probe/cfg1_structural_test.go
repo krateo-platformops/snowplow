@@ -129,6 +129,10 @@ var nonCacheInitPublishers = map[string][]string{
 	// RESTAction resolve, cache on or off, refuses extras that name a key the
 	// resolver writes, so the refusal must stay observable with the cache off.
 	"internal/resolvers/restactions/api/reserved_extras.go": {"snowplow_extras_reserved_key_refused_total"},
+	// Viewer-context value drop counter: ParseExtras runs on every /call, /rbac
+	// and /export request, cache on or off, so a dropped malformed tz must stay
+	// observable with the cache off.
+	"internal/viewercontext/viewercontext.go": {"snowplow_viewer_context_dropped_total"},
 	// #1116 refused-read counter: same RESOLVER-path family — a read item a
 	// dial guard refuses is a stage failure on every RESTAction resolve, cache
 	// on or off, so it must stay observable with the cache off.
