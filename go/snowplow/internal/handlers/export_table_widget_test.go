@@ -69,6 +69,16 @@ var (
 	tableTitles    = []string{"Name", "Namespace, scope", "Size (MiB)", "Name", "Size, raw"} // two "Name" columns, told apart by position
 )
 
+// tableTZEcho / tableTZDeclared are the viewer-context tz test's switches
+// (export_viewer_context_tz_test.go): the first makes the Table's data template
+// append the request's .tz to every name, so a tz that reaches the template
+// changes the exported bytes; the second declares spec.keyExtras: [tz]. Both
+// default off, so every other test sees the unchanged widget.
+var (
+	tableTZEcho     bool
+	tableTZDeclared bool
+)
+
 func tableWidgetCR() string {
 	var cols []string
 	for i := range tableValueKeys {
@@ -79,10 +89,18 @@ func tableWidgetCR() string {
 		`{valueKey:"owner",kind:"jsonSchemaType",type:"string",stringValue:.owner},` +
 		`{valueKey:"ns",kind:"jsonSchemaType",type:"string",stringValue:.ns},` +
 		`{valueKey:"size",kind:"jsonSchemaType",type:"integer",numberValue:.size}]) }`
+	if tableTZEcho {
+		expr = strings.Replace(expr, "${ (if .slice", `${ (.tz // "") as $tz | (if .slice`, 1)
+		expr = strings.Replace(expr, "stringValue:.name", "stringValue:(.name + $tz)", 1)
+	}
+	keyExtras := ""
+	if tableTZDeclared {
+		keyExtras = `"keyExtras":["tz"],`
+	}
 	b, _ := json.Marshal(expr)
 	return `{"apiVersion":"widgets.templates.krateo.io/v1beta1","kind":"Table",` +
 		`"metadata":{"name":"rows-table","namespace":"demo"},` +
-		`"spec":{"apiRef":{"name":"rows-ra","namespace":"demo"},` +
+		`"spec":{` + keyExtras + `"apiRef":{"name":"rows-ra","namespace":"demo"},` +
 		`"widgetData":{"columns":[` + strings.Join(cols, ",") + `],"dataSource":[]},` +
 		`"widgetDataTemplate":[{"forPath":"dataSource","expression":` + string(b) + `}]}}`
 }

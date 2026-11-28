@@ -10,7 +10,7 @@
 // key ignores identity, that body was then written into the per-BindingUID cell
 // EVERY co-cohort member reads.
 //
-// THE FIX lives in widgets.Resolve (sanitizeUndeclaredIdentityExtras,
+// THE FIX lives in widgets.Resolve (sanitizeUndeclaredViewerContextExtras,
 // internal/resolvers/widgets/resolve.go), NOT at this dispatcher — so the
 // /call path, the refresher's re-resolve, the boot seed and nested resolves all
 // get the same contract. The unit-level strip/keep matrix is in that package;
@@ -36,6 +36,7 @@ import (
 
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/viewercontext"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -49,6 +50,7 @@ func a3EchoSpec(identityContext []string, keyExtras []string) map[string]any {
 			map[string]any{"forPath": ".echoedUser", "expression": "${ .username }"},
 			map[string]any{"forPath": ".echoedDisplay", "expression": "${ .displayName }"},
 			map[string]any{"forPath": ".echoedFoo", "expression": "${ .foo }"},
+			map[string]any{"forPath": ".echoedTz", "expression": "${ .tz }"},
 		},
 	}
 	toAny := func(ss []string) []any {
@@ -181,36 +183,49 @@ func TestA3_UndeclaredIdentityExtras_Quarantined(t *testing.T) {
 	}
 }
 
-// TestA3_IdentityVocabularyIsInSync pins the THREE identity-dimension keys
-// end-to-end, and with them the fact that the two vocabularies — this package's
-// identityDimensionKeys (the F6 guard's exemption set) and the twin inside
-// internal/resolvers/widgets (the sanitiser's strip set) — cover the same keys.
-// The packages cannot import each other, so behaviour is the only place they can
-// be checked against one another: if the resolver's set ever loses a key this
-// package still exempts, that key reaches the jq dict unstripped AND is exempt
-// from the Put quarantine — the A-3 hole, reopened silently.
-func TestA3_IdentityVocabularyIsInSync(t *testing.T) {
+// TestA3_ViewerContextVocabularyIsInSync pins the FOUR viewer-context keys
+// (username, groups, displayName, tz) end-to-end, and with them the fact that
+// the vocabularies - this package's viewerContextKeys (the F6 guard's exemption
+// set), the twin inside internal/resolvers/widgets (the sanitiser's strip set)
+// and internal/viewercontext (the single definition, which also owns per-key
+// value validation) - cover the same keys. The widgets twin is unexported and
+// the two packages must not import each other, so behaviour is the only place
+// they can be checked against one another: if the resolver's set ever loses a
+// key this package still exempts, that key reaches the jq dict unstripped AND is
+// exempt from the Put quarantine - the A-3 hole, reopened silently.
+func TestA3_ViewerContextVocabularyIsInSync(t *testing.T) {
 	h1BuildWatcher(t)
 
-	if len(identityDimensionKeys) != 3 {
-		t.Fatalf("A-3: the F6 guard's identity vocabulary must be exactly {username, groups, displayName}; got %#v", identityDimensionKeys)
+	want := []string{"username", "groups", "displayName", "tz"}
+	if len(viewerContextKeys) != len(want) {
+		t.Fatalf("A-3: the F6 guard's viewer-context vocabulary must be exactly %v; got %#v", want, viewerContextKeys)
 	}
-	for _, k := range []string{"username", "groups", "displayName"} {
-		if _, ok := identityDimensionKeys[k]; !ok {
-			t.Fatalf("A-3: %q missing from the F6 guard's identity vocabulary", k)
+	for _, k := range want {
+		if _, ok := viewerContextKeys[k]; !ok {
+			t.Fatalf("A-3: %q missing from the F6 guard's viewer-context vocabulary", k)
+		}
+		if !viewercontext.IsKey(k) {
+			t.Fatalf("A-3: %q is in the F6 guard's set but not in internal/viewercontext, the single definition", k)
 		}
 	}
+	if got := viewercontext.Keys(); len(got) != len(want) {
+		t.Fatalf("A-3: internal/viewercontext has %v, the F6 guard's set has %v", got, want)
+	}
 
-	// Drive all three through the real path on an undeclared widget: none may
+	// Drive all four through the real path on an undeclared widget: none may
 	// shape the body, and the request must still be served and cached.
 	served, persisted, _ := a3Serve(t, a3EchoSpec(nil, nil), map[string]any{
 		"username":    "evil-user",
 		"displayName": "evil-display",
 		"groups":      []any{"evil-group"},
+		"tz":          "Asia/Tokyo",
 	})
-	for _, spoof := range []string{"evil-user", "evil-display", "evil-group"} {
+	if len(persisted) == 0 {
+		t.Fatal("A-3 vocabulary: an undeclared widget carrying only viewer-context keys must still be cached")
+	}
+	for _, spoof := range []string{"evil-user", "evil-display", "evil-group", "Asia/Tokyo"} {
 		if bytes.Contains(served, []byte(spoof)) {
-			t.Errorf("A-3 vocabulary: %q reached the SERVED body of an undeclared widget — the resolver's strip set is missing this key; body=%s", spoof, served)
+			t.Errorf("A-3 vocabulary: %q reached the SERVED body of an undeclared widget - the resolver's strip set is missing this key; body=%s", spoof, served)
 		}
 		if bytes.Contains(persisted, []byte(spoof)) {
 			t.Errorf("A-3 vocabulary: %q reached the PERSISTED shared cell of an undeclared widget; persisted=%s", spoof, persisted)

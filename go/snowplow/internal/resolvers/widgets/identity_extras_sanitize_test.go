@@ -1,5 +1,5 @@
 // identity_extras_sanitize_test.go — A-3 (1.12.3) unit arms for
-// sanitizeUndeclaredIdentityExtras, the strip/keep decision that keeps
+// sanitizeUndeclaredViewerContextExtras, the strip/keep decision that keeps
 // client-supplied identity out of the resolve input.
 //
 // The end-to-end arms (served body + persisted shared cell) live in
@@ -93,9 +93,9 @@ func TestA3_SanitizeMatrix(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := sanitizeUndeclaredIdentityExtras(tc.cr, tc.in)
+			got := sanitizeUndeclaredViewerContextExtras(tc.cr, tc.in)
 			if !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("sanitizeUndeclaredIdentityExtras() = %#v, want %#v. %s", got, tc.want, tc.whyKeep)
+				t.Fatalf("sanitizeUndeclaredViewerContextExtras() = %#v, want %#v. %s", got, tc.want, tc.whyKeep)
 			}
 		})
 	}
@@ -107,9 +107,9 @@ func TestA3_SanitizeMatrix(t *testing.T) {
 func TestA3_SanitizeDoesNotMutateInput(t *testing.T) {
 	in := map[string]any{"username": "evil", "foo": "bar"}
 	before := map[string]any{"username": "evil", "foo": "bar"}
-	_ = sanitizeUndeclaredIdentityExtras(a3CR(nil, nil), in)
+	_ = sanitizeUndeclaredViewerContextExtras(a3CR(nil, nil), in)
 	if !reflect.DeepEqual(in, before) {
-		t.Fatalf("sanitizeUndeclaredIdentityExtras MUTATED its input: %#v (was %#v). The caller's map is also the key material — mutating it here moves the cache key", in, before)
+		t.Fatalf("sanitizeUndeclaredViewerContextExtras MUTATED its input: %#v (was %#v). The caller's map is also the key material — mutating it here moves the cache key", in, before)
 	}
 }
 
@@ -117,7 +117,7 @@ func TestA3_SanitizeDoesNotMutateInput(t *testing.T) {
 // path. The identity-free and fully-declared corpora are ~99% of traffic.
 func TestA3_SanitizeReturnsSameMapWhenNothingToStrip(t *testing.T) {
 	in := map[string]any{"name": "n", "namespace": "ns"}
-	got := sanitizeUndeclaredIdentityExtras(a3CR(nil, []string{"name", "namespace"}), in)
+	got := sanitizeUndeclaredViewerContextExtras(a3CR(nil, []string{"name", "namespace"}), in)
 	if !sameMapHeader(got, in) {
 		t.Fatal("expected the SAME map back (no copy) when nothing needs stripping — the common path must not allocate")
 	}

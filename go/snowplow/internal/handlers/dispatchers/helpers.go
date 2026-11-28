@@ -24,6 +24,7 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"github.com/krateo-platformops/snowplow/internal/slowcall"
+	"github.com/krateo-platformops/snowplow/internal/viewercontext"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -489,7 +490,7 @@ func filterDeclaredKeyExtras(cr map[string]any, requestExtras map[string]any) ma
 //
 //	An identity key can only reach the resolve dict AT ALL if the widget
 //	DECLARES it — widgets.Resolve strips every undeclared identity key from
-//	opts.Extras before mergeExtras (sanitizeUndeclaredIdentityExtras,
+//	opts.Extras before mergeExtras (sanitizeUndeclaredViewerContextExtras,
 //	internal/resolvers/widgets/resolve.go). And a DECLARED one cannot pollute a
 //	shared cell either: declared in spec.identityContext means DeclaredIdentity
 //	overwrites it with the JWT's own value server-side, so it is not
@@ -518,18 +519,27 @@ func filterDeclaredKeyExtras(cr map[string]any, requestExtras map[string]any) ma
 // NON-identity request key (the F6-6 `foo` case) — that is the only shared-cell
 // pollution this guard exists to stop, and the only one still reachable.
 //
-// identityDimensionKeys is the closed set the frontend can put on the wire as
-// identity (audit §1: buildExtrasParam sends username + displayName when not
-// injecting) plus groups (the other A2 identityContext enum value). Not a
-// widget-name/route table (feedback_no_special_cases) — a fixed, mechanism-level
-// identity vocabulary, the same axis DeclaredIdentity honors. It is duplicated
-// (not shared) with the twin in internal/resolvers/widgets/resolve.go: the two
-// packages must not import each other, and both are pinned to the same three
-// keys by TestA3_IdentityVocabularyIsInSync.
-var identityDimensionKeys = map[string]struct{}{
+// viewerContextKeys is the closed set the frontend can put on the wire as a fact
+// about the viewer: identity (audit §1: buildExtrasParam sends username +
+// displayName when not injecting; groups is the other A2 identityContext enum
+// value) and the viewer's IANA time zone, tz (client-asserted: not in the JWT,
+// never an identityContext value, so never injected). Not a widget-name/route
+// table (feedback_no_special_cases) — a fixed, mechanism-level vocabulary. It is
+// duplicated (not shared) with the twin in internal/resolvers/widgets/resolve.go,
+// and both are pinned to each other and to internal/viewercontext (which also
+// owns per-key VALUE validation, applied at the request edge) by
+// TestA3_ViewerContextVocabularyIsInSync.
+//
+// tz and the Put quarantine: an UNDECLARED tz is stripped from the resolve input
+// by widgets.Resolve, so it cannot shape the body and the Put is safe — the same
+// by-construction argument as the identity keys. A DECLARED tz partitions the
+// key (a forged value reaches only its own cell). One exception, below, in
+// requestExtrasFullyDeclared: an inline-embedding parent.
+var viewerContextKeys = map[string]struct{}{
 	"username":    {},
 	"groups":      {},
 	"displayName": {},
+	"tz":          {},
 }
 
 // Returns TRUE (fully declared → safe to Put) when the request carries no extras,
@@ -550,8 +560,17 @@ func requestExtrasFullyDeclared(cr map[string]any, requestExtras map[string]any)
 		if _, ok := declaredSet[k]; ok {
 			continue // author-declared keyExtras key — partitions the key, safe
 		}
-		if _, ok := identityDimensionKeys[k]; ok {
-			continue // A2/A6 identity axis — folder handles it, never shared-cell pollution
+		if _, ok := viewerContextKeys[k]; ok {
+			// A2/A6 identity axis, or the client-asserted tz: widgets.Resolve strips
+			// it when undeclared, so it never shapes the body — except for an
+			// inline-embedding parent, whose embedded children receive the RAW
+			// request extras (embedInlineChildren) and may declare it themselves
+			// while the parent cell is not partitioned by it. The identity keys
+			// are already covered there by the per-user inline marker
+			// (inlineParentIdentityForKey); a client-asserted key is not.
+			if !(viewercontext.ClientAsserted(k) && hasInlineGETRef(cr)) {
+				continue
+			}
 		}
 		// #777 b′ — an undeclared request extra can only shape the body through
 		// an extras-reading spec surface (apiRef, widgetDataTemplate,
