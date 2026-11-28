@@ -45,7 +45,7 @@ READ_20261122_CR = {
 # installer 0.3.714 (helm pull, digest sha256:6427817ecce6d305cf9757346fe73ad0c8ac948efc61e9122ee0a23591de828e):
 # the features its values.schema.json declares that the CR leaves out, at their values.yaml defaults
 READ_20261122_DEFAULTS = {"cloudnativePg": False, "repoGraph": False, "structureGraph": False}
-# the installer 057 ran at the reading (re-taken 2026-11-28 on 0.3.714, no feature moved;
+# the installer 057 ran at the reading (re-taken 2026-11-28 about 10:07Z on 0.3.714 (057 rolled to 0.3.715 at 10:43Z), no feature moved;
 # readings: 0.3.697 and 0.3.698 on 2026-11-22, 0.3.700 to 0.3.703 on 2026-11-23, 0.3.707 on 2026-11-24; the features never moved): every
 # test below names it and the reading's date through these pins
 READ_VERSION = "0.3.714"

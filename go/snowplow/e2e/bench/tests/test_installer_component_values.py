@@ -36,7 +36,10 @@ def _sha(path) -> str:
 # On 0.3.700 three not-recorded paths left 057's CR, agentgateway-policies.llm.retry.*, and the installer's schema
 # declared the agent's toleration, installer #1121: installer_schema true. On 0.3.707 the installer's schema describes
 # nine more switches (0.3.704's and 0.3.705's #1144, #1147, #1149), each at its default: the record gains them, 057 changed
-# nothing. 0.3.714 moved only the version: the same switches, sizes and not-recorded paths)
+# nothing. 0.3.714, read 2026-11-28 about 10:07Z while 057 ran it (before the roll to 0.3.715 at 10:43Z), moved no
+# recorded switch or size and no path 057 sets; its schema declares more string-typed keys 057 does not set
+# (selfservicePlatform.*, agentgateway-policies.mcpSessionRouting, krateo-audit-worm seal/verify credentialsSecret,
+# a ClickHouse extraUsersConfig.profiles), so the 66 / 147 counts cover boolean leaves only)
 PINNED = "9bb302e78b28ae8ab9fbf38effcfa5b8dc487a0eaf9b46a0f11067b17e998c59"
 
 
