@@ -139,7 +139,7 @@ The chart wires **livenessProbe → `/health`**, **startupProbe → `/health`**
   (#1264, see [Stage outcomes on the Server span](#stage-outcomes-on-the-server-span-1264)). `/health`, `/readyz`, `/debug/*` and the browser RUM upload
   `POST /telemetry/v1/traces` (#1020 D6: telemetry about the portal, not
   platform API; read its health from the `snowplow_rum_ingest_*` counters,
-  see `howto/rum-ingest.md`) get no span. The ingest forwards an allowlisted copy of each browser span; on `krateo.widget.fetch` that includes `krateo.widget.resource`, `krateo.widget.namespace` and `krateo.widget.name` (the widget's plural, namespace and name, each a DNS-1123 name checked by length and shape; any other value is dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; no identity). Sampled at
+  see `howto/rum-ingest.md`) get no span. The ingest forwards an allowlisted copy of each browser span; on `krateo.widget.fetch` that includes `krateo.widget.resource`, `krateo.widget.namespace` and `krateo.widget.name` (the widget's plural, namespace and name, each a DNS-1123 name checked by length and shape AND against snowplow's own informer cache, so the values are bounded by the widgets in the cluster, not by the browser; any other value is dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; no identity). Sampled at
   100% by the chart's `parentbased_always_on` (see `OTEL_TRACES_SAMPLER` in
   `docs/configuration.md`). **Sampling trade (installer#402, #1013):** the
   platform gateway traces 100% and decides nothing (agentgateway-policies

@@ -15,6 +15,13 @@ const SpanWidgetFetch = "krateo.widget.fetch"
 // routes snowplow itself serves.
 type RouteSet func(route string) bool
 
+// WidgetSet looks a widget up in snowplow's own informer cache, in process and
+// without an apiserver call. known reports whether resource is a plural snowplow
+// serves widgets for; exists, asked with a namespace and name, whether that widget
+// is in the cache. An implementation that cannot tell (cache off, informer not
+// synced) answers false, false. A nil WidgetSet knows nothing.
+type WidgetSet func(resource, namespace, name string) (known, exists bool)
+
 // registeredMethods are the methods a route is looked up under: every method
 // snowplow registers a pattern for.
 var registeredMethods = [...]string{

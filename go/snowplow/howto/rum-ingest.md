@@ -33,7 +33,7 @@ new OTLPTraceExporter({
 |---|---|---|
 | body | 512 KiB, with or without `Content-Length` | `413` |
 | spans per request | 512 | `413` |
-| attributes per span | 64 sent (at most 4 are forwarded, see the allowlist; the rest are dropped) | `413` |
+| attributes per span | 64 sent (at most 6 are forwarded, on `krateo.widget.fetch`; see the allowlist; the rest are dropped) | `413` |
 | resource attributes | 64 | `413` |
 | resource spans / scope spans per request | 16 / 64 | `413` |
 | a key repeated within any JSON object | refused | `400` |
@@ -74,9 +74,20 @@ Everything not listed here is dropped. Nothing is forwarded as sent: the payload
 | `krateo.agentiko.claim.family` | `krateo.agentiko.claim.unbacked` only | a string (`stringValue`) matching `^[a-z][a-z0-9_]{0,31}$`. See below. |
 | `krateo.agentiko.claim.outcome` | `krateo.agentiko.claim.unbacked` only | a string (`stringValue`) matching `^[a-z][a-z0-9_]{0,31}$`. See below. |
 | `krateo.a2a.method` | `krateo.agentiko.a2a` only | exactly one of `message/stream`, `message/send`, `tasks/get`, `tasks/resubscribe` (`stringValue`). See below. |
-| `krateo.widget.resource` | `krateo.widget.fetch` only | the widget plural from the `/call` URL (for example `tables`): a DNS-1123 label (`stringValue`; lower-case `a-z 0-9 -`, starts and ends alphanumeric, at most 63 characters). |
-| `krateo.widget.namespace` | `krateo.widget.fetch` only | the widget's namespace: a DNS-1123 label, as above. |
-| `krateo.widget.name` | `krateo.widget.fetch` only | the widget's name: a DNS-1123 subdomain (`stringValue`; dot-separated labels as above, at most 253 characters in all). |
+| `krateo.widget.resource` | `krateo.widget.fetch` only | the widget plural from the `/call` URL (for example `tables`): a DNS-1123 label (`stringValue`; lower-case `a-z 0-9 -`, starts and ends alphanumeric, at most 63 characters) AND a plural snowplow's own informer cache serves widgets for. See below. |
+| `krateo.widget.namespace` | `krateo.widget.fetch` only | the widget's namespace: a DNS-1123 label, as above, kept only with the two other widget keys and only when that widget is in snowplow's informer cache. See below. |
+| `krateo.widget.name` | `krateo.widget.fetch` only | the widget's name: a DNS-1123 subdomain (`stringValue`; dot-separated labels as above, at most 253 characters in all), kept on the same terms as the namespace. See below. |
+
+### `krateo.widget.resource`, `.namespace`, `.name`: bounded by snowplow's own configuration
+
+The three values join a browser fetch to snowplow's server spans by widget. They come from the browser, so snowplow does not trust them: after the shape check above, each is checked against the informers snowplow already runs, in process and with no apiserver call (`cache.WatchedResource`).
+
+- `krateo.widget.resource` is kept only when it is a plural of the `widgets.templates.krateo.io` group that snowplow holds a synced, servable informer for. The set is whatever the live informers say, never a hand-written list.
+- `krateo.widget.namespace` and `krateo.widget.name` are kept only together, only when the resource was kept, and only when that widget is in the informer's cache.
+- Anything else is dropped and counted in `snowplow_rum_ingest_attributes_dropped_total`; the span is still forwarded.
+- With `CACHE_ENABLED=false` there are no informers, so all three are dropped and counted. The same holds while an informer is not yet synced or its watch is broken (unknown is not known): a widget fetched in the first moments after a pod start, before its informer is servable, loses the three attributes.
+
+So the distinct values of the three keys are bounded by the widgets in the cluster, whatever a browser sends. They are still trace attributes: join on them, but a span-metrics aggregation that groups by them makes one series per widget, so do not use them as metric dimensions without that in mind.
 
 Every other attribute is dropped and counted, as is an allowlisted key on a span that does not list it, or whose value fails its check. That includes `enduser.id`, `url.full` and any header.
 

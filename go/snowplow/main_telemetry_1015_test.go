@@ -77,6 +77,12 @@ func telemetryRouter(t *testing.T, url string) http.Handler {
 // counters move with every forwarder in the package, a previous test's draining at its shutdown included).
 func telemetryRouterFwd(t *testing.T, url string) (http.Handler, *rum.Forwarder) {
 	t.Helper()
+	return telemetryRouterWidgets(t, url, nil)
+}
+
+// telemetryRouterWidgets is telemetryRouterFwd with the ingest's widget lookup (nil: none, as cache off).
+func telemetryRouterWidgets(t *testing.T, url string, widgets rum.WidgetSet) (http.Handler, *rum.Forwarder) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	fwd, err := rum.NewForwarder(url)
@@ -89,7 +95,7 @@ func telemetryRouterFwd(t *testing.T, url string) (http.Handler, *rum.Forwarder)
 	mux.Handle("GET /call", stub)
 	mux.Handle("GET /swagger/", stub) // main registers this subtree pattern too
 	mountCallWriteRoutes(newRouteTable(mux), use.NewChain(), func(http.Handler) http.Handler { return stub })
-	mountTelemetryRoute(newRouteTable(mux), use.NewChain(), debugAuthTestKeys, rum.NewIngest(fwd, rum.RegisteredRoutes(mux)))
+	mountTelemetryRoute(newRouteTable(mux), use.NewChain(), debugAuthTestKeys, rum.NewIngest(fwd, rum.RegisteredRoutes(mux)).WithWidgets(widgets))
 	t.Cleanup(cache.ResetRouteScopeRegistryForTest)
 	return mux, fwd
 }

@@ -18,8 +18,9 @@ const (
 	// MaxSpansPerRequest: the browser exporter's default maxExportBatchSize.
 	MaxSpansPerRequest = 512
 	// MaxAttributesPerSpan bounds what the browser SENDS, not what is
-	// forwarded: a krateo.* span carries at most 4 allowlisted attributes
-	// (its row of spanAllowlist: the 3 http.* keys, plus
+	// forwarded: a krateo.* span carries at most 6 allowlisted attributes
+	// (its row of spanAllowlist: the 3 http.* keys, plus the 3 widget keys on
+	// krateo.widget.fetch, or
 	// krateo.interaction.abandoned on an interaction span; the claim family
 	// and outcome on krateo.agentiko.claim.unbacked; the method, status,
 	// route and A2A method on krateo.agentiko.a2a), and the browser fetch

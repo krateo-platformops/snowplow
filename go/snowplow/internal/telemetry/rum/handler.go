@@ -57,6 +57,7 @@ type Ingest struct {
 	// routes is snowplow's own routing table (RegisteredRoutes over the mux):
 	// a krateo.widget.fetch http.route must be one of them.
 	routes  RouteSet
+	widgets WidgetSet
 	limiter *userLimiter
 	// decodes bounds the requests reading and decoding a body at once, across
 	// all users (F1): with the structural caps this bounds the memory the
@@ -103,6 +104,15 @@ func NewIngest(fwd *Forwarder, routes RouteSet) *Ingest {
 		now:        time.Now,
 		inFlight:   map[string]struct{}{},
 	}
+}
+
+// WithWidgets sets the widget lookup that bounds krateo.widget.resource,
+// .namespace and .name to snowplow's own configuration. Without one those
+// three attributes are always dropped and counted. Call it before the ingest
+// serves.
+func (in *Ingest) WithWidgets(w WidgetSet) *Ingest {
+	in.widgets = w
+	return in
 }
 
 func (in *Ingest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -162,7 +172,7 @@ func (in *Ingest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestsAccepted.Add(1)
-	f := filter(req, in.routes)
+	f := filter(req, in.routes, in.widgets)
 	spansDroppedService.Add(uint64(f.droppedService))
 	spansDroppedName.Add(uint64(f.droppedName))
 	spansDroppedInvalid.Add(uint64(f.droppedInvalid))

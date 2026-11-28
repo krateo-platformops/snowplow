@@ -203,7 +203,18 @@ func newRUMIngest(ctx context.Context, mux *http.ServeMux) http.Handler {
 		return nil
 	}
 	fwd.Start(ctx)
-	return rum.NewIngest(fwd, rum.RegisteredRoutes(mux))
+	return rum.NewIngest(fwd, rum.RegisteredRoutes(mux)).WithWidgets(widgetSetFromCache)
+}
+
+// widgetsGroup is the API group of snowplow's widget kinds.
+const widgetsGroup = "widgets.templates.krateo.io"
+
+// widgetSetFromCache is the ingest's widget lookup: snowplow's own informers,
+// in process, no apiserver call (cache.WatchedResource). With the cache off
+// (CACHE_ENABLED=false) there are no informers, so it knows nothing and the
+// three widget attributes of a browser span are dropped and counted.
+func widgetSetFromCache(resource, namespace, name string) (known, exists bool) {
+	return cache.WatchedResource(widgetsGroup, resource, namespace, name)
 }
 
 // newRequestChain is the middleware every route starts from. It is a function
