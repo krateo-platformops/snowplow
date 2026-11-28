@@ -126,8 +126,10 @@ func shapeOK(s string) bool {
 // without the non-zone entry `Factory`. The embedded database cannot be
 // enumerated at run time (its archive is unexported), so the list is generated
 // from that same zip and a test fails if a newer toolchain's zip names a zone
-// the list lacks (regenerate: see TestZonesListMatchesToolchainZip).
+// the list lacks or the list keeps one the toolchain dropped (regenerate:
+// go generate, see TestZonesListMatchesToolchainZip).
 //
+//go:generate go run gen_zones.go
 //go:embed zones.txt
 var zonesTxt string
 

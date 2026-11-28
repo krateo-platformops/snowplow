@@ -670,8 +670,10 @@ and the SPA's recovery are OPEN rows owned by the chart review checklist and fro
    value, never injected — so those two rules are its only protection, plus a value check:
    a `tz` that is not, byte for byte, a zone name the embedded tzdata carries
    (`internal/viewercontext/zones.txt`, so `Europe/Rome` and `UTC` pass, while `europe/rome`,
-   `Europe//Rome`, `Local`, `Factory` and the empty string do not; each zone has exactly one
-   accepted spelling, so it cannot fork the cache, and the result does not depend on the OS;
+   `Europe//Rome`, `Local`, `Factory` and the empty string do not; a zone name has exactly one
+   accepted spelling, so a misspelling cannot fork the cache, while tzdata's own aliases
+   (`UTC`, `Etc/UTC`, `Zulu`, ...) are each names in their own right and each accepted as
+   spelled, not folded together; the result does not depend on the OS;
    a cheap first filter allows only ASCII letters, digits and `/ _ + -`, at most 64 bytes)
    is dropped at the
    request edge (`util.ParseExtras`, and the `/refreshes` coordinates) before the key, the

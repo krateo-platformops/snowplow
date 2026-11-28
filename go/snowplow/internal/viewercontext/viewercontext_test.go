@@ -2,7 +2,6 @@ package viewercontext
 
 import (
 	"archive/zip"
-	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -164,26 +163,33 @@ func TestEveryListedZoneLoads(t *testing.T) {
 	}
 }
 
-// The list is generated from the Go toolchain's lib/time/zoneinfo.zip, the very
-// archive time/tzdata embeds. If a toolchain bump brings a zone the list lacks,
-// that zone would be refused: fail here so the list is regenerated.
-//
-//	python3 -I -c "import zipfile,subprocess,sys;g=subprocess.check_output(['go','env','GOROOT'],text=True).strip();z=zipfile.ZipFile(g+'/lib/time/zoneinfo.zip');open('zones.txt','w').write('\n'.join(sorted(i.filename for i in z.infolist() if i.filename!='Factory'))+'\n')"
+// The list is generated (go generate ./internal/viewercontext, gen_zones.go)
+// from the Go toolchain's lib/time/zoneinfo.zip, the very archive time/tzdata
+// embeds. It must equal that archive's zone set (minus Factory), in BOTH
+// directions: a zone the toolchain adds that the list lacks would be refused,
+// and a zone the toolchain drops that the list keeps would be accepted yet
+// unresolvable. time.LoadLocation cannot catch the second case, because it
+// tries the OS database before the embedded one. Fail here, loudly, so the list
+// is regenerated.
 func TestZonesListMatchesToolchainZip(t *testing.T) {
 	zr, err := zip.OpenReader(filepath.Join(runtime.GOROOT(), "lib", "time", "zoneinfo.zip"))
 	if err != nil {
-		if os.IsNotExist(err) {
-			t.Skipf("toolchain zoneinfo.zip not present (%v)", err)
-		}
-		t.Fatal(err)
+		t.Fatalf("toolchain zoneinfo.zip is needed to pin zones.txt to the embedded tzdata: %v", err)
 	}
 	defer zr.Close()
+	inZip := map[string]struct{}{}
 	for _, f := range zr.File {
 		if f.Name == "Factory" || strings.HasSuffix(f.Name, "/") {
 			continue
 		}
+		inZip[f.Name] = struct{}{}
 		if _, ok := zoneNames()[f.Name]; !ok {
-			t.Errorf("toolchain tzdata has zone %q that zones.txt lacks; regenerate zones.txt (command above)", f.Name)
+			t.Errorf("the toolchain's tzdata has zone %q that zones.txt lacks; run: go generate ./internal/viewercontext", f.Name)
+		}
+	}
+	for z := range zoneNames() {
+		if _, ok := inZip[z]; !ok {
+			t.Errorf("zones.txt lists %q but the toolchain's tzdata does not carry it; run: go generate ./internal/viewercontext", z)
 		}
 	}
 }
