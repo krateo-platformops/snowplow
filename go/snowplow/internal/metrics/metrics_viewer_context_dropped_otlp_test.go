@@ -7,6 +7,8 @@ package metrics
 // attribute value is in it; a value-derived attribute would blow it.
 
 import (
+	"encoding/json"
+	"expvar"
 	"testing"
 
 	"github.com/krateo-platformops/snowplow/internal/viewercontext"
@@ -23,10 +25,10 @@ func TestViewerContextDroppedReachesOTLP(t *testing.T) {
 	// A distinct count per key proves the callback reads the ACTUAL atomic.
 	want := map[string]int64{}
 	for i, k := range enum {
-		for j := 0; j <= i; j++ {
+		for j := 0; j <= i+1; j++ {
 			viewercontext.RecordDroppedForTest(k)
 		}
-		want[k] = int64(i + 1)
+		want[k] = int64(i + 2)
 	}
 
 	pts := pointsFor(flatten(collectViaRealCallback(t, "deadbeef")), "snowplow_viewer_context_dropped_total")
@@ -55,6 +57,25 @@ func TestViewerContextDroppedReachesOTLP(t *testing.T) {
 	for k, w := range want {
 		if got[k] != w {
 			t.Fatalf("key %q OTLP value = %d, want %d: the callback is not reading the drop atomic", k, got[k], w)
+		}
+	}
+
+	// /debug/vars publishes the SAME counts, as a map keyed by the same enum.
+	// A bare number, or a map from another source, fails here.
+	v := expvar.Get("snowplow_viewer_context_dropped_total")
+	if v == nil {
+		t.Fatal("snowplow_viewer_context_dropped_total is not published on expvar")
+	}
+	var ev map[string]uint64
+	if err := json.Unmarshal([]byte(v.String()), &ev); err != nil {
+		t.Fatalf("expvar value is not a map{key -> uint64}: %v (%s)", err, v.String())
+	}
+	if len(ev) != len(got) {
+		t.Fatalf("expvar has %d keys, OTLP has %d: %v vs %v", len(ev), len(got), ev, got)
+	}
+	for k, n := range got {
+		if int64(ev[k]) != n {
+			t.Fatalf("key %q: expvar = %d, OTLP = %d; the two surfaces diverged", k, ev[k], n)
 		}
 	}
 }
