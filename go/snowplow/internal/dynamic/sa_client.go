@@ -237,6 +237,14 @@ func SetServiceAccountTokenPathForTest(path string) func() {
 	}
 }
 
+// ResetServiceAccountRESTConfigForTest clears the memoised service-account
+// *rest.Config, so a test that overrode the in-cluster config (whose value the
+// first ServiceAccountRESTConfig call, e.g. building a dispatcher handler,
+// captured) leaves nothing behind for later tests, whatever the order. Exported
+// test-support ONLY, like SetServiceAccountRESTConfigForTest; production never
+// calls it.
+func ResetServiceAccountRESTConfigForTest() { resetSARestConfigForTest() }
+
 // SetServiceAccountRESTConfigForTest makes ServiceAccountRESTConfig return rc,
 // so a cross-package test can stand a hermetic apiserver in for the in-cluster
 // one (rest.InClusterConfig reads fixed /var/run/secrets paths a test cannot

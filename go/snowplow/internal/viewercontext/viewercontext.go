@@ -152,15 +152,67 @@ func zoneNames() map[string]struct{} {
 	return zones
 }
 
-var droppedTotal atomic.Uint64
+// dropped counts values dropped for failing their key's validator, one atomic
+// per key that HAS a validator (only those can drop). The key set is fixed at
+// init from the vocabulary and never grows at request time, so the map is
+// read-only after init and a request can neither add a key nor a series: the
+// count is keyed by the vocabulary key name, never by the value.
+var dropped = func() map[string]*atomic.Uint64 {
+	m := make(map[string]*atomic.Uint64)
+	for k, e := range vocabulary {
+		if e.valid != nil {
+			m[k] = new(atomic.Uint64)
+		}
+	}
+	return m
+}()
 
 func init() {
-	expvar.Publish("snowplow_viewer_context_dropped_total", expvar.Func(func() any { return DroppedTotal() }))
+	expvar.Publish("snowplow_viewer_context_dropped_total", expvar.Func(func() any { return DroppedByKeySnapshot() }))
+}
+
+// DroppedByKeySnapshot returns the drop count per viewer-context key that has a
+// validator. /debug/vars publishes it and the OTLP counter observes it, both
+// reading these same atomics, so the two surfaces cannot diverge. The key set
+// is DroppedKeyEnum(); no value is ever recorded.
+func DroppedByKeySnapshot() map[string]uint64 {
+	out := make(map[string]uint64, len(dropped))
+	for k, c := range dropped {
+		out[k] = c.Load()
+	}
+	return out
+}
+
+// DroppedKeyEnum returns the fixed key set of the drop counter (unordered) -
+// the bound the OTLP `key` attribute must stay within.
+func DroppedKeyEnum() []string {
+	out := make([]string, 0, len(dropped))
+	for k := range dropped {
+		out = append(out, k)
+	}
+	return out
 }
 
 // DroppedTotal counts viewer-context values dropped for failing their
-// validator. Values are never recorded, only the count.
-func DroppedTotal() uint64 { return droppedTotal.Load() }
+// validator, across all keys. Values are never recorded, only the count.
+func DroppedTotal() uint64 {
+	var n uint64
+	for _, c := range dropped {
+		n += c.Load()
+	}
+	return n
+}
+
+// RecordDroppedForTest bumps one key's drop counter for the OTLP falsifier.
+// Production MUST NOT use it; the real bump is DropInvalid.
+func RecordDroppedForTest(key string) { dropped[key].Add(1) }
+
+// ResetDroppedForTest zeroes every key's counter. Production MUST NOT use it.
+func ResetDroppedForTest() {
+	for _, c := range dropped {
+		c.Store(0)
+	}
+}
 
 // DropInvalid returns extras without the viewer-context entries whose value
 // fails its validator. It returns the input map itself (no copy) when nothing
@@ -178,7 +230,7 @@ func DropInvalid(extras map[string]any) map[string]any {
 			}
 		}
 		delete(out, k)
-		droppedTotal.Add(1)
+		dropped[k].Add(1)
 	}
 	if out == nil {
 		return extras
