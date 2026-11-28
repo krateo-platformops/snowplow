@@ -246,7 +246,7 @@ HTTP/1.1 401 Unauthorized
 Content-Type: application/json
 WWW-Authenticate: Bearer error="invalid_token"
 
-{"kind":"Status","apiVersion":"v1","status":"Failure","message":"secrets \"delegated-f1c3254e9f0b7f9d465f98290d8321af4b7f3445f8900e0fb6128aba88aac6da\" not found","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"DelegatedCredentialMissing","message":"the delegated credential is missing; exchange the token again"}]}}
+{"kind":"Status","apiVersion":"v1","status":"Failure","message":"secrets \"delegated-a4d6011698e0658a0df9755b91f9ff6c82b3b20bf9df2e39c78bdd0d462e7b8d\" not found","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"DelegatedCredentialMissing","message":"the delegated credential is missing; exchange the token again"}]}}
 ```
 
 The `message` names the delegated Secret, a SHA-256 of the username and the

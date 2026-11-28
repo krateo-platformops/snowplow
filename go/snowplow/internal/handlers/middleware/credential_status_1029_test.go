@@ -329,7 +329,7 @@ func TestCredentialStatus1029_DocExamplesEqualTheWire(t *testing.T) {
 			su994Informer(t, session)
 			su994APIServer(t, session)
 			rec, _ := c1029Serve(t, d1560Token(t, d1560Actor, su994Group))
-			wireSub = []string{endpoints.DelegatedSecretName("alice", "my-agent", []string{su994Group}), d1560Name()}
+			wireSub = []string{endpoints.DelegatedSecretName("alice", "my-agent", nil), d1560Name()}
 			return rec
 		},
 		"DelegatedCredentialMismatch": func(t *testing.T) *httptest.ResponseRecorder {

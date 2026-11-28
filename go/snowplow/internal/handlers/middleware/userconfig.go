@@ -205,7 +205,13 @@ import (
 // v1.103.0 → v1.106.0 (#1504): re-audited by `diff -r` of every plumbing
 // package this module imports. Only crdgen/ (the chart guard's; see chartcrd)
 // changed; every package this file transcribes is byte-identical.
-const PinnedPlumbingVersion = "v1.106.0"
+//
+// v1.106.0 → v1.111.0 (#1596): re-audited by `diff -r` of the two module trees.
+// Non-test changes are in endpoints/ (DelegatedSecretName takes the groups; a
+// caller, credsecret.Select, passes them), jwtutil/ (audience options on the
+// validators, not used here), and helm/, helm/v3 (not imported). server/use,
+// which this file transcribes, is byte-identical.
+const PinnedPlumbingVersion = "v1.111.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
