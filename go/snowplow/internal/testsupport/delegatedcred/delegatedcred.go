@@ -3,7 +3,7 @@
 // snowplow#1560).
 //
 // The Secret is shaped as authn's contract describes it: named
-// endpoints.DelegatedSecretName(username, actor); annotated with the username
+// endpoints.DelegatedSecretName(username, actor, groups); annotated with the username
 // (endpoints.UsernameAnnotation) and the actor (endpoints.ActorAnnotation);
 // carrying NO labels (an actor's exchange is not a sign-in, so none of the
 // tenant-onboarding labels a session Secret has); holding a client certificate
@@ -35,16 +35,20 @@ import (
 // Spec is one delegated credential Secret.
 type Spec struct {
 	Namespace string
-	// Username and Actor name the Secret and fill its two annotations.
+	// Username and Actor, with Groups (or NameGroups), name the Secret; they fill its two annotations (Username, Actor).
 	Username string
 	Actor    string
-	// Groups are the certificate's Organizations.
+	// Groups are the certificate's Organizations, and part of the name.
 	Groups []string
 	// NotBefore and NotAfter bound the certificate. Zero values give a
 	// certificate valid from a minute ago for ten minutes (authn's are
 	// about 600 s).
 	NotBefore time.Time
 	NotAfter  time.Time
+	// NameGroups, when non-nil, are the groups the NAME is derived from
+	// instead of Groups: a Secret named for one set of groups whose
+	// certificate carries another, which CheckDelegatedCredential refuses.
+	NameGroups []string
 	// ServerURL and Token are the endpoint's server-url and token.
 	ServerURL string
 	Token     string
@@ -60,11 +64,15 @@ func Secret(t testing.TB, s Spec) *corev1.Secret {
 	if na.IsZero() {
 		na = nb.Add(10 * time.Minute)
 	}
+	nameGroups := s.Groups
+	if s.NameGroups != nil {
+		nameGroups = s.NameGroups
+	}
 	cert, key := Certificate(t, s.Username, s.Groups, nb, na)
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: s.Namespace,
-			Name:      endpoints.DelegatedSecretName(s.Username, s.Actor),
+			Name:      endpoints.DelegatedSecretName(s.Username, s.Actor, nameGroups),
 			Annotations: map[string]string{
 				endpoints.UsernameAnnotation: s.Username,
 				endpoints.ActorAnnotation:    s.Actor,

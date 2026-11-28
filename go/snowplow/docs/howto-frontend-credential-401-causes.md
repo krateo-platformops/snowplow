@@ -73,7 +73,7 @@ JWT's `act` and `groups`**:
 
 | token | Secret read |
 |---|---|
-| carries `act` (a delegated token, authn `/delegate`, #1560) | the delegated credential for the person and the token's outermost actor (`act.sub`), named by plumbing's `endpoints.DelegatedSecretName`: `delegated-` and 64 hex digits |
+| carries `act` (a delegated token, authn `/delegate`, #1560) | the delegated credential for the person, the token's outermost actor (`act.sub`) and the token's set of groups (order and repeats don't matter; two sign-ins of one person whose groups differ read different Secrets), named by plumbing's `endpoints.DelegatedSecretName`: `delegated-` and 64 hex digits |
 | no `act`, `groups` contains `krateo:loa:2` (a step-up login, authn `POST /oidc/stepup`) | `<user>-clientconfig-stepup` |
 | any other token | `<user>-clientconfig` |
 
@@ -246,11 +246,11 @@ HTTP/1.1 401 Unauthorized
 Content-Type: application/json
 WWW-Authenticate: Bearer error="invalid_token"
 
-{"kind":"Status","apiVersion":"v1","status":"Failure","message":"secrets \"delegated-f1c3254e9f0b7f9d465f98290d8321af4b7f3445f8900e0fb6128aba88aac6da\" not found","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"DelegatedCredentialMissing","message":"the delegated credential is missing; exchange the token again"}]}}
+{"kind":"Status","apiVersion":"v1","status":"Failure","message":"secrets \"delegated-a4d6011698e0658a0df9755b91f9ff6c82b3b20bf9df2e39c78bdd0d462e7b8d\" not found","reason":"Unauthorized","code":401,"details":{"causes":[{"reason":"DelegatedCredentialMissing","message":"the delegated credential is missing; exchange the token again"}]}}
 ```
 
-The `message` names the delegated Secret, a SHA-256 of the username and the
-actor. It goes only to the caller holding that token. Snowplow scrubs the name
+The `message` names the delegated Secret, a SHA-256 of the username, the actor and the token's set of
+groups. It goes only to the caller holding that token. Snowplow scrubs the name
 from its own logs. A Secret that exists but is someone else's gets the same
 answer, under the same name.
 
