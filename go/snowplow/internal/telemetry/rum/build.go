@@ -23,8 +23,23 @@ func (f filtered) rejected() int { return f.droppedService + f.droppedName + f.d
 
 // filter applies the #1015 allowlist and returns the spans to forward, each
 // a NEW tracepb.Span populated field by field from the allowlisted inputs.
-func filter(req *exportRequest, snowplowRoutes RouteSet) filtered {
+func filter(req *exportRequest, snowplowRoutes RouteSet, widgets WidgetSet) filtered {
 	var f filtered
+	if widgets != nil {
+		// Look each widget up in the informer once per request, as the routes.
+		type wk struct{ r, ns, n string }
+		type wv struct{ known, exists bool }
+		memo := map[wk]wv{}
+		live := widgets
+		widgets = func(r, ns, n string) (bool, bool) {
+			v, ok := memo[wk{r, ns, n}]
+			if !ok {
+				v.known, v.exists = live(r, ns, n)
+				memo[wk{r, ns, n}] = v
+			}
+			return v.known, v.exists
+		}
+	}
 	if snowplowRoutes != nil {
 		// A batch repeats a handful of routes across up to 512 spans: look
 		// each up on the mux once per request.
@@ -49,7 +64,7 @@ func filter(req *exportRequest, snowplowRoutes RouteSet) filtered {
 			case spanAllowlist[in.Name] == nil:
 				f.droppedName++
 			default:
-				out, dropped, unregistered, ok := buildSpan(in, spanAllowlist[in.Name], snowplowRoutes)
+				out, dropped, unregistered, ok := buildSpan(in, spanAllowlist[in.Name], snowplowRoutes, widgets)
 				if !ok {
 					f.droppedInvalid++
 					continue
@@ -69,7 +84,7 @@ func filter(req *exportRequest, snowplowRoutes RouteSet) filtered {
 // is not valid; dropped is the number of span attributes left out,
 // unregistered how many of those were a krateo.widget.fetch http.route that
 // is not one of snowplowRoutes.
-func buildSpan(in *span, allowed map[string]valueCheck, snowplowRoutes RouteSet) (out *tracepb.Span, dropped, unregistered int, ok bool) {
+func buildSpan(in *span, allowed map[string]valueCheck, snowplowRoutes RouteSet, widgets WidgetSet) (out *tracepb.Span, dropped, unregistered int, ok bool) {
 	traceID, ok := hexID(in.TraceID, 16)
 	if !ok {
 		return nil, 0, 0, false
@@ -113,6 +128,7 @@ func buildSpan(in *span, allowed map[string]valueCheck, snowplowRoutes RouteSet)
 		seen[kv.Key] = true
 		attrs = append(attrs, &commonpb.KeyValue{Key: kv.Key, Value: v})
 	}
+	attrs, dropped = boundWidgetAttrs(attrs, dropped, widgets)
 	return &tracepb.Span{
 		TraceId:           traceID,
 		SpanId:            spanID,
@@ -145,4 +161,54 @@ func envelope(spans []*tracepb.Span) *collectortracepb.ExportTraceServiceRequest
 			}},
 		}},
 	}
+}
+
+// boundWidgetAttrs makes krateo.widget.resource, .namespace and .name
+// configuration and not browser assertions: the three passed their shape
+// check, and are kept only when snowplow's own informer cache agrees. The
+// resource must be a plural snowplow serves widgets for; the namespace and name
+// are kept only together, only with that resource, and only when the widget
+// exists in the cache. Every attribute left out is counted in dropped. With no
+// WidgetSet (cache off, or an ingest built without one) all three are dropped.
+// So the distinct values of the three keys are bounded by the widgets in the
+// cluster, whatever a browser sends.
+func boundWidgetAttrs(attrs []*commonpb.KeyValue, dropped int, widgets WidgetSet) ([]*commonpb.KeyValue, int) {
+	var res, ns, name string
+	have := false
+	for _, a := range attrs {
+		switch a.Key {
+		case AttrWidgetResource:
+			res, have = a.Value.GetStringValue(), true
+		case AttrWidgetNamespace:
+			ns, have = a.Value.GetStringValue(), true
+		case AttrWidgetName:
+			name, have = a.Value.GetStringValue(), true
+		}
+	}
+	if !have {
+		return attrs, dropped
+	}
+	var knownRes, exists bool
+	if widgets != nil && res != "" {
+		knownRes, _ = widgets(res, "", "")
+		if knownRes && ns != "" && name != "" {
+			_, exists = widgets(res, ns, name)
+		}
+	}
+	out := attrs[:0:0]
+	for _, a := range attrs {
+		keep := true
+		switch a.Key {
+		case AttrWidgetResource:
+			keep = knownRes
+		case AttrWidgetNamespace, AttrWidgetName:
+			keep = exists
+		}
+		if !keep {
+			dropped++
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, dropped
 }

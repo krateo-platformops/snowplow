@@ -220,6 +220,46 @@ func WatchedAbsent(gvr schema.GroupVersionResource, namespace, name string) bool
 	return Global().probeObjectState(gvr, namespace, name) == objAbsent
 }
 
+// WatchedResource reports, from the process watcher alone (no apiserver call,
+// no side effect, never registers a GVR), whether resource is a plural of
+// group that snowplow holds a servable informer for (known), and, when
+// namespace and name are both non-empty, whether that informer's indexer holds
+// the object (exists). It is the rum ingest's closed-set check for the widget
+// attributes of a browser span (krateo.widget.resource/.namespace/.name): the
+// set is whatever the live informers say, never a hand-written list. A nil
+// watcher, passthrough mode (CACHE_ENABLED=false) and a GVR that is not
+// servable (not yet synced, watch broken, type unconfirmed) answer false, false:
+// unknown is not known.
+func WatchedResource(group, resource, namespace, name string) (known, exists bool) {
+	return Global().probeResource(group, resource, namespace, name)
+}
+
+// probeResource is WatchedResource on rw (nil-safe).
+func (rw *ResourceWatcher) probeResource(group, resource, namespace, name string) (known, exists bool) {
+	if rw == nil || rw.mode == modePassthrough {
+		return false, false
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	for gvr := range rw.informers {
+		if gvr.Group != group || gvr.Resource != resource {
+			continue
+		}
+		gi, ok := rw.servableLocked(gvr)
+		if !ok {
+			continue
+		}
+		known = true
+		if namespace == "" || name == "" {
+			return known, false
+		}
+		if _, ok, err := gi.Informer().GetIndexer().GetByKey(namespace + "/" + name); err == nil && ok {
+			return true, true
+		}
+	}
+	return known, false
+}
+
 // --- snowplow_resolved_cache_denial_only_put_total{site} --------------------
 
 // The Put sites (a CLOSED set, every cell pre-populated).
