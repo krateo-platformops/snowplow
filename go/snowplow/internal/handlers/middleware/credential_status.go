@@ -81,6 +81,11 @@ const (
 	// the token verify. Named after its jwtutil error, as TokenInvalid and
 	// TokenExpired are.
 	CauseKeyNotPublished = "KeyNotPublished"
+	// CauseTokenAudienceMismatch — the bearer token verified, and was issued
+	// for another recipient than snowplow (jwtutil.ErrAudienceMismatch, #1596).
+	// Logging in again does not help: it is the same kind of token again. A
+	// configuration fault, not a login problem.
+	CauseTokenAudienceMismatch = "TokenAudienceMismatch"
 	// CauseSessionCredentialMissing — a valid token without krateo:loa:2
 	// whose session credential Secret is missing.
 	CauseSessionCredentialMissing = "SessionCredentialMissing"
@@ -130,6 +135,7 @@ var preDispatchCauses = map[string]preDispatchCause{
 	CauseTokenInvalid:             {"the bearer token is not valid; log in again", invalidTokenChallenge},
 	CauseTokenExpired:             {"the bearer token has expired; log in again", invalidTokenChallenge},
 	CauseKeyNotPublished:          {"the bearer token's signing key is no longer published; log in again", invalidTokenChallenge},
+	CauseTokenAudienceMismatch:    {"the bearer token was issued for another recipient; this is a configuration fault, not a login problem", invalidTokenChallenge},
 	CauseSessionCredentialMissing: {"the session credential is missing; log in again", invalidTokenChallenge},
 	CauseStepUpRequired:           {"the step-up credential is missing or expired; step up again", stepUpChallenge},
 	CauseDelegatedCredentialMissing: {"the delegated credential is missing; exchange the token again",
@@ -198,8 +204,12 @@ func tokenMissing(w http.ResponseWriter, err error) error {
 //
 // ErrKeyNotPublished is checked FIRST: jwtutil reports a retired key as
 // ErrTokenInvalid AND ErrKeyNotPublished, so the generic branch would swallow
-// it.
+// it. ErrAudienceMismatch is checked before the generic branch for the same
+// reason (#1596): it wraps ErrTokenInvalid. Its message names no audience.
 func tokenRejected(w http.ResponseWriter, err error) error {
+	if errors.Is(err, jwtutil.ErrAudienceMismatch) {
+		return preDispatchUnauthorized(w, CauseTokenAudienceMismatch, err)
+	}
 	if errors.Is(err, jwtutil.ErrKeyNotPublished) {
 		return preDispatchUnauthorized(w, CauseKeyNotPublished, err)
 	}
