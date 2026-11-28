@@ -214,8 +214,13 @@ Both `ServeHTTP` methods follow the same skeleton:
    timing log (`per_call_log.go`).
 2. `defer markCustomerInFlight()()` — signals the prewarm engine and refresher
    to yield background work for the dispatch's duration.
-3. `util.ParseExtras(req)` — parses the `?extras=<json>` query param into a
-   `map[string]any`.
+3. `util.ParseExtras(req)` — parses the `?extras=<json>` query param (or, on
+   `POST /call/read` and `POST /export`, the body's `extras`) into a
+   `map[string]any`, then drops any viewer-context value that fails its key's
+   validator (today: a `tz` that is not an IANA zone name) as if it had not been
+   sent (`viewercontext.DropInvalid`). It is the single reader of request
+   extras: `/call` widgets, `/call` RESTActions, `/rbac`, and every `/export`
+   page (re-dispatched through the `/call` lane) go through it.
 4. `fetchObject(req)` — fetch the dispatch-target CR (`helpers.go` →
    `objects.Get`, §2.6).
 5. **RBAC dispatch gate** — cache-on only (§2.7).
@@ -287,7 +292,14 @@ key extras are the union of the widget's inline template extras and the request
 extras filtered by `spec.keyExtras` (F6, `filterDeclaredKeyExtras`) plus the
 `spec.identityContext` identity axis (username/groups — server-injected, so a
 client-supplied `extras.username` can never spoof it). A resolve fed
-undeclared request extras is served but its Put is quarantined.
+undeclared request extras is served but its Put is quarantined — except the
+viewer-context keys (`username`, `groups`, `displayName`, `tz`), which
+`widgets.Resolve` strips when undeclared (so they neither move the key nor
+block the Put) and which partition the key when declared in `spec.keyExtras`.
+A declared `tz` reaches the widget's apiRef RESTAction the same way route
+params do: `widgets.Resolve` (`resolveInputExtras`) → `resolveApiRef` →
+`apirefOptionsFor` → `apiref.Resolve` → the RESTAction resolve dict
+(`.extras.tz`).
 
 ### 2.9 Resolve — RESTAction (`internal/resolvers/restactions/`)
 

@@ -48,14 +48,20 @@ func TestTZValidator_RejectsEverythingElse(t *testing.T) {
 		"Local":                "Local",
 		"empty":                "",
 		"dot-dot path":         "../etc/passwd",
-		"backslash":            `Europe\Rome`,
-		"semicolon":            "UTC;",
-		"unknown zone":         "Mars/Olympus_Mons",
-		"nul":                  "UTC\x00",
-		"unicode":              "Europe/Rómé",
-		"non-string number":    float64(1),
-		"non-string nil":       nil,
-		"non-string list":      []any{"UTC"},
+		// time.LoadLocation resolves these to a real zone (it joins the name
+		// onto the zoneinfo directory), so ONLY the allow-list and the length
+		// bound keep them out: they pin those two checks.
+		"dot segment":        "Europe/./Rome",
+		"dot prefix":         "./UTC",
+		"overlong real zone": "Europe/" + strings.Repeat("/", MaxTZLen+6) + "Rome",
+		"backslash":          `Europe\Rome`,
+		"semicolon":          "UTC;",
+		"unknown zone":       "Mars/Olympus_Mons",
+		"nul":                "UTC\x00",
+		"unicode":            "Europe/Rómé",
+		"non-string number":  float64(1),
+		"non-string nil":     nil,
+		"non-string list":    []any{"UTC"},
 	}
 	for name, v := range cases {
 		if Valid(TZ, v) {

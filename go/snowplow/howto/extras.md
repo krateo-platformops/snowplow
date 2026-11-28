@@ -154,6 +154,18 @@ a deterministic `fmt.Sprintf("%v", …)` so the key still varies with content.
   yields nothing, because a value the client chose would otherwise shape a
   body written into the cell its whole RBAC cohort reads.
 
+  **Viewer time zone (`tz`).** The frontend sends the viewer's IANA time zone
+  (e.g. `Europe/Rome`) as the extra `tz` on every read, so a RESTAction can
+  start a day-sized slot at the viewer's midnight. It is a viewer-context key
+  like the identity keys, with one difference: it is client-asserted (the server
+  cannot inject or verify it). A widget that does not declare it never sees it
+  and its cache key does not change. **To use it, declare `keyExtras: [tz]` on
+  the widget and read `.extras.tz` in the RESTAction** (the widget's apiRef
+  hands declared extras to the RESTAction like route params). It then
+  partitions the key, so each zone gets its own cell. A value that is not a
+  real IANA zone name is dropped before anything sees it, so it is safe to
+  pass to a query; do not rely on it for anything but presentation.
+
   The same filtered union feeds all four key consumers — dispatch lookup,
   the shared `widgetContent` cell, subscription arming, and the boot/keepwarm
   seed — from the single `effectiveKeyExtras` site, so they cannot drift.
