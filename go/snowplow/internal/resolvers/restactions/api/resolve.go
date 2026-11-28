@@ -2408,8 +2408,12 @@ func ResolveWithFailure(ctx context.Context, opts ResolveOptions) (map[string]an
 	}
 	// One span per resolve and one per stage (stage_trace.go). Off: one atomic load.
 	ctx, rt := startResolveTrace(ctx, opts)
-	dict, failure := resolveStages(ctx, opts)
-	rt.end(failure)
+	completed := false
+	var failure *StageFailure
+	defer func() { rt.end(failure, completed) }() // a panic still ends the span
+	var dict map[string]any
+	dict, failure = resolveStages(ctx, opts)
+	completed = true
 	return dict, failure
 }
 
@@ -2539,17 +2543,11 @@ func resolveStages(ctx context.Context, opts ResolveOptions) (map[string]any, *S
 			continue
 		}
 		r.outcomes.ran(id)
-		spanCtx, st := r.beginStageTrace(id)
-		stop := r.runStage(spanCtx, st, id, apiMap)
-		if !stop {
-			st.end(false, false, r.outcomes.reasonOf(id))
-		}
-		if stop {
+		if r.runStageTraced(id, apiMap) {
 			// A truncating exit: this stage failed (its own item errors, if
 			// any, already carry a more specific reason).
 			r.taintNarrow() // #603 PR-2
-			r.outcomes.fail(id, StageReasonError)
-			st.end(true, false, r.outcomes.reasonOf(id))
+			// (runStageTraced recorded the stage's Error reason before ending its span.)
 			// #709 — a truncating exit is a failure of this stage whatever its
 			// continueOnError says. Reported by class only: the endpoint error
 			// can name the requester's clientconfig Secret, so its text stays

@@ -54,6 +54,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
@@ -83,6 +84,7 @@ const (
 	sourceRefresher  = "refresher"
 	sourcePrewarm    = "prewarm"
 	sourceBackground = "background"
+	sourceUnknown    = "unknown"
 
 	targetInCluster = "in_cluster"
 	targetExternal  = "external"
@@ -105,7 +107,7 @@ func TraceAttrKeys() []string {
 // other keys are author config (namespace, name, stage) or an int.
 func TraceAttrEnumValues() map[string][]string {
 	return map[string][]string{
-		attrRASource:     {sourceCustomer, sourceRefresher, sourcePrewarm, sourceBackground},
+		attrRASource:     {sourceCustomer, sourceRefresher, sourcePrewarm, sourceBackground, sourceUnknown},
 		attrRAOutcome:    {outcomeOK, outcomeFailed},
 		attrStageTarget:  {targetInCluster, targetExternal},
 		attrStageShape:   {shapeSingle, shapeIterator},
@@ -114,11 +116,24 @@ func TraceAttrEnumValues() map[string][]string {
 	}
 }
 
-// traceSource folds the resolve's context into the closed source set.
+type customerResolveKey struct{}
+
+// WithCustomerResolve marks ctx as a customer's own request (the /call dispatchers
+// set it). It is what makes snowplow.restaction.source read "customer": a path
+// that forgets the marker reads "unknown", so the omission is visible.
+func WithCustomerResolve(ctx context.Context) context.Context {
+	return context.WithValue(ctx, customerResolveKey{}, true)
+}
+
+// traceSource folds the resolve's context into the closed source set. A
+// background marker outranks the customer one.
 func traceSource(ctx context.Context) string {
 	switch cache.RefDenialOrigin(ctx) {
 	case cache.RefDenialOriginServe:
-		return sourceCustomer
+		if v, _ := ctx.Value(customerResolveKey{}).(bool); v {
+			return sourceCustomer
+		}
+		return sourceUnknown
 	case cache.BackgroundOriginRefresher:
 		return sourceRefresher
 	case cache.BackgroundOriginCohortSeed, cache.BackgroundOriginPrewarmEngineBoot, cache.RefDenialOriginPrewarmPath:
@@ -136,7 +151,7 @@ type resolveTrace struct{ span trace.Span }
 // startResolveTrace starts the resolve span and returns ctx carrying it. With
 // tracing off it returns ctx unchanged and a nil handle, without allocating.
 func startResolveTrace(ctx context.Context, opts ResolveOptions) (context.Context, *resolveTrace) {
-	if !tracing.Active() {
+	if !tracing.Active() || !trace.SpanFromContext(ctx).IsRecording() {
 		return ctx, nil
 	}
 	ctx, span := resolveTracer().Start(ctx, SpanRestactionResolve, trace.WithAttributes(
@@ -148,12 +163,12 @@ func startResolveTrace(ctx context.Context, opts ResolveOptions) (context.Contex
 	return ctx, &resolveTrace{span: span}
 }
 
-func (t *resolveTrace) end(failure *StageFailure) {
+func (t *resolveTrace) end(failure *StageFailure, completed bool) {
 	if t == nil {
 		return
 	}
 	out := outcomeOK
-	if failure != nil {
+	if failure != nil || !completed {
 		out = outcomeFailed
 	}
 	t.span.SetAttributes(attribute.String(attrRAOutcome, out))
@@ -182,6 +197,21 @@ func (r *resolveRun) beginStageTrace(id string) (context.Context, *stageTrace) {
 		attribute.String(attrStage, id),
 	))
 	return ctx, &stageTrace{span: span}
+}
+
+// runStageTraced runs one stage under its span and returns runStage's stop. The
+// span ends in a defer, so a panic still ends it (marked failed); a truncating
+// stop records the stage's Error reason first, so the span reads it.
+func (r *resolveRun) runStageTraced(id string, apiMap map[string]*templates.API) (stop bool) {
+	spanCtx, st := r.beginStageTrace(id)
+	done := false
+	defer func() { st.end(stop || !done, false, r.outcomes.reasonOf(id)) }()
+	stop = r.runStage(spanCtx, st, id, apiMap)
+	done = true
+	if stop {
+		r.outcomes.fail(id, StageReasonError)
+	}
+	return stop
 }
 
 // traceNotRun records a stage the loop reached and did not enter (refused before

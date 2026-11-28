@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/krateo-platformops/plumbing/endpoints"
 	"github.com/krateo-platformops/plumbing/ptr"
@@ -23,6 +24,7 @@ import (
 
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/pagebudget"
 	"github.com/krateo-platformops/snowplow/internal/tracing"
 )
 
@@ -59,7 +61,16 @@ func traceFixture(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// runTraced resolves as a customer inside a recording parent span (the request's
+// Server span), the shape a /call has with tracing on.
 func runTraced(ctx context.Context, srv *httptest.Server, items []*templates.API, extras map[string]any) {
+	ctx, parent := otel.Tracer("test").Start(WithCustomerResolve(ctx), "server")
+	defer parent.End()
+	runTracedRaw(ctx, srv, items, extras)
+}
+
+// runTracedRaw resolves on ctx exactly as given.
+func runTracedRaw(ctx context.Context, srv *httptest.Server, items []*templates.API, extras map[string]any) {
 	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: srv.URL})
 	_ = Resolve(ctx, ResolveOptions{
 		RC:                  &rest.Config{},
@@ -149,7 +160,7 @@ func TestStageTrace_ResolveSpanWithThreeStageChildren(t *testing.T) {
 		stageIDs[s.SpanContext().SpanID().String()] = true
 	}
 	for _, s := range sr.Ended() {
-		if s.Name() == SpanRestactionResolve || s.Name() == SpanRestactionStage {
+		if s.Name() == SpanRestactionResolve || s.Name() == SpanRestactionStage || s.Name() == "server" {
 			continue
 		}
 		clients++
@@ -208,7 +219,8 @@ func TestStageTrace_SourceFromContext(t *testing.T) {
 		want string
 		ctx  func() context.Context
 	}{
-		{sourceCustomer, iterResolveCtx},
+		{sourceUnknown, iterResolveCtx},
+		{sourceCustomer, func() context.Context { return WithCustomerResolve(iterResolveCtx()) }},
 		{sourceRefresher, func() context.Context {
 			return cache.WithBackgroundResolveOrigin(iterResolveCtx(), cache.BackgroundOriginRefresher)
 		}},
@@ -218,7 +230,9 @@ func TestStageTrace_SourceFromContext(t *testing.T) {
 		}},
 	} {
 		sr := withRecorder(t)
-		runTraced(c.ctx(), srv, threeStages()[:1], nil)
+		ctx, parent := otel.Tracer("test").Start(c.ctx(), "server")
+		runTracedRaw(ctx, srv, threeStages()[:1], nil)
+		parent.End()
 		res := spansNamed(sr, SpanRestactionResolve)
 		if len(res) != 1 || attrMap(res[0])[attrRASource].AsString() != c.want {
 			t.Errorf("want source %q, got %v", c.want, res)
@@ -273,6 +287,90 @@ func TestStageTrace_AttributesAreAClosedSet(t *testing.T) {
 	}
 }
 
+// Background work (the refresher, the prewarms) never starts a root span: under
+// parentbased_always_on each would be a new 100%-sampled trace. It traces only
+// inside a trace that is already recording, and a customer resolve with no
+// recording parent emits nothing either: the rule is a property of the context.
+func TestStageTrace_BackgroundTracesOnlyInsideARecordingTrace(t *testing.T) {
+	srv := traceFixture(t)
+	bg := func() context.Context {
+		return cache.WithBackgroundResolveOrigin(iterResolveCtx(), cache.BackgroundOriginRefresher)
+	}
+
+	sr := withRecorder(t)
+	runTracedRaw(bg(), srv, threeStages()[:1], nil)
+	if n := len(sr.Ended()); n != 0 {
+		t.Fatalf("a background resolve with no parent span emitted %d spans, want none", n)
+	}
+	runTracedRaw(WithCustomerResolve(iterResolveCtx()), srv, threeStages()[:1], nil)
+	if n := len(sr.Ended()); n != 0 {
+		t.Fatalf("a resolve with no recording parent emitted %d spans, want none", n)
+	}
+
+	ctx, parent := otel.Tracer("test").Start(bg(), "server")
+	runTracedRaw(ctx, srv, threeStages()[:1], nil)
+	parent.End()
+	res := spansNamed(sr, SpanRestactionResolve)
+	if len(res) != 1 || attrMap(res[0])[attrRASource].AsString() != sourceRefresher ||
+		len(spansNamed(sr, SpanRestactionStage)) != 1 {
+		t.Fatalf("a background resolve inside a recording trace must trace, source refresher: %v", res)
+	}
+
+	sr2 := withRecorder(t)
+	runTraced(iterResolveCtx(), srv, threeStages()[:1], nil)
+	if r := spansNamed(sr2, SpanRestactionResolve); len(r) != 1 || attrMap(r[0])[attrRASource].AsString() != sourceCustomer {
+		t.Fatalf("a customer resolve must trace, source customer: %v", r)
+	}
+}
+
+// dropResolve records every span but restaction.resolve: a resolve the sampler
+// dropped, under a recording parent, with recording spans around it.
+type dropResolve struct{}
+
+func (dropResolve) Description() string { return "drop restaction.resolve" }
+func (dropResolve) ShouldSample(p sdktrace.SamplingParameters) sdktrace.SamplingResult {
+	if p.Name == SpanRestactionResolve {
+		return sdktrace.SamplingResult{Decision: sdktrace.Drop}
+	}
+	return sdktrace.SamplingResult{Decision: sdktrace.RecordAndSample}
+}
+
+// A resolve span the sampler dropped gets no stage spans.
+func TestStageTrace_SampledOutResolveStartsNoStageSpans(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr), sdktrace.WithSampler(dropResolve{}))
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	defer tracing.SetActiveForTest(true)()
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+
+	runTraced(iterResolveCtx(), traceFixture(t), threeStages()[:2], nil)
+	if n := len(spansNamed(sr, SpanRestactionResolve)); n != 0 {
+		t.Fatalf("the sampler dropped the resolve span, %d recorded", n)
+	}
+	if n := len(spansNamed(sr, SpanRestactionStage)); n != 0 {
+		t.Fatalf("stage spans appeared under a sampled-out resolve: %d", n)
+	}
+}
+
+// A stage whose exchange the page budget cut carries the bounded cause.
+func TestStageTrace_BudgetCauseOnTheStageSpan(t *testing.T) {
+	t.Setenv("CLIENT_MAX_RETRIES", "0")
+	sr := withRecorder(t)
+	srv := traceFixture(t)
+	ctx := pagebudget.WithCustomer(iterResolveCtx(), time.Now().Add(-2*pagebudget.PageMaxGoal))
+	items := []*templates.API{{Name: "a", Path: "/ok", Verb: ptr.To(http.MethodGet)}}
+	runTraced(ctx, srv, items, nil)
+	st := spansNamed(sr, SpanRestactionStage)
+	if len(st) != 1 {
+		t.Fatalf("want one stage span, got %d", len(st))
+	}
+	a := attrMap(st[0])
+	if got := a[attrStageBudget].AsString(); got != pagebudget.NotSent.String() {
+		t.Fatalf("budget_cause = %q, want %q (attrs %v)", got, pagebudget.NotSent.String(), st[0].Attributes())
+	}
+}
+
 // BenchmarkStageTraceOff is the span code's own cost per three-stage resolve
 // with tracing off: the figure the paired BenchmarkResolveThreeStages hides in
 // loopback noise.
@@ -289,7 +387,7 @@ func BenchmarkStageTraceOff(b *testing.B) {
 			st.noteItemErrs(nil)
 			st.end(false, false, "")
 		}
-		rt.end(nil)
+		rt.end(nil, true)
 	}
 }
 
@@ -312,11 +410,11 @@ func TestStageTrace_OffRecordsNothingAndAllocatesNothing(t *testing.T) {
 		st.noteItemErrs(nil)
 		st.end(false, false, "")
 		r.traceNotRun("b")
-		rt.end(nil)
+		rt.end(nil, true)
 	}); got != 0 {
 		t.Fatalf("tracing off must not allocate, got %v allocs/op", got)
 	}
-	runTraced(iterResolveCtx(), traceFixture(t), threeStages()[:1], nil)
+	runTracedRaw(iterResolveCtx(), traceFixture(t), threeStages()[:1], nil)
 	if n := len(sr.Ended()); n != 0 {
 		t.Fatalf("tracing off recorded %d spans", n)
 	}
