@@ -537,6 +537,19 @@ def _flag(argv, name):
     return argv[argv.index(name) + 1]
 
 
+def _step_takes(monkeypatch, seconds):
+    """gke-up calls apply_exclusion with its default clock; give it one that reads 0 at the step's start and
+    `seconds` at every later read, so the step's duration is known rather than whatever the fakes took."""
+    reads = []
+
+    def clock():
+        reads.append(1)
+        return 0.0 if len(reads) == 1 else float(seconds)
+
+    real = gke.apply_exclusion
+    monkeypatch.setattr(gke, "apply_exclusion", lambda spec, **kw: real(spec, clock=clock, **kw))
+
+
 def test_the_exclusions_window_is_the_clusters_ttl_window():
     spec = gke.default_spec(NAME, now=T, ttl_hours=13)
     argv = gke.exclusion_command(spec)
@@ -556,7 +569,8 @@ def test_the_exclusions_window_is_the_clusters_ttl_window():
     assert not any("maintenance-exclusion" in t for c in gke.create_commands(spec) for t in c)
 
 
-def test_gke_up_adds_the_exclusion_reads_it_back_and_records_it(fakes, capsys):
+def test_gke_up_adds_the_exclusion_reads_it_back_and_records_it(fakes, capsys, monkeypatch):
+    _step_takes(monkeypatch, 2.5)
     rc, rec = _up(fakes)
     out = capsys.readouterr()
     assert rc == 0, out.err
@@ -578,8 +592,15 @@ def test_gke_up_adds_the_exclusion_reads_it_back_and_records_it(fakes, capsys):
     # when GKE says the cluster was created, from the same read-back: what the operations record is proven against
     assert gke.rfc3339_epoch(rec["cluster_created"]) is not None
     assert "maintenance exclusion in place: bench-run-ttl (no_upgrades, " in out.out
-    assert rec["seconds"] > 0 and f"(the step took {rec['seconds']:g} s)" in out.out and "refused_once" not in rec
+    assert rec["seconds"] == 2.5 and "(the step took 2.5 s)" in out.out and "refused_once" not in rec
     assert "it does not cover control-plane resizes and repairs" in out.out
+
+
+def test_a_step_faster_than_the_clocks_resolution_records_and_prints_zero(fakes, capsys, monkeypatch):
+    # seconds is rounded to 0.1 s: a fast step is legal and reads "0 s", not a missing figure
+    _step_takes(monkeypatch, 0.04)
+    rc, rec = _up(fakes)
+    assert rc == 0 and rec["seconds"] == 0.0 and "(the step took 0 s)" in capsys.readouterr().out
 
 
 REFUSED = {
