@@ -70,6 +70,8 @@ K6_THRESHOLDS = {
 _KEEP = ("page_load_ms", "page_loads", "page_errors", "first_load_failed",
          "route_table_mismatch", "bench_frame", "http_req_failed", "http_req_duration",
          "browser_page_load_ms", "browser_page_loads", "browser_widget_states",
+         # the first loads' time the OLD way (their skeleton's end), for comparison with run 31 and earlier
+         "browser_first_load_skeleton_ms",
          "browser_page_timeouts", "browser_logins", "browser_signin_ms", "browser_sse_opened",
          "dropped_iterations", "clicks", "arrivals",
          # the browser's completed requests: the pair's customer witness reads them
@@ -957,7 +959,9 @@ def warm_final_check(o: dict | None) -> dict | None:
     p95 ~210-235 ms after the click: the warm navigation bar was not measured at all, and a zero read as health.
     FAIL when (1) every warm load is recorded as 0 ms, or (2) a warm load that made requests reports a time
     before its last request answered (call_timing: from_load_ms + response_end, by load_id; WARM_FINAL_SLACK_MS).
-    None when the stream holds no warm load: driver.warm_navs already fails that."""
+    A live update's re-fetch (call_timing `live`) is not the load's own and is not compared: it does not extend a load.
+    None when the stream holds no warm load: the k6 path's `warm_nav_p95_ms` fails that ("no data"); the
+    `driver.warm_navs` check is the non-k6 path's."""
     if o is None:
         return None
     from bench import calltiming
@@ -971,7 +975,7 @@ def warm_final_check(o: dict | None) -> dict | None:
     last: dict[str, float] = {}
     for _, t, md, _ in calltiming._aligned(o, "browser_call_ms"):
         m = calltiming.timing_of(md)
-        if t.get("during") != "load" or m is None or str(m.get("load_id")) not in warm:
+        if t.get("during") != "load" or m is None or str(m.get("load_id")) not in warm or m.get("live"):
             continue
         a, b = calltiming._num(m.get("from_load_ms")), calltiming._num(m.get("response_end"))
         if a is not None and b is not None:
@@ -1444,6 +1448,32 @@ def _by(points, *keys):
             for k, v in sorted(g.items(), key=lambda kv: tuple(str(x) for x in kv[0]))}
 
 
+def final_page_report(p: dict) -> dict:
+    """The page-load definition in force and its split, per visit (first / warm).
+
+    A load ends when the page is FINAL (pageload.js): its last skeleton gone, last own /call answered or last counted
+    DOM change. `ended_by` says which; `live_update` whether a live update's re-fetch reached the load (it does not
+    extend it). `first_load_skeleton_end` is the first loads' time the OLD way (their skeleton's end), the series
+    runs before the final-page definition (run 31 and earlier) were judged on: compare THAT to old evidence, the
+    first-load bars above to new evidence. Evidence with no `ended_by` tag predates the definition."""
+    loads = [(v, t) for v, t in p.get("browser_page_load_ms", []) if t.get("timeout") != "yes"]
+    by: dict = {}
+    for visit in ("first", "warm"):
+        ls = [(v, t) for v, t in loads if t.get("visit") == visit]
+        ended = Counter(t.get("ended_by") or "untagged" for _, t in ls)
+        live = sum(1 for _, t in ls if t.get("live_update") == "yes")
+        by[visit] = {"n": len(ls), "ended_by": dict(sorted(ended.items())),
+                     "ended_by_share": {k: round(c / len(ls), 4) for k, c in sorted(ended.items())} if ls else {},
+                     "live_update_loads": live, "live_update_share": round(live / len(ls), 4) if ls else None}
+    skel = [v for v, _ in p.get("browser_first_load_skeleton_ms", [])]
+    tagged = sum(c for k, c in Counter(t.get("ended_by") or "untagged" for _, t in loads).items() if k != "untagged")
+    return {"load_definition": ("final-page (a load ends when its own requests answered and the page is quiet)"
+                                if tagged else "skeleton end (before the final-page definition)"),
+            "page_load_by_visit_ended_by": by,
+            "first_load_skeleton_end": ({"n": len(skel), "p50_ms": _pct(skel, 50), "p95_ms": _pct(skel, 95),
+                                         "max_ms": max(skel)} if skel else None)}
+
+
 def _clicks(summary: dict, sc: str) -> dict:
     done = _metric(summary, f"clicks{{scenario:{sc}}}", "count") or 0
     open_ = _metric(summary, f"clicks_open_schedule{{scenario:{sc}}}", "count") or 0
@@ -1492,6 +1522,8 @@ def browser_report(o: dict | None) -> dict | None:
             # skeleton=no: painted from the app's own cache, no skeleton; its time ends when its own requests
             # answered and the page stopped changing (pageload.js; `ended_by`), never 0 by construction
             "page_load_by_visit_skeleton": _by(p.get("browser_page_load_ms", []), "visit", "skeleton"),
+            # what ended each load, and the loads a live update reached (they are NOT extended by it)
+            **final_page_report(p),
             # the sign-in (submit -> the app leaves /login): authn, not a page load
             "signin_by_session": _by(p.get("browser_signin_ms", []), "session"),
             # all sessions together (run 11's reader found no flat value)
