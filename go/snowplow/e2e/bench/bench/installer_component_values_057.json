@@ -1,10 +1,10 @@
 {
  "kind": "installer_component_values_057",
  "read": {
-  "date": "2026-11-24",
-  "installer_version": "0.3.707",
+  "date": "2026-11-28",
+  "installer_version": "0.3.714",
   "object": "installers.composition.krateo.io (the one Installer CR), spec.componentValues",
-  "rule": "switches and sizes by installer 0.3.707's values schema; every other path by path and reason only, never its value"
+  "rule": "switches and sizes by installer 0.3.714's values schema; every other path by path and reason only, never its value"
  },
  "recorded": {
   "agentgateway-policies.cors.allowCredentials": false,

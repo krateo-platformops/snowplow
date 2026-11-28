@@ -60,10 +60,10 @@ AT_0_3_545 = {
 }
 # installer 0.3.616's: the same, plus kagent's per-user tool server (installer #829), behind a comment
 AT_0_3_616 = {**AT_0_3_545, "kagent": [["perUserRbac", "toolImagePullSecrets"]]}
-# installer 0.3.698's: the same, plus zendesk-kog's wrapper plugin (behind a comment too); 0.3.700's to 0.3.707's (the record's): the same
+# installer 0.3.698's: the same, plus zendesk-kog's wrapper plugin (behind a comment too); 0.3.700's to 0.3.714's (the record's): the same
 AT_0_3_698 = {**AT_0_3_616, "zendesk-kog": [["plugin", "imagePullSecrets"]]}
-AT_0_3_707 = dict(AT_0_3_698)
-AT_RECORDED = {"0.3.707": AT_0_3_707}[RECORDED]
+AT_0_3_714 = dict(AT_0_3_698)
+AT_RECORDED = {"0.3.714": AT_0_3_714}[RECORDED]
 
 
 def _values(snowplow_tag="1.12.69", frontend_tag="1.8.41", **over) -> dict:
@@ -418,7 +418,7 @@ def test_falsifier_the_laptop_refuses_a_run_whose_values_leave_the_ca_bundle_tar
         REAL_CHART_CHECK(_env(), ["N1", "N2"])
     assert str(e.value).startswith(f"installer {RECORDED}, run N1's values: the installer refuses to render its "
                                    "components with the run's effective spec"), str(e.value)
-    assert ("compositions.yaml:1005:4): features.internalTls is on but componentValues.internal-ca-bundle.target"
+    assert ("compositions.yaml:1055:4): features.internalTls is on but componentValues.internal-ca-bundle.target"
             ".namespaces is empty") in str(e.value), str(e.value)
 
 
@@ -529,7 +529,7 @@ def test_the_bench_enable_rule_is_the_installers(tmp_path, snowplow):
         return {d["metadata"]["name"] for d in _render(chart, values, "--show-only", "templates/definitions.yaml")
                 if d.get("kind") == "CompositionDefinition"}
     pins = yaml.safe_load((root / "files" / "component-pins.min.yaml").read_text())
-    # installer 0.3.707's files/component-pins.min.yaml (as 0.3.698's to 0.3.703's), its entries with alsoFeatures
+    # installer 0.3.714's files/component-pins.min.yaml (as 0.3.698's to 0.3.707's), its entries with alsoFeatures
     assert [(c["name"], c["alsoFeatures"]) for c in pins["components"] if c.get("alsoFeatures")] == [
         ("cert-manager", ["internalTls"]), ("cert-manager-issuers", ["internalTls"]),
         ("cloudnative-pg", ["cloudnativePg"]), ("external-secrets", ["serviceDesk"])]
